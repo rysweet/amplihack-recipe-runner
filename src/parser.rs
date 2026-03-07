@@ -1,0 +1,246 @@
+/// YAML recipe parser.
+///
+/// Parses YAML recipe definitions into Recipe model objects, with validation
+/// and step-type inference. Direct port from Python `amplihack.recipes.parser`.
+use crate::models::{Recipe, StepType};
+use std::collections::HashSet;
+use std::path::Path;
+
+const MAX_YAML_SIZE_BYTES: usize = 1_000_000;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ParseError {
+    #[error("Recipe file not found: {0}")]
+    FileNotFound(String),
+
+    #[error("Recipe file too large ({size} bytes). Maximum allowed: {max} bytes")]
+    FileTooLarge { size: usize, max: usize },
+
+    #[error("Invalid recipe: {0}")]
+    Invalid(String),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("YAML parse error: {0}")]
+    Yaml(#[from] serde_yaml::Error),
+}
+
+pub struct RecipeParser;
+
+impl RecipeParser {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Parse a recipe YAML file from disk.
+    pub fn parse_file(&self, path: &Path) -> Result<Recipe, ParseError> {
+        if !path.is_file() {
+            return Err(ParseError::FileNotFound(path.display().to_string()));
+        }
+
+        let metadata = std::fs::metadata(path)?;
+        let size = metadata.len() as usize;
+        if size > MAX_YAML_SIZE_BYTES {
+            return Err(ParseError::FileTooLarge {
+                size,
+                max: MAX_YAML_SIZE_BYTES,
+            });
+        }
+
+        let content = std::fs::read_to_string(path)?;
+        self.parse(&content)
+    }
+
+    /// Parse a YAML string into a Recipe.
+    pub fn parse(&self, yaml_content: &str) -> Result<Recipe, ParseError> {
+        if yaml_content.len() > MAX_YAML_SIZE_BYTES {
+            return Err(ParseError::FileTooLarge {
+                size: yaml_content.len(),
+                max: MAX_YAML_SIZE_BYTES,
+            });
+        }
+
+        let recipe: Recipe = serde_yaml::from_str(yaml_content)?;
+
+        if recipe.name.is_empty() {
+            return Err(ParseError::Invalid(
+                "Recipe must have a 'name' field".to_string(),
+            ));
+        }
+
+        if recipe.steps.is_empty() {
+            return Err(ParseError::Invalid(
+                "Recipe must have a 'steps' field with at least one step".to_string(),
+            ));
+        }
+
+        // Check for duplicate step IDs
+        let mut seen = HashSet::new();
+        for step in &recipe.steps {
+            if step.id.is_empty() {
+                return Err(ParseError::Invalid(
+                    "Every step must have a non-empty 'id' field".to_string(),
+                ));
+            }
+            if !seen.insert(&step.id) {
+                return Err(ParseError::Invalid(format!(
+                    "Duplicate step id: '{}'",
+                    step.id
+                )));
+            }
+        }
+
+        Ok(recipe)
+    }
+
+    /// Validate a parsed recipe and return a list of warning strings.
+    pub fn validate(&self, recipe: &Recipe) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        for step in &recipe.steps {
+            let st = step.effective_type();
+            match st {
+                StepType::Agent => {
+                    if step.prompt.is_none() {
+                        warnings.push(format!(
+                            "Step '{}': agent step is missing a 'prompt' field",
+                            step.id
+                        ));
+                    }
+                }
+                StepType::Bash => {
+                    if step.command.is_none() {
+                        warnings.push(format!(
+                            "Step '{}': bash step is missing a 'command' field",
+                            step.id
+                        ));
+                    }
+                }
+                StepType::Recipe => {
+                    if step.recipe.is_none() {
+                        warnings.push(format!(
+                            "Step '{}': recipe step is missing a 'recipe' field",
+                            step.id
+                        ));
+                    }
+                }
+            }
+        }
+
+        warnings
+    }
+}
+
+impl Default for RecipeParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_minimal_recipe() {
+        let yaml = r#"
+name: "test-recipe"
+steps:
+  - id: "step-1"
+    command: "echo hello"
+"#;
+        let parser = RecipeParser::new();
+        let recipe = parser.parse(yaml).unwrap();
+        assert_eq!(recipe.name, "test-recipe");
+        assert_eq!(recipe.steps.len(), 1);
+        assert_eq!(recipe.steps[0].id, "step-1");
+        assert_eq!(recipe.steps[0].effective_type(), StepType::Bash);
+    }
+
+    #[test]
+    fn test_parse_agent_step() {
+        let yaml = r#"
+name: "agent-recipe"
+steps:
+  - id: "agent-step"
+    agent: "amplihack:core:architect"
+    prompt: "Do something"
+"#;
+        let parser = RecipeParser::new();
+        let recipe = parser.parse(yaml).unwrap();
+        assert_eq!(recipe.steps[0].effective_type(), StepType::Agent);
+    }
+
+    #[test]
+    fn test_parse_recipe_step() {
+        let yaml = r#"
+name: "parent-recipe"
+steps:
+  - id: "sub"
+    type: "recipe"
+    recipe: "child-recipe"
+"#;
+        let parser = RecipeParser::new();
+        let recipe = parser.parse(yaml).unwrap();
+        assert_eq!(recipe.steps[0].effective_type(), StepType::Recipe);
+    }
+
+    #[test]
+    fn test_reject_duplicate_step_ids() {
+        let yaml = r#"
+name: "dup-recipe"
+steps:
+  - id: "same-id"
+    command: "echo 1"
+  - id: "same-id"
+    command: "echo 2"
+"#;
+        let parser = RecipeParser::new();
+        let err = parser.parse(yaml).unwrap_err();
+        assert!(err.to_string().contains("Duplicate step id"));
+    }
+
+    #[test]
+    fn test_reject_empty_name() {
+        let yaml = r#"
+name: ""
+steps:
+  - id: "step-1"
+    command: "echo hello"
+"#;
+        let parser = RecipeParser::new();
+        let err = parser.parse(yaml).unwrap_err();
+        assert!(err.to_string().contains("name"));
+    }
+
+    #[test]
+    fn test_validate_missing_prompt() {
+        let yaml = r#"
+name: "bad-recipe"
+steps:
+  - id: "agent-no-prompt"
+    agent: "amplihack:core:architect"
+"#;
+        let parser = RecipeParser::new();
+        let recipe = parser.parse(yaml).unwrap();
+        let warnings = parser.validate(&recipe);
+        assert!(warnings.iter().any(|w| w.contains("missing a 'prompt'")));
+    }
+
+    #[test]
+    fn test_parse_with_context() {
+        let yaml = r#"
+name: "ctx-recipe"
+context:
+  task_description: "hello"
+  repo_path: "."
+steps:
+  - id: "step-1"
+    command: "echo {{task_description}}"
+"#;
+        let parser = RecipeParser::new();
+        let recipe = parser.parse(yaml).unwrap();
+        assert!(recipe.context.contains_key("task_description"));
+    }
+}
