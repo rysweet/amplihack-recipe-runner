@@ -110,6 +110,10 @@ enum Token {
     Ident(String),     // variable name (may contain dots)
     Eq,                // ==
     NotEq,             // !=
+    Lt,                // <
+    LtEq,              // <=
+    Gt,                // >
+    GtEq,              // >=
     In,                // in
     NotIn,             // not in
     And,               // and
@@ -117,6 +121,8 @@ enum Token {
     Not,               // not (standalone, not followed by 'in')
     LParen,            // (
     RParen,            // )
+    Comma,             // ,
+    Dot,               // .  (for method calls)
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, ConditionError> {
@@ -129,12 +135,21 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ConditionError> {
             ' ' | '\t' | '\n' | '\r' => i += 1,
             '(' => { tokens.push(Token::LParen); i += 1; }
             ')' => { tokens.push(Token::RParen); i += 1; }
+            ',' => { tokens.push(Token::Comma); i += 1; }
             '=' if i + 1 < chars.len() && chars[i + 1] == '=' => {
                 tokens.push(Token::Eq); i += 2;
             }
             '!' if i + 1 < chars.len() && chars[i + 1] == '=' => {
                 tokens.push(Token::NotEq); i += 2;
             }
+            '<' if i + 1 < chars.len() && chars[i + 1] == '=' => {
+                tokens.push(Token::LtEq); i += 2;
+            }
+            '<' => { tokens.push(Token::Lt); i += 1; }
+            '>' if i + 1 < chars.len() && chars[i + 1] == '=' => {
+                tokens.push(Token::GtEq); i += 2;
+            }
+            '>' => { tokens.push(Token::Gt); i += 1; }
             '\'' | '"' => {
                 let quote = chars[i];
                 i += 1;
@@ -154,7 +169,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ConditionError> {
                 i += 1; // skip closing quote
                 tokens.push(Token::String(s));
             }
-            c if c.is_ascii_digit() || c == '-' => {
+            c if c.is_ascii_digit() || (c == '-' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit()) => {
                 let start = i;
                 if c == '-' { i += 1; }
                 while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
@@ -168,7 +183,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ConditionError> {
             }
             c if c.is_ascii_alphanumeric() || c == '_' => {
                 let start = i;
-                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '.') {
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
                     i += 1;
                 }
                 let word: String = chars[start..i].iter().collect();
@@ -196,6 +211,11 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ConditionError> {
                     "false" | "False" => tokens.push(Token::Ident("false".to_string())),
                     _ => tokens.push(Token::Ident(word)),
                 }
+            }
+            '.' => {
+                // Dot for method calls (e.g., value.strip())
+                tokens.push(Token::Dot);
+                i += 1;
             }
             c => return Err(ConditionError::Parse(format!("unexpected character: '{}'", c))),
         }
@@ -257,7 +277,7 @@ impl<'a> ExprParser<'a> {
         self.parse_comparison()
     }
 
-    // comparison: primary (('==' | '!=' | 'in' | 'not in') primary)?
+    // comparison: primary (('==' | '!=' | '<' | '<=' | '>' | '>=' | 'in' | 'not in') primary)?
     fn parse_comparison(&mut self) -> Result<bool, ConditionError> {
         let lhs = self.parse_primary()?;
 
@@ -271,6 +291,26 @@ impl<'a> ExprParser<'a> {
                 self.advance();
                 let rhs = self.parse_primary()?;
                 Ok(!values_equal(&lhs, &rhs))
+            }
+            Some(Token::Lt) => {
+                self.advance();
+                let rhs = self.parse_primary()?;
+                Ok(compare_values(&lhs, &rhs) == Some(std::cmp::Ordering::Less))
+            }
+            Some(Token::LtEq) => {
+                self.advance();
+                let rhs = self.parse_primary()?;
+                Ok(matches!(compare_values(&lhs, &rhs), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)))
+            }
+            Some(Token::Gt) => {
+                self.advance();
+                let rhs = self.parse_primary()?;
+                Ok(compare_values(&lhs, &rhs) == Some(std::cmp::Ordering::Greater))
+            }
+            Some(Token::GtEq) => {
+                self.advance();
+                let rhs = self.parse_primary()?;
+                Ok(matches!(compare_values(&lhs, &rhs), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)))
             }
             Some(Token::In) => {
                 self.advance();
@@ -286,8 +326,64 @@ impl<'a> ExprParser<'a> {
         }
     }
 
-    // primary: STRING | NUMBER | IDENT | '(' or_expr ')'
+    // primary: atom postfix*
+    // postfix: '.' IDENT '(' args ')' (method call)
     fn parse_primary(&mut self) -> Result<Value, ConditionError> {
+        let mut value = self.parse_atom()?;
+
+        // Handle method calls: value.method(args...)
+        while self.peek() == Some(&Token::Dot) {
+            self.advance(); // consume '.'
+            let method_name = match self.peek().cloned() {
+                Some(Token::Ident(name)) => {
+                    self.advance();
+                    name
+                }
+                _ => return Err(ConditionError::Parse("expected method name after '.'".to_string())),
+            };
+
+            if !SAFE_METHOD_NAMES.contains(&method_name.as_str()) {
+                return Err(ConditionError::Unsafe(format!(
+                    "method '.{}()' is not allowed. Safe methods: {:?}",
+                    method_name, SAFE_METHOD_NAMES
+                )));
+            }
+
+            // Parse args: '(' [arg, ...] ')'
+            if self.peek() != Some(&Token::LParen) {
+                return Err(ConditionError::Parse(format!(
+                    "expected '(' after method name '{}'", method_name
+                )));
+            }
+            self.advance(); // consume '('
+
+            let mut args = Vec::new();
+            if self.peek() != Some(&Token::RParen) {
+                args.push(self.parse_or_value()?);
+                while self.peek() == Some(&Token::Comma) {
+                    self.advance();
+                    args.push(self.parse_or_value()?);
+                }
+            }
+
+            if self.peek() != Some(&Token::RParen) {
+                return Err(ConditionError::Parse("expected ')'".to_string()));
+            }
+            self.advance();
+
+            value = apply_method(&value, &method_name, &args)?;
+        }
+
+        Ok(value)
+    }
+
+    /// Parse an expression that returns a Value (for function/method args)
+    fn parse_or_value(&mut self) -> Result<Value, ConditionError> {
+        self.parse_atom()
+    }
+
+    // atom: STRING | NUMBER | IDENT | function_call | '(' or_expr ')'
+    fn parse_atom(&mut self) -> Result<Value, ConditionError> {
         match self.peek().cloned() {
             Some(Token::String(s)) => {
                 self.advance();
@@ -301,6 +397,23 @@ impl<'a> ExprParser<'a> {
             }
             Some(Token::Ident(name)) => {
                 self.advance();
+                // Check if this is a function call: ident '(' args ')'
+                if SAFE_CALL_NAMES.contains(&name.as_str()) && self.peek() == Some(&Token::LParen) {
+                    self.advance(); // consume '('
+                    let mut args = Vec::new();
+                    if self.peek() != Some(&Token::RParen) {
+                        args.push(self.parse_primary()?);
+                        while self.peek() == Some(&Token::Comma) {
+                            self.advance();
+                            args.push(self.parse_primary()?);
+                        }
+                    }
+                    if self.peek() != Some(&Token::RParen) {
+                        return Err(ConditionError::Parse("expected ')'".to_string()));
+                    }
+                    self.advance();
+                    return apply_function(&name, &args);
+                }
                 Ok(self.resolve_ident(&name))
             }
             Some(Token::LParen) => {
@@ -338,6 +451,186 @@ impl<'a> ExprParser<'a> {
             };
         }
         current
+    }
+}
+
+/// Safe function names (pure type-coercion and helpers).
+const SAFE_CALL_NAMES: &[&str] = &["int", "str", "len", "bool", "float", "min", "max"];
+
+/// Safe method names (side-effect-free string methods).
+const SAFE_METHOD_NAMES: &[&str] = &[
+    "strip", "lstrip", "rstrip", "lower", "upper", "title",
+    "startswith", "endswith", "replace", "split", "join",
+    "count", "find",
+];
+
+/// Apply a safe built-in function.
+fn apply_function(name: &str, args: &[Value]) -> Result<Value, ConditionError> {
+    match name {
+        "int" => {
+            let arg = args.first().unwrap_or(&Value::Null);
+            let n = match arg {
+                Value::Number(n) => n.as_i64().unwrap_or(0),
+                Value::String(s) => s.trim().parse::<i64>().unwrap_or(0),
+                Value::Bool(b) => if *b { 1 } else { 0 },
+                _ => 0,
+            };
+            Ok(Value::Number(serde_json::Number::from(n)))
+        }
+        "float" => {
+            let arg = args.first().unwrap_or(&Value::Null);
+            let n = match arg {
+                Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                Value::String(s) => s.trim().parse::<f64>().unwrap_or(0.0),
+                Value::Bool(b) => if *b { 1.0 } else { 0.0 },
+                _ => 0.0,
+            };
+            Ok(serde_json::Number::from_f64(n)
+                .map(Value::Number)
+                .unwrap_or(Value::Null))
+        }
+        "str" => {
+            let arg = args.first().unwrap_or(&Value::Null);
+            Ok(Value::String(match arg {
+                Value::String(s) => s.clone(),
+                Value::Null => String::new(),
+                v => v.to_string(),
+            }))
+        }
+        "bool" => {
+            let arg = args.first().unwrap_or(&Value::Null);
+            Ok(Value::Bool(is_truthy(arg)))
+        }
+        "len" => {
+            let arg = args.first().unwrap_or(&Value::Null);
+            let len = match arg {
+                Value::String(s) => s.len() as i64,
+                Value::Array(a) => a.len() as i64,
+                Value::Object(o) => o.len() as i64,
+                _ => 0,
+            };
+            Ok(Value::Number(serde_json::Number::from(len)))
+        }
+        "min" => {
+            if args.len() < 2 {
+                return Err(ConditionError::Parse("min() requires at least 2 arguments".to_string()));
+            }
+            let mut best = &args[0];
+            for arg in &args[1..] {
+                if compare_values(arg, best) == Some(std::cmp::Ordering::Less) {
+                    best = arg;
+                }
+            }
+            Ok(best.clone())
+        }
+        "max" => {
+            if args.len() < 2 {
+                return Err(ConditionError::Parse("max() requires at least 2 arguments".to_string()));
+            }
+            let mut best = &args[0];
+            for arg in &args[1..] {
+                if compare_values(arg, best) == Some(std::cmp::Ordering::Greater) {
+                    best = arg;
+                }
+            }
+            Ok(best.clone())
+        }
+        _ => Err(ConditionError::Unsafe(format!(
+            "function '{}' is not allowed", name
+        ))),
+    }
+}
+
+/// Apply a safe method call on a value.
+fn apply_method(value: &Value, method: &str, args: &[Value]) -> Result<Value, ConditionError> {
+    let s = match value {
+        Value::String(s) => s.as_str(),
+        _ => return Err(ConditionError::Parse(format!(
+            "method '.{}()' can only be called on strings", method
+        ))),
+    };
+
+    match method {
+        "strip" => Ok(Value::String(s.trim().to_string())),
+        "lstrip" => Ok(Value::String(s.trim_start().to_string())),
+        "rstrip" => Ok(Value::String(s.trim_end().to_string())),
+        "lower" => Ok(Value::String(s.to_lowercase())),
+        "upper" => Ok(Value::String(s.to_uppercase())),
+        "title" => {
+            let titled = s.split_whitespace()
+                .map(|word| {
+                    let mut chars = word.chars();
+                    match chars.next() {
+                        None => String::new(),
+                        Some(c) => c.to_uppercase().to_string() + &chars.as_str().to_lowercase(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            Ok(Value::String(titled))
+        }
+        "startswith" => {
+            let prefix = args.first().and_then(|a| a.as_str()).unwrap_or("");
+            Ok(Value::Bool(s.starts_with(prefix)))
+        }
+        "endswith" => {
+            let suffix = args.first().and_then(|a| a.as_str()).unwrap_or("");
+            Ok(Value::Bool(s.ends_with(suffix)))
+        }
+        "replace" => {
+            let old = args.first().and_then(|a| a.as_str()).unwrap_or("");
+            let new = args.get(1).and_then(|a| a.as_str()).unwrap_or("");
+            Ok(Value::String(s.replace(old, new)))
+        }
+        "split" => {
+            let sep = args.first().and_then(|a| a.as_str());
+            let parts: Vec<Value> = if let Some(sep) = sep {
+                s.split(sep).map(|p| Value::String(p.to_string())).collect()
+            } else {
+                s.split_whitespace().map(|p| Value::String(p.to_string())).collect()
+            };
+            Ok(Value::Array(parts))
+        }
+        "join" => {
+            // join is called on separator with iterable arg
+            let arr = args.first().and_then(|a| a.as_array());
+            if let Some(arr) = arr {
+                let joined: String = arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+                    .join(s);
+                Ok(Value::String(joined))
+            } else {
+                Ok(Value::String(String::new()))
+            }
+        }
+        "count" => {
+            let sub = args.first().and_then(|a| a.as_str()).unwrap_or("");
+            Ok(Value::Number(serde_json::Number::from(s.matches(sub).count() as i64)))
+        }
+        "find" => {
+            let sub = args.first().and_then(|a| a.as_str()).unwrap_or("");
+            let idx = s.find(sub).map(|i| i as i64).unwrap_or(-1);
+            Ok(Value::Number(serde_json::Number::from(idx)))
+        }
+        _ => Err(ConditionError::Unsafe(format!(
+            "method '.{}()' is not allowed", method
+        ))),
+    }
+}
+
+fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Value::Number(na), Value::Number(nb)) => na.as_f64()?.partial_cmp(&nb.as_f64()?),
+        (Value::String(sa), Value::String(sb)) => Some(sa.cmp(sb)),
+        // Cross-type: try numeric coercion
+        (Value::String(s), Value::Number(n)) => {
+            s.trim().parse::<f64>().ok()?.partial_cmp(&n.as_f64()?)
+        }
+        (Value::Number(n), Value::String(s)) => {
+            n.as_f64()?.partial_cmp(&s.trim().parse::<f64>().ok()?)
+        }
+        _ => None,
     }
 }
 
@@ -467,5 +760,63 @@ mod tests {
         let c = ctx(vec![("obj", json!({"nested": {"val": 42}}))]);
         let val = c.get("obj.nested.val").unwrap();
         assert_eq!(val, &json!(42));
+    }
+
+    #[test]
+    fn test_evaluate_function_len() {
+        let c = ctx(vec![("text", json!("hello"))]);
+        assert!(c.evaluate("len(text) == 5").unwrap());
+    }
+
+    #[test]
+    fn test_evaluate_function_int() {
+        let c = ctx(vec![("num_str", json!("42"))]);
+        assert!(c.evaluate("int(num_str) == 42").unwrap());
+    }
+
+    #[test]
+    fn test_evaluate_method_strip() {
+        let c = ctx(vec![("text", json!("  hello  "))]);
+        assert!(c.evaluate("text.strip() == 'hello'").unwrap());
+    }
+
+    #[test]
+    fn test_evaluate_method_lower() {
+        let c = ctx(vec![("text", json!("HELLO"))]);
+        assert!(c.evaluate("text.lower() == 'hello'").unwrap());
+    }
+
+    #[test]
+    fn test_evaluate_method_upper() {
+        let c = ctx(vec![("text", json!("hello"))]);
+        assert!(c.evaluate("text.upper() == 'HELLO'").unwrap());
+    }
+
+    #[test]
+    fn test_evaluate_method_startswith() {
+        let c = ctx(vec![("text", json!("hello world"))]);
+        assert!(c.evaluate("text.startswith('hello')").unwrap());
+        assert!(!c.evaluate("text.startswith('world')").unwrap());
+    }
+
+    #[test]
+    fn test_evaluate_method_replace() {
+        let c = ctx(vec![("text", json!("hello world"))]);
+        assert!(c.evaluate("text.replace('world', 'rust') == 'hello rust'").unwrap());
+    }
+
+    #[test]
+    fn test_evaluate_comparison_lt_gt() {
+        let c = ctx(vec![("a", json!(5)), ("b", json!(10))]);
+        assert!(c.evaluate("a < b").unwrap());
+        assert!(c.evaluate("b > a").unwrap());
+        assert!(c.evaluate("a <= 5").unwrap());
+        assert!(c.evaluate("b >= 10").unwrap());
+    }
+
+    #[test]
+    fn test_reject_unsafe_method() {
+        let c = ctx(vec![("text", json!("hello"))]);
+        assert!(c.evaluate("text.system()").is_err());
     }
 }

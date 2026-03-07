@@ -16,6 +16,9 @@ regex = "1"
 shell-escape = "0.1"
 log = "0.4"
 env_logger = "0.11"
-
-[dev-dependencies]
+dirs = "6"
+sha2 = "0.10"
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+which = "7"
 tempfile = "3"

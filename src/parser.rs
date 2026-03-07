@@ -8,6 +8,17 @@ use std::path::Path;
 
 const MAX_YAML_SIZE_BYTES: usize = 1_000_000;
 
+/// Top-level fields recognized by the parser.
+const KNOWN_TOP_FIELDS: &[&str] = &[
+    "name", "description", "version", "author", "tags", "context", "steps", "recursion", "output",
+];
+
+/// Step-level fields recognized by the parser.
+const KNOWN_STEP_FIELDS: &[&str] = &[
+    "id", "type", "agent", "prompt", "command", "output", "condition",
+    "parse_json", "mode", "working_dir", "timeout", "auto_stage", "recipe", "context",
+];
+
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
     #[error("Recipe file not found: {0}")]
@@ -96,6 +107,11 @@ impl RecipeParser {
 
     /// Validate a parsed recipe and return a list of warning strings.
     pub fn validate(&self, recipe: &Recipe) -> Vec<String> {
+        self.validate_with_yaml(recipe, None)
+    }
+
+    /// Validate a parsed recipe with optional raw YAML for field checking.
+    pub fn validate_with_yaml(&self, recipe: &Recipe, raw_yaml: Option<&str>) -> Vec<String> {
         let mut warnings = Vec::new();
 
         for step in &recipe.steps {
@@ -123,6 +139,51 @@ impl RecipeParser {
                             "Step '{}': recipe step is missing a 'recipe' field",
                             step.id
                         ));
+                    }
+                }
+            }
+        }
+
+        // Check for unrecognized fields if raw YAML is provided
+        if let Some(yaml_str) = raw_yaml {
+            if let Ok(data) = serde_yaml::from_str::<serde_yaml::Value>(yaml_str) {
+                if let Some(map) = data.as_mapping() {
+                    let known: HashSet<&str> = KNOWN_TOP_FIELDS.iter().copied().collect();
+                    for key in map.keys() {
+                        if let Some(key_str) = key.as_str() {
+                            if !known.contains(key_str) {
+                                warnings.push(format!(
+                                    "Unrecognized top-level field '{}' (possible typo)",
+                                    key_str
+                                ));
+                            }
+                        }
+                    }
+
+                    // Check step-level fields
+                    let step_known: HashSet<&str> = KNOWN_STEP_FIELDS.iter().copied().collect();
+                    if let Some(steps) = map.get(&serde_yaml::Value::String("steps".to_string())) {
+                        if let Some(steps_seq) = steps.as_sequence() {
+                            for (i, step_raw) in steps_seq.iter().enumerate() {
+                                if let Some(step_map) = step_raw.as_mapping() {
+                                    let default_sid = format!("index {}", i);
+                                    let sid = step_map
+                                        .get(&serde_yaml::Value::String("id".to_string()))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or(&default_sid);
+                                    for key in step_map.keys() {
+                                        if let Some(key_str) = key.as_str() {
+                                            if !step_known.contains(key_str) {
+                                                warnings.push(format!(
+                                                    "Step '{}': unrecognized field '{}' (possible typo)",
+                                                    sid, key_str
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -242,5 +303,21 @@ steps:
         let parser = RecipeParser::new();
         let recipe = parser.parse(yaml).unwrap();
         assert!(recipe.context.contains_key("task_description"));
+    }
+
+    #[test]
+    fn test_validate_unrecognized_fields() {
+        let yaml = r#"
+name: "typo-recipe"
+descrption: "typo!"
+steps:
+  - id: "step-1"
+    comand: "echo oops"
+"#;
+        let parser = RecipeParser::new();
+        let recipe = parser.parse(yaml).unwrap();
+        let warnings = parser.validate_with_yaml(&recipe, Some(yaml));
+        assert!(warnings.iter().any(|w| w.contains("descrption")));
+        assert!(warnings.iter().any(|w| w.contains("comand")));
     }
 }

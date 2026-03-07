@@ -64,7 +64,7 @@ fn main() -> anyhow::Result<()> {
         .with_working_dir(&cli.working_dir)
         .with_dry_run(cli.dry_run)
         .with_auto_stage(!cli.no_auto_stage)
-        .with_recipe_search_dirs(cli.recipe_dirs);
+        .with_recipe_search_dirs(cli.recipe_dirs.into_iter().map(std::path::PathBuf::from).collect());
 
     // Execute
     let ctx = if user_context.is_empty() {
