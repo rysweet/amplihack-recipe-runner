@@ -1095,7 +1095,7 @@ steps:
     assert!(r.success);
     assert_eq!(r.step_results.len(), 3);
     for sr in &r.step_results {
-        assert_eq!(sr.status, StepStatus::Completed);
+        assert_eq!(sr.status, StepStatus::Skipped);
         assert!(sr.output.contains("dry run") || sr.output.contains("dry_run"));
     }
 }

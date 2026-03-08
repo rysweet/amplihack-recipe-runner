@@ -12,7 +12,7 @@ Complete schema reference for amplihack recipe runner YAML files.
 | `author`      | string           | no       | `""`    | Author name                              |
 | `tags`        | list of strings  | no       | `[]`    | Recipe tags for categorisation           |
 | `context`     | map              | no       | `{}`    | Default variable values for templates    |
-| `extends`     | string           | no       | —       | Parent recipe name (for inheritance)     |
+| `extends`     | string           | no       | —       | Parent recipe name (for inheritance). Note: only single-level inheritance is supported; extended recipes cannot themselves use `extends`. |
 | `recursion`   | RecursionConfig  | no       | see below | Sub-recipe recursion limits           |
 | `hooks`       | RecipeHooks      | no       | —       | Lifecycle hooks                          |
 | `steps`       | list of Step     | **yes**  | —       | Ordered list of steps to execute         |
@@ -62,7 +62,7 @@ Hook commands receive context variables via template substitution.
 | `when_tags`         | list of strings | no       | `[]`    | Step only runs when these tags match active tag filters  |
 | `parallel_group`    | string          | no       | —       | Group name for parallel execution                        |
 
-> **Note:** The `context` field on a step is serialised with `#[serde(rename = "context")]` from the internal `sub_context` field. In YAML you write `context:`.
+> **Note:** The `context` field provides step-specific variables that are passed as overrides to sub-recipes. In YAML you write `context:`.
 
 ---
 

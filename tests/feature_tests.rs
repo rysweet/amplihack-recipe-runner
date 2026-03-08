@@ -2,11 +2,12 @@
 /// tag filtering, audit log, timing, and property-based tests.
 use recipe_runner_rs::adapters::Adapter;
 use recipe_runner_rs::context::RecipeContext;
-use recipe_runner_rs::models::StepStatus;
+use recipe_runner_rs::models::{StepResult, StepStatus, StepType};
 use recipe_runner_rs::parser::RecipeParser;
-use recipe_runner_rs::runner::RecipeRunner;
+use recipe_runner_rs::runner::{ExecutionListener, RecipeRunner};
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 // Re-use mock adapter pattern
 struct MockAdapter;
@@ -562,4 +563,108 @@ proptest! {
             prop_assert_eq!(a, b);
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXECUTION LISTENER (C2-RD-8)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Clone)]
+struct TrackingListener {
+    started: Arc<Mutex<Vec<String>>>,
+    completed: Arc<Mutex<Vec<String>>>,
+}
+
+impl TrackingListener {
+    fn new() -> Self {
+        Self {
+            started: Arc::new(Mutex::new(Vec::new())),
+            completed: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl ExecutionListener for TrackingListener {
+    fn on_step_start(&self, step_id: &str, _step_type: StepType) {
+        self.started.lock().unwrap().push(step_id.to_string());
+    }
+    fn on_step_complete(&self, result: &StepResult) {
+        self.completed.lock().unwrap().push(result.step_id.clone());
+    }
+}
+
+#[test]
+fn test_execution_listener_callbacks_fire() {
+    let listener = TrackingListener::new();
+    let started = listener.started.clone();
+    let completed = listener.completed.clone();
+
+    let parser = RecipeParser::new();
+    let recipe = parser
+        .parse(
+            r#"
+name: listener-test
+steps:
+  - id: step-a
+    command: "echo hello"
+  - id: step-b
+    command: "echo world"
+"#,
+        )
+        .unwrap();
+
+    let runner = RecipeRunner::new(MockAdapter).with_listener(Box::new(listener));
+    let result = runner.execute(&recipe, None);
+
+    assert!(result.success);
+    let s = started.lock().unwrap();
+    let c = completed.lock().unwrap();
+    assert_eq!(s.len(), 2);
+    assert_eq!(c.len(), 2);
+    assert!(s.contains(&"step-a".to_string()));
+    assert!(s.contains(&"step-b".to_string()));
+    assert!(c.contains(&"step-a".to_string()));
+    assert!(c.contains(&"step-b".to_string()));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONTINUE_ON_ERROR + PARALLEL_GROUP (C2-RD-9)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_continue_on_error_in_parallel_group() {
+    let r = parse_and_run(
+        r#"
+name: parallel-continue
+steps:
+  - id: pg-ok
+    command: "echo ok"
+    parallel_group: g1
+  - id: pg-fail
+    command: "FAIL"
+    parallel_group: g1
+    continue_on_error: true
+  - id: after-group
+    command: "echo after"
+"#,
+    );
+    assert!(
+        r.success,
+        "Recipe should succeed despite failure in parallel group with continue_on_error"
+    );
+    assert_eq!(r.step_results.len(), 3);
+
+    let pg_fail = r
+        .step_results
+        .iter()
+        .find(|s| s.step_id == "pg-fail")
+        .unwrap();
+    assert_eq!(pg_fail.status, StepStatus::Failed);
+
+    let after = r
+        .step_results
+        .iter()
+        .find(|s| s.step_id == "after-group")
+        .unwrap();
+    assert_eq!(after.status, StepStatus::Completed);
 }

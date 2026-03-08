@@ -449,7 +449,7 @@ impl<A: Adapter> RecipeRunner<A> {
             // Populate context placeholder so downstream steps can reference this output
             if let Some(ref output_key) = step.output {
                 ctx.set(
-                    output_key.clone(),
+                    output_key,
                     serde_json::Value::String("(dry-run)".to_string()),
                 );
             }

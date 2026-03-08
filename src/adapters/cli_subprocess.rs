@@ -147,11 +147,13 @@ impl CLISubprocessAdapter {
                     let _ = Command::new("kill")
                         .args(["-15", &child_pid.to_string()])
                         .output();
-                    // Give 5s grace, then SIGKILL
+                    // Give 5s grace, then SIGKILL only if process hasn't been stopped
                     std::thread::sleep(Duration::from_secs(5));
-                    let _ = Command::new("kill")
-                        .args(["-9", &child_pid.to_string()])
-                        .output();
+                    if !stop_clone.load(Ordering::SeqCst) {
+                        let _ = Command::new("kill")
+                            .args(["-9", &child_pid.to_string()])
+                            .output();
+                    }
                     return;
                 }
 

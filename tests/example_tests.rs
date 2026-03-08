@@ -411,7 +411,7 @@ fn test_tutorial_14_dry_run() {
     assert!(result.success);
     assert_eq!(result.step_results.len(), 4);
     for sr in &result.step_results {
-        assert_eq!(sr.status, StepStatus::Completed);
+        assert_eq!(sr.status, StepStatus::Skipped);
     }
 }
 

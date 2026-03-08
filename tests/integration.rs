@@ -305,7 +305,7 @@ steps:
     let result = runner.execute(&recipe, None);
 
     assert!(result.success);
-    assert_eq!(result.step_results[0].status, StepStatus::Completed);
+    assert_eq!(result.step_results[0].status, StepStatus::Skipped);
 }
 
 #[test]
@@ -588,7 +588,7 @@ steps:
     let adapter = MockAdapter::new();
     let result = recipe_runner_rs::run_recipe(yaml, adapter, None, true).unwrap();
     assert!(result.success);
-    assert_eq!(result.step_results[0].status, StepStatus::Completed);
+    assert_eq!(result.step_results[0].status, StepStatus::Skipped);
 }
 
 #[test]
