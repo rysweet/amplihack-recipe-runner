@@ -1,0 +1,53 @@
+# step-type-inference.yaml
+# Tests automatic step type detection based on which fields are present.
+# - Only `command` → inferred as bash
+# - Only `agent` + `prompt` → inferred as agent
+# - Only `recipe` → inferred as recipe
+# - `prompt` without `command` → inferred as agent
+# - Explicit `type: bash` → bash (no inference needed)
+# Note: agent and recipe steps are included for type inference testing
+# but will need a mock adapter to actually execute.
+
+name: "step-type-inference"
+description: |
+  Tests automatic step type detection from field presence.
+  The runner should infer bash, agent, or recipe type based on
+  which fields are populated, without requiring explicit type.
+version: "1.0.0"
+
+context:
+  project: "test-project"
+
+steps:
+  # --- Inferred bash: only `command` present, no explicit type ---
+  - id: "infer-bash-from-command"
+    command: "echo 'PASS: inferred bash from command field'"
+    output: "bash_inferred"
+
+  # --- Explicit bash: type is set directly ---
+  - id: "explicit-bash"
+    type: "bash"
+    command: "echo 'PASS: explicit bash type'"
+    output: "explicit_bash_out"
+
+  # --- Inferred agent: `agent` + `prompt` present, no command ---
+  - id: "infer-agent-from-fields"
+    agent: "mock:test:agent"
+    prompt: "Test prompt for agent inference"
+    output: "agent_inferred"
+
+  # --- Inferred agent: only `prompt` present, no command ---
+  - id: "infer-agent-from-prompt"
+    prompt: "Test prompt only — should infer agent type"
+    output: "prompt_inferred"
+
+  # --- Inferred recipe: only `recipe` present ---
+  - id: "infer-recipe-from-field"
+    recipe: "testing/output-chaining"
+    output: "recipe_inferred"
+
+  # --- Bash with command and condition (still bash) ---
+  - id: "bash-with-condition"
+    command: "echo 'PASS: bash with condition'"
+    condition: "true"
+    output: "bash_condition_out"

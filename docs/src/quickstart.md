@@ -6,8 +6,8 @@ Get up and running with the amplihack Recipe Runner in minutes.
 
 ```bash
 # Clone the repository
-git clone https://github.com/rysweet/amplihack-recipe-runner-rs.git
-cd amplihack-recipe-runner-rs
+git clone https://github.com/rysweet/amplihack-recipe-runner.git
+cd amplihack-recipe-runner
 
 # Build in release mode
 cargo build --release

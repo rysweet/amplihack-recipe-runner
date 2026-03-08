@@ -1,0 +1,41 @@
+# 06-parse-json.yaml — JSON extraction from step output
+#
+# Demonstrates:
+#   - parse_json: true to parse step output as structured data
+#   - Accessing parsed fields via {{result.key}} dot-notation
+#   - Chaining JSON output between steps
+#
+# Run:
+#   recipe-runner run examples/tutorials/06-parse-json.yaml
+
+name: "parse-json"
+description: "Parse JSON output so fields become context variables."
+version: "1.0.0"
+
+steps:
+  - id: "produce-json"
+    type: "bash"
+    command: |
+      echo '{"status": "ok", "count": 42, "items": ["a", "b", "c"]}'
+    output: "result"
+    parse_json: true
+
+  - id: "use-parsed-fields"
+    type: "bash"
+    command: |
+      echo "Status: {{result.status}}"
+      echo "Count:  {{result.count}}"
+      echo "Items:  {{result.items}}"
+
+  - id: "nested-json"
+    type: "bash"
+    command: |
+      echo '{"build": {"version": "2.1.0", "passing": true}}'
+    output: "info"
+    parse_json: true
+
+  - id: "read-nested"
+    type: "bash"
+    command: |
+      echo "Build version: {{info.build.version}}"
+      echo "Passing: {{info.build.passing}}"

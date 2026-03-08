@@ -1,0 +1,103 @@
+# Quality Audit Cycle Pattern
+#
+# Demonstrates the audit loop: run → analyze → fix → re-run → verify.
+# This pattern is common for linting, security scanning, and code quality gates.
+# The final step uses a condition to verify improvement was actually achieved.
+
+name: "quality-audit"
+description: |
+  Quality audit cycle that runs a linter, analyzes results, applies fixes,
+  then re-runs to verify improvement. Demonstrates the iterative audit loop
+  pattern where automated checks bracket agent-driven analysis and remediation.
+version: "1.0.0"
+author: "amplihack"
+tags: ["quality", "audit", "linting", "pattern"]
+
+context:
+  repo_path: "."
+  language: "python"
+  linter_command: "ruff check --output-format json"
+  max_issues: 10
+
+steps:
+  # Phase 1: Baseline measurement
+  - id: "run-linter-baseline"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    command: "{{linter_command}} . 2>&1 || true"
+    output: "baseline_lint_output"
+    continue_on_error: true
+
+  - id: "count-baseline-issues"
+    type: "bash"
+    command: "echo '{{baseline_lint_output}}' | grep -c 'error\\|warning\\|issue' || echo '0'"
+    output: "baseline_issue_count"
+
+  # Phase 2: Agent analysis of lint results
+  - id: "analyze-lint-results"
+    type: "agent"
+    prompt: |
+      Analyze the following linter output for a {{language}} project.
+      Categorize issues by severity and type. Identify the most impactful
+      fixes that would reduce issue count the most.
+
+      Linter output:
+      {{baseline_lint_output}}
+
+      Return a JSON object with:
+      - "total_issues": number of issues found
+      - "categories": object mapping category names to counts
+      - "priority_fixes": array of the top 5 most impactful fixes
+      - "auto_fixable": number of issues that can be auto-fixed
+    output: "lint_analysis"
+    parse_json: true
+
+  # Phase 3: Agent applies fixes
+  - id: "apply-fixes"
+    type: "agent"
+    prompt: |
+      Based on the lint analysis, apply the recommended fixes to the {{language}}
+      codebase at {{repo_path}}.
+
+      Analysis: {{lint_analysis}}
+
+      Focus on auto-fixable issues first, then address the priority fixes.
+      Make minimal, surgical changes. Do not refactor beyond what's needed
+      to resolve the identified issues.
+    output: "fix_summary"
+
+  # Phase 4: Re-run linter to measure improvement
+  - id: "run-linter-after-fixes"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    command: "{{linter_command}} . 2>&1 || true"
+    output: "fixed_lint_output"
+    continue_on_error: true
+
+  - id: "count-fixed-issues"
+    type: "bash"
+    command: "echo '{{fixed_lint_output}}' | grep -c 'error\\|warning\\|issue' || echo '0'"
+    output: "fixed_issue_count"
+
+  # Phase 5: Verify improvement with condition gate
+  - id: "verify-improvement"
+    type: "bash"
+    condition: "int('{{fixed_issue_count}}') < int('{{baseline_issue_count}}')"
+    command: |
+      echo "=== Quality Audit Results ==="
+      echo "Baseline issues: {{baseline_issue_count}}"
+      echo "After fixes:     {{fixed_issue_count}}"
+      echo "Improvement:     $(( {{baseline_issue_count}} - {{fixed_issue_count}} )) issues resolved"
+      echo "Status: IMPROVED"
+    output: "audit_summary"
+
+  - id: "report-no-improvement"
+    type: "bash"
+    condition: "int('{{fixed_issue_count}}') >= int('{{baseline_issue_count}}')"
+    command: |
+      echo "=== Quality Audit Results ==="
+      echo "Baseline issues: {{baseline_issue_count}}"
+      echo "After fixes:     {{fixed_issue_count}}"
+      echo "Status: NO IMPROVEMENT - manual review needed"
+      exit 1
+    output: "audit_failure"

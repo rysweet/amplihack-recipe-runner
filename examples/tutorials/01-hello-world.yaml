@@ -1,0 +1,20 @@
+# 01-hello-world.yaml — Simplest possible recipe
+#
+# Demonstrates:
+#   - Minimal recipe structure (name + steps)
+#   - A single bash step
+#   - Storing step output in a variable via `output`
+#
+# Run:
+#   recipe-runner run examples/tutorials/01-hello-world.yaml
+
+name: "hello-world"
+description: "The simplest possible recipe — one step, one output."
+version: "1.0.0"
+
+steps:
+  - id: "greet"
+    type: "bash"
+    command: |
+      echo "Hello from Recipe Runner!"
+    output: "greeting"

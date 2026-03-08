@@ -1,0 +1,54 @@
+# 04-multi-step-pipeline.yaml — Sequential pipeline
+#
+# Demonstrates:
+#   - Steps that build on each other's output
+#   - Creating, writing, reading, processing, and cleaning up files
+#   - Each step uses variables produced by prior steps
+#
+# Run:
+#   recipe-runner run examples/tutorials/04-multi-step-pipeline.yaml
+
+name: "multi-step-pipeline"
+description: "A 5-step pipeline where each step feeds the next."
+version: "1.0.0"
+
+steps:
+  - id: "create-workspace"
+    type: "bash"
+    command: |
+      dir=$(mktemp -d)
+      echo "$dir"
+    output: "temp_dir"
+
+  - id: "write-file"
+    type: "bash"
+    command: |
+      cat > {{temp_dir}}/data.txt << 'EOF'
+      line one
+      line two
+      line three
+      line four
+      line five
+      EOF
+      echo "Wrote 5 lines to {{temp_dir}}/data.txt"
+    output: "write_result"
+
+  - id: "read-file"
+    type: "bash"
+    command: |
+      cat {{temp_dir}}/data.txt
+    output: "file_contents"
+
+  - id: "count-lines"
+    type: "bash"
+    command: |
+      count=$(wc -l < {{temp_dir}}/data.txt | tr -d ' ')
+      echo "Line count: $count"
+    output: "line_count"
+
+  - id: "cleanup"
+    type: "bash"
+    command: |
+      rm -rf {{temp_dir}}
+      echo "Cleaned up {{temp_dir}}"
+    output: "cleanup_result"

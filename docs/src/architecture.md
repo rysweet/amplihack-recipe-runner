@@ -1,4 +1,4 @@
-# Architecture — amplihack-recipe-runner-rs
+# Architecture — amplihack-recipe-runner
 
 Rust implementation of the amplihack recipe runner. Parses YAML recipe files,
 evaluates conditions in a sandboxed expression language, and executes steps
@@ -66,7 +66,7 @@ graph TD
 | `runner.rs`          | Orchestration: hooks, conditions, audit, recursion     |
 | `agent_resolver.rs`  | Agent reference → markdown file resolution             |
 | `discovery.rs`       | Multi-directory recipe discovery and manifest sync     |
-| `adapters/mod.rs`    | `Adapter` trait + `FallbackAdapter<P, S>`              |
+| `adapters/mod.rs`    | `Adapter` trait definition                             |
 | `adapters/cli_subprocess.rs` | Subprocess execution for bash and agent steps |
 
 ---
@@ -279,18 +279,6 @@ then escalates to `SIGKILL`.
 variables (`AMPLIHACK_SESSION_DEPTH`, `AMPLIHACK_TREE_ID`, `AMPLIHACK_MAX_DEPTH`,
 `AMPLIHACK_MAX_SESSIONS`) and strips `CLAUDECODE` to prevent nested session
 confusion.
-
-### FallbackAdapter\<P, S\>
-
-Generic composition: tries the primary adapter `P`, falls back to secondary `S`
-on error. `is_available()` returns `true` if either adapter is available.
-
-```rust
-struct FallbackAdapter<P: Adapter, S: Adapter> {
-    primary:   P,
-    secondary: S,
-}
-```
 
 ---
 

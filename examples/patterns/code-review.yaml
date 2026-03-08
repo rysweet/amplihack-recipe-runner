@@ -1,0 +1,127 @@
+# Code Review Workflow Pattern
+#
+# Demonstrates agent-assisted code review: extract diff via bash, analyze with
+# an agent (returning structured JSON), conditionally flag issues, generate
+# review comments, and post a summary. Shows how bash and agent steps interleave
+# for a review pipeline.
+
+name: "code-review"
+description: |
+  Automated code review workflow that extracts a git diff, analyzes it with
+  an agent for bugs, security issues, and style problems, then generates
+  structured review comments. Demonstrates parse_json for structured agent
+  output and condition-based branching on analysis results.
+version: "1.0.0"
+author: "amplihack"
+tags: ["code-review", "git", "quality", "pattern"]
+
+context:
+  repo_path: "."
+  base_branch: "main"
+  review_strictness: "standard"
+  max_diff_lines: 500
+
+steps:
+  # Step 1: Get the diff to review
+  - id: "get-diff"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    command: |
+      echo "=== Extracting Diff ==="
+      DIFF=$(git --no-pager diff {{base_branch}} -- . 2>/dev/null || \
+             git --no-pager diff HEAD -- . 2>/dev/null || \
+             git --no-pager diff --cached -- . 2>/dev/null || \
+             echo "No changes found")
+      echo "$DIFF" | head -{{max_diff_lines}}
+    output: "diff_content"
+
+  # Step 2: Get diff stats for context
+  - id: "get-diff-stats"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    command: |
+      echo "=== Diff Statistics ==="
+      git --no-pager diff {{base_branch}} --stat 2>/dev/null || \
+      git --no-pager diff HEAD --stat 2>/dev/null || \
+      git --no-pager diff --cached --stat 2>/dev/null || \
+      echo "No stats available"
+      echo ""
+      echo "files_changed=$(git diff {{base_branch}} --name-only 2>/dev/null | wc -l || echo 0)"
+    output: "diff_stats"
+    continue_on_error: true
+
+  # Step 3: Agent analyzes the diff — returns structured JSON
+  - id: "analyze-diff"
+    type: "agent"
+    prompt: |
+      Review the following code diff with {{review_strictness}} strictness.
+
+      Diff statistics:
+      {{diff_stats}}
+
+      Diff content:
+      {{diff_content}}
+
+      Analyze for:
+      1. Bugs and logic errors
+      2. Security vulnerabilities
+      3. Performance issues
+      4. Missing error handling
+      5. API contract violations
+
+      Return a JSON object with:
+      - "has_issues": boolean
+      - "severity": "critical", "warning", or "info"
+      - "issue_count": number
+      - "issues": array of objects with "file", "line", "severity", "category", "description"
+      - "positive_notes": array of strings noting good practices observed
+    output: "analysis"
+    parse_json: true
+
+  # Step 4: Check if critical issues were found — conditional gate
+  - id: "check-critical-issues"
+    type: "bash"
+    condition: "'critical' in '{{analysis}}'"
+    command: |
+      echo "⚠️  CRITICAL ISSUES DETECTED"
+      echo "Review found critical issues that must be addressed before merge."
+      echo "critical_found=true"
+    output: "critical_check"
+
+  # Step 5: Agent generates detailed review comments
+  - id: "generate-review-comments"
+    type: "agent"
+    prompt: |
+      Generate detailed, actionable code review comments based on this analysis.
+
+      Analysis: {{analysis}}
+      Diff: {{diff_content}}
+
+      For each issue, provide:
+      1. The specific file and line
+      2. What the problem is
+      3. A concrete suggestion for fixing it
+      4. Why it matters
+
+      Return a JSON object with:
+      - "comments": array of objects with "file", "line", "body", "suggestion"
+      - "summary": a 2-3 sentence overall assessment
+      - "approval": "approve", "request_changes", or "comment"
+    output: "review_comments"
+    parse_json: true
+
+  # Step 6: Post review summary
+  - id: "post-summary"
+    type: "bash"
+    command: |
+      echo "============================================"
+      echo "           CODE REVIEW SUMMARY"
+      echo "============================================"
+      echo ""
+      echo "Analysis: {{analysis}}"
+      echo ""
+      echo "Review Comments: {{review_comments}}"
+      echo ""
+      echo "============================================"
+      echo "Review complete."
+    output: "review_output"

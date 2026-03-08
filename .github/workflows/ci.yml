@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Run tests
+        run: cargo test --all-targets
+
+      - name: Check no warnings
+        run: cargo build --release 2>&1 | grep -c "warning" | xargs test 0 -eq
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --all-targets -- -D warnings
+
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  validate-self-building-recipe:
+    name: Validate Self-Building Recipe
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build recipe runner
+        run: cargo build --release
+
+      - name: Validate self-building recipe parses correctly
+        run: ./target/release/recipe-runner-rs recipes/build-recipe-runner.yaml --validate-only
+
+      - name: Verify recipe structure
+        run: ./target/release/recipe-runner-rs recipes/build-recipe-runner.yaml --explain
+
+      - name: Dry-run self-building recipe
+        run: ./target/release/recipe-runner-rs recipes/build-recipe-runner.yaml --dry-run
+
+      - name: Check recipe covers all source modules
+        run: |
+          # Every src/*.rs file should be referenced in the recipe
+          missing=0
+          for mod in models parser context runner agent_resolver discovery lib main; do
+            if ! grep -q "$mod" recipes/build-recipe-runner.yaml; then
+              echo "ERROR: recipes/build-recipe-runner.yaml missing reference to $mod"
+              missing=1
+            fi
+          done
+          if [ "$missing" -eq 1 ]; then
+            echo "Self-building recipe is out of sync with source modules"
+            exit 1
+          fi
+          echo "All source modules referenced in self-building recipe ✓"

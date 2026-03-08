@@ -1,0 +1,48 @@
+# 05-working-directories.yaml — Per-step working directories
+#
+# Demonstrates:
+#   - Setting working_dir on individual steps
+#   - Using {{variable}} in working_dir paths
+#   - Proving each step runs in its specified directory
+#
+# Run:
+#   recipe-runner run examples/tutorials/05-working-directories.yaml
+
+name: "working-directories"
+description: "Per-step working_dir with template variable paths."
+version: "1.0.0"
+
+steps:
+  - id: "create-dirs"
+    type: "bash"
+    command: |
+      base=$(mktemp -d)
+      mkdir -p "$base/alpha" "$base/beta"
+      echo "$base"
+    output: "base_dir"
+
+  - id: "work-in-alpha"
+    type: "bash"
+    working_dir: "{{base_dir}}/alpha"
+    command: |
+      echo "I am in: $(pwd)"
+    output: "alpha_pwd"
+
+  - id: "work-in-beta"
+    type: "bash"
+    working_dir: "{{base_dir}}/beta"
+    command: |
+      echo "I am in: $(pwd)"
+    output: "beta_pwd"
+
+  - id: "verify"
+    type: "bash"
+    command: |
+      echo "alpha ran in: {{alpha_pwd}}"
+      echo "beta ran in: {{beta_pwd}}"
+
+  - id: "cleanup"
+    type: "bash"
+    command: |
+      rm -rf {{base_dir}}
+      echo "Removed {{base_dir}}"

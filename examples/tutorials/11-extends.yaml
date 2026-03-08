@@ -1,0 +1,34 @@
+# 11-extends.yaml — Recipe composition via extends
+#
+# Demonstrates:
+#   - Inheriting context and steps from a parent recipe (base.yaml)
+#   - Child context values override parent values
+#   - Parent steps run first, then child steps are appended
+#
+# Run:
+#   recipe-runner run examples/tutorials/11-extends.yaml
+#
+# Result: steps from base.yaml run first (base-setup),
+#         then the steps below (child-build, child-verify).
+
+name: "extends-example"
+description: "Inherits from base.yaml and adds its own steps."
+version: "1.0.0"
+extends: "base"
+
+context:
+  log_level: "debug"
+  app_name: "my-app"
+
+steps:
+  - id: "child-build"
+    type: "bash"
+    command: |
+      echo "Building {{app_name}} with log_level={{log_level}}"
+    output: "build_result"
+
+  - id: "child-verify"
+    type: "bash"
+    command: |
+      echo "Setup said: {{setup_result}}"
+      echo "Build said: {{build_result}}"

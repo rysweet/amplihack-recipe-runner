@@ -1,0 +1,33 @@
+# 12-recursion-limits.yaml — Recursion configuration
+#
+# Demonstrates:
+#   - Setting max_depth and max_total_steps on a recipe
+#   - These limits prevent runaway sub-recipe chains
+#   - Here we set conservative limits for safety
+#
+# Run:
+#   recipe-runner run examples/tutorials/12-recursion-limits.yaml
+
+name: "recursion-limits"
+description: "Recursion config — cap depth and total steps."
+version: "1.0.0"
+
+recursion:
+  max_depth: 2
+  max_total_steps: 10
+
+steps:
+  - id: "step-one"
+    type: "bash"
+    command: |
+      echo "Step 1 of a recipe with max_depth=2, max_total_steps=10"
+
+  - id: "step-two"
+    type: "bash"
+    command: |
+      echo "Step 2 — these limits guard against infinite sub-recipe loops"
+
+  - id: "step-three"
+    type: "bash"
+    command: |
+      echo "Step 3 — all done within our 10-step budget"

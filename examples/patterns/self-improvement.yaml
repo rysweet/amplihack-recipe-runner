@@ -1,0 +1,190 @@
+# Self-Improvement Loop Pattern
+#
+# Demonstrates the eval-analyze-fix-reeval cycle used for iterative quality
+# improvement. Runs an evaluation, analyzes failures, researches and applies
+# fixes, re-evaluates, and compares results. The final step uses a condition
+# to determine if the target score was reached. This pattern drives
+# autonomous improvement in code generation, test suites, and model tuning.
+
+name: "self-improvement"
+description: |
+  Self-improvement loop: evaluate → analyze errors → research fixes →
+  apply improvements → re-evaluate → compare. Iterates toward a target
+  score by analyzing failures, applying corrections, and measuring progress.
+version: "1.0.0"
+author: "amplihack"
+tags: ["self-improvement", "eval", "iteration", "learning", "pattern"]
+
+context:
+  eval_command: "python -m pytest tests/ --tb=short -q"
+  target_score: "95"
+  repo_path: "."
+  max_fix_attempts: 3
+  improvement_log: "improvement-log.md"
+
+steps:
+  # Step 1: Run baseline evaluation
+  - id: "run-baseline-eval"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    command: |
+      echo "=== Baseline Evaluation ==="
+      EVAL_OUTPUT=$({{eval_command}} 2>&1 || true)
+      echo "$EVAL_OUTPUT"
+      echo ""
+      # Extract pass/fail counts
+      PASSED=$(echo "$EVAL_OUTPUT" | grep -oP '\d+ passed' | grep -oP '\d+' || echo "0")
+      FAILED=$(echo "$EVAL_OUTPUT" | grep -oP '\d+ failed' | grep -oP '\d+' || echo "0")
+      TOTAL=$((PASSED + FAILED))
+      if [ $TOTAL -gt 0 ]; then
+        SCORE=$((PASSED * 100 / TOTAL))
+      else
+        SCORE=0
+      fi
+      echo "baseline_passed=${PASSED}"
+      echo "baseline_failed=${FAILED}"
+      echo "baseline_total=${TOTAL}"
+      echo "baseline_score=${SCORE}"
+    output: "baseline_result"
+    continue_on_error: true
+    timeout: 300
+
+  # Step 2: Agent analyzes errors from eval output
+  - id: "analyze-errors"
+    type: "agent"
+    prompt: |
+      Analyze the following test/evaluation output to identify failure patterns.
+
+      Evaluation output:
+      {{baseline_result}}
+
+      Target score: {{target_score}}%
+
+      Categorize each failure by:
+      1. Root cause (bug, missing feature, bad test, environment issue)
+      2. Difficulty to fix (easy, medium, hard)
+      3. Impact on score (how many test cases it affects)
+
+      Return a JSON object with:
+      - "current_score": extracted score number
+      - "target_score": {{target_score}}
+      - "gap": difference between current and target
+      - "failures": array of objects with "test_name", "root_cause", "difficulty", "impact", "fix_description"
+      - "fix_priority": ordered array of failure indices to fix first (highest impact)
+      - "estimated_score_after_fixes": projected score if all easy/medium fixes applied
+    output: "error_analysis"
+    parse_json: true
+
+  # Step 3: Agent researches potential fixes
+  - id: "research-fixes"
+    type: "agent"
+    prompt: |
+      Research and propose specific code fixes for the identified failures.
+
+      Error analysis: {{error_analysis}}
+      Repository: {{repo_path}}
+
+      For each failure in the priority list, propose:
+      1. The exact file(s) to modify
+      2. What change to make
+      3. Why this fix addresses the root cause
+      4. Any risks or side effects
+
+      Focus on the top {{max_fix_attempts}} highest-impact fixes.
+      Prioritize fixes that are safe and unlikely to introduce regressions.
+    output: "fix_proposals"
+
+  # Step 4: Agent applies the proposed improvements
+  - id: "apply-improvements"
+    type: "agent"
+    prompt: |
+      Apply the following proposed fixes to the codebase at {{repo_path}}.
+
+      Fix proposals: {{fix_proposals}}
+      Error analysis: {{error_analysis}}
+
+      Apply only the fixes classified as "easy" or "medium" difficulty.
+      Make minimal, targeted changes. After applying each fix, briefly note
+      what was changed and why.
+    output: "applied_fixes"
+
+  # Step 5: Re-run evaluation to measure improvement
+  - id: "run-improved-eval"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    command: |
+      echo "=== Post-Improvement Evaluation ==="
+      EVAL_OUTPUT=$({{eval_command}} 2>&1 || true)
+      echo "$EVAL_OUTPUT"
+      echo ""
+      PASSED=$(echo "$EVAL_OUTPUT" | grep -oP '\d+ passed' | grep -oP '\d+' || echo "0")
+      FAILED=$(echo "$EVAL_OUTPUT" | grep -oP '\d+ failed' | grep -oP '\d+' || echo "0")
+      TOTAL=$((PASSED + FAILED))
+      if [ $TOTAL -gt 0 ]; then
+        SCORE=$((PASSED * 100 / TOTAL))
+      else
+        SCORE=0
+      fi
+      echo "improved_passed=${PASSED}"
+      echo "improved_failed=${FAILED}"
+      echo "improved_total=${TOTAL}"
+      echo "improved_score=${SCORE}"
+    output: "improved_result"
+    continue_on_error: true
+    timeout: 300
+
+  # Step 6: Compare results and determine if target was reached
+  - id: "compare-results-success"
+    type: "agent"
+    condition: "'improved_score=' in '{{improved_result}}'"
+    prompt: |
+      Compare the baseline and improved evaluation results.
+
+      Baseline: {{baseline_result}}
+      After improvements: {{improved_result}}
+      Target score: {{target_score}}%
+      Fixes applied: {{applied_fixes}}
+
+      Provide a summary with:
+      1. Score change (before → after)
+      2. Which fixes had the most impact
+      3. Whether the target was reached
+      4. Remaining failures and recommended next steps
+      5. Lessons learned for future improvement cycles
+
+      Return a JSON object with:
+      - "baseline_score": number
+      - "improved_score": number
+      - "improvement": number (delta)
+      - "target_reached": boolean
+      - "effective_fixes": array of strings
+      - "remaining_issues": array of strings
+      - "lessons_learned": array of strings
+    output: "comparison"
+    parse_json: true
+
+  # Step 7: Log improvement results
+  - id: "log-results"
+    type: "bash"
+    command: |
+      TIMESTAMP=$(date +%Y-%m-%d\ %H:%M:%S)
+      cat >> "{{improvement_log}}" << EOF
+
+      ## Improvement Cycle — ${TIMESTAMP}
+
+      ### Baseline
+      {{baseline_result}}
+
+      ### After Fixes
+      {{improved_result}}
+
+      ### Comparison
+      {{comparison}}
+
+      ### Fixes Applied
+      {{applied_fixes}}
+
+      ---
+      EOF
+      echo "Results logged to {{improvement_log}}"
+    output: "log_confirmation"

@@ -1,0 +1,42 @@
+# json-extraction-strategies.yaml
+# Tests all 3 JSON extraction strategies supported by parse_json.
+# Strategy 1: Raw JSON output (entire output is valid JSON).
+# Strategy 2: JSON inside markdown code fences (```json ... ```).
+# Strategy 3: JSON embedded in surrounding text (extracted from mixed output).
+
+name: "json-extraction-strategies"
+description: |
+  Tests all 3 JSON extraction strategies with parse_json: true.
+  Verifies that the runner can extract JSON from raw output,
+  markdown-fenced output, and mixed text output.
+version: "1.0.0"
+
+context: {}
+
+steps:
+  # --- Strategy 1: Raw JSON (entire output is valid JSON) ---
+  - id: "raw-json"
+    type: "bash"
+    command: 'echo ''{"status": "ok", "count": 42}'''
+    parse_json: true
+    output: "raw_json_out"
+
+  # --- Strategy 2: JSON in markdown code fences ---
+  - id: "fenced-json"
+    type: "bash"
+    command: |
+      echo '```json'
+      echo '{"result": "success", "items": [1, 2, 3]}'
+      echo '```'
+    parse_json: true
+    output: "fenced_json_out"
+
+  # --- Strategy 3: JSON with surrounding text ---
+  - id: "mixed-json"
+    type: "bash"
+    command: |
+      echo 'Processing complete. Here are the results:'
+      echo '{"processed": true, "errors": 0}'
+      echo 'Done.'
+    parse_json: true
+    output: "mixed_json_out"

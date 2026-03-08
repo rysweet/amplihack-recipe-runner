@@ -1,0 +1,42 @@
+# 08-hooks.yaml — Recipe hooks (pre_step, post_step, on_error)
+#
+# Demonstrates:
+#   - pre_step: runs before every step
+#   - post_step: runs after every successful step
+#   - on_error: runs after a failed step
+#   - Hook output is visible in logs
+#
+# Run:
+#   recipe-runner run examples/tutorials/08-hooks.yaml
+
+name: "hooks"
+description: "Lifecycle hooks that fire around each step."
+version: "1.0.0"
+
+hooks:
+  pre_step: "echo PRE: about to run a step"
+  post_step: "echo POST: step succeeded"
+  on_error: "echo ERROR: step failed"
+
+steps:
+  - id: "good-step"
+    type: "bash"
+    command: |
+      echo "This step succeeds — expect PRE then POST."
+
+  - id: "another-good-step"
+    type: "bash"
+    command: |
+      echo "Another success — PRE and POST again."
+
+  - id: "bad-step"
+    type: "bash"
+    continue_on_error: true
+    command: |
+      echo "This step will fail — expect PRE then ERROR."
+      exit 1
+
+  - id: "final-step"
+    type: "bash"
+    command: |
+      echo "Final step — PRE and POST one more time."

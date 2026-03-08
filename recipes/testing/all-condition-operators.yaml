@@ -1,0 +1,97 @@
+# all-condition-operators.yaml
+# Tests every condition operator supported by the expression evaluator.
+# Context provides variables of different types to exercise each operator.
+# Every step should execute (all conditions are true).
+
+name: "all-condition-operators"
+description: |
+  Tests every condition operator: ==, !=, <, <=, >, >=,
+  in, not in, and, or, not. Each step's condition evaluates
+  to true, so every step should run and echo which operator passed.
+version: "1.0.0"
+
+context:
+  a: 5
+  b: 10
+  name: "hello"
+  flag: true
+  empty: ""
+  items: [1, 2, 3]
+
+steps:
+  # --- Equality ---
+  - id: "eq-operator"
+    type: "bash"
+    condition: "a == 5"
+    command: "echo 'PASS: eq operator (a == 5)'"
+    output: "eq_result"
+
+  # --- Inequality ---
+  - id: "ne-operator"
+    type: "bash"
+    condition: "a != b"
+    command: "echo 'PASS: ne operator (a != b)'"
+    output: "ne_result"
+
+  # --- Less than ---
+  - id: "lt-operator"
+    type: "bash"
+    condition: "a < b"
+    command: "echo 'PASS: lt operator (a < b)'"
+    output: "lt_result"
+
+  # --- Less than or equal ---
+  - id: "le-operator"
+    type: "bash"
+    condition: "a <= 5"
+    command: "echo 'PASS: le operator (a <= 5)'"
+    output: "le_result"
+
+  # --- Greater than ---
+  - id: "gt-operator"
+    type: "bash"
+    condition: "b > a"
+    command: "echo 'PASS: gt operator (b > a)'"
+    output: "gt_result"
+
+  # --- Greater than or equal ---
+  - id: "ge-operator"
+    type: "bash"
+    condition: "b >= 10"
+    command: "echo 'PASS: ge operator (b >= 10)'"
+    output: "ge_result"
+
+  # --- Containment (in) ---
+  - id: "in-operator"
+    type: "bash"
+    condition: "'ell' in name"
+    command: "echo 'PASS: in operator (ell in name)'"
+    output: "in_result"
+
+  # --- Negative containment (not in) ---
+  - id: "not-in-operator"
+    type: "bash"
+    condition: "'xyz' not in name"
+    command: "echo 'PASS: not in operator (xyz not in name)'"
+    output: "not_in_result"
+
+  # --- Logical AND ---
+  - id: "and-operator"
+    type: "bash"
+    condition: "flag and a > 0"
+    command: "echo 'PASS: and operator (flag and a > 0)'"
+    output: "and_result"
+
+  # --- Logical OR ---
+  - id: "or-operator"
+    type: "bash"
+    condition: "flag or empty"
+    command: "echo 'PASS: or operator (flag or empty)'"
+    output: "or_result"
+
+  # --- Logical NOT ---
+  - id: "not-operator"
+    type: "bash"
+    condition: "not empty"
+    command: "echo 'PASS: not operator (not empty)'"
+    output: "not_result"

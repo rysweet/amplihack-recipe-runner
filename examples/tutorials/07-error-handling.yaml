@@ -1,0 +1,38 @@
+# 07-error-handling.yaml — continue_on_error
+#
+# Demonstrates:
+#   - A step that deliberately fails (exit 1)
+#   - continue_on_error: true lets the recipe keep going
+#   - Subsequent steps still execute after the failure
+#
+# Run:
+#   recipe-runner run examples/tutorials/07-error-handling.yaml
+
+name: "error-handling"
+description: "Graceful failure — continue_on_error keeps the recipe alive."
+version: "1.0.0"
+
+steps:
+  - id: "step-before"
+    type: "bash"
+    command: |
+      echo "Step 1: everything is fine."
+    output: "before_result"
+
+  - id: "failing-step"
+    type: "bash"
+    continue_on_error: true
+    command: |
+      echo "Step 2: about to fail deliberately."
+      exit 1
+
+  - id: "step-after-failure"
+    type: "bash"
+    command: |
+      echo "Step 3: I still ran even though Step 2 failed!"
+    output: "after_result"
+
+  - id: "final-check"
+    type: "bash"
+    command: |
+      echo "Step 4: Recipe completed. Error was contained."

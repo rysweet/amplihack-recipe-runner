@@ -1,0 +1,65 @@
+# all-functions.yaml
+# Tests every safe built-in function available in condition expressions.
+# Each step's condition uses a different function and evaluates to true.
+
+name: "all-functions"
+description: |
+  Tests every safe function in the expression evaluator:
+  len(), int(), str(), bool(), float(), min(), max().
+  All conditions evaluate to true so every step should run.
+version: "1.0.0"
+
+context:
+  name: "hello"
+  a: 5
+  b: 10
+
+steps:
+  # --- len() ---
+  - id: "fn-len"
+    type: "bash"
+    condition: "len(name) > 0"
+    command: "echo 'PASS: len(name) = 5, which is > 0'"
+    output: "len_result"
+
+  # --- int() ---
+  - id: "fn-int"
+    type: "bash"
+    condition: 'int("42") == 42'
+    command: "echo 'PASS: int(\"42\") == 42'"
+    output: "int_result"
+
+  # --- str() ---
+  - id: "fn-str"
+    type: "bash"
+    condition: 'str(42) == "42"'
+    command: "echo 'PASS: str(42) == \"42\"'"
+    output: "str_result"
+
+  # --- bool() ---
+  - id: "fn-bool"
+    type: "bash"
+    condition: "bool(1)"
+    command: "echo 'PASS: bool(1) is truthy'"
+    output: "bool_result"
+
+  # --- float() ---
+  - id: "fn-float"
+    type: "bash"
+    condition: 'float("3.14") > 3'
+    command: "echo 'PASS: float(\"3.14\") > 3'"
+    output: "float_result"
+
+  # --- min() ---
+  - id: "fn-min"
+    type: "bash"
+    condition: "min(a, b) == 5"
+    command: "echo 'PASS: min(5, 10) == 5'"
+    output: "min_result"
+
+  # --- max() ---
+  - id: "fn-max"
+    type: "bash"
+    condition: "max(a, b) == 10"
+    command: "echo 'PASS: max(5, 10) == 10'"
+    output: "max_result"

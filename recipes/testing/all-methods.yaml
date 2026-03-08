@@ -1,0 +1,70 @@
+# all-methods.yaml
+# Tests every safe string method available in condition expressions.
+# Each step's condition uses a different method and evaluates to true.
+
+name: "all-methods"
+description: |
+  Tests every safe string method in the expression evaluator:
+  startswith(), endswith(), upper(), lower(), strip(),
+  replace(), count(), find(). All conditions are true.
+version: "1.0.0"
+
+context:
+  name: "hello"
+
+steps:
+  # --- startswith() ---
+  - id: "method-startswith"
+    type: "bash"
+    condition: 'name.startswith("hel")'
+    command: "echo 'PASS: name.startswith(\"hel\")'"
+    output: "startswith_result"
+
+  # --- endswith() ---
+  - id: "method-endswith"
+    type: "bash"
+    condition: 'name.endswith("llo")'
+    command: "echo 'PASS: name.endswith(\"llo\")'"
+    output: "endswith_result"
+
+  # --- upper() ---
+  - id: "method-upper"
+    type: "bash"
+    condition: 'name.upper() == "HELLO"'
+    command: "echo 'PASS: name.upper() == HELLO'"
+    output: "upper_result"
+
+  # --- lower() ---
+  - id: "method-lower"
+    type: "bash"
+    condition: 'name.lower() == "hello"'
+    command: "echo 'PASS: name.lower() == hello'"
+    output: "lower_result"
+
+  # --- strip() ---
+  - id: "method-strip"
+    type: "bash"
+    condition: '" hello ".strip() == "hello"'
+    command: "echo 'PASS: \" hello \".strip() == hello'"
+    output: "strip_result"
+
+  # --- replace() ---
+  - id: "method-replace"
+    type: "bash"
+    condition: 'name.replace("l", "r") == "herro"'
+    command: "echo 'PASS: name.replace(l, r) == herro'"
+    output: "replace_result"
+
+  # --- count() ---
+  - id: "method-count"
+    type: "bash"
+    condition: 'name.count("l") == 2'
+    command: "echo 'PASS: name.count(l) == 2'"
+    output: "count_result"
+
+  # --- find() ---
+  - id: "method-find"
+    type: "bash"
+    condition: 'name.find("ll") == 2'
+    command: "echo 'PASS: name.find(ll) == 2'"
+    output: "find_result"

@@ -8,6 +8,9 @@
 - [CLI Reference](cli-reference.md)
 - [Condition Language](conditions.md)
 
+# Examples
+- [Tutorials](examples-tutorials.md)
+- [Workflow Patterns](examples-patterns.md)
+
 # Reference
 - [Architecture](architecture.md)
-- [Feature Scorecard](scorecard.md)

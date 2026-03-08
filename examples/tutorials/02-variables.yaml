@@ -1,0 +1,36 @@
+# 02-variables.yaml — Template variables and context
+#
+# Demonstrates:
+#   - Defining context variables at the recipe level
+#   - Using {{variable}} substitution in commands
+#   - Storing output from one step and using it in the next
+#
+# Run:
+#   recipe-runner run examples/tutorials/02-variables.yaml
+
+name: "variables"
+description: "Template variable substitution with {{context}} values."
+version: "1.0.0"
+
+context:
+  greeting: "Howdy"
+  name: "Developer"
+  count: 3
+
+steps:
+  - id: "say-hello"
+    type: "bash"
+    command: |
+      echo "{{greeting}}, {{name}}!"
+    output: "hello_message"
+
+  - id: "use-count"
+    type: "bash"
+    command: |
+      echo "Repeating {{count}} times for: {{hello_message}}"
+
+  - id: "build-sentence"
+    type: "bash"
+    command: |
+      echo "Message was: {{hello_message}} (count={{count}})"
+    output: "summary"

@@ -1,0 +1,50 @@
+# continue-on-error-chain.yaml
+# Tests continue_on_error behavior in a step chain.
+# Step 1: succeeds normally.
+# Step 2: fails (exit 1) but has continue_on_error: true → recipe continues.
+# Step 3: succeeds, proving the runner continued past the step 2 failure.
+# Step 4: fails (exit 1) WITHOUT continue_on_error → recipe should abort.
+# Step 5: should NOT run, proving fail-fast behavior when continue_on_error is false.
+
+name: "continue-on-error-chain"
+description: |
+  Tests continue_on_error in detail. Verifies that:
+  1. Steps after a continue_on_error failure still run.
+  2. Steps after a non-continue_on_error failure do NOT run.
+  This proves both the "continue" and "fail-fast" paths.
+version: "1.0.0"
+
+context: {}
+
+steps:
+  # --- Step 1: Normal success ---
+  - id: "step1-succeed"
+    type: "bash"
+    command: "echo 'Step 1: success'"
+    output: "step1_out"
+
+  # --- Step 2: Fails, but continue_on_error lets the recipe proceed ---
+  - id: "step2-fail-continue"
+    type: "bash"
+    command: "echo 'Step 2: about to fail' && exit 1"
+    continue_on_error: true
+    output: "step2_out"
+
+  # --- Step 3: Should run (proves continue_on_error worked) ---
+  - id: "step3-succeed-after-error"
+    type: "bash"
+    command: "echo 'Step 3: running after step 2 failure — continue_on_error works'"
+    output: "step3_out"
+
+  # --- Step 4: Fails WITHOUT continue_on_error → recipe aborts ---
+  - id: "step4-fail-stop"
+    type: "bash"
+    command: "echo 'Step 4: about to fail hard' && exit 1"
+    continue_on_error: false
+    output: "step4_out"
+
+  # --- Step 5: Should NOT run (proves fail-fast) ---
+  - id: "step5-should-not-run"
+    type: "bash"
+    command: "echo 'FAIL: Step 5 should not have run'"
+    output: "step5_out"

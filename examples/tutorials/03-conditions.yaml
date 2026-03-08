@@ -1,0 +1,58 @@
+# 03-conditions.yaml — Conditional step execution
+#
+# Demonstrates:
+#   - Boolean conditions: "run_tests", "not skip_deploy"
+#   - Numeric comparisons: "count > 0"
+#   - Steps that get skipped when their condition is false
+#
+# Run:
+#   recipe-runner run examples/tutorials/03-conditions.yaml
+
+name: "conditions"
+description: "Conditional execution — steps run or skip based on expressions."
+version: "1.0.0"
+
+context:
+  run_tests: true
+  skip_deploy: false
+  count: 5
+
+steps:
+  - id: "always-runs"
+    type: "bash"
+    command: |
+      echo "This step has no condition — it always runs."
+    output: "baseline"
+
+  - id: "run-tests"
+    type: "bash"
+    condition: "run_tests"
+    command: |
+      echo "Running tests because run_tests is true."
+    output: "test_result"
+
+  - id: "deploy"
+    type: "bash"
+    condition: "not skip_deploy"
+    command: |
+      echo "Deploying because skip_deploy is false."
+    output: "deploy_result"
+
+  - id: "count-check"
+    type: "bash"
+    condition: "count > 0"
+    command: |
+      echo "Count is {{count}}, which is greater than 0."
+
+  # This step will be SKIPPED because skip_deploy is false,
+  # so "skip_deploy" evaluates to false.
+  - id: "skipped-step"
+    type: "bash"
+    condition: "skip_deploy"
+    command: |
+      echo "You should NOT see this — skip_deploy is false."
+
+  - id: "summary"
+    type: "bash"
+    command: |
+      echo "Done. The 'skipped-step' above should have been skipped."

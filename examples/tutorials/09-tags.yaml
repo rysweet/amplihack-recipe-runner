@@ -1,0 +1,56 @@
+# 09-tags.yaml — Tag filtering with when_tags
+#
+# Demonstrates:
+#   - Tagging steps with when_tags
+#   - Running subsets: --include-tags fast  (runs only fast-tagged steps)
+#   - Running subsets: --exclude-tags slow  (skips slow-tagged steps)
+#   - Steps without tags always run (unless include-tags is set)
+#
+# Run all steps:
+#   recipe-runner run examples/tutorials/09-tags.yaml
+#
+# Run only fast steps:
+#   recipe-runner run examples/tutorials/09-tags.yaml --include-tags fast
+#
+# Skip slow steps:
+#   recipe-runner run examples/tutorials/09-tags.yaml --exclude-tags slow
+
+name: "tags"
+description: "Tag-based step filtering with --include-tags / --exclude-tags."
+version: "1.0.0"
+
+steps:
+  - id: "unit-tests"
+    type: "bash"
+    when_tags: ["fast"]
+    command: |
+      echo "Running unit tests (fast)"
+
+  - id: "lint"
+    type: "bash"
+    when_tags: ["fast"]
+    command: |
+      echo "Running linter (fast)"
+
+  - id: "integration-tests"
+    type: "bash"
+    when_tags: ["fast", "integration"]
+    command: |
+      echo "Running integration tests (fast + integration)"
+
+  - id: "load-tests"
+    type: "bash"
+    when_tags: ["slow"]
+    command: |
+      echo "Running load tests (slow)"
+
+  - id: "e2e-tests"
+    type: "bash"
+    when_tags: ["slow"]
+    command: |
+      echo "Running end-to-end tests (slow)"
+
+  - id: "report"
+    type: "bash"
+    command: |
+      echo "Generating report (no tags — always runs unless include-tags is set)"

@@ -1,0 +1,168 @@
+# Multi-Agent Consensus Pattern
+#
+# Demonstrates parallel perspectives converging into a decision. Three agents
+# independently analyze the same problem, each returning structured JSON.
+# A fourth agent synthesizes votes and determines consensus. Finally, a bash
+# step applies the decision. This pattern is used for architectural decisions,
+# security reviews, and any situation requiring diverse expert opinions.
+
+name: "multi-agent-consensus"
+description: |
+  Multi-agent decision-making pattern where three independent agents analyze
+  a problem from different perspectives, their opinions are synthesized into
+  a consensus, and the decision is applied. Demonstrates structured JSON
+  output from multiple agents feeding into a synthesis step.
+version: "1.0.0"
+author: "amplihack"
+tags: ["multi-agent", "consensus", "voting", "decision", "pattern"]
+
+context:
+  decision_topic: "Choose the best approach for implementing caching in the API layer"
+  codebase_context: "REST API with PostgreSQL backend, ~50 endpoints, 10k RPM traffic"
+  options: "1) Redis sidecar, 2) In-memory LRU cache, 3) HTTP cache headers only"
+  repo_path: "."
+
+steps:
+  # Step 1: Gather relevant context from the codebase
+  - id: "gather-context"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    command: |
+      echo "=== Codebase Context ==="
+      echo "Project: {{codebase_context}}"
+      echo ""
+      echo "File count by type:"
+      find . -type f ! -path "*/.git/*" ! -path "*/node_modules/*" ! -path "*/target/*" \
+        | sed 's/.*\.//' | sort | uniq -c | sort -rn | head -10
+      echo ""
+      echo "Lines of code estimate:"
+      find . -type f \( -name "*.py" -o -name "*.ts" -o -name "*.rs" -o -name "*.go" \) \
+        ! -path "*/.git/*" ! -path "*/node_modules/*" ! -path "*/target/*" \
+        -exec cat {} \; 2>/dev/null | wc -l
+    output: "codebase_info"
+    continue_on_error: true
+
+  # Step 2: Agent 1 — Performance Engineer perspective
+  - id: "analyst-performance"
+    type: "agent"
+    prompt: |
+      You are a Performance Engineer. Analyze the following decision from a
+      performance and scalability perspective.
+
+      Decision: {{decision_topic}}
+      Options: {{options}}
+      Context: {{codebase_context}}
+      Codebase info: {{codebase_info}}
+
+      Evaluate each option for: latency impact, throughput, memory usage,
+      scalability under load, and cache invalidation complexity.
+
+      Return a JSON object with:
+      - "perspective": "performance"
+      - "recommendation": the option number you recommend (1, 2, or 3)
+      - "confidence": 0.0 to 1.0
+      - "reasoning": your analysis (2-3 paragraphs)
+      - "risks": array of risk strings for your recommended option
+      - "scores": object mapping option numbers to scores 1-10
+    output: "vote_performance"
+    parse_json: true
+
+  # Step 3: Agent 2 — Operations/Reliability perspective
+  - id: "analyst-operations"
+    type: "agent"
+    prompt: |
+      You are a Site Reliability Engineer. Analyze the following decision from
+      an operations and reliability perspective.
+
+      Decision: {{decision_topic}}
+      Options: {{options}}
+      Context: {{codebase_context}}
+      Codebase info: {{codebase_info}}
+
+      Evaluate each option for: operational complexity, monitoring/observability,
+      failure modes, deployment impact, and maintenance burden.
+
+      Return a JSON object with:
+      - "perspective": "operations"
+      - "recommendation": the option number you recommend (1, 2, or 3)
+      - "confidence": 0.0 to 1.0
+      - "reasoning": your analysis (2-3 paragraphs)
+      - "risks": array of risk strings for your recommended option
+      - "scores": object mapping option numbers to scores 1-10
+    output: "vote_operations"
+    parse_json: true
+
+  # Step 4: Agent 3 — Software Architecture perspective
+  - id: "analyst-architecture"
+    type: "agent"
+    prompt: |
+      You are a Software Architect. Analyze the following decision from a
+      code quality and architecture perspective.
+
+      Decision: {{decision_topic}}
+      Options: {{options}}
+      Context: {{codebase_context}}
+      Codebase info: {{codebase_info}}
+
+      Evaluate each option for: code complexity, testability, coupling,
+      migration path, and alignment with existing architecture.
+
+      Return a JSON object with:
+      - "perspective": "architecture"
+      - "recommendation": the option number you recommend (1, 2, or 3)
+      - "confidence": 0.0 to 1.0
+      - "reasoning": your analysis (2-3 paragraphs)
+      - "risks": array of risk strings for your recommended option
+      - "scores": object mapping option numbers to scores 1-10
+    output: "vote_architecture"
+    parse_json: true
+
+  # Step 5: Synthesize votes into consensus
+  - id: "synthesize-consensus"
+    type: "agent"
+    prompt: |
+      Synthesize the following three expert analyses into a consensus decision.
+
+      Performance Engineer: {{vote_performance}}
+      Site Reliability Engineer: {{vote_operations}}
+      Software Architect: {{vote_architecture}}
+
+      Decision topic: {{decision_topic}}
+      Options: {{options}}
+
+      Determine consensus using weighted voting:
+      - If all three agree: strong consensus
+      - If two agree: majority consensus (note dissent)
+      - If all disagree: no consensus (recommend further discussion)
+
+      Return a JSON object with:
+      - "consensus_reached": boolean
+      - "consensus_type": "unanimous", "majority", or "none"
+      - "selected_option": the winning option number (or null if no consensus)
+      - "vote_summary": object mapping option numbers to vote counts
+      - "combined_score": weighted average score for selected option
+      - "rationale": synthesis of why this option won
+      - "dissenting_view": summary of disagreement (if any)
+      - "action_items": array of next steps to implement the decision
+    output: "consensus"
+    parse_json: true
+
+  # Step 6: Apply the consensus decision
+  - id: "apply-decision"
+    type: "bash"
+    command: |
+      echo "============================================"
+      echo "     MULTI-AGENT CONSENSUS RESULT"
+      echo "============================================"
+      echo ""
+      echo "Topic: {{decision_topic}}"
+      echo ""
+      echo "Votes:"
+      echo "  Performance:   {{vote_performance}}" | grep -o '"recommendation":[^,]*'
+      echo "  Operations:    {{vote_operations}}" | grep -o '"recommendation":[^,]*'
+      echo "  Architecture:  {{vote_architecture}}" | grep -o '"recommendation":[^,]*'
+      echo ""
+      echo "Consensus: {{consensus}}"
+      echo ""
+      echo "============================================"
+    output: "decision_summary"

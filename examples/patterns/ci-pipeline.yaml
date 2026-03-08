@@ -1,0 +1,137 @@
+# CI/CD Pipeline Pattern
+#
+# Demonstrates a realistic continuous integration pipeline with sequential
+# gated steps. Each step's success gates the next via conditions on output
+# variables. All steps are bash — no agent steps needed for pure CI.
+# This is the pattern to follow for automated build/test/deploy pipelines.
+
+name: "ci-pipeline"
+description: |
+  Realistic CI/CD pipeline with gated steps. Each phase checks the result
+  of the previous phase before proceeding. Demonstrates condition-based
+  flow control, output variable chaining, and fail-fast behavior.
+version: "1.0.0"
+author: "amplihack"
+tags: ["ci", "cd", "pipeline", "build", "test", "pattern"]
+
+context:
+  repo_path: "."
+  branch: "main"
+  build_command: "make build"
+  test_command: "make test"
+  lint_command: "make lint"
+  package_format: "tar.gz"
+  artifact_dir: "./dist"
+
+steps:
+  # Step 1: Checkout and validate repository state
+  - id: "checkout"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    command: |
+      echo "=== Repository Check ==="
+      git rev-parse --is-inside-work-tree && \
+      git --no-pager log -1 --format="commit: %H%nauthor: %an%ndate: %ai%nmessage: %s" && \
+      echo "branch: $(git rev-parse --abbrev-ref HEAD)" && \
+      echo "checkout_ok=true"
+    output: "checkout_result"
+
+  # Step 2: Install dependencies
+  - id: "install-deps"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    condition: "'checkout_ok=true' in '{{checkout_result}}'"
+    command: |
+      echo "=== Installing Dependencies ==="
+      if [ -f "package.json" ]; then
+        npm ci --prefer-offline 2>&1 && echo "deps_installed=true"
+      elif [ -f "requirements.txt" ]; then
+        pip install -r requirements.txt 2>&1 && echo "deps_installed=true"
+      elif [ -f "Cargo.toml" ]; then
+        cargo fetch 2>&1 && echo "deps_installed=true"
+      elif [ -f "go.mod" ]; then
+        go mod download 2>&1 && echo "deps_installed=true"
+      else
+        echo "No dependency file found, skipping"
+        echo "deps_installed=true"
+      fi
+    output: "deps_result"
+    timeout: 300
+
+  # Step 3: Lint
+  - id: "lint"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    condition: "'deps_installed=true' in '{{deps_result}}'"
+    command: |
+      echo "=== Running Linter ==="
+      {{lint_command}} 2>&1 && echo "lint_passed=true" || echo "lint_passed=false"
+    output: "lint_result"
+    continue_on_error: true
+    timeout: 120
+
+  # Step 4: Run tests
+  - id: "test"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    condition: "'deps_installed=true' in '{{deps_result}}'"
+    command: |
+      echo "=== Running Tests ==="
+      {{test_command}} 2>&1
+      TEST_EXIT=$?
+      if [ $TEST_EXIT -eq 0 ]; then
+        echo "tests_passed=true"
+      else
+        echo "tests_passed=false"
+      fi
+      exit $TEST_EXIT
+    output: "test_result"
+    timeout: 600
+
+  # Step 5: Build
+  - id: "build"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    condition: "'tests_passed=true' in '{{test_result}}'"
+    command: |
+      echo "=== Building ==="
+      {{build_command}} 2>&1
+      BUILD_EXIT=$?
+      if [ $BUILD_EXIT -eq 0 ]; then
+        echo "build_passed=true"
+      else
+        echo "build_passed=false"
+      fi
+      exit $BUILD_EXIT
+    output: "build_result"
+    timeout: 600
+
+  # Step 6: Package artifacts
+  - id: "package"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    condition: "'build_passed=true' in '{{build_result}}'"
+    command: |
+      echo "=== Packaging Artifacts ==="
+      mkdir -p {{artifact_dir}}
+      TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+      COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+      ARTIFACT_NAME="build-${COMMIT}-${TIMESTAMP}.{{package_format}}"
+      echo "artifact_name=${ARTIFACT_NAME}"
+      echo "artifact_dir={{artifact_dir}}"
+      echo "package_complete=true"
+    output: "package_result"
+
+  # Step 7: Pipeline summary
+  - id: "pipeline-summary"
+    type: "bash"
+    command: |
+      echo "=== CI Pipeline Summary ==="
+      echo "Checkout:     OK"
+      echo "Dependencies: {{deps_result}}" | grep -o "deps_installed=[a-z]*"
+      echo "Lint:         {{lint_result}}" | grep -o "lint_passed=[a-z]*"
+      echo "Tests:        {{test_result}}" | grep -o "tests_passed=[a-z]*"
+      echo "Build:        {{build_result}}" | grep -o "build_passed=[a-z]*"
+      echo "Package:      {{package_result}}" | grep -o "package_complete=[a-z]*"
+      echo "==========================="
+    output: "pipeline_summary"

@@ -1,0 +1,175 @@
+# large-context.yaml
+# Stress test with many context variables (20+) and many steps (20+).
+# Each step reads and writes different variables to verify the context
+# doesn't corrupt under heavy concurrent-like access patterns.
+
+name: "large-context"
+description: |
+  Stress test with 25 context variables and 25 steps.
+  Each step reads existing variables and writes new ones.
+  Verifies context integrity under heavy use — no corruption,
+  no cross-contamination between variables.
+version: "1.0.0"
+
+context:
+  v01: "alpha"
+  v02: "bravo"
+  v03: "charlie"
+  v04: "delta"
+  v05: "echo"
+  v06: "foxtrot"
+  v07: "golf"
+  v08: "hotel"
+  v09: "india"
+  v10: "juliet"
+  v11: "kilo"
+  v12: "lima"
+  v13: "mike"
+  v14: "november"
+  v15: "oscar"
+  v16: "papa"
+  v17: "quebec"
+  v18: "romeo"
+  v19: "sierra"
+  v20: "tango"
+  n01: 1
+  n02: 2
+  n03: 3
+  n04: 4
+  n05: 5
+
+steps:
+  # --- Steps 1-5: Read initial string vars, write computed values ---
+  - id: "step-01"
+    type: "bash"
+    command: "echo '{{v01}}-{{v02}}'"
+    output: "out_01"
+
+  - id: "step-02"
+    type: "bash"
+    command: "echo '{{v03}}-{{v04}}'"
+    output: "out_02"
+
+  - id: "step-03"
+    type: "bash"
+    command: "echo '{{v05}}-{{v06}}'"
+    output: "out_03"
+
+  - id: "step-04"
+    type: "bash"
+    command: "echo '{{v07}}-{{v08}}'"
+    output: "out_04"
+
+  - id: "step-05"
+    type: "bash"
+    command: "echo '{{v09}}-{{v10}}'"
+    output: "out_05"
+
+  # --- Steps 6-10: Read more initial vars ---
+  - id: "step-06"
+    type: "bash"
+    command: "echo '{{v11}}-{{v12}}'"
+    output: "out_06"
+
+  - id: "step-07"
+    type: "bash"
+    command: "echo '{{v13}}-{{v14}}'"
+    output: "out_07"
+
+  - id: "step-08"
+    type: "bash"
+    command: "echo '{{v15}}-{{v16}}'"
+    output: "out_08"
+
+  - id: "step-09"
+    type: "bash"
+    command: "echo '{{v17}}-{{v18}}'"
+    output: "out_09"
+
+  - id: "step-10"
+    type: "bash"
+    command: "echo '{{v19}}-{{v20}}'"
+    output: "out_10"
+
+  # --- Steps 11-15: Read computed outputs from earlier steps ---
+  - id: "step-11"
+    type: "bash"
+    command: "echo '{{out_01}}+{{out_02}}'"
+    output: "out_11"
+
+  - id: "step-12"
+    type: "bash"
+    command: "echo '{{out_03}}+{{out_04}}'"
+    output: "out_12"
+
+  - id: "step-13"
+    type: "bash"
+    command: "echo '{{out_05}}+{{out_06}}'"
+    output: "out_13"
+
+  - id: "step-14"
+    type: "bash"
+    command: "echo '{{out_07}}+{{out_08}}'"
+    output: "out_14"
+
+  - id: "step-15"
+    type: "bash"
+    command: "echo '{{out_09}}+{{out_10}}'"
+    output: "out_15"
+
+  # --- Steps 16-20: Mix initial and computed vars with conditions ---
+  - id: "step-16"
+    type: "bash"
+    condition: "n01 > 0"
+    command: "echo '{{v01}}:{{out_11}}'"
+    output: "out_16"
+
+  - id: "step-17"
+    type: "bash"
+    condition: "n02 > 1"
+    command: "echo '{{v05}}:{{out_12}}'"
+    output: "out_17"
+
+  - id: "step-18"
+    type: "bash"
+    condition: "n03 > 2"
+    command: "echo '{{v09}}:{{out_13}}'"
+    output: "out_18"
+
+  - id: "step-19"
+    type: "bash"
+    condition: "n04 > 3"
+    command: "echo '{{v13}}:{{out_14}}'"
+    output: "out_19"
+
+  - id: "step-20"
+    type: "bash"
+    condition: "n05 > 4"
+    command: "echo '{{v17}}:{{out_15}}'"
+    output: "out_20"
+
+  # --- Steps 21-25: Deep chaining — read outputs of outputs ---
+  - id: "step-21"
+    type: "bash"
+    command: "echo 'chain:{{out_16}}'"
+    output: "out_21"
+
+  - id: "step-22"
+    type: "bash"
+    command: "echo 'chain:{{out_17}}'"
+    output: "out_22"
+
+  - id: "step-23"
+    type: "bash"
+    command: "echo 'chain:{{out_18}}'"
+    output: "out_23"
+
+  - id: "step-24"
+    type: "bash"
+    command: "echo 'chain:{{out_19}}'"
+    output: "out_24"
+
+  - id: "step-25"
+    type: "bash"
+    command: "echo 'final:{{out_21}}|{{out_22}}|{{out_23}}|{{out_24}}'"
+    output: "final_out"

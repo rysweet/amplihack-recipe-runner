@@ -1,0 +1,52 @@
+# 10-parallel-groups.yaml — Parallel step execution
+#
+# Demonstrates:
+#   - parallel_group groups consecutive steps for concurrent execution
+#   - Both "build" steps run at the same time
+#   - The verify step waits until the parallel group finishes
+#   - Steps write files to prove both executed
+#
+# Run:
+#   recipe-runner run examples/tutorials/10-parallel-groups.yaml
+
+name: "parallel-groups"
+description: "Concurrent execution of steps in the same parallel_group."
+version: "1.0.0"
+
+steps:
+  - id: "setup"
+    type: "bash"
+    command: |
+      dir=$(mktemp -d)
+      echo "$dir"
+    output: "work_dir"
+
+  - id: "build-frontend"
+    type: "bash"
+    parallel_group: "build"
+    command: |
+      echo "frontend built at $(date +%s)" > {{work_dir}}/frontend.txt
+      echo "Frontend build complete"
+    output: "frontend_result"
+
+  - id: "build-backend"
+    type: "bash"
+    parallel_group: "build"
+    command: |
+      echo "backend built at $(date +%s)" > {{work_dir}}/backend.txt
+      echo "Backend build complete"
+    output: "backend_result"
+
+  - id: "verify"
+    type: "bash"
+    command: |
+      echo "--- Both builds finished ---"
+      echo "Frontend: $(cat {{work_dir}}/frontend.txt)"
+      echo "Backend:  $(cat {{work_dir}}/backend.txt)"
+    output: "verify_result"
+
+  - id: "cleanup"
+    type: "bash"
+    command: |
+      rm -rf {{work_dir}}
+      echo "Cleaned up {{work_dir}}"

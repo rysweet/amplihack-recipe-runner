@@ -1,0 +1,48 @@
+# 14-dry-run.yaml — Dry-run mode demonstration
+#
+# Demonstrates:
+#   - A mix of bash and agent steps
+#   - When run with --dry-run, no steps actually execute
+#   - Agent steps produce mock output in dry-run mode
+#   - parse_json steps show mock JSON handling
+#
+# Normal run:
+#   recipe-runner run examples/tutorials/14-dry-run.yaml
+#
+# Dry run (no execution, just validation):
+#   recipe-runner run examples/tutorials/14-dry-run.yaml --dry-run
+
+name: "dry-run"
+description: "Validate recipes without executing — use --dry-run flag."
+version: "1.0.0"
+
+context:
+  project: "my-service"
+
+steps:
+  - id: "check-env"
+    type: "bash"
+    command: |
+      echo "Checking environment for {{project}}..."
+    output: "env_check"
+
+  - id: "analyze-code"
+    type: "agent"
+    agent: "amplihack:core:builder"
+    prompt: |
+      Analyze the codebase for {{project}} and return a summary.
+    output: "analysis"
+
+  - id: "get-metrics"
+    type: "bash"
+    command: |
+      echo '{"tests": 42, "coverage": 87.5, "passing": true}'
+    output: "metrics"
+    parse_json: true
+
+  - id: "report"
+    type: "bash"
+    command: |
+      echo "Project: {{project}}"
+      echo "Tests:   {{metrics.tests}}"
+      echo "Coverage: {{metrics.coverage}}"

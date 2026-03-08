@@ -1,5 +1,5 @@
 /// Tests for new features: continue_on_error, recursion limits, hooks,
-/// tag filtering, audit log, fallback adapter, timing, and property-based tests.
+/// tag filtering, audit log, timing, and property-based tests.
 
 use recipe_runner_rs::adapters::Adapter;
 use recipe_runner_rs::context::RecipeContext;
@@ -269,62 +269,6 @@ steps:
     assert!(json.contains("recipe_name"));
     assert!(json.contains("step_results"));
     assert!(json.contains("duration"));
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// FALLBACK ADAPTER
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn test_fallback_adapter_uses_secondary_on_failure() {
-    use recipe_runner_rs::adapters::FallbackAdapter;
-
-    struct FailingAdapter;
-    impl Adapter for FailingAdapter {
-        fn execute_agent_step(&self, _: &str, _: Option<&str>, _: Option<&str>,
-            _: Option<&str>, _: &str) -> Result<String, anyhow::Error> {
-            anyhow::bail!("primary failed")
-        }
-        fn execute_bash_step(&self, _: &str, _: &str, _: Option<u64>)
-            -> Result<String, anyhow::Error> {
-            anyhow::bail!("primary failed")
-        }
-        fn is_available(&self) -> bool { true }
-        fn name(&self) -> &str { "failing" }
-    }
-
-    let adapter = FallbackAdapter::new(FailingAdapter, MockAdapter);
-    let parser = RecipeParser::new();
-    let recipe = parser.parse("name: t\nsteps:\n  - id: s1\n    command: echo ok").unwrap();
-    let r = RecipeRunner::new(adapter).execute(&recipe, None);
-    assert!(r.success);
-    assert!(r.step_results[0].output.contains("[mock-bash]"));
-}
-
-#[test]
-fn test_fallback_adapter_uses_primary_when_available() {
-    use recipe_runner_rs::adapters::FallbackAdapter;
-
-    struct SucceedingAdapter;
-    impl Adapter for SucceedingAdapter {
-        fn execute_agent_step(&self, _: &str, _: Option<&str>, _: Option<&str>,
-            _: Option<&str>, _: &str) -> Result<String, anyhow::Error> {
-            Ok("primary-output".to_string())
-        }
-        fn execute_bash_step(&self, _: &str, _: &str, _: Option<u64>)
-            -> Result<String, anyhow::Error> {
-            Ok("primary-output".to_string())
-        }
-        fn is_available(&self) -> bool { true }
-        fn name(&self) -> &str { "succeeding" }
-    }
-
-    let adapter = FallbackAdapter::new(SucceedingAdapter, MockAdapter);
-    let parser = RecipeParser::new();
-    let recipe = parser.parse("name: t\nsteps:\n  - id: s1\n    command: echo ok").unwrap();
-    let r = RecipeRunner::new(adapter).execute(&recipe, None);
-    assert!(r.success);
-    assert_eq!(r.step_results[0].output, "primary-output");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

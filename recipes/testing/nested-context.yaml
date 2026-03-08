@@ -1,0 +1,53 @@
+# nested-context.yaml
+# Tests dot-notation access for deeply nested context variables.
+# Verifies that template substitution and conditions work with nested maps.
+
+name: "nested-context"
+description: |
+  Tests dot-notation access for nested context maps.
+  Verifies conditions like config.db.port == 5432 and
+  template substitution like {{config.db.host}}.
+version: "1.0.0"
+
+context:
+  config:
+    db:
+      host: "localhost"
+      port: 5432
+    app:
+      name: "test"
+      debug: true
+
+steps:
+  # --- Access nested numeric value in condition ---
+  - id: "nested-port-condition"
+    type: "bash"
+    condition: "config.db.port == 5432"
+    command: "echo 'PASS: config.db.port == 5432'"
+    output: "port_check"
+
+  # --- Access nested string in template ---
+  - id: "nested-host-template"
+    type: "bash"
+    command: "echo 'host={{config.db.host}}'"
+    output: "host_out"
+
+  # --- Access nested app name in template ---
+  - id: "nested-app-template"
+    type: "bash"
+    command: "echo 'app={{config.app.name}}'"
+    output: "app_out"
+
+  # --- Access nested boolean in condition ---
+  - id: "nested-debug-condition"
+    type: "bash"
+    condition: "config.app.debug"
+    command: "echo 'PASS: config.app.debug is true'"
+    output: "debug_check"
+
+  # --- Combine nested access in condition and template ---
+  - id: "nested-combined"
+    type: "bash"
+    condition: 'config.app.name == "test"'
+    command: "echo 'connecting to {{config.db.host}}:{{config.db.port}} for app {{config.app.name}}'"
+    output: "combined_out"

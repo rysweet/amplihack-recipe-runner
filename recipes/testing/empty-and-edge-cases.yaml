@@ -1,0 +1,76 @@
+# empty-and-edge-cases.yaml
+# Tests edge cases around falsy/truthy values in conditions.
+# Empty strings, zero, and false should be falsy (steps skipped).
+# Non-empty strings and truthy values should pass (steps run).
+
+name: "empty-and-edge-cases"
+description: |
+  Tests truthiness edge cases in condition evaluation.
+  Empty string, zero, and false should be falsy and skip their steps.
+  Non-empty string and true values should be truthy and run.
+version: "1.0.0"
+
+context:
+  empty_str: ""
+  zero_val: 0
+  false_val: false
+  nonempty: "has_value"
+  true_val: true
+  one_val: 1
+
+steps:
+  # --- Falsy: empty string should cause skip ---
+  - id: "empty-string-skip"
+    type: "bash"
+    condition: "empty_str"
+    command: "echo 'FAIL: empty string should be falsy'"
+    output: "empty_str_result"
+
+  # --- Falsy: zero should cause skip ---
+  - id: "zero-skip"
+    type: "bash"
+    condition: "zero_val"
+    command: "echo 'FAIL: zero should be falsy'"
+    output: "zero_result"
+
+  # --- Falsy: false should cause skip ---
+  - id: "false-skip"
+    type: "bash"
+    condition: "false_val"
+    command: "echo 'FAIL: false should be falsy'"
+    output: "false_result"
+
+  # --- Truthy: non-empty string should run ---
+  - id: "nonempty-run"
+    type: "bash"
+    condition: "nonempty"
+    command: "echo 'PASS: non-empty string is truthy'"
+    output: "nonempty_result"
+
+  # --- Truthy: true should run ---
+  - id: "true-run"
+    type: "bash"
+    condition: "true_val"
+    command: "echo 'PASS: true is truthy'"
+    output: "true_result"
+
+  # --- Truthy: 1 should run ---
+  - id: "one-run"
+    type: "bash"
+    condition: "one_val"
+    command: "echo 'PASS: 1 is truthy'"
+    output: "one_result"
+
+  # --- Edge: negated empty string should run ---
+  - id: "not-empty-run"
+    type: "bash"
+    condition: "not empty_str"
+    command: "echo 'PASS: not empty_str is truthy'"
+    output: "not_empty_result"
+
+  # --- Edge: negated false should run ---
+  - id: "not-false-run"
+    type: "bash"
+    condition: "not false_val"
+    command: "echo 'PASS: not false_val is truthy'"
+    output: "not_false_result"

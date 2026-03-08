@@ -1,0 +1,19 @@
+# base.yaml — Shared base recipe for 11-extends.yaml
+#
+# This recipe provides common context and setup steps that
+# child recipes inherit via `extends`.
+
+name: "base"
+description: "Shared base recipe with common setup."
+version: "1.0.0"
+
+context:
+  environment: "development"
+  log_level: "info"
+
+steps:
+  - id: "base-setup"
+    type: "bash"
+    command: |
+      echo "Base setup: env={{environment}}, log={{log_level}}"
+    output: "setup_result"

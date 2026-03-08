@@ -1,0 +1,43 @@
+# output-chaining.yaml
+# Tests that output from one step flows into the next step's context.
+# Each step appends a letter, building a chain: A → AB → ABC → ABCD → ABCDE.
+
+name: "output-chaining"
+description: |
+  Tests output flowing between steps via context variables.
+  Step 1 outputs "A", step 2 reads it and appends "B", etc.
+  Final output should be "ABCDE" proving the full chain works.
+version: "1.0.0"
+
+context: {}
+
+steps:
+  # --- Step 1: Seed the chain ---
+  - id: "chain-step-1"
+    type: "bash"
+    command: "echo -n 'A'"
+    output: "step1_out"
+
+  # --- Step 2: Read step1 output, append B ---
+  - id: "chain-step-2"
+    type: "bash"
+    command: "echo -n '{{step1_out}}B'"
+    output: "step2_out"
+
+  # --- Step 3: Read step2 output, append C ---
+  - id: "chain-step-3"
+    type: "bash"
+    command: "echo -n '{{step2_out}}C'"
+    output: "step3_out"
+
+  # --- Step 4: Read step3 output, append D ---
+  - id: "chain-step-4"
+    type: "bash"
+    command: "echo -n '{{step3_out}}D'"
+    output: "step4_out"
+
+  # --- Step 5: Read step4 output, append E ---
+  - id: "chain-step-5"
+    type: "bash"
+    command: "echo -n '{{step4_out}}E'"
+    output: "step5_out"

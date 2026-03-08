@@ -1,0 +1,33 @@
+# 13-timeouts.yaml — Step-level timeouts
+#
+# Demonstrates:
+#   - Setting a timeout (in seconds) on individual steps
+#   - A fast step that completes well within its timeout
+#   - A step with a short timeout for documentation purposes
+#
+# Run:
+#   recipe-runner run examples/tutorials/13-timeouts.yaml
+
+name: "timeouts"
+description: "Per-step timeout configuration."
+version: "1.0.0"
+
+steps:
+  - id: "fast-step"
+    type: "bash"
+    timeout: 5
+    command: |
+      echo "This finishes instantly — well within the 5s timeout."
+    output: "fast_result"
+
+  - id: "timed-step"
+    type: "bash"
+    timeout: 2
+    command: |
+      echo "This also finishes quickly (2s timeout)."
+    output: "timed_result"
+
+  - id: "no-timeout"
+    type: "bash"
+    command: |
+      echo "This step has no timeout — it runs until done."
