@@ -154,7 +154,7 @@ impl CLISubprocessAdapter {
                         if let Ok(file) = std::fs::File::open(&output_path) {
                             let reader = BufReader::new(file);
                             if let Some(Ok(last_line)) = reader.lines().last() {
-                                let truncated = &last_line[..last_line.len().min(120)];
+                                let truncated = crate::safe_truncate(&last_line, 120);
                                 eprintln!("  [agent] {}", truncated);
                             }
                         }
@@ -182,7 +182,7 @@ impl CLISubprocessAdapter {
                 "Agent step timed out after {}s. Partial output ({} bytes): {}...",
                 timeout.unwrap_or(0),
                 partial.len(),
-                &partial[..partial.len().min(500)]
+                crate::safe_truncate(&partial, 500)
             );
         }
 
@@ -195,7 +195,7 @@ impl CLISubprocessAdapter {
                 "{} failed (exit {}): {}",
                 self.cli,
                 status.code().unwrap_or(-1),
-                &stdout[stdout.len().saturating_sub(500)..]
+                crate::safe_tail(&stdout, 500)
             );
         }
 

@@ -136,7 +136,7 @@ fn main() -> anyhow::Result<()> {
                     "{:<30} {:<10} {}",
                     r.name,
                     r.version,
-                    &r.description[..r.description.len().min(60)]
+                    recipe_runner_rs::safe_truncate(&r.description, 60)
                 );
             }
             println!("\n{} recipe(s) found.", recipes.len());

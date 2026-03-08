@@ -6,6 +6,30 @@ pub mod models;
 pub mod parser;
 pub mod runner;
 
+/// Safely truncate a string to at most `max_bytes` bytes at a UTF-8 boundary.
+pub fn safe_truncate(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Safely get the tail of a string starting at most `max_bytes` from the end.
+pub fn safe_tail(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut start = s.len() - max_bytes;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
 // Public API convenience functions
 
 use adapters::Adapter;

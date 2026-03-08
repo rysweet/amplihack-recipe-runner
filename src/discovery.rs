@@ -344,14 +344,26 @@ pub fn sync_upstream(
         .args(["remote", "get-url", &remote])
         .output()?;
     if !check.status.success() {
-        Command::new("git")
+        let add_output = Command::new("git")
             .args(["remote", "add", &remote, repo])
             .output()?;
+        if !add_output.status.success() {
+            let stderr = String::from_utf8_lossy(&add_output.stderr);
+            if !stderr.contains("already exists") {
+                return Err(anyhow::anyhow!("git remote add failed: {}", stderr));
+            }
+        }
         info!("Added remote '{}' -> {}", remote, repo);
     }
 
     // Fetch
-    Command::new("git").args(["fetch", &remote, br]).output()?;
+    let fetch_output = Command::new("git").args(["fetch", &remote, br]).output()?;
+    if !fetch_output.status.success() {
+        return Err(anyhow::anyhow!(
+            "git fetch failed: {}",
+            String::from_utf8_lossy(&fetch_output.stderr)
+        ));
+    }
 
     // Diff
     let upstream_ref = format!("{}/{}", remote, br);
@@ -386,7 +398,7 @@ pub fn sync_upstream(
     Ok(serde_json::json!({
         "has_changes": has_changes,
         "files_changed": files_changed,
-        "diff_summary": if has_changes { &diff_stdout[..diff_stdout.len().min(500)] } else { "No changes" },
+        "diff_summary": if has_changes { crate::safe_truncate(&diff_stdout, 500) } else { "No changes" },
         "upstream_ref": upstream_ref,
     }))
 }
