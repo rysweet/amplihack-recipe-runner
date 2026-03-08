@@ -1,7 +1,7 @@
 /// Recipe execution context with template rendering and safe expression evaluation.
 ///
 /// Provides variable storage, dot-notation access, Mustache-style template rendering,
-/// and a safe condition evaluator. Direct port from Python `amplihack.recipes.context`.
+/// and a safe condition evaluator.
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;

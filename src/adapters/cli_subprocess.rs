@@ -1,5 +1,5 @@
 /// CLI subprocess adapter — executes agent steps by spawning `claude -p` subprocesses
-/// and bash steps via `/bin/bash -c`. Direct port from Python `cli_subprocess.py`.
+/// and bash steps via `/bin/bash -c`.
 ///
 /// Agent steps use a temporary working directory to prevent file write races
 /// when running inside a nested Claude Code session (#2758). Session tree env

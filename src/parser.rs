@@ -1,7 +1,7 @@
 /// YAML recipe parser.
 ///
 /// Parses YAML recipe definitions into Recipe model objects, with validation
-/// and step-type inference. Direct port from Python `amplihack.recipes.parser`.
+/// and step-type inference.
 use crate::discovery;
 use crate::models::{Recipe, StepType};
 use std::collections::HashSet;

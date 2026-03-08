@@ -2,7 +2,7 @@
 ///
 /// Resolves references like `amplihack:builder` or `amplihack:core:architect`
 /// to the markdown content of the corresponding agent definition file.
-/// Direct port from Python `amplihack.recipes.agent_resolver`.
+///
 use regex::Regex;
 use std::path::PathBuf;
 use std::sync::LazyLock;

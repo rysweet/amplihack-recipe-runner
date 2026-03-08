@@ -1,7 +1,7 @@
 /// amplihack Recipe Runner (Rust)
 ///
 /// CLI interface for parsing and executing YAML-defined recipes.
-/// Port from Python `amplihack.recipes`.
+///
 use clap::{Parser, Subcommand};
 use recipe_runner_rs::adapters::cli_subprocess::CLISubprocessAdapter;
 use recipe_runner_rs::discovery;

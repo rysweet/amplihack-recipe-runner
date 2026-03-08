@@ -2,7 +2,7 @@
 ///
 /// Runs a parsed Recipe step-by-step through an adapter, managing context
 /// accumulation, conditional execution, template rendering, and fail-fast behavior.
-/// Direct port from Python `amplihack.recipes.runner`.
+///
 use crate::adapters::Adapter;
 use crate::agent_resolver::{AgentResolveError, AgentResolver};
 use crate::context::RecipeContext;

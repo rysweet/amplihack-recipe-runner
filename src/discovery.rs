@@ -1,7 +1,7 @@
 /// Recipe discovery — find, list, and sync recipe YAML files.
 ///
 /// Searches well-known directories for recipe files and provides metadata.
-/// Direct port from Python `amplihack.recipes.discovery`.
+///
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json;

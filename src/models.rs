@@ -1,7 +1,7 @@
 /// Data models for the Recipe Runner.
 ///
 /// Defines the core data structures: steps, recipes, results, and error types.
-/// Direct port from Python `amplihack.recipes.models`.
+///
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;

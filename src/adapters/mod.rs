@@ -1,6 +1,6 @@
 /// Adapter trait and implementations for recipe step execution.
 ///
-/// Direct port from Python `amplihack.recipes.adapters`.
+///
 pub mod cli_subprocess;
 
 /// Trait that all recipe execution adapters must implement.
