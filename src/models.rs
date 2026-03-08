@@ -187,7 +187,7 @@ pub struct RecipeResult {
     pub recipe_name: String,
     pub success: bool,
     pub step_results: Vec<StepResult>,
-    #[serde(skip)]
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub context: HashMap<String, serde_json::Value>,
     /// Total wall-clock duration.
     #[serde(skip_serializing_if = "Option::is_none")]

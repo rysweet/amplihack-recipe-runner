@@ -169,9 +169,28 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Parse recipe
+    // Parse recipe — try as file path first, then as recipe name
     let parser = RecipeParser::new();
-    let recipe = parser.parse_file(&recipe_path)?;
+    let resolved_path;
+    let recipe = if recipe_path.is_file() {
+        resolved_path = recipe_path;
+        parser.parse_file(&resolved_path)?
+    } else {
+        let name = recipe_path.to_string_lossy();
+        let extra_dirs: Vec<PathBuf> = cli.recipe_dirs.iter().map(PathBuf::from).collect();
+        let search = if extra_dirs.is_empty() {
+            None
+        } else {
+            Some(extra_dirs.as_slice())
+        };
+        resolved_path = discovery::find_recipe(&name, search).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Recipe '{}' not found. Use `recipe-runner list` to see available recipes.",
+                name
+            )
+        })?;
+        parser.parse_file(&resolved_path)?
+    };
 
     // --explain: show recipe structure
     if cli.explain {
@@ -229,7 +248,7 @@ fn main() -> anyhow::Result<()> {
     // --validate-only: parse + validate
     if cli.validate_only {
         let warnings =
-            parser.validate_with_yaml(&recipe, Some(&std::fs::read_to_string(&recipe_path)?));
+            parser.validate_with_yaml(&recipe, Some(&std::fs::read_to_string(&resolved_path)?));
         if warnings.is_empty() {
             println!(
                 "✓ Recipe '{}' is valid ({} steps)",
