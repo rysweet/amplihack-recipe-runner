@@ -77,17 +77,47 @@ fn find_step<'a>(json: &'a Value, step_id: &str) -> Option<&'a Value> {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_parse_json_failure_kills_recipe_by_default() {
+fn test_parse_json_failure_degrades_by_default() {
     let dir = TempDir::new().unwrap();
     let recipe = write_recipe(
         dir.path(),
         "recipe.yaml",
         r#"
-name: test-parse-json-fail
+name: test-parse-json-degrade
 steps:
   - id: bad-json
     command: "echo 'this is not json at all'"
     parse_json: true
+  - id: should-run
+    command: "echo 'reached'"
+"#,
+    );
+
+    let (code, json, _stderr) = run_json(&recipe, &[]);
+
+    // With parse_json_required defaulting to false, the recipe degrades gracefully.
+    assert_eq!(code, 0, "recipe should succeed with degraded step");
+    let bad = find_step(&json, "bad-json").expect("bad-json step should exist");
+    assert_eq!(bad["status"].as_str().unwrap(), "degraded");
+
+    // The second step should have executed.
+    let good = find_step(&json, "should-run").expect("should-run step should exist");
+    assert_eq!(good["status"].as_str().unwrap(), "completed");
+}
+
+#[test]
+fn test_parse_json_required_kills_recipe() {
+    let dir = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        dir.path(),
+        "recipe.yaml",
+        r#"
+name: test-parse-json-required
+steps:
+  - id: bad-json
+    command: "echo 'this is not json at all'"
+    parse_json: true
+    parse_json_required: true
   - id: should-not-run
     command: "echo 'reached'"
 "#,
@@ -95,13 +125,13 @@ steps:
 
     let (code, json, _stderr) = run_json(&recipe, &[]);
 
-    assert_eq!(code, 1, "recipe should fail on bad JSON parse");
+    assert_eq!(code, 1, "recipe should fail when parse_json_required is true");
     let bad = find_step(&json, "bad-json").expect("bad-json step should exist");
     assert_eq!(bad["status"].as_str().unwrap(), "failed");
 
     // The second step should not have executed.
     match find_step(&json, "should-not-run") {
-        None => {} // not present at all — fine
+        None => {}
         Some(step) => {
             assert_ne!(
                 step["status"].as_str().unwrap(),
@@ -132,29 +162,17 @@ steps:
 
     let (code, json, _stderr) = run_json(&recipe, &[]);
 
-    // With continue_on_error the recipe should proceed.
+    // parse_json failure degrades gracefully (parse_json_required defaults to false).
+    assert_eq!(code, 0, "recipe should succeed with degraded step");
     let bad = find_step(&json, "bad-json").expect("bad-json step should exist");
-    // The step may report "completed" (fallback to raw output) or "failed" but recipe continues.
-    let bad_status = bad["status"].as_str().unwrap();
-    assert!(
-        bad_status == "completed" || bad_status == "failed",
-        "bad-json step should be completed or failed, got {bad_status}"
-    );
+    assert_eq!(bad["status"].as_str().unwrap(), "degraded");
 
     let good = find_step(&json, "should-run").expect("should-run step should exist");
     assert_eq!(
         good["status"].as_str().unwrap(),
         "completed",
-        "second step must execute when continue_on_error is set"
+        "second step must execute when parse_json degrades"
     );
-
-    // If the bad step completed, recipe may succeed overall
-    if bad_status == "completed" {
-        assert_eq!(
-            code, 0,
-            "recipe should succeed when error was continued past"
-        );
-    }
 }
 
 #[test]

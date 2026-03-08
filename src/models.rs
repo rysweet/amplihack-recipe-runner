@@ -23,6 +23,7 @@ pub enum StepStatus {
     Completed,
     Skipped,
     Failed,
+    Degraded,
 }
 
 impl fmt::Display for StepStatus {
@@ -33,6 +34,7 @@ impl fmt::Display for StepStatus {
             StepStatus::Completed => "completed",
             StepStatus::Skipped => "skipped",
             StepStatus::Failed => "failed",
+            StepStatus::Degraded => "degraded",
         };
         write!(f, "{}", s)
     }
@@ -51,6 +53,10 @@ pub struct Step {
     pub condition: Option<String>,
     #[serde(default)]
     pub parse_json: bool,
+    /// If true, parse_json failure stops the recipe. If false (default),
+    /// parse_json failure stores raw output and marks step as DEGRADED.
+    #[serde(default)]
+    pub parse_json_required: bool,
     pub mode: Option<String>,
     pub working_dir: Option<String>,
     pub timeout: Option<u64>,

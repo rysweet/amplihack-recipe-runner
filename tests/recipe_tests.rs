@@ -760,8 +760,8 @@ steps:
 }
 
 #[test]
-fn test_json_parse_fails_after_retry_exhausted() {
-    // Both first try and retry return non-JSON
+fn test_json_parse_degrades_after_retry_exhausted() {
+    // Both first try and retry return non-JSON — defaults to degraded
     let adapter = RecordingAdapter::new();
     let r = parse_and_run(
         r#"
@@ -770,6 +770,28 @@ steps:
   - id: s1
     prompt: "gibberish"
     parse_json: true
+    output: "data"
+"#,
+        adapter,
+    );
+    assert!(r.success);
+    assert_eq!(r.step_results[0].status, StepStatus::Degraded);
+    // Raw output should be preserved
+    assert!(!r.step_results[0].output.is_empty());
+}
+
+#[test]
+fn test_json_parse_fails_when_required() {
+    // When parse_json_required is true, failure stops the recipe
+    let adapter = RecordingAdapter::new();
+    let r = parse_and_run(
+        r#"
+name: t
+steps:
+  - id: s1
+    prompt: "gibberish"
+    parse_json: true
+    parse_json_required: true
     output: "data"
 "#,
         adapter,
