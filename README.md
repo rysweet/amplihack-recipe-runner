@@ -24,16 +24,6 @@ recipe-runner-rs recipe.yaml --dry-run
 recipe-runner-rs recipe.yaml -R ./recipes -R ../amplihack/amplifier-bundle/recipes
 ```
 
-## Why Rust?
-
-| Metric | Python | Rust |
-|---|---|---|
-| Startup time | ~800ms | ~5ms |
-| Binary size | N/A (requires Python) | ~4MB standalone |
-| Dependencies at runtime | Python 3.11+, pip | None |
-| Type safety | Runtime errors | Compile-time guarantees |
-| Memory safety | GC pauses | Zero-cost abstractions |
-
 ## Documentation
 
 📖 **Full docs: [rysweet.github.io/amplihack-recipe-runner](https://rysweet.github.io/amplihack-recipe-runner/)**
@@ -60,22 +50,18 @@ src/
     └── cli_subprocess.rs  # CLI subprocess adapter (temp dir, session tree, heartbeat)
 ```
 
-## Feature Parity
+## Features
 
-**100% parity** with the Python recipe runner, **plus 11 Rust-only features**.
-
-| Python Module | Rust Module | Tests |
+| Module | Tests | Purpose |
 |---|---|---|
-| `models.py` | `models.rs` | ✅ |
-| `parser.py` | `parser.rs` | 11 tests |
-| `context.py` | `context.rs` | 21 tests |
-| `runner.py` | `runner.rs` | 10 tests |
-| `agent_resolver.py` | `agent_resolver.rs` | 6 tests |
-| `discovery.py` | `discovery.rs` | 10 tests |
-| `adapters/cli_subprocess.py` | `adapters/cli_subprocess.rs` | ✅ |
-| `__init__.py` | `lib.rs` (public API) | ✅ |
-
-### Rust-Only Features
+| `models.rs` | ✅ | Core data structures (Recipe, Step, StepResult) |
+| `parser.rs` | 11 | YAML parsing, validation, typo detection |
+| `context.rs` | 21 | Template engine + safe condition evaluator |
+| `runner.rs` | 10 | Execution engine, hooks, parallel groups |
+| `agent_resolver.rs` | 6 | Agent ref resolution with path traversal protection |
+| `discovery.rs` | 10 | Multi-dir discovery with SHA-256 manifest |
+| `cli_subprocess.rs` | ✅ | CLI subprocess adapter with timeout enforcement |
+| `lib.rs` | ✅ | Public API |
 
 | Feature | Description |
 |---|---|

@@ -398,7 +398,7 @@ value not in "blocked,disabled"
 
 | Rule                        | Rationale                                    |
 |-----------------------------|----------------------------------------------|
-| No `__` (dunder) access     | Blocks Python-style attribute introspection  |
+| No `__` (dunder) access     | Blocks dunder attribute introspection        |
 | Whitelisted functions only  | `int`, `str`, `len`, `bool`, `float`, `min`, `max` |
 | Whitelisted methods only    | `strip`, `lower`, `upper`, `startswith`, `endswith`, `replace`, `split`, `join`, `count`, `find`, and variants |
 | No assignment operators     | Expressions are read-only                    |
