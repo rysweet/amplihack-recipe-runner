@@ -125,7 +125,10 @@ steps:
 
     let (code, json, _stderr) = run_json(&recipe, &[]);
 
-    assert_eq!(code, 1, "recipe should fail when parse_json_required is true");
+    assert_eq!(
+        code, 1,
+        "recipe should fail when parse_json_required is true"
+    );
     let bad = find_step(&json, "bad-json").expect("bad-json step should exist");
     assert_eq!(bad["status"].as_str().unwrap(), "failed");
 

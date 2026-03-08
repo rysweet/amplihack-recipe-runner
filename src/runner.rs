@@ -1158,7 +1158,8 @@ impl<A: Adapter> RecipeRunner<A> {
                                     step_id: step.id.clone(),
                                     status: StepStatus::Failed,
                                     output: String::new(),
-                                    error: "parse_json failed: output is not valid JSON".to_string(),
+                                    error: "parse_json failed: output is not valid JSON"
+                                        .to_string(),
                                     duration: Some(step_start.elapsed()),
                                 };
                             }
