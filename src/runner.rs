@@ -504,63 +504,64 @@ impl<A: Adapter> RecipeRunner<A> {
             }
         };
 
-        // Parse JSON if requested — retry once on failure
-        let final_output = if step.parse_json && !output.is_empty() {
+        // Parse JSON if requested — retry once on failure.
+        // When parse_json fails, respect continue_on_error: if set, complete
+        // with raw output instead of failing the recipe (#2954).
+        let (final_output, step_status, step_error) = if step.parse_json && !output.is_empty() {
             match parse_json_output(&output, &step.id) {
-                Some(parsed) => serde_json::to_string(&parsed).unwrap_or(output),
+                Some(parsed) => (
+                    serde_json::to_string(&parsed).unwrap_or_else(|_| output.clone()),
+                    StepStatus::Completed,
+                    String::new(),
+                ),
                 None => {
                     // Retry: re-execute with explicit JSON instruction
                     warn!(
                         "Step '{}': parse_json failed on first attempt. Retrying with JSON reminder.",
                         step.id
                     );
-                    match self.retry_for_json(step, ctx) {
-                        Some(retry_output) => {
-                            match parse_json_output(&retry_output, &step.id) {
-                                Some(parsed) => {
-                                    info!("Step '{}': parse_json succeeded on retry.", step.id);
-                                    serde_json::to_string(&parsed).unwrap_or(retry_output)
-                                }
-                                None => {
-                                    error!(
-                                        "Step '{}': parse_json failed on retry. Raw: {}...",
-                                        step.id,
-                                        crate::safe_truncate(&retry_output, 200)
-                                    );
-                                    return StepResult {
-                                        step_id: step.id.clone(),
-                                        status: StepStatus::Failed,
-                                        output: String::new(),
-                                        error: "parse_json failed after retry: output is not valid JSON".to_string(),
-                                        duration: Some(step_start.elapsed()),
-                                    };
-                                }
-                            }
+                    let retry_result = self.retry_for_json(step, ctx).and_then(|retry_output| {
+                        parse_json_output(&retry_output, &step.id).map(|parsed| {
+                            info!("Step '{}': parse_json succeeded on retry.", step.id);
+                            serde_json::to_string(&parsed).unwrap_or(retry_output)
+                        })
+                    });
+
+                    match retry_result {
+                        Some(parsed_output) => {
+                            (parsed_output, StepStatus::Completed, String::new())
                         }
                         None => {
-                            error!(
-                                "Step '{}': parse_json failed and retry not possible. Raw: {}...",
-                                step.id,
-                                crate::safe_truncate(&output, 200)
-                            );
-                            return StepResult {
-                                step_id: step.id.clone(),
-                                status: StepStatus::Failed,
-                                output: String::new(),
-                                error: "parse_json failed: output is not valid JSON".to_string(),
-                                duration: Some(step_start.elapsed()),
-                            };
+                            if step.continue_on_error {
+                                warn!(
+                                    "Step '{}': parse_json failed, using raw output (continue_on_error=true)",
+                                    step.id
+                                );
+                                (output, StepStatus::Completed, String::new())
+                            } else {
+                                error!(
+                                    "Step '{}': parse_json failed. Raw: {}...",
+                                    step.id,
+                                    crate::safe_truncate(&output, 200)
+                                );
+                                (
+                                    String::new(),
+                                    StepStatus::Failed,
+                                    "parse_json failed: output is not valid JSON".to_string(),
+                                )
+                            }
                         }
                     }
                 }
             }
         } else {
-            output
+            (output, StepStatus::Completed, String::new())
         };
 
-        // Store output in context
-        if let Some(ref output_key) = step.output {
-            // Try to parse as JSON value, fall back to string
+        // Store output in context (only if step didn't fail)
+        if step_status != StepStatus::Failed
+            && let Some(ref output_key) = step.output
+        {
             let value =
                 serde_json::from_str(&final_output).unwrap_or(Value::String(final_output.clone()));
             ctx.set(output_key, value);
@@ -573,9 +574,9 @@ impl<A: Adapter> RecipeRunner<A> {
 
         StepResult {
             step_id: step.id.clone(),
-            status: StepStatus::Completed,
+            status: step_status,
             output: final_output,
-            error: String::new(),
+            error: step_error,
             duration: Some(step_start.elapsed()),
         }
     }
@@ -627,6 +628,7 @@ impl<A: Adapter> RecipeRunner<A> {
                         step.mode.as_deref(),
                         working_dir,
                         step.timeout,
+                        step.model.as_deref(),
                     )
                     .map_err(|e| StepExecutionError {
                         step_id: step.id.clone(),
@@ -707,6 +709,58 @@ impl<A: Adapter> RecipeRunner<A> {
         self.depth.set(current_depth);
 
         if !sub_result.success {
+            if step.recovery_on_failure {
+                let working_dir = step.working_dir.as_deref().unwrap_or(&self.working_dir);
+                let failed: Vec<_> = sub_result
+                    .step_results
+                    .iter()
+                    .filter(|r| r.status == StepStatus::Failed)
+                    .map(|r| format!("{}: {}", r.step_id, r.error))
+                    .collect();
+                let completed: Vec<_> = sub_result
+                    .step_results
+                    .iter()
+                    .filter(|r| r.status == StepStatus::Completed)
+                    .map(|r| r.step_id.clone())
+                    .collect();
+
+                let recovery_prompt = format!(
+                    "Sub-recipe '{}' failed.\nFailed steps:\n{}\nCompleted steps: {:?}\n\n\
+                     Attempt to complete the remaining work. If you succeed, end with 'STATUS: COMPLETE'. \
+                     If recovery is impossible, explain why.",
+                    recipe_name,
+                    failed.join("\n"),
+                    completed
+                );
+
+                match self.adapter.execute_agent_step(
+                    &recovery_prompt,
+                    None,
+                    None,
+                    None,
+                    working_dir,
+                    step.timeout,
+                    None,
+                ) {
+                    Ok(output)
+                        if output.to_lowercase().contains("status: complete")
+                            || output.to_lowercase().contains("recovered") =>
+                    {
+                        info!("Sub-recipe '{}' recovered via agent", recipe_name);
+                        return Ok(output);
+                    }
+                    _ => {
+                        return Err(StepExecutionError {
+                            step_id: step.id.clone(),
+                            message: format!(
+                                "Sub-recipe '{}' failed and agentic recovery was unsuccessful",
+                                recipe_name
+                            ),
+                        });
+                    }
+                }
+            }
+
             return Err(StepExecutionError {
                 step_id: step.id.clone(),
                 message: format!("Sub-recipe '{}' failed", recipe_name),
@@ -951,6 +1005,7 @@ impl<A: Adapter> RecipeRunner<A> {
             None,
             working_dir,
             step.timeout,
+            None,
         ) {
             Ok(output) => Some(output),
             Err(e) => {
@@ -1229,6 +1284,7 @@ mod tests {
             _mode: Option<&str>,
             _working_dir: &str,
             _timeout: Option<u64>,
+            _model: Option<&str>,
         ) -> Result<String, anyhow::Error> {
             Ok(format!(
                 "Agent response for: {}",

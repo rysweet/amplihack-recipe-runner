@@ -81,6 +81,7 @@ impl Adapter for RecordingAdapter {
         _mode: Option<&str>,
         _working_dir: &str,
         _timeout: Option<u64>,
+        _model: Option<&str>,
     ) -> Result<String, anyhow::Error> {
         self.agent_calls.fetch_add(1, Ordering::SeqCst);
         for pat in &self.fail_patterns {
@@ -1043,6 +1044,7 @@ fn test_unavailable_adapter_fails_gracefully() {
             _: Option<&str>,
             _: &str,
             _: Option<u64>,
+            _: Option<&str>,
         ) -> Result<String, anyhow::Error> {
             Ok("".into())
         }
@@ -2089,5 +2091,200 @@ fn test_shell_render_prevents_injection() {
         rendered.contains("'") || rendered.contains("\\$"),
         "dangerous input should be quoted/escaped, got: {}",
         rendered
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AGENTIC RECOVERY FOR SUB-RECIPE FAILURES (#2953)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_sub_recipe_failure_no_recovery() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("failing.yaml"),
+        r#"
+name: failing
+steps:
+  - id: ok-step
+    command: "echo ok"
+  - id: bad-step
+    command: "FAIL hard"
+"#,
+    )
+    .unwrap();
+
+    let adapter = RecordingAdapter::new().fail_on("FAIL");
+    let parser = RecipeParser::new();
+    let recipe = parser
+        .parse(
+            r#"
+name: parent
+steps:
+  - id: run-child
+    recipe: "failing"
+    recovery_on_failure: false
+"#,
+        )
+        .unwrap();
+    let runner = RecipeRunner::new(adapter).with_recipe_search_dirs(vec![tmp.path().to_path_buf()]);
+    let result = runner.execute(&recipe, None);
+    assert!(!result.success, "should fail without recovery");
+    assert!(
+        result.step_results[0]
+            .error
+            .contains("Sub-recipe 'failing' failed"),
+        "error should mention sub-recipe failure, got: {}",
+        result.step_results[0].error
+    );
+}
+
+/// Custom adapter for recovery tests: bash fails on "break_now" but agent
+/// always succeeds with a canned recovery response.
+struct RecoverySuccessAdapter;
+impl Adapter for RecoverySuccessAdapter {
+    fn execute_agent_step(
+        &self,
+        _prompt: &str,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: &str,
+        _: Option<u64>,
+        _: Option<&str>,
+    ) -> Result<String, anyhow::Error> {
+        Ok("I fixed the issue. STATUS: COMPLETE".to_string())
+    }
+    fn execute_bash_step(
+        &self,
+        command: &str,
+        _: &str,
+        _: Option<u64>,
+    ) -> Result<String, anyhow::Error> {
+        if command.contains("break_now") {
+            anyhow::bail!("step failed");
+        }
+        Ok(format!("[bash] {}", command))
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
+    fn name(&self) -> &str {
+        "recovery-success-mock"
+    }
+}
+
+/// Custom adapter for recovery tests: bash fails on "break_now" and the
+/// recovery agent returns a non-success response.
+struct RecoveryFailAdapter;
+impl Adapter for RecoveryFailAdapter {
+    fn execute_agent_step(
+        &self,
+        _prompt: &str,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: &str,
+        _: Option<u64>,
+        _: Option<&str>,
+    ) -> Result<String, anyhow::Error> {
+        Ok("I cannot fix this, the data is corrupt".to_string())
+    }
+    fn execute_bash_step(
+        &self,
+        command: &str,
+        _: &str,
+        _: Option<u64>,
+    ) -> Result<String, anyhow::Error> {
+        if command.contains("break_now") {
+            anyhow::bail!("step failed");
+        }
+        Ok(format!("[bash] {}", command))
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
+    fn name(&self) -> &str {
+        "recovery-fail-mock"
+    }
+}
+
+#[test]
+fn test_sub_recipe_failure_recovery_succeeds() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("failing.yaml"),
+        r#"
+name: failing
+steps:
+  - id: ok-step
+    command: "echo ok"
+  - id: bad-step
+    command: "break_now"
+"#,
+    )
+    .unwrap();
+
+    let parser = RecipeParser::new();
+    let recipe = parser
+        .parse(
+            r#"
+name: parent
+steps:
+  - id: run-child
+    recipe: "failing"
+    recovery_on_failure: true
+"#,
+        )
+        .unwrap();
+    let runner = RecipeRunner::new(RecoverySuccessAdapter)
+        .with_recipe_search_dirs(vec![tmp.path().to_path_buf()]);
+    let result = runner.execute(&recipe, None);
+    assert!(result.success, "should succeed after recovery");
+    assert_eq!(result.step_results[0].status, StepStatus::Completed);
+    assert!(
+        result.step_results[0].output.contains("STATUS: COMPLETE"),
+        "output should contain recovery agent response"
+    );
+}
+
+#[test]
+fn test_sub_recipe_failure_recovery_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("failing.yaml"),
+        r#"
+name: failing
+steps:
+  - id: ok-step
+    command: "echo ok"
+  - id: bad-step
+    command: "break_now"
+"#,
+    )
+    .unwrap();
+
+    let parser = RecipeParser::new();
+    let recipe = parser
+        .parse(
+            r#"
+name: parent
+steps:
+  - id: run-child
+    recipe: "failing"
+    recovery_on_failure: true
+"#,
+        )
+        .unwrap();
+    let runner = RecipeRunner::new(RecoveryFailAdapter)
+        .with_recipe_search_dirs(vec![tmp.path().to_path_buf()]);
+    let result = runner.execute(&recipe, None);
+    assert!(!result.success, "should fail when recovery is unsuccessful");
+    assert!(
+        result.step_results[0]
+            .error
+            .contains("agentic recovery was unsuccessful"),
+        "error should mention failed recovery, got: {}",
+        result.step_results[0].error
     );
 }

@@ -20,6 +20,7 @@ impl Adapter for MockAdapter {
         _: Option<&str>,
         _: &str,
         _: Option<u64>,
+        _: Option<&str>,
     ) -> Result<String, anyhow::Error> {
         if prompt.contains("FAIL") {
             anyhow::bail!("Simulated failure");
@@ -96,6 +97,8 @@ steps:
 
 #[test]
 fn test_continue_on_error_with_parse_json() {
+    // When parse_json fails AND continue_on_error is true, the step should
+    // complete with the raw (non-JSON) output so the recipe continues.
     let r = parse_and_run(
         r#"
 name: t
@@ -110,8 +113,93 @@ steps:
 "#,
     );
     assert!(r.success);
-    assert_eq!(r.step_results[0].status, StepStatus::Failed);
+    // Step completes (not fails) because continue_on_error allows raw fallback
+    assert_eq!(r.step_results[0].status, StepStatus::Completed);
+    // Raw output is preserved (the mock returns "[mock-agent] ...")
+    assert!(
+        !r.step_results[0].output.is_empty(),
+        "raw output should be preserved on parse_json fallback"
+    );
     assert_eq!(r.step_results[1].status, StepStatus::Completed);
+}
+
+#[test]
+fn test_parse_json_failure_without_continue_on_error_stops_recipe() {
+    // When parse_json fails AND continue_on_error is false (default),
+    // the step fails and the recipe stops.
+    let r = parse_and_run(
+        r#"
+name: t
+steps:
+  - id: bad-json
+    prompt: "return something"
+    parse_json: true
+  - id: never-runs
+    command: "echo ok"
+"#,
+    );
+    assert!(!r.success);
+    assert_eq!(r.step_results.len(), 1);
+    assert_eq!(r.step_results[0].status, StepStatus::Failed);
+    assert!(r.step_results[0].error.contains("parse_json failed"));
+}
+
+#[test]
+fn test_parse_json_success_returns_parsed_output() {
+    // When the agent returns valid JSON and parse_json is true,
+    // the step output should be the parsed JSON.
+    use recipe_runner_rs::runner::RecipeRunner;
+
+    struct JsonMockAdapter;
+    impl Adapter for JsonMockAdapter {
+        fn execute_agent_step(
+            &self,
+            _prompt: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: &str,
+            _: Option<u64>,
+            _: Option<&str>,
+        ) -> Result<String, anyhow::Error> {
+            Ok(r#"{"result": "success", "count": 42}"#.to_string())
+        }
+        fn execute_bash_step(
+            &self,
+            command: &str,
+            _: &str,
+            _: Option<u64>,
+        ) -> Result<String, anyhow::Error> {
+            Ok(format!("[bash] {}", command))
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &str {
+            "json-mock"
+        }
+    }
+
+    let parser = RecipeParser::new();
+    let recipe = parser
+        .parse(
+            r#"
+name: t
+steps:
+  - id: json-step
+    prompt: "give json"
+    parse_json: true
+    output: "data"
+"#,
+        )
+        .unwrap();
+    let r = RecipeRunner::new(JsonMockAdapter).execute(&recipe, None);
+    assert!(r.success);
+    assert_eq!(r.step_results[0].status, StepStatus::Completed);
+    // Output should contain the parsed JSON
+    let parsed: serde_json::Value = serde_json::from_str(&r.step_results[0].output).unwrap();
+    assert_eq!(parsed["result"], "success");
+    assert_eq!(parsed["count"], 42);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

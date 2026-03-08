@@ -41,6 +41,7 @@ impl Adapter for MockAdapter {
         _mode: Option<&str>,
         _working_dir: &str,
         _timeout: Option<u64>,
+        _model: Option<&str>,
     ) -> Result<String, anyhow::Error> {
         // Find matching response
         for (pattern, response) in &self.responses {
@@ -503,6 +504,7 @@ steps:
             _m: Option<&str>,
             _w: &str,
             _t: Option<u64>,
+            _model: Option<&str>,
         ) -> Result<String, anyhow::Error> {
             Ok("ok".to_string())
         }
@@ -703,4 +705,85 @@ steps:
         "post_step hook should have created marker file at {}",
         marker.display()
     );
+}
+
+// -- Test: model parameter passthrough --
+
+#[test]
+fn test_model_parameter_passed_to_adapter() {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct ModelCapturingAdapter {
+        captured_models: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    impl Adapter for ModelCapturingAdapter {
+        fn execute_agent_step(
+            &self,
+            _prompt: &str,
+            _agent_name: Option<&str>,
+            _system_prompt: Option<&str>,
+            _mode: Option<&str>,
+            _working_dir: &str,
+            _timeout: Option<u64>,
+            model: Option<&str>,
+        ) -> Result<String, anyhow::Error> {
+            self.captured_models
+                .lock()
+                .unwrap()
+                .push(model.map(|s| s.to_string()));
+            Ok("ok".to_string())
+        }
+
+        fn execute_bash_step(
+            &self,
+            _command: &str,
+            _working_dir: &str,
+            _timeout: Option<u64>,
+        ) -> Result<String, anyhow::Error> {
+            Ok("ok".to_string())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &str {
+            "model-capturing"
+        }
+    }
+
+    let yaml = r#"
+name: model-test
+steps:
+  - id: fast-classify
+    agent: classifier
+    prompt: "Classify this"
+    model: haiku
+
+  - id: default-agent
+    agent: worker
+    prompt: "Do work"
+"#;
+
+    let parser = RecipeParser::new();
+    let recipe = parser.parse(yaml).unwrap();
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let adapter = ModelCapturingAdapter {
+        captured_models: captured.clone(),
+    };
+    let runner = RecipeRunner::new(adapter);
+    let result = runner.execute(&recipe, None);
+
+    assert!(result.success, "Recipe should succeed: {:?}", result);
+
+    let models = captured.lock().unwrap();
+    assert_eq!(models.len(), 2, "Should have captured 2 agent calls");
+    assert_eq!(
+        models[0],
+        Some("haiku".to_string()),
+        "First step should pass model=haiku"
+    );
+    assert_eq!(models[1], None, "Second step should pass model=None");
 }

@@ -81,6 +81,7 @@ impl CLISubprocessAdapter {
         prompt: &str,
         system_prompt: Option<&str>,
         timeout: Option<u64>,
+        model: Option<&str>,
     ) -> Result<String, anyhow::Error> {
         // Use a temp directory to avoid file races with the parent session (#2758)
         let temp_dir = tempfile::tempdir()
@@ -109,6 +110,9 @@ impl CLISubprocessAdapter {
         cmd.args(["-p", &full_prompt]);
         if let Some(sp) = system_prompt {
             cmd.args(["--system-prompt", sp]);
+        }
+        if let Some(m) = model {
+            cmd.args(["--model", m]);
         }
         let mut child = cmd
             .current_dir(actual_cwd)
@@ -227,8 +231,9 @@ impl Adapter for CLISubprocessAdapter {
         _mode: Option<&str>,
         _working_dir: &str,
         timeout: Option<u64>,
+        model: Option<&str>,
     ) -> Result<String, anyhow::Error> {
-        self.execute_agent_step_with_timeout(prompt, system_prompt, timeout)
+        self.execute_agent_step_with_timeout(prompt, system_prompt, timeout, model)
     }
 
     fn execute_bash_step(

@@ -8,6 +8,7 @@ pub mod cli_subprocess;
 /// Adapters must be `Sync` to support parallel step execution via scoped threads.
 pub trait Adapter: Sync {
     /// Execute an agent step and return the output.
+    #[allow(clippy::too_many_arguments)]
     fn execute_agent_step(
         &self,
         prompt: &str,
@@ -16,6 +17,7 @@ pub trait Adapter: Sync {
         mode: Option<&str>,
         working_dir: &str,
         timeout: Option<u64>,
+        model: Option<&str>,
     ) -> Result<String, anyhow::Error>;
 
     /// Execute a bash step and return the output.

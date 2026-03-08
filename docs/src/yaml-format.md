@@ -56,6 +56,7 @@ Hook commands receive context variables via template substitution.
 | `working_dir`       | string          | no       | —       | Override working directory for this step                 |
 | `timeout`           | int             | no       | —       | Step timeout in seconds                                  |
 | `auto_stage`        | bool            | no       | `true`  | Git auto-stage after agent steps                         |
+| `model`             | string          | no       | —       | Model override for agent steps (e.g., "haiku", "sonnet") |
 | `recipe`            | string          | no       | —       | Sub-recipe name (recipe steps)                           |
 | `context`           | map             | no       | —       | Context overrides passed to sub-recipe                   |
 | `continue_on_error` | bool            | no       | `false` | Continue execution if this step fails                    |

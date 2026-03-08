@@ -23,6 +23,7 @@ impl Adapter for MockAdapter {
         _mode: Option<&str>,
         _working_dir: &str,
         _timeout: Option<u64>,
+        _model: Option<&str>,
     ) -> Result<String, anyhow::Error> {
         if prompt.contains("JSON") || prompt.contains("json") || prompt.contains("analyze") {
             Ok(
@@ -71,6 +72,7 @@ impl Adapter for FailOnExitAdapter {
         _: Option<&str>,
         _: &str,
         _: Option<u64>,
+        _: Option<&str>,
     ) -> Result<String, anyhow::Error> {
         Ok(format!("[mock-agent] {}", &prompt[..prompt.len().min(100)]))
     }

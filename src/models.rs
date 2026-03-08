@@ -66,6 +66,12 @@ pub struct Step {
     /// Tags for conditional step filtering via --include-tags / --exclude-tags.
     #[serde(default)]
     pub when_tags: Vec<String>,
+    /// If true, attempt agentic recovery when a sub-recipe fails before
+    /// reporting the step as failed.
+    #[serde(default)]
+    pub recovery_on_failure: bool,
+    /// Model override for agent steps (e.g., "haiku", "sonnet").
+    pub model: Option<String>,
 }
 
 impl Step {

@@ -248,7 +248,7 @@ trait Adapter {
     fn execute_agent_step(
         &self, prompt: &str, agent_name: &str,
         system_prompt: Option<&str>, mode: Option<&str>,
-        working_dir: Option<&str>,
+        working_dir: Option<&str>, model: Option<&str>,
     ) -> Result<String>;
 
     fn execute_bash_step(
