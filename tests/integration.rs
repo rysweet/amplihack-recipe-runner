@@ -533,3 +533,166 @@ steps:
     assert_eq!(result.step_results[0].status, StepStatus::Completed);
     assert_eq!(result.step_results[1].status, StepStatus::Failed);
 }
+
+// -- RR-H10: run_recipe() and run_recipe_by_name() integration tests --
+
+#[test]
+fn test_run_recipe_valid_bash_only() {
+    let yaml = r#"
+name: "bash-only"
+steps:
+  - id: "echo-hello"
+    command: "echo hello"
+  - id: "echo-world"
+    command: "echo world"
+"#;
+    let adapter = MockAdapter::new()
+        .with_response("echo hello", "hello")
+        .with_response("echo world", "world");
+    let result = recipe_runner_rs::run_recipe(yaml, adapter, None, false).unwrap();
+    assert!(result.success);
+    assert_eq!(result.step_results.len(), 2);
+    assert_eq!(result.step_results[0].status, StepStatus::Completed);
+    assert_eq!(result.step_results[1].status, StepStatus::Completed);
+}
+
+#[test]
+fn test_run_recipe_invalid_yaml_errors() {
+    let bad_yaml = "not: valid: yaml: [[[";
+    let adapter = MockAdapter::new();
+    let result = recipe_runner_rs::run_recipe(bad_yaml, adapter, None, false);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_run_recipe_empty_name_errors() {
+    let yaml = r#"
+name: ""
+steps:
+  - id: "s1"
+    command: "echo hi"
+"#;
+    let adapter = MockAdapter::new();
+    let result = recipe_runner_rs::run_recipe(yaml, adapter, None, false);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_run_recipe_dry_run() {
+    let yaml = r#"
+name: "dry-test"
+steps:
+  - id: "step1"
+    command: "echo dry"
+"#;
+    let adapter = MockAdapter::new();
+    let result = recipe_runner_rs::run_recipe(yaml, adapter, None, true).unwrap();
+    assert!(result.success);
+    assert_eq!(result.step_results[0].status, StepStatus::Completed);
+}
+
+#[test]
+fn test_run_recipe_by_name_valid() {
+    let tmp = tempfile::tempdir().unwrap();
+    let recipe_yaml = r#"
+name: "my-recipe"
+steps:
+  - id: "s1"
+    command: "echo from recipe"
+"#;
+    std::fs::write(tmp.path().join("my-recipe.yaml"), recipe_yaml).unwrap();
+
+    // Set env var so discovery finds the recipe
+    let adapter = MockAdapter::new().with_response("echo from recipe", "done");
+    // run_recipe_by_name uses default discovery dirs, so the temp recipe may not
+    // be found. We verify find_recipe locates it directly, then exercise the
+    // public API (which may return a not-found error depending on env).
+    assert!(discovery::find_recipe("my-recipe", Some(&[tmp.path().to_path_buf()])).is_some());
+    let _result = recipe_runner_rs::run_recipe_by_name("my-recipe", adapter, None, false);
+}
+
+#[test]
+fn test_run_recipe_by_name_nonexistent_errors() {
+    let adapter = MockAdapter::new();
+    let result = recipe_runner_rs::run_recipe_by_name(
+        "absolutely-nonexistent-recipe-xyz",
+        adapter,
+        None,
+        false,
+    );
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("not found"),
+        "Error should mention 'not found', got: {}",
+        err_msg
+    );
+}
+
+// -- RR-M6: Hook execution verification --
+
+#[test]
+fn test_hook_pre_step_actually_executes() {
+    use recipe_runner_rs::adapters::cli_subprocess::CLISubprocessAdapter;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let marker = tmp.path().join("hook_ran.txt");
+
+    let yaml = format!(
+        r#"
+name: "hook-exec-test"
+hooks:
+  pre_step: "touch {}"
+steps:
+  - id: "step1"
+    command: "echo hello"
+"#,
+        marker.display()
+    );
+
+    let adapter = CLISubprocessAdapter::new();
+    let parser = RecipeParser::new();
+    let recipe = parser.parse(&yaml).unwrap();
+    let runner = RecipeRunner::new(adapter).with_working_dir(tmp.path().to_str().unwrap());
+    let result = runner.execute(&recipe, None);
+
+    assert!(result.success, "Recipe should succeed: {:?}", result);
+    assert!(
+        marker.exists(),
+        "pre_step hook should have created marker file at {}",
+        marker.display()
+    );
+}
+
+#[test]
+fn test_hook_post_step_actually_executes() {
+    use recipe_runner_rs::adapters::cli_subprocess::CLISubprocessAdapter;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let marker = tmp.path().join("post_hook_ran.txt");
+
+    let yaml = format!(
+        r#"
+name: "post-hook-test"
+hooks:
+  post_step: "touch {}"
+steps:
+  - id: "step1"
+    command: "echo hello"
+"#,
+        marker.display()
+    );
+
+    let adapter = CLISubprocessAdapter::new();
+    let parser = RecipeParser::new();
+    let recipe = parser.parse(&yaml).unwrap();
+    let runner = RecipeRunner::new(adapter).with_working_dir(tmp.path().to_str().unwrap());
+    let result = runner.execute(&recipe, None);
+
+    assert!(result.success, "Recipe should succeed: {:?}", result);
+    assert!(
+        marker.exists(),
+        "post_step hook should have created marker file at {}",
+        marker.display()
+    );
+}

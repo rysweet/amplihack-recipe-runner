@@ -112,6 +112,14 @@ fn parse_context_value(raw: &str) -> Value {
     Value::String(raw.to_string())
 }
 
+/// Parse a `key=value` context pair, splitting on the first `=` only.
+///
+/// Returns `None` if there is no `=` (malformed pair).
+fn parse_context_pair(pair: &str) -> Option<(String, Value)> {
+    let (key, val) = pair.split_once('=')?;
+    Some((key.to_string(), parse_context_value(val)))
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::init();
 
@@ -154,8 +162,8 @@ fn main() -> anyhow::Result<()> {
     // Parse context overrides with type detection
     let mut user_context: HashMap<String, Value> = HashMap::new();
     for pair in &cli.context {
-        if let Some((key, val)) = pair.split_once('=') {
-            user_context.insert(key.to_string(), parse_context_value(val));
+        if let Some((key, val)) = parse_context_pair(pair) {
+            user_context.insert(key, val);
         } else {
             eprintln!("Warning: ignoring malformed context override: {}", pair);
         }
@@ -282,5 +290,110 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(0);
     } else {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // -- RR-M7: parse_context_value unit tests --
+
+    #[test]
+    fn test_parse_context_value_string() {
+        assert_eq!(parse_context_value("hello"), json!("hello"));
+    }
+
+    #[test]
+    fn test_parse_context_value_empty_string() {
+        assert_eq!(parse_context_value(""), json!(""));
+    }
+
+    #[test]
+    fn test_parse_context_value_bool_true() {
+        assert_eq!(parse_context_value("true"), json!(true));
+        assert_eq!(parse_context_value("True"), json!(true));
+    }
+
+    #[test]
+    fn test_parse_context_value_bool_false() {
+        assert_eq!(parse_context_value("false"), json!(false));
+        assert_eq!(parse_context_value("False"), json!(false));
+    }
+
+    #[test]
+    fn test_parse_context_value_integer() {
+        assert_eq!(parse_context_value("42"), json!(42));
+        assert_eq!(parse_context_value("-7"), json!(-7));
+        assert_eq!(parse_context_value("0"), json!(0));
+    }
+
+    #[test]
+    fn test_parse_context_value_float() {
+        assert_eq!(parse_context_value("1.23"), json!(1.23));
+        assert_eq!(parse_context_value("-0.5"), json!(-0.5));
+    }
+
+    #[test]
+    fn test_parse_context_value_json_object() {
+        let val = parse_context_value(r#"{"a":1,"b":"two"}"#);
+        assert_eq!(val, json!({"a": 1, "b": "two"}));
+    }
+
+    #[test]
+    fn test_parse_context_value_json_array() {
+        let val = parse_context_value(r#"[1,2,3]"#);
+        assert_eq!(val, json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn test_parse_context_value_string_not_parsed_as_json_string() {
+        // A quoted JSON string like `"hello"` should still become Value::String
+        // because of the `!v.is_string()` guard.
+        let val = parse_context_value(r#""hello""#);
+        assert_eq!(val, json!("\"hello\""));
+    }
+
+    // -- parse_context_pair tests --
+
+    #[test]
+    fn test_parse_pair_simple() {
+        let (k, v) = parse_context_pair("key=value").unwrap();
+        assert_eq!(k, "key");
+        assert_eq!(v, json!("value"));
+    }
+
+    #[test]
+    fn test_parse_pair_value_with_equals() {
+        let (k, v) = parse_context_pair("key=val=ue").unwrap();
+        assert_eq!(k, "key");
+        assert_eq!(v, json!("val=ue"));
+    }
+
+    #[test]
+    fn test_parse_pair_empty_value() {
+        let (k, v) = parse_context_pair("key=").unwrap();
+        assert_eq!(k, "key");
+        assert_eq!(v, json!(""));
+    }
+
+    #[test]
+    fn test_parse_pair_no_equals_returns_none() {
+        assert!(parse_context_pair("key").is_none());
+    }
+
+    #[test]
+    fn test_parse_pair_empty_string_returns_none() {
+        assert!(parse_context_pair("").is_none());
+    }
+
+    #[test]
+    fn test_parse_pair_typed_value() {
+        let (_, v) = parse_context_pair("count=42").unwrap();
+        assert_eq!(v, json!(42));
+
+        let (_, v) = parse_context_pair("flag=true").unwrap();
+        assert_eq!(v, json!(true));
     }
 }
