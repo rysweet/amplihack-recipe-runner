@@ -97,8 +97,8 @@ steps:
 
 #[test]
 fn test_continue_on_error_with_parse_json() {
-    // When parse_json fails AND continue_on_error is true, the step should
-    // complete with the raw (non-JSON) output so the recipe continues.
+    // When parse_json fails, the step degrades gracefully with raw output
+    // preserved and the recipe continues.
     let r = parse_and_run(
         r#"
 name: t
@@ -113,8 +113,8 @@ steps:
 "#,
     );
     assert!(r.success);
-    // Step completes (not fails) because continue_on_error allows raw fallback
-    assert_eq!(r.step_results[0].status, StepStatus::Completed);
+    // Step is degraded (not failed) — raw output preserved
+    assert_eq!(r.step_results[0].status, StepStatus::Degraded);
     // Raw output is preserved (the mock returns "[mock-agent] ...")
     assert!(
         !r.step_results[0].output.is_empty(),
@@ -124,8 +124,32 @@ steps:
 }
 
 #[test]
-fn test_parse_json_failure_without_continue_on_error_stops_recipe() {
-    // When parse_json fails AND continue_on_error is false (default),
+fn test_parse_json_failure_degrades_by_default() {
+    // When parse_json fails and parse_json_required is false (default),
+    // the step degrades gracefully and the recipe continues.
+    let r = parse_and_run(
+        r#"
+name: t
+steps:
+  - id: bad-json
+    prompt: "return something"
+    parse_json: true
+    output: "data"
+  - id: still-runs
+    command: "echo ok"
+"#,
+    );
+    assert!(r.success);
+    assert_eq!(r.step_results.len(), 2);
+    assert_eq!(r.step_results[0].status, StepStatus::Degraded);
+    // Raw output is preserved
+    assert!(!r.step_results[0].output.is_empty());
+    assert_eq!(r.step_results[1].status, StepStatus::Completed);
+}
+
+#[test]
+fn test_parse_json_required_stops_recipe_on_failure() {
+    // When parse_json fails AND parse_json_required is true,
     // the step fails and the recipe stops.
     let r = parse_and_run(
         r#"
@@ -134,6 +158,7 @@ steps:
   - id: bad-json
     prompt: "return something"
     parse_json: true
+    parse_json_required: true
   - id: never-runs
     command: "echo ok"
 "#,

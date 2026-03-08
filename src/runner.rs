@@ -55,6 +55,7 @@ impl ExecutionListener for StderrListener {
             StepStatus::Completed => "✓",
             StepStatus::Skipped => "⊘",
             StepStatus::Failed => "✗",
+            StepStatus::Degraded => "⚠",
             _ => "?",
         };
         let dur = result
@@ -532,15 +533,9 @@ impl<A: Adapter> RecipeRunner<A> {
                             (parsed_output, StepStatus::Completed, String::new())
                         }
                         None => {
-                            if step.continue_on_error {
-                                warn!(
-                                    "Step '{}': parse_json failed, using raw output (continue_on_error=true)",
-                                    step.id
-                                );
-                                (output, StepStatus::Completed, String::new())
-                            } else {
+                            if step.parse_json_required {
                                 error!(
-                                    "Step '{}': parse_json failed. Raw: {}...",
+                                    "Step '{}': parse_json failed (parse_json_required=true). Raw: {}...",
                                     step.id,
                                     crate::safe_truncate(&output, 200)
                                 );
@@ -549,6 +544,12 @@ impl<A: Adapter> RecipeRunner<A> {
                                     StepStatus::Failed,
                                     "parse_json failed: output is not valid JSON".to_string(),
                                 )
+                            } else {
+                                warn!(
+                                    "Step '{}': parse_json failed, using raw output (degraded)",
+                                    step.id
+                                );
+                                (output, StepStatus::Degraded, String::new())
                             }
                         }
                     }
@@ -558,7 +559,7 @@ impl<A: Adapter> RecipeRunner<A> {
             (output, StepStatus::Completed, String::new())
         };
 
-        // Store output in context (only if step didn't fail)
+        // Store output in context (only if step didn't fail; degraded steps store raw output)
         if step_status != StepStatus::Failed
             && let Some(ref output_key) = step.output
         {
@@ -1145,25 +1146,36 @@ impl<A: Adapter> RecipeRunner<A> {
         match adapter.execute_bash_step(&rendered, working_dir, step.timeout) {
             Ok(output) => {
                 // Apply parse_json if requested
-                let final_output = if step.parse_json && !output.is_empty() {
+                let (final_output, status) = if step.parse_json && !output.is_empty() {
                     match parse_json_output(&output, &step.id) {
-                        Some(parsed) => serde_json::to_string(&parsed).unwrap_or(output),
+                        Some(parsed) => (
+                            serde_json::to_string(&parsed).unwrap_or(output),
+                            StepStatus::Completed,
+                        ),
                         None => {
-                            return StepResult {
-                                step_id: step.id.clone(),
-                                status: StepStatus::Failed,
-                                output: String::new(),
-                                error: "parse_json failed: output is not valid JSON".to_string(),
-                                duration: Some(step_start.elapsed()),
-                            };
+                            if step.parse_json_required {
+                                return StepResult {
+                                    step_id: step.id.clone(),
+                                    status: StepStatus::Failed,
+                                    output: String::new(),
+                                    error: "parse_json failed: output is not valid JSON"
+                                        .to_string(),
+                                    duration: Some(step_start.elapsed()),
+                                };
+                            }
+                            warn!(
+                                "Step '{}': parse_json failed on bash step, using raw output (degraded)",
+                                step.id
+                            );
+                            (output, StepStatus::Degraded)
                         }
                     }
                 } else {
-                    output
+                    (output, StepStatus::Completed)
                 };
                 StepResult {
                     step_id: step.id.clone(),
-                    status: StepStatus::Completed,
+                    status,
                     output: final_output,
                     error: String::new(),
                     duration: Some(step_start.elapsed()),

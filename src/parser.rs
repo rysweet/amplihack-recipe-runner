@@ -34,6 +34,7 @@ const KNOWN_STEP_FIELDS: &[&str] = &[
     "output",
     "condition",
     "parse_json",
+    "parse_json_required",
     "mode",
     "working_dir",
     "timeout",
