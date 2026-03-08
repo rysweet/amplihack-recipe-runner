@@ -111,10 +111,10 @@ pub fn list_recipes(search_dirs: Option<&[PathBuf]>) -> Vec<RecipeInfo> {
 /// automatically when the TTL expires or when the set of search directories
 /// changes.
 pub struct DiscoveryCache {
-    pub cache: HashMap<String, RecipeInfo>,
-    pub last_updated: Instant,
-    pub ttl: Duration,
-    pub search_dirs: Vec<PathBuf>,
+    cache: HashMap<String, RecipeInfo>,
+    last_updated: Instant,
+    ttl: Duration,
+    search_dirs: Vec<PathBuf>,
 }
 
 impl DiscoveryCache {
@@ -158,6 +158,16 @@ impl DiscoveryCache {
     pub fn invalidate(&mut self) {
         self.search_dirs.clear();
         self.cache.clear();
+    }
+
+    /// Return the number of cached recipes.
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Check if the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
     }
 }
 
@@ -319,7 +329,7 @@ pub fn update_manifest(local_dir: Option<&Path>) -> Result<PathBuf, std::io::Err
     }
 
     let manifest_path = recipe_dir.join("_recipe_manifest.json");
-    let json = serde_json::to_string_pretty(&manifest).unwrap_or_default();
+    let json = serde_json::to_string_pretty(&manifest).map_err(std::io::Error::other)?;
     std::fs::write(&manifest_path, format!("{}\n", json))?;
     info!(
         "Updated recipe manifest at {} ({} recipes)",
@@ -462,9 +472,12 @@ fn file_hash(path: &Path) -> String {
             let mut hasher = Sha256::new();
             hasher.update(&bytes);
             let result = hasher.finalize();
-            hex::encode(&result[..8]) // First 16 hex chars = 8 bytes
+            hex::encode(&result[..8])
         }
-        Err(_) => String::new(),
+        Err(e) => {
+            warn!("Failed to read file for hashing: {}: {}", path.display(), e);
+            String::new()
+        }
     }
 }
 
@@ -673,7 +686,7 @@ steps:
         let mut cache = DiscoveryCache::new(Duration::from_secs(60));
 
         cache.get_or_discover(&dirs);
-        assert_eq!(cache.cache.len(), 1);
+        assert_eq!(cache.len(), 1);
 
         // Add file, then invalidate
         std::fs::write(

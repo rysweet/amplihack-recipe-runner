@@ -64,7 +64,8 @@ impl CLISubprocessAdapter {
         );
         child_env.insert(
             "AMPLIHACK_MAX_DEPTH".to_string(),
-            env::var("AMPLIHACK_MAX_DEPTH").unwrap_or_else(|_| "3".to_string()),
+            env::var("AMPLIHACK_MAX_DEPTH")
+                .unwrap_or_else(|_| crate::models::DEFAULT_MAX_DEPTH.to_string()),
         );
         child_env.insert(
             "AMPLIHACK_MAX_SESSIONS".to_string(),
@@ -74,10 +75,11 @@ impl CLISubprocessAdapter {
         child_env
     }
 
-    /// Internal: spawn agent with optional timeout.
+    /// Internal: spawn agent with optional system prompt and timeout.
     fn execute_agent_step_with_timeout(
         &self,
         prompt: &str,
+        system_prompt: Option<&str>,
         timeout: Option<u64>,
     ) -> Result<String, anyhow::Error> {
         // Use a temp directory to avoid file races with the parent session (#2758)
@@ -103,8 +105,12 @@ impl CLISubprocessAdapter {
 
         let log_fh = std::fs::File::create(&output_file)?;
 
-        let mut child = std::process::Command::new(&self.cli)
-            .args(["-p", &full_prompt])
+        let mut cmd = std::process::Command::new(&self.cli);
+        cmd.args(["-p", &full_prompt]);
+        if let Some(sp) = system_prompt {
+            cmd.args(["--system-prompt", sp]);
+        }
+        let mut child = cmd
             .current_dir(actual_cwd)
             .envs(&child_env)
             .stdout(log_fh)
@@ -214,11 +220,11 @@ impl Adapter for CLISubprocessAdapter {
         &self,
         prompt: &str,
         _agent_name: Option<&str>,
-        _system_prompt: Option<&str>,
+        system_prompt: Option<&str>,
         _mode: Option<&str>,
         _working_dir: &str,
     ) -> Result<String, anyhow::Error> {
-        self.execute_agent_step_with_timeout(prompt, None)
+        self.execute_agent_step_with_timeout(prompt, system_prompt, None)
     }
 
     fn execute_bash_step(
@@ -228,18 +234,23 @@ impl Adapter for CLISubprocessAdapter {
         timeout: Option<u64>,
     ) -> Result<String, anyhow::Error> {
         let child_env = Self::build_child_env();
+        let effective_dir = if working_dir.is_empty() || working_dir == "." {
+            &self.working_dir
+        } else {
+            working_dir
+        };
 
         let output = if let Some(secs) = timeout {
             Command::new("timeout")
                 .args([&secs.to_string(), "/bin/bash", "-c", command])
-                .current_dir(working_dir)
+                .current_dir(effective_dir)
                 .envs(&child_env)
                 .output()
                 .with_context(|| "Failed to execute bash step with timeout")?
         } else {
             Command::new("/bin/bash")
                 .args(["-c", command])
-                .current_dir(working_dir)
+                .current_dir(effective_dir)
                 .envs(&child_env)
                 .output()
                 .with_context(|| "Failed to execute bash step")?

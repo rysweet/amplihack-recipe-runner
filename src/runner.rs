@@ -22,7 +22,7 @@ use std::process::Command;
 use std::sync::LazyLock;
 use std::time::Instant;
 
-const DEFAULT_MAX_DEPTH: u32 = 6;
+use crate::models::DEFAULT_MAX_DEPTH;
 
 static JSON_FENCE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)```(?:json)?\s*\n?(.*?)\n?\s*```").unwrap());
@@ -128,7 +128,7 @@ impl<A: Adapter> RecipeRunner<A> {
         self
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn with_depth(self, depth: u32) -> Self {
         self.depth.set(depth);
         self
@@ -405,7 +405,8 @@ impl<A: Adapter> RecipeRunner<A> {
 
     fn open_audit_log(&self, recipe_name: &str) -> Option<std::fs::File> {
         let dir = self.audit_dir.as_ref()?;
-        if std::fs::create_dir_all(dir).is_err() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            warn!("Failed to create audit log directory: {}", e);
             return None;
         }
         let ts = std::time::SystemTime::now()
@@ -413,7 +414,13 @@ impl<A: Adapter> RecipeRunner<A> {
             .unwrap_or_default()
             .as_secs();
         let path = dir.join(format!("{}-{}.jsonl", recipe_name, ts));
-        std::fs::File::create(path).ok()
+        match std::fs::File::create(&path) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                warn!("Failed to create audit log file: {}", e);
+                None
+            }
+        }
     }
 
     fn write_audit_entry(&self, file: &Option<std::fs::File>, result: &StepResult) {
@@ -674,7 +681,7 @@ impl<A: Adapter> RecipeRunner<A> {
 
         // Increment depth, execute, then restore
         self.depth.set(current_depth + 1);
-        let sub_result = self.execute_with_depth(&sub_recipe, Some(merged), current_depth + 1);
+        let sub_result = self.execute_with_depth(&sub_recipe, Some(merged));
         self.depth.set(current_depth);
 
         if !sub_result.success {
@@ -697,12 +704,11 @@ impl<A: Adapter> RecipeRunner<A> {
         Ok(format!("{}", sub_result))
     }
 
-    /// Execute a recipe at a specific recursion depth.
+    /// Execute a recipe at the current recursion depth.
     fn execute_with_depth(
         &self,
         recipe: &Recipe,
         user_context: Option<HashMap<String, Value>>,
-        _depth: u32,
     ) -> RecipeResult {
         let mut initial: HashMap<String, Value> = recipe.context.clone();
         if let Some(uc) = user_context {
@@ -877,7 +883,7 @@ impl<A: Adapter> RecipeRunner<A> {
             }
         });
 
-        results.into_iter().map(|r| r.unwrap()).collect()
+        results.into_iter().flatten().collect()
     }
 
     /// Execute a single bash step in a parallel context without `&mut RecipeContext`.

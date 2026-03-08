@@ -105,8 +105,11 @@ impl Default for RecursionConfig {
     }
 }
 
+/// Default maximum recursion depth for sub-recipe execution.
+pub const DEFAULT_MAX_DEPTH: u32 = 6;
+
 fn default_max_depth() -> u32 {
-    6
+    DEFAULT_MAX_DEPTH
 }
 fn default_max_total_steps() -> u32 {
     200

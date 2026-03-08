@@ -43,7 +43,10 @@ impl RecipeContext {
             .replace_all(template, |caps: &regex::Captures| {
                 let var_name = &caps[1];
                 match self.get(var_name) {
-                    None => String::new(),
+                    None => {
+                        log::warn!("Template variable '{}' not found in context — replaced with empty string", var_name);
+                        String::new()
+                    }
                     Some(Value::String(s)) => s.clone(),
                     Some(Value::Null) => String::new(),
                     Some(v) => v.to_string(),
@@ -58,7 +61,10 @@ impl RecipeContext {
             .replace_all(template, |caps: &regex::Captures| {
                 let var_name = &caps[1];
                 let raw = match self.get(var_name) {
-                    None => String::new(),
+                    None => {
+                        log::warn!("Template variable '{}' not found in context — replaced with empty string", var_name);
+                        String::new()
+                    }
                     Some(Value::String(s)) => s.clone(),
                     Some(Value::Null) => String::new(),
                     Some(v) => v.to_string(),
@@ -76,10 +82,13 @@ impl RecipeContext {
     /// - `var and var2`, `var or var2`, `not var`
     /// - Parenthesized sub-expressions
     pub fn evaluate(&self, condition: &str) -> Result<bool, ConditionError> {
-        if condition.contains("__") {
-            return Err(ConditionError::Unsafe(
-                "dunder attribute access is not allowed".to_string(),
-            ));
+        const MAX_CONDITION_LEN: usize = 8192;
+        if condition.len() > MAX_CONDITION_LEN {
+            return Err(ConditionError::Parse(format!(
+                "condition expression too long ({} bytes, max {})",
+                condition.len(),
+                MAX_CONDITION_LEN
+            )));
         }
         let tokens = tokenize(condition)?;
         let mut parser = ExprParser::new(&tokens, &self.data);
@@ -265,6 +274,7 @@ struct ExprParser<'a> {
     tokens: &'a [Token],
     pos: usize,
     data: &'a HashMap<String, Value>,
+    depth: usize,
 }
 
 impl<'a> ExprParser<'a> {
@@ -273,6 +283,7 @@ impl<'a> ExprParser<'a> {
             tokens,
             pos: 0,
             data,
+            depth: 0,
         }
     }
 
@@ -449,6 +460,13 @@ impl<'a> ExprParser<'a> {
             }
             Some(Token::Ident(name)) => {
                 self.advance();
+                // Block dunder access (e.g. __import__, __class__)
+                if name.contains("__") {
+                    return Err(ConditionError::Unsafe(format!(
+                        "dunder identifier '{}' is not allowed",
+                        name
+                    )));
+                }
                 // Check if this is a function call: ident '(' args ')'
                 if SAFE_CALL_NAMES.contains(&name.as_str()) && self.peek() == Some(&Token::LParen) {
                     self.advance(); // consume '('
@@ -470,7 +488,14 @@ impl<'a> ExprParser<'a> {
             }
             Some(Token::LParen) => {
                 self.advance();
+                self.depth += 1;
+                if self.depth > 32 {
+                    return Err(ConditionError::Parse(
+                        "condition expression too deeply nested (max 32 levels)".to_string(),
+                    ));
+                }
                 let result = self.parse_or()?;
+                self.depth -= 1;
                 if self.peek() != Some(&Token::RParen) {
                     return Err(ConditionError::Parse("expected ')'".to_string()));
                 }
@@ -493,6 +518,11 @@ impl<'a> ExprParser<'a> {
         }
         if name == "false" {
             return Value::Bool(false);
+        }
+
+        // Block dunder access (e.g. __import__, __class__)
+        if name.contains("__") {
+            return Value::Null;
         }
 
         // Support dot notation
@@ -538,7 +568,12 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, ConditionError> {
             let arg = args.first().unwrap_or(&Value::Null);
             let n = match arg {
                 Value::Number(n) => n.as_i64().unwrap_or(0),
-                Value::String(s) => s.trim().parse::<i64>().unwrap_or(0),
+                Value::String(s) => s.trim().parse::<i64>().map_err(|_| {
+                    ConditionError::Parse(format!(
+                        "cannot convert '{}' to int",
+                        crate::safe_truncate(s, 50)
+                    ))
+                })?,
                 Value::Bool(b) => {
                     if *b {
                         1
@@ -554,7 +589,12 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, ConditionError> {
             let arg = args.first().unwrap_or(&Value::Null);
             let n = match arg {
                 Value::Number(n) => n.as_f64().unwrap_or(0.0),
-                Value::String(s) => s.trim().parse::<f64>().unwrap_or(0.0),
+                Value::String(s) => s.trim().parse::<f64>().map_err(|_| {
+                    ConditionError::Parse(format!(
+                        "cannot convert '{}' to float",
+                        crate::safe_truncate(s, 50)
+                    ))
+                })?,
                 Value::Bool(b) => {
                     if *b {
                         1.0

@@ -162,7 +162,7 @@ struct Step {
     auto_stage:        Option<bool>,         // git add -A after agent steps
     continue_on_error: Option<bool>,         // Don't fail-fast
     when_tags:         Option<Vec<String>>,  // Tag-based filtering
-    parallel_group:    Option<String>,       // Future: concurrent grouping
+    parallel_group:    Option<String>,       // Concurrent step grouping (fully implemented)
     sub_context:       Option<HashMap<…>>,   // Context overrides for sub-recipe
 }
 ```
