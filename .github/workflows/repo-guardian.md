@@ -3,6 +3,8 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+engine: copilot
+
 permissions:
   contents: read
   issues: read
