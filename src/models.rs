@@ -156,6 +156,17 @@ fn default_version() -> String {
     "1.0.0".to_string()
 }
 
+/// Serialize an `Option<Duration>` as an f64 number of seconds.
+fn serialize_duration_secs<S>(duration: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match duration {
+        Some(d) => serializer.serialize_f64(d.as_secs_f64()),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// Result of executing a single step.
 #[derive(Debug, Clone, Serialize)]
 pub struct StepResult {
@@ -164,7 +175,7 @@ pub struct StepResult {
     pub output: String,
     pub error: String,
     /// Wall-clock duration of this step.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(serialize_with = "serialize_duration_secs", skip_serializing_if = "Option::is_none")]
     pub duration: Option<Duration>,
 }
 
@@ -190,7 +201,7 @@ pub struct RecipeResult {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub context: HashMap<String, serde_json::Value>,
     /// Total wall-clock duration.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(serialize_with = "serialize_duration_secs", skip_serializing_if = "Option::is_none")]
     pub duration: Option<Duration>,
 }
 
