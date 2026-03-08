@@ -35,10 +35,10 @@ recipe-runner-rs recipe.yaml -R ./recipes -R ../amplihack/amplifier-bundle/recip
 
 ## Documentation
 
-- **[Architecture](docs/architecture.md)** — Module design, data flow, adapter pattern
-- **[YAML Format Reference](docs/yaml-format.md)** — Complete recipe schema
-- **[CLI Reference](docs/cli-reference.md)** — All commands, flags, exit codes
-- **[Condition Language](docs/conditions.md)** — Safe expression evaluator reference
+- **[Architecture](docs/src/architecture.md)** — Module design, data flow, adapter pattern
+- **[YAML Format Reference](docs/src/yaml-format.md)** — Complete recipe schema
+- **[CLI Reference](docs/src/cli-reference.md)** — All commands, flags, exit codes
+- **[Condition Language](docs/src/conditions.md)** — Safe expression evaluator reference
 
 ## Architecture
 
@@ -59,18 +59,35 @@ src/
 
 ## Feature Parity
 
-**100% parity** with the Python recipe runner. See [SCORECARD.md](SCORECARD.md) for the full 24-feature comparison.
+**100% parity** with the Python recipe runner, **plus 12 Rust-only features**. See [SCORECARD.md](SCORECARD.md) for the full 36-feature comparison.
 
 | Python Module | Rust Module | Tests |
 |---|---|---|
 | `models.py` | `models.rs` | ✅ |
-| `parser.py` | `parser.rs` | 8 tests |
+| `parser.py` | `parser.rs` | 11 tests |
 | `context.py` | `context.rs` | 21 tests |
-| `runner.py` | `runner.rs` | 7 tests |
+| `runner.py` | `runner.rs` | 10 tests |
 | `agent_resolver.py` | `agent_resolver.rs` | 6 tests |
-| `discovery.py` | `discovery.rs` | 6 tests |
+| `discovery.py` | `discovery.rs` | 10 tests |
 | `adapters/cli_subprocess.py` | `adapters/cli_subprocess.rs` | ✅ |
 | `__init__.py` | `lib.rs` (public API) | ✅ |
+
+### Rust-Only Features
+
+| Feature | Description |
+|---|---|
+| Recipe-level recursion limits | `max_depth` + `max_total_steps` |
+| Timeout enforcement | SIGTERM/SIGKILL on agent step deadline |
+| `continue_on_error` | Per-step failure tolerance |
+| Adapter fallback chain | `FallbackAdapter<P, S>` generic composition |
+| CLI subcommands | `list`, `--validate-only`, `--explain`, `--progress` |
+| Tag filtering | `when_tags` + `--include-tags`/`--exclude-tags` |
+| JSONL audit log | Structured per-run execution audit |
+| Pre/post/on_error hooks | Shell commands at step lifecycle events |
+| Discovery caching | TTL-based cache for recipe discovery |
+| Parallel step execution | `parallel_group` with `std::thread::scope` |
+| Recipe composition | `extends` for single-level recipe inheritance |
+| Property-based testing | proptest fuzz for conditions, templates, parser |
 
 ## Tests
 
@@ -78,7 +95,7 @@ src/
 cargo test
 ```
 
-**60 tests** across unit + integration:
+**183 tests** across unit + integration + recipe + feature/proptest:
 - Recipe YAML parsing and validation with typo detection
 - Template rendering with `{{var}}` substitution
 - Shell escape injection prevention
@@ -89,9 +106,12 @@ cargo test
 - JSON extraction from LLM output (3 strategies) with retry
 - Sub-recipe execution with context merge and depth guard
 - Agent resolver with path traversal protection
-- Recipe discovery with SHA-256 manifest
+- Recipe discovery with SHA-256 manifest and caching
 - Full lifecycle integration tests
-- Fail-fast behavior verification
+- Fail-fast and continue_on_error behavior
+- Tag filtering, hooks, audit log, parallel groups
+- Recipe composition via extends
+- Property-based fuzzing (condition evaluator, templates, parser)
 
 ## Creating a Recipe
 

@@ -1,0 +1,243 @@
+name: "build-recipe-runner"
+description: |
+  Builds the Rust recipe runner from scratch — scaffolds the project,
+  generates core modules via agent, compiles, tests, and produces a
+  release binary.
+version: "1.0.0"
+
+context:
+  repo_path: "."
+  project_name: "recipe-runner-rs"
+  rust_edition: "2024"
+
+# ---------------------------------------------------------------------------
+# Phase 1 — Prerequisites
+# ---------------------------------------------------------------------------
+steps:
+  - id: "check-rust"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    command: |
+      rustc --version && cargo --version
+    output: "rust_version"
+
+  - id: "check-git"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    command: |
+      git --version
+    output: "git_version"
+
+  # -------------------------------------------------------------------------
+  # Phase 2 — Scaffold
+  # -------------------------------------------------------------------------
+  - id: "create-project"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    condition: "not __import__('os').path.exists('Cargo.toml')"
+    command: |
+      cargo init --name {{project_name}}
+    output: "init_result"
+
+  - id: "add-dependencies"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    command: |
+      cargo add clap --features derive && \
+      cargo add serde --features derive && \
+      cargo add serde_yaml && \
+      cargo add serde_json && \
+      cargo add shell-escape && \
+      cargo add sha2 && \
+      cargo add hex && \
+      cargo add tempfile && \
+      cargo add regex && \
+      cargo add anyhow && \
+      cargo add thiserror && \
+      cargo add log && \
+      cargo add env_logger && \
+      cargo add uuid --features v4 && \
+      cargo add which && \
+      cargo add dirs
+    output: "deps_result"
+
+  # -------------------------------------------------------------------------
+  # Phase 3 — Core Implementation
+  # -------------------------------------------------------------------------
+  - id: "create-models"
+    agent: "amplihack:core:builder"
+    working_dir: "{{repo_path}}"
+    prompt: |
+      Create src/models.rs for the recipe runner.  Define all data structures:
+        - Recipe (name, description, version, context, steps, recursion, output)
+        - Step (id, step_type, agent, prompt, command, condition, output,
+          working_dir, parse_json, mode, timeout)
+        - RecipeContext (defaults HashMap, runtime overrides)
+        - RecursionGuard (max_depth, max_total_steps)
+        - RecipeOutput (format, template)
+        - StepResult (step_id, status, output_value, duration)
+      Use serde Serialize/Deserialize derives.  Keep types simple and public.
+    output: "models_code"
+
+  - id: "create-parser"
+    agent: "amplihack:core:builder"
+    working_dir: "{{repo_path}}"
+    prompt: |
+      Create src/parser.rs — a YAML parser that:
+        1. Reads a recipe file from disk with std::fs::read_to_string.
+        2. Deserialises into the Recipe struct from models.rs using serde_yaml.
+        3. Validates required fields (name, steps non-empty).
+        4. Returns anyhow::Result<Recipe>.
+    output: "parser_code"
+
+  - id: "create-context"
+    agent: "amplihack:core:builder"
+    working_dir: "{{repo_path}}"
+    prompt: |
+      Create src/context.rs with:
+        1. A TemplateEngine that replaces {{variable}} placeholders in strings
+           using a HashMap<String, String> of current context values.
+        2. A ConditionEvaluator that handles simple conditions:
+           - "not <path_exists>" checks
+           - "which <binary>" checks (using the `which` crate)
+           - "'substring' in variable_name" checks
+           - Boolean true/false/empty-string checks
+        3. Return types use anyhow::Result.
+    output: "context_code"
+
+  - id: "create-runner"
+    agent: "amplihack:core:builder"
+    working_dir: "{{repo_path}}"
+    prompt: |
+      Create src/runner.rs — the main execution engine:
+        1. RecipeRunner struct holds the parsed Recipe, resolved context, and
+           a vector of StepResult.
+        2. run() iterates steps sequentially:
+           a. Evaluate condition — skip if false.
+           b. Expand templates in command/prompt/working_dir.
+           c. Dispatch to bash executor (std::process::Command) for type=bash.
+           d. Dispatch to agent resolver for agent steps.
+           e. Capture stdout/stderr, elapsed time, exit code.
+           f. Store output in context for subsequent steps.
+           g. On non-zero exit for bash steps, fail fast with anyhow error.
+        3. Return a summary Vec<StepResult>.
+    output: "runner_code"
+
+  - id: "create-agent-resolver"
+    agent: "amplihack:core:builder"
+    working_dir: "{{repo_path}}"
+    prompt: |
+      Create src/agent_resolver.rs:
+        - Resolve agent identifiers like "amplihack:core:builder" into an
+          executable path or command by searching:
+            1. ~/.amplihack/.claude/agents/<namespace>/<name>.md
+            2. A configurable agents directory passed at runtime.
+        - AgentResolver::resolve(agent_id: &str) -> Result<PathBuf>
+        - Use the `dirs` crate for home directory lookup.
+    output: "agent_resolver_code"
+
+  - id: "create-discovery"
+    agent: "amplihack:core:builder"
+    working_dir: "{{repo_path}}"
+    prompt: |
+      Create src/discovery.rs:
+        - discover_recipes(dir: &Path) -> Vec<PathBuf>
+          Walks a directory tree and returns all .yaml/.yml files.
+        - Use std::fs::read_dir recursively.
+        - Filter by extension (.yaml or .yml).
+    output: "discovery_code"
+
+  - id: "create-adapters"
+    agent: "amplihack:core:builder"
+    working_dir: "{{repo_path}}"
+    prompt: |
+      Create src/adapters/mod.rs and src/adapters/cli_subprocess.rs:
+        mod.rs — re-exports CliSubprocess.
+        cli_subprocess.rs — wraps std::process::Command:
+          - run(command: &str, working_dir: &Path, env: HashMap)
+            -> Result<SubprocessOutput>
+          - SubprocessOutput { stdout, stderr, exit_code, duration }
+          - Streams stderr to log::warn in real time.
+          - Uses shell-escape for safe argument handling.
+    output: "adapters_code"
+
+  - id: "create-lib"
+    agent: "amplihack:core:builder"
+    working_dir: "{{repo_path}}"
+    prompt: |
+      Create src/lib.rs that declares and re-exports all public modules:
+        pub mod models;
+        pub mod parser;
+        pub mod context;
+        pub mod runner;
+        pub mod agent_resolver;
+        pub mod discovery;
+        pub mod adapters;
+    output: "lib_code"
+
+  - id: "create-main"
+    agent: "amplihack:core:builder"
+    working_dir: "{{repo_path}}"
+    prompt: |
+      Create src/main.rs with a clap-based CLI:
+        Subcommands:
+          run   — Execute a recipe file (--recipe <path>, --context key=value repeatable)
+          list  — Discover and list recipes in a directory (--dir <path>)
+          validate — Parse and validate a recipe without executing
+        Use env_logger for log initialisation.
+        Exit with code 1 on any error, printing it to stderr.
+    output: "main_code"
+
+  # -------------------------------------------------------------------------
+  # Phase 4 — Verify
+  # -------------------------------------------------------------------------
+  - id: "build"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    command: |
+      cargo build 2>&1
+    output: "build_result"
+
+  - id: "test"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    command: |
+      cargo test 2>&1
+    output: "test_result"
+
+  - id: "clippy"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    condition: "which cargo-clippy"
+    command: |
+      cargo clippy -- -D warnings 2>&1
+    output: "clippy_result"
+
+  # -------------------------------------------------------------------------
+  # Phase 5 — Package
+  # -------------------------------------------------------------------------
+  - id: "build-release"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    command: |
+      cargo build --release 2>&1
+    output: "release_result"
+
+  - id: "verify-binary"
+    type: "bash"
+    working_dir: "{{repo_path}}"
+    command: |
+      ./target/release/{{project_name}} --help
+    output: "help_output"
+
+output:
+  format: "markdown"
+  template: |
+    ## Build Complete
+
+    **Rust**: {{rust_version}}
+    **Binary**: target/release/{{project_name}}
+
+    ```
+    {{help_output}}
+    ```

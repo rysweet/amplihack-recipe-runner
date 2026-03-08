@@ -4,7 +4,9 @@
 pub mod cli_subprocess;
 
 /// Trait that all recipe execution adapters must implement.
-pub trait Adapter {
+///
+/// Adapters must be `Sync` to support parallel step execution via scoped threads.
+pub trait Adapter: Sync {
     /// Execute an agent step and return the output.
     fn execute_agent_step(
         &self,

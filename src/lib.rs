@@ -9,7 +9,7 @@ pub mod runner;
 // Public API convenience functions
 
 use models::{Recipe, RecipeResult};
-use parser::RecipeParser;
+use parser::{RecipeParser, resolve_extends};
 use runner::RecipeRunner;
 use adapters::Adapter;
 use serde_json::Value;
@@ -27,7 +27,8 @@ pub fn run_recipe<A: Adapter>(
     user_context: Option<HashMap<String, Value>>,
     dry_run: bool,
 ) -> Result<RecipeResult, parser::ParseError> {
-    let recipe = parse_recipe(yaml_content)?;
+    let mut recipe = parse_recipe(yaml_content)?;
+    resolve_extends(&mut recipe, &[])?;
     let runner = RecipeRunner::new(adapter).with_dry_run(dry_run);
     Ok(runner.execute(&recipe, user_context))
 }
@@ -41,7 +42,8 @@ pub fn run_recipe_by_name<A: Adapter>(
 ) -> Result<RecipeResult, Box<dyn std::error::Error>> {
     let path = discovery::find_recipe(name, None)
         .ok_or_else(|| format!("Recipe '{}' not found in any search directory", name))?;
-    let recipe = RecipeParser::new().parse_file(&path)?;
+    let mut recipe = RecipeParser::new().parse_file(&path)?;
+    resolve_extends(&mut recipe, &[])?;
     let runner = RecipeRunner::new(adapter).with_dry_run(dry_run);
     Ok(runner.execute(&recipe, user_context))
 }

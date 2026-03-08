@@ -2,9 +2,10 @@
 ///
 /// Parses YAML recipe definitions into Recipe model objects, with validation
 /// and step-type inference. Direct port from Python `amplihack.recipes.parser`.
+use crate::discovery;
 use crate::models::{Recipe, StepType};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const MAX_YAML_SIZE_BYTES: usize = 1_000_000;
 
@@ -37,6 +38,9 @@ pub enum ParseError {
 
     #[error("YAML parse error: {0}")]
     Yaml(#[from] serde_yaml::Error),
+
+    #[error("Extends error: {0}")]
+    Extends(String),
 }
 
 pub struct RecipeParser;
@@ -201,6 +205,71 @@ impl Default for RecipeParser {
     }
 }
 
+/// Resolve single-level recipe inheritance via the `extends` field.
+///
+/// If `recipe.extends` is `Some`, finds and parses the parent recipe, then
+/// merges the parent into the child:
+/// - Child context values override parent context values
+/// - Child steps are appended after parent steps
+/// - Child name, version, description override parent
+/// - Parent tags are merged with child tags (union)
+/// - Recursion config: child overrides if set (non-default)
+/// - Hooks: child overrides if set
+///
+/// Only single-level inheritance is supported (parent's `extends` is ignored).
+pub fn resolve_extends(recipe: &mut Recipe, search_dirs: &[PathBuf]) -> Result<(), ParseError> {
+    let parent_name = match recipe.extends.take() {
+        Some(name) => name,
+        None => return Ok(()),
+    };
+
+    let parent_path = discovery::find_recipe(&parent_name, Some(search_dirs))
+        .ok_or_else(|| ParseError::Extends(format!(
+            "Parent recipe '{}' not found in search directories", parent_name
+        )))?;
+
+    let parser = RecipeParser::new();
+    let parent = parser.parse_file(&parent_path)?;
+
+    // Merge context: start with parent, child overrides
+    let mut merged_context = parent.context;
+    merged_context.extend(recipe.context.drain());
+    recipe.context = merged_context;
+
+    // Merge steps: parent steps first, then child steps
+    let child_steps = std::mem::take(&mut recipe.steps);
+    let mut merged_steps = parent.steps;
+    merged_steps.extend(child_steps);
+    recipe.steps = merged_steps;
+
+    // Merge tags: union
+    let mut tag_set: HashSet<String> = parent.tags.into_iter().collect();
+    tag_set.extend(recipe.tags.drain(..));
+    recipe.tags = tag_set.into_iter().collect();
+    recipe.tags.sort();
+
+    // Recursion: child overrides if non-default
+    let default_recursion = crate::models::RecursionConfig::default();
+    if recipe.recursion.max_depth == default_recursion.max_depth
+        && recipe.recursion.max_total_steps == default_recursion.max_total_steps
+    {
+        recipe.recursion = parent.recursion;
+    }
+
+    // Hooks: child field overrides parent field individually
+    if recipe.hooks.pre_step.is_none() {
+        recipe.hooks.pre_step = parent.hooks.pre_step;
+    }
+    if recipe.hooks.post_step.is_none() {
+        recipe.hooks.post_step = parent.hooks.post_step;
+    }
+    if recipe.hooks.on_error.is_none() {
+        recipe.hooks.on_error = parent.hooks.on_error;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +390,103 @@ steps:
         let warnings = parser.validate_with_yaml(&recipe, Some(yaml));
         assert!(warnings.iter().any(|w| w.contains("descrption")));
         assert!(warnings.iter().any(|w| w.contains("comand")));
+    }
+
+    #[test]
+    fn test_resolve_extends_inherits_parent_steps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent_yaml = r#"
+name: "parent"
+description: "Parent recipe"
+tags: ["base", "shared"]
+context:
+  parent_var: "from-parent"
+  shared_var: "parent-value"
+steps:
+  - id: "parent-step-1"
+    command: "echo parent step 1"
+  - id: "parent-step-2"
+    command: "echo parent step 2"
+"#;
+        std::fs::write(tmp.path().join("parent.yaml"), parent_yaml).unwrap();
+
+        let child_yaml = r#"
+name: "child"
+description: "Child recipe"
+extends: "parent"
+tags: ["child-tag", "shared"]
+context:
+  child_var: "from-child"
+  shared_var: "child-value"
+steps:
+  - id: "child-step-1"
+    command: "echo child step 1"
+"#;
+        let parser = RecipeParser::new();
+        let mut recipe = parser.parse(child_yaml).unwrap();
+        let search_dirs = vec![tmp.path().to_path_buf()];
+        resolve_extends(&mut recipe, &search_dirs).unwrap();
+
+        // Child name/description override parent
+        assert_eq!(recipe.name, "child");
+        assert_eq!(recipe.description, "Child recipe");
+
+        // Parent steps come first, then child steps
+        assert_eq!(recipe.steps.len(), 3);
+        assert_eq!(recipe.steps[0].id, "parent-step-1");
+        assert_eq!(recipe.steps[1].id, "parent-step-2");
+        assert_eq!(recipe.steps[2].id, "child-step-1");
+
+        // Child context overrides parent context
+        assert_eq!(
+            recipe.context.get("shared_var").and_then(|v| v.as_str()),
+            Some("child-value")
+        );
+        assert_eq!(
+            recipe.context.get("parent_var").and_then(|v| v.as_str()),
+            Some("from-parent")
+        );
+        assert_eq!(
+            recipe.context.get("child_var").and_then(|v| v.as_str()),
+            Some("from-child")
+        );
+
+        // Tags are merged (union)
+        assert!(recipe.tags.contains(&"base".to_string()));
+        assert!(recipe.tags.contains(&"shared".to_string()));
+        assert!(recipe.tags.contains(&"child-tag".to_string()));
+
+        // extends is consumed (set to None)
+        assert!(recipe.extends.is_none());
+    }
+
+    #[test]
+    fn test_resolve_extends_no_extends() {
+        let yaml = r#"
+name: "standalone"
+steps:
+  - id: "step-1"
+    command: "echo hello"
+"#;
+        let parser = RecipeParser::new();
+        let mut recipe = parser.parse(yaml).unwrap();
+        // Should be a no-op
+        resolve_extends(&mut recipe, &[]).unwrap();
+        assert_eq!(recipe.steps.len(), 1);
+    }
+
+    #[test]
+    fn test_resolve_extends_parent_not_found() {
+        let yaml = r#"
+name: "orphan"
+extends: "nonexistent-parent"
+steps:
+  - id: "step-1"
+    command: "echo hello"
+"#;
+        let parser = RecipeParser::new();
+        let mut recipe = parser.parse(yaml).unwrap();
+        let err = resolve_extends(&mut recipe, &[]).unwrap_err();
+        assert!(err.to_string().contains("not found"));
     }
 }

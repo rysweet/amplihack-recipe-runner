@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 fn default_search_dirs() -> Vec<PathBuf> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -97,6 +99,72 @@ pub fn list_recipes(search_dirs: Option<&[PathBuf]>) -> Vec<RecipeInfo> {
     let mut recipes: Vec<RecipeInfo> = discover_recipes(search_dirs).into_values().collect();
     recipes.sort_by(|a, b| a.name.cmp(&b.name));
     recipes
+}
+
+/// TTL-based cache for recipe discovery results.
+///
+/// Avoids re-scanning directories on every call. The cache is invalidated
+/// automatically when the TTL expires or when the set of search directories
+/// changes.
+pub struct DiscoveryCache {
+    pub cache: HashMap<String, RecipeInfo>,
+    pub last_updated: Instant,
+    pub ttl: Duration,
+    pub search_dirs: Vec<PathBuf>,
+}
+
+impl DiscoveryCache {
+    /// Create a new, empty cache with the given TTL.
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            cache: HashMap::new(),
+            last_updated: Instant::now(),
+            ttl,
+            search_dirs: Vec::new(),
+        }
+    }
+
+    /// Return cached results if still valid, otherwise re-discover.
+    ///
+    /// The cache is considered invalid when:
+    /// - It has never been populated (empty `search_dirs`)
+    /// - The TTL has elapsed since the last update
+    /// - The requested `dirs` differ from the dirs used to populate the cache
+    pub fn get_or_discover(&mut self, dirs: &[PathBuf]) -> &HashMap<String, RecipeInfo> {
+        let dirs_changed = self.search_dirs != dirs;
+        let expired = self.last_updated.elapsed() >= self.ttl;
+        let empty = self.search_dirs.is_empty() && self.cache.is_empty();
+
+        if empty || expired || dirs_changed {
+            debug!("DiscoveryCache miss (empty={}, expired={}, dirs_changed={})", empty, expired, dirs_changed);
+            self.cache = discover_recipes(Some(dirs));
+            self.search_dirs = dirs.to_vec();
+            self.last_updated = Instant::now();
+        } else {
+            debug!("DiscoveryCache hit ({} recipes cached)", self.cache.len());
+        }
+
+        &self.cache
+    }
+
+    /// Force the cache to refresh on the next `get_or_discover` call.
+    pub fn invalidate(&mut self) {
+        self.search_dirs.clear();
+        self.cache.clear();
+    }
+}
+
+/// Thread-safe convenience wrapper around [`DiscoveryCache`].
+///
+/// Uses a module-level `Mutex<DiscoveryCache>` so callers don't need to manage
+/// their own cache instance.  The default TTL is 30 seconds.
+pub fn cached_discover_recipes(dirs: &[PathBuf]) -> HashMap<String, RecipeInfo> {
+    static CACHE: std::sync::LazyLock<Mutex<DiscoveryCache>> = std::sync::LazyLock::new(|| {
+        Mutex::new(DiscoveryCache::new(Duration::from_secs(30)))
+    });
+
+    let mut cache = CACHE.lock().expect("DiscoveryCache mutex poisoned");
+    cache.get_or_discover(dirs).clone()
 }
 
 /// Find a recipe by name and return its file path.
@@ -498,5 +566,97 @@ steps:
         let h2 = file_hash(&path);
         assert_eq!(h1, h2);
         assert!(!h1.is_empty());
+    }
+
+    // -- DiscoveryCache tests --
+
+    fn make_recipe_dir(name: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(format!("{}.yaml", name)),
+            format!("name: {}\nsteps:\n  - id: s1\n    command: echo", name),
+        )
+        .unwrap();
+        tmp
+    }
+
+    #[test]
+    fn test_cache_hit() {
+        let tmp = make_recipe_dir("cached-recipe");
+        let dirs = vec![tmp.path().to_path_buf()];
+        let mut cache = DiscoveryCache::new(Duration::from_secs(60));
+
+        // First call populates
+        let result = cache.get_or_discover(&dirs);
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key("cached-recipe"));
+
+        // Add another recipe file — a cache hit should NOT see it
+        std::fs::write(
+            tmp.path().join("extra.yaml"),
+            "name: extra\nsteps:\n  - id: s1\n    command: echo",
+        )
+        .unwrap();
+
+        let result = cache.get_or_discover(&dirs);
+        assert_eq!(result.len(), 1, "cache hit must return stale data");
+    }
+
+    #[test]
+    fn test_cache_miss_ttl_expired() {
+        let tmp = make_recipe_dir("ttl-recipe");
+        let dirs = vec![tmp.path().to_path_buf()];
+        // TTL of zero means every call is a miss
+        let mut cache = DiscoveryCache::new(Duration::from_secs(0));
+
+        let result = cache.get_or_discover(&dirs);
+        assert_eq!(result.len(), 1);
+
+        // Add another recipe file — expired TTL must re-discover
+        std::fs::write(
+            tmp.path().join("new-recipe.yaml"),
+            "name: new-recipe\nsteps:\n  - id: s1\n    command: echo",
+        )
+        .unwrap();
+
+        let result = cache.get_or_discover(&dirs);
+        assert_eq!(result.len(), 2, "expired cache must re-scan and find new recipe");
+    }
+
+    #[test]
+    fn test_cache_miss_dirs_changed() {
+        let tmp1 = make_recipe_dir("dir1-recipe");
+        let tmp2 = make_recipe_dir("dir2-recipe");
+        let mut cache = DiscoveryCache::new(Duration::from_secs(60));
+
+        // Populate with dir1
+        let result = cache.get_or_discover(&[tmp1.path().to_path_buf()]);
+        assert!(result.contains_key("dir1-recipe"));
+
+        // Switch to dir2 — dirs changed so cache must miss
+        let result = cache.get_or_discover(&[tmp2.path().to_path_buf()]);
+        assert!(!result.contains_key("dir1-recipe"), "old dir results must not appear");
+        assert!(result.contains_key("dir2-recipe"), "new dir results must appear");
+    }
+
+    #[test]
+    fn test_cache_invalidate() {
+        let tmp = make_recipe_dir("inv-recipe");
+        let dirs = vec![tmp.path().to_path_buf()];
+        let mut cache = DiscoveryCache::new(Duration::from_secs(60));
+
+        cache.get_or_discover(&dirs);
+        assert_eq!(cache.cache.len(), 1);
+
+        // Add file, then invalidate
+        std::fs::write(
+            tmp.path().join("another.yaml"),
+            "name: another\nsteps:\n  - id: s1\n    command: echo",
+        )
+        .unwrap();
+        cache.invalidate();
+
+        let result = cache.get_or_discover(&dirs);
+        assert_eq!(result.len(), 2, "invalidated cache must re-scan");
     }
 }

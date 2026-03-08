@@ -370,6 +370,89 @@ steps:
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// PARALLEL GROUP EXECUTION
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_parallel_group_basic() {
+    let r = parse_and_run(r#"
+name: t
+steps:
+  - id: a
+    command: "echo a"
+    parallel_group: "p1"
+    output: "out_a"
+  - id: b
+    command: "echo b"
+    parallel_group: "p1"
+    output: "out_b"
+"#);
+    assert!(r.success);
+    assert_eq!(r.step_results.len(), 2);
+    assert_eq!(r.step_results[0].status, StepStatus::Completed);
+    assert_eq!(r.step_results[1].status, StepStatus::Completed);
+    // Verify outputs were captured
+    assert!(r.context.contains_key("out_a"));
+    assert!(r.context.contains_key("out_b"));
+}
+
+#[test]
+fn test_parallel_group_mixed() {
+    let r = parse_and_run(r#"
+name: t
+steps:
+  - id: seq1
+    command: "echo first"
+    output: "r1"
+  - id: par_a
+    command: "echo a"
+    parallel_group: "g1"
+    output: "r2"
+  - id: par_b
+    command: "echo b"
+    parallel_group: "g1"
+    output: "r3"
+  - id: seq2
+    command: "echo last"
+    output: "r4"
+"#);
+    assert!(r.success);
+    assert_eq!(r.step_results.len(), 4);
+    assert_eq!(r.step_results[0].status, StepStatus::Completed); // seq1
+    assert_eq!(r.step_results[1].status, StepStatus::Completed); // par_a
+    assert_eq!(r.step_results[2].status, StepStatus::Completed); // par_b
+    assert_eq!(r.step_results[3].status, StepStatus::Completed); // seq2
+    // All outputs stored
+    assert!(r.context.contains_key("r1"));
+    assert!(r.context.contains_key("r2"));
+    assert!(r.context.contains_key("r3"));
+    assert!(r.context.contains_key("r4"));
+}
+
+#[test]
+fn test_parallel_group_failure() {
+    let r = parse_and_run(r#"
+name: t
+steps:
+  - id: ok
+    command: "echo ok"
+    parallel_group: "g1"
+  - id: fail
+    command: "FAIL"
+    parallel_group: "g1"
+  - id: should-not-run
+    command: "echo after"
+"#);
+    assert!(!r.success);
+    // Both parallel steps should have results (they run concurrently)
+    assert_eq!(r.step_results.len(), 2);
+    let fail_result = r.step_results.iter().find(|r| r.step_id == "fail").unwrap();
+    assert_eq!(fail_result.status, StepStatus::Failed);
+    // Step after the group must not run
+    assert!(!r.step_results.iter().any(|r| r.step_id == "should-not-run"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // RECIPE COMPOSITION (extends, when_tags)
 // ═══════════════════════════════════════════════════════════════════════════
 

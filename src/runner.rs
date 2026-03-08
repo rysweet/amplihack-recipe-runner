@@ -8,7 +8,7 @@ use crate::agent_resolver::{AgentResolver, AgentResolveError};
 use crate::context::RecipeContext;
 use crate::discovery;
 use crate::models::{Recipe, RecipeResult, Step, StepExecutionError, StepResult, StepStatus, StepType};
-use crate::parser::RecipeParser;
+use crate::parser::{RecipeParser, resolve_extends};
 use log::{error, info, warn};
 use regex::Regex;
 use serde_json::Value;
@@ -145,6 +145,21 @@ impl<A: Adapter> RecipeRunner<A> {
         recipe: &Recipe,
         user_context: Option<HashMap<String, Value>>,
     ) -> RecipeResult {
+        // Resolve extends (single-level inheritance) if set
+        let mut recipe = recipe.clone();
+        if recipe.extends.is_some() {
+            if let Err(e) = resolve_extends(&mut recipe, &self.recipe_search_dirs) {
+                error!("Failed to resolve extends: {}", e);
+                return RecipeResult {
+                    recipe_name: recipe.name.clone(),
+                    success: false,
+                    step_results: vec![],
+                    context: HashMap::new(),
+                    duration: None,
+                };
+            }
+        }
+
         // Apply recipe-level recursion limits
         self.max_depth.set(recipe.recursion.max_depth);
         self.max_total_steps.set(recipe.recursion.max_total_steps);
@@ -174,75 +189,165 @@ impl<A: Adapter> RecipeRunner<A> {
         // Initialize audit log
         let audit_file = self.open_audit_log(&recipe.name);
 
-        for step in &recipe.steps {
-            // Check total step limit
-            if self.total_steps.get() >= self.max_total_steps.get() {
-                error!(
-                    "Total step limit ({}) reached, stopping execution",
-                    self.max_total_steps.get()
-                );
-                step_results.push(StepResult {
-                    step_id: step.id.clone(),
-                    status: StepStatus::Failed,
-                    output: String::new(),
-                    error: format!(
-                        "Total step limit ({}) exceeded",
+        let mut step_idx = 0;
+        while step_idx < recipe.steps.len() {
+            if recipe.steps[step_idx].parallel_group.is_some() {
+                // Collect consecutive steps sharing the same parallel_group
+                let group_name = recipe.steps[step_idx].parallel_group.as_ref().unwrap().clone();
+                let group_start = step_idx;
+                while step_idx < recipe.steps.len()
+                    && recipe.steps[step_idx].parallel_group.as_deref() == Some(&group_name)
+                {
+                    step_idx += 1;
+                }
+                let group_steps: Vec<&Step> = recipe.steps[group_start..step_idx].iter().collect();
+
+                // Check total step limit before the group
+                if self.total_steps.get() >= self.max_total_steps.get() {
+                    error!(
+                        "Total step limit ({}) reached, stopping execution",
                         self.max_total_steps.get()
-                    ),
-                    duration: None,
-                });
-                success = false;
-                break;
-            }
+                    );
+                    step_results.push(StepResult {
+                        step_id: group_steps[0].id.clone(),
+                        status: StepStatus::Failed,
+                        output: String::new(),
+                        error: format!(
+                            "Total step limit ({}) exceeded",
+                            self.max_total_steps.get()
+                        ),
+                        duration: None,
+                    });
+                    success = false;
+                    break;
+                }
 
-            // Tag filtering
-            if self.should_skip_by_tags(step) {
-                info!("Skipping step '{}': excluded by tag filter", step.id);
-                step_results.push(StepResult {
-                    step_id: step.id.clone(),
-                    status: StepStatus::Skipped,
-                    output: String::new(),
-                    error: String::new(),
-                    duration: None,
-                });
-                continue;
-            }
+                // Notify listeners and run pre_step hooks for all steps in the group
+                for gs in &group_steps {
+                    self.listener.on_step_start(&gs.id, gs.effective_type());
+                    self.run_hook(&recipe.hooks.pre_step, "pre_step", &gs.id, &ctx);
+                }
 
-            self.listener.on_step_start(&step.id, step.effective_type());
-
-            // Run pre_step hook
-            self.run_hook(&recipe.hooks.pre_step, "pre_step", &step.id, &ctx);
-
-            let result = self.execute_step(step, &mut ctx);
-            self.total_steps.set(self.total_steps.get() + 1);
-
-            let failed = result.status == StepStatus::Failed;
-
-            // Run post_step or on_error hook
-            if failed {
-                self.run_hook(&recipe.hooks.on_error, "on_error", &step.id, &ctx);
-            } else {
-                self.run_hook(&recipe.hooks.post_step, "post_step", &step.id, &ctx);
-            }
-
-            self.listener.on_step_complete(&result);
-            self.write_audit_entry(&audit_file, &result);
-
-            if failed && !step.continue_on_error {
-                step_results.push(result);
-                success = false;
-                break;
-            }
-
-            if failed && step.continue_on_error {
-                warn!(
-                    "Step '{}' failed but continue_on_error is set, continuing",
-                    step.id
+                // Execute group (bash steps in parallel, others sequential)
+                let group_results = self.execute_parallel_group(
+                    &group_steps, &recipe, &ctx, &*self.listener,
                 );
-                // Mark as failed but keep going
-            }
 
-            step_results.push(result);
+                // Merge results into context in step order for determinism
+                let mut group_failed = false;
+                for (gs, result) in group_steps.iter().zip(group_results.into_iter()) {
+                    self.total_steps.set(self.total_steps.get() + 1);
+                    let failed = result.status == StepStatus::Failed;
+
+                    if failed {
+                        self.run_hook(&recipe.hooks.on_error, "on_error", &gs.id, &ctx);
+                    } else {
+                        self.run_hook(&recipe.hooks.post_step, "post_step", &gs.id, &ctx);
+                    }
+
+                    self.listener.on_step_complete(&result);
+                    self.write_audit_entry(&audit_file, &result);
+
+                    // Store output in context in step order
+                    if !failed {
+                        if let Some(ref output_key) = gs.output {
+                            let value = serde_json::from_str(&result.output)
+                                .unwrap_or(Value::String(result.output.clone()));
+                            ctx.set(output_key, value);
+                        }
+                    }
+
+                    if failed && !gs.continue_on_error {
+                        group_failed = true;
+                    }
+
+                    if failed && gs.continue_on_error {
+                        warn!(
+                            "Step '{}' failed but continue_on_error is set, continuing",
+                            gs.id
+                        );
+                    }
+
+                    step_results.push(result);
+                }
+
+                if group_failed {
+                    success = false;
+                    break;
+                }
+            } else {
+                let step = &recipe.steps[step_idx];
+
+                // Check total step limit
+                if self.total_steps.get() >= self.max_total_steps.get() {
+                    error!(
+                        "Total step limit ({}) reached, stopping execution",
+                        self.max_total_steps.get()
+                    );
+                    step_results.push(StepResult {
+                        step_id: step.id.clone(),
+                        status: StepStatus::Failed,
+                        output: String::new(),
+                        error: format!(
+                            "Total step limit ({}) exceeded",
+                            self.max_total_steps.get()
+                        ),
+                        duration: None,
+                    });
+                    success = false;
+                    break;
+                }
+
+                // Tag filtering
+                if self.should_skip_by_tags(step) {
+                    info!("Skipping step '{}': excluded by tag filter", step.id);
+                    step_results.push(StepResult {
+                        step_id: step.id.clone(),
+                        status: StepStatus::Skipped,
+                        output: String::new(),
+                        error: String::new(),
+                        duration: None,
+                    });
+                    step_idx += 1;
+                    continue;
+                }
+
+                self.listener.on_step_start(&step.id, step.effective_type());
+
+                // Run pre_step hook
+                self.run_hook(&recipe.hooks.pre_step, "pre_step", &step.id, &ctx);
+
+                let result = self.execute_step(step, &mut ctx);
+                self.total_steps.set(self.total_steps.get() + 1);
+
+                let failed = result.status == StepStatus::Failed;
+
+                // Run post_step or on_error hook
+                if failed {
+                    self.run_hook(&recipe.hooks.on_error, "on_error", &step.id, &ctx);
+                } else {
+                    self.run_hook(&recipe.hooks.post_step, "post_step", &step.id, &ctx);
+                }
+
+                self.listener.on_step_complete(&result);
+                self.write_audit_entry(&audit_file, &result);
+
+                if failed && !step.continue_on_error {
+                    step_results.push(result);
+                    success = false;
+                    break;
+                }
+
+                if failed && step.continue_on_error {
+                    warn!(
+                        "Step '{}' failed but continue_on_error is set, continuing",
+                        step.id
+                    );
+                }
+
+                step_results.push(result);
+                step_idx += 1;
+            }
         }
 
         RecipeResult {
@@ -677,6 +782,138 @@ impl<A: Adapter> RecipeRunner<A> {
         if let Some(staged) = git_stage_all(working_dir) {
             let count = staged.lines().count();
             info!("Auto-staged {} file(s) after step '{}'", count, step.id);
+        }
+    }
+
+    /// Execute a group of steps that share the same `parallel_group`.
+    ///
+    /// Bash steps run concurrently via `std::thread::scope`; non-bash steps
+    /// (agent, recipe) fall back to sequential execution within the group
+    /// since adapters may not be thread-safe for those step types.
+    fn execute_parallel_group(
+        &self,
+        steps: &[&Step],
+        _recipe: &Recipe,
+        ctx: &RecipeContext,
+        _listener: &dyn ExecutionListener,
+    ) -> Vec<StepResult> {
+        let adapter = &self.adapter;
+        let default_wd = self.working_dir.as_str();
+        let dry_run = self.dry_run;
+        let mut results: Vec<Option<StepResult>> = vec![None; steps.len()];
+
+        std::thread::scope(|s| {
+            let mut handles = Vec::new();
+
+            for (idx, step) in steps.iter().enumerate() {
+                if self.should_skip_by_tags(step) {
+                    results[idx] = Some(StepResult {
+                        step_id: step.id.clone(),
+                        status: StepStatus::Skipped,
+                        output: String::new(),
+                        error: String::new(),
+                        duration: None,
+                    });
+                    continue;
+                }
+
+                if step.effective_type() == StepType::Bash {
+                    let ctx_clone = ctx.clone();
+                    let handle = s.spawn(move || {
+                        Self::execute_bash_step_parallel(
+                            step, &ctx_clone, adapter, default_wd, dry_run,
+                        )
+                    });
+                    handles.push((idx, handle));
+                } else {
+                    // Non-bash steps fall back to sequential on the main thread
+                    let mut ctx_clone = ctx.clone();
+                    let result = self.execute_step(step, &mut ctx_clone);
+                    results[idx] = Some(result);
+                }
+            }
+
+            for (idx, handle) in handles {
+                match handle.join() {
+                    Ok(result) => results[idx] = Some(result),
+                    Err(_) => {
+                        results[idx] = Some(StepResult {
+                            step_id: steps[idx].id.clone(),
+                            status: StepStatus::Failed,
+                            output: String::new(),
+                            error: "Thread panicked during parallel execution".to_string(),
+                            duration: None,
+                        });
+                    }
+                }
+            }
+        });
+
+        results.into_iter().map(|r| r.unwrap()).collect()
+    }
+
+    /// Execute a single bash step in a parallel context without `&mut RecipeContext`.
+    fn execute_bash_step_parallel(
+        step: &Step,
+        ctx: &RecipeContext,
+        adapter: &A,
+        default_working_dir: &str,
+        dry_run: bool,
+    ) -> StepResult {
+        let step_start = Instant::now();
+
+        if dry_run {
+            return StepResult {
+                step_id: step.id.clone(),
+                status: StepStatus::Completed,
+                output: "[dry run]".to_string(),
+                error: String::new(),
+                duration: Some(step_start.elapsed()),
+            };
+        }
+
+        if let Some(ref condition) = step.condition {
+            match ctx.evaluate(condition) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return StepResult {
+                        step_id: step.id.clone(),
+                        status: StepStatus::Skipped,
+                        output: String::new(),
+                        error: String::new(),
+                        duration: Some(step_start.elapsed()),
+                    };
+                }
+                Err(e) => {
+                    return StepResult {
+                        step_id: step.id.clone(),
+                        status: StepStatus::Failed,
+                        output: String::new(),
+                        error: format!("Condition error: {}", e),
+                        duration: Some(step_start.elapsed()),
+                    };
+                }
+            }
+        }
+
+        let rendered = ctx.render_shell(step.command.as_deref().unwrap_or(""));
+        let working_dir = step.working_dir.as_deref().unwrap_or(default_working_dir);
+
+        match adapter.execute_bash_step(&rendered, working_dir, step.timeout) {
+            Ok(output) => StepResult {
+                step_id: step.id.clone(),
+                status: StepStatus::Completed,
+                output,
+                error: String::new(),
+                duration: Some(step_start.elapsed()),
+            },
+            Err(e) => StepResult {
+                step_id: step.id.clone(),
+                status: StepStatus::Failed,
+                output: String::new(),
+                error: e.to_string(),
+                duration: Some(step_start.elapsed()),
+            },
         }
     }
 }
