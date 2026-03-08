@@ -20,14 +20,75 @@ Source: [examples/patterns/](https://github.com/rysweet/amplihack-recipe-runner/
 
 ## Combining Patterns
 
-Patterns can be composed using sub-recipes. For example, a CI pipeline
-could invoke the quality-audit pattern as a sub-recipe step:
+Patterns compose via sub-recipe steps, hooks, tags, and parallel groups. Here's a
+full deployment recipe that chains three patterns together — CI first, then review,
+then deploy — with quality audit as a gate between stages:
 
 ```yaml
+name: "ship-release"
+description: "CI → Review → Quality Gate → Deploy"
+version: "1.0"
+
+context:
+  repo_path: "."
+  environment: "staging"
+
+hooks:
+  on_error: "echo 'Pipeline failed at step: $STEP_ID' >> pipeline.log"
+
 steps:
-  - id: "quality-gate"
-    recipe: "quality-audit"
+  # ── Stage 1: Build & Test (sub-recipe) ──
+  - id: "ci"
+    recipe: "ci-pipeline"
     context:
       repo_path: "{{repo_path}}"
-      language: "rust"
+    output: "ci_result"
+
+  # ── Stage 2: Parallel code reviews ──
+  - id: "security-review"
+    agent: "amplihack:security"
+    parallel_group: "reviews"
+    prompt: "Review {{repo_path}} for security vulnerabilities."
+    output: "security_findings"
+
+  - id: "architecture-review"
+    agent: "amplihack:architect"
+    parallel_group: "reviews"
+    prompt: "Review {{repo_path}} for architectural issues."
+    output: "arch_findings"
+
+  # ── Stage 3: Quality gate (sub-recipe, conditional) ──
+  - id: "quality-gate"
+    recipe: "quality-audit"
+    condition: "ci_result and 'PASS' in ci_result"
+    context:
+      repo_path: "{{repo_path}}"
+    output: "audit_result"
+
+  # ── Stage 4: Deploy (tagged — only runs with --include-tags release) ──
+  - id: "deploy"
+    recipe: "deploy-pipeline"
+    when_tags: ["release"]
+    condition: "'PASS' in audit_result"
+    context:
+      repo_path: "{{repo_path}}"
+      environment: "{{environment}}"
+    output: "deploy_result"
+
+  # ── Notification ──
+  - id: "notify"
+    command: |
+      echo "Release pipeline complete."
+      echo "CI: {{ci_result}}"
+      echo "Audit: {{audit_result}}"
+      echo "Deploy: {{deploy_result}}"
 ```
+
+This recipe demonstrates:
+
+- **Sub-recipes** (`recipe:`) — CI, quality audit, and deploy each run as self-contained workflows
+- **Parallel groups** (`parallel_group:`) — security and architecture reviews run concurrently
+- **Conditional gates** (`condition:`) — quality audit only runs if CI passed; deploy only if audit passed
+- **Tag filtering** (`when_tags:`) — deploy step only executes when `--include-tags release` is passed
+- **Error hooks** (`hooks.on_error:`) — logs which step failed for post-mortem
+- **Output chaining** — each stage's result flows into the next stage's conditions
