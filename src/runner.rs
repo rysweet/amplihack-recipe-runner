@@ -392,7 +392,7 @@ impl<A: Adapter> RecipeRunner<A> {
 
     fn run_hook(&self, hook: &Option<String>, hook_name: &str, step_id: &str, ctx: &RecipeContext) {
         if let Some(cmd) = hook {
-            let rendered = ctx.render(cmd);
+            let rendered = ctx.render_shell(cmd);
             info!("Running {} hook for step '{}'", hook_name, step_id);
             if let Err(e) = self
                 .adapter
@@ -446,9 +446,16 @@ impl<A: Adapter> RecipeRunner<A> {
             } else {
                 "[dry run]".to_string()
             };
+            // Populate context placeholder so downstream steps can reference this output
+            if let Some(ref output_key) = step.output {
+                ctx.set(
+                    output_key.clone(),
+                    serde_json::Value::String("(dry-run)".to_string()),
+                );
+            }
             return StepResult {
                 step_id: step.id.clone(),
-                status: StepStatus::Completed,
+                status: StepStatus::Skipped,
                 output,
                 error: String::new(),
                 duration: Some(step_start.elapsed()),
@@ -658,12 +665,26 @@ impl<A: Adapter> RecipeRunner<A> {
             })?;
 
         let parser = RecipeParser::new();
-        let sub_recipe = parser
-            .parse_file(Path::new(&path))
-            .map_err(|e| StepExecutionError {
-                step_id: step.id.clone(),
-                message: format!("Failed to parse sub-recipe '{}': {}", recipe_name, e),
+        let mut sub_recipe =
+            parser
+                .parse_file(Path::new(&path))
+                .map_err(|e| StepExecutionError {
+                    step_id: step.id.clone(),
+                    message: format!("Failed to parse sub-recipe '{}': {}", recipe_name, e),
+                })?;
+
+        // Resolve extends (single-level inheritance) if the sub-recipe uses it
+        if sub_recipe.extends.is_some() {
+            resolve_extends(&mut sub_recipe, &self.recipe_search_dirs).map_err(|e| {
+                StepExecutionError {
+                    step_id: step.id.clone(),
+                    message: format!(
+                        "Failed to resolve extends for sub-recipe '{}': {}",
+                        recipe_name, e
+                    ),
+                }
             })?;
+        }
 
         // Merge: current context + step-level sub_context overrides
         let mut merged = ctx.to_map();
@@ -934,13 +955,32 @@ impl<A: Adapter> RecipeRunner<A> {
         let working_dir = step.working_dir.as_deref().unwrap_or(default_working_dir);
 
         match adapter.execute_bash_step(&rendered, working_dir, step.timeout) {
-            Ok(output) => StepResult {
-                step_id: step.id.clone(),
-                status: StepStatus::Completed,
-                output,
-                error: String::new(),
-                duration: Some(step_start.elapsed()),
-            },
+            Ok(output) => {
+                // Apply parse_json if requested
+                let final_output = if step.parse_json && !output.is_empty() {
+                    match parse_json_output(&output, &step.id) {
+                        Some(parsed) => serde_json::to_string(&parsed).unwrap_or(output),
+                        None => {
+                            return StepResult {
+                                step_id: step.id.clone(),
+                                status: StepStatus::Failed,
+                                output: String::new(),
+                                error: "parse_json failed: output is not valid JSON".to_string(),
+                                duration: Some(step_start.elapsed()),
+                            };
+                        }
+                    }
+                } else {
+                    output
+                };
+                StepResult {
+                    step_id: step.id.clone(),
+                    status: StepStatus::Completed,
+                    output: final_output,
+                    error: String::new(),
+                    duration: Some(step_start.elapsed()),
+                }
+            }
             Err(e) => StepResult {
                 step_id: step.id.clone(),
                 status: StepStatus::Failed,

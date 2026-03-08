@@ -4,7 +4,7 @@ A code-enforced workflow execution engine that reads declarative YAML recipe fil
 
 ## Feature Highlights
 
-- 216 tests across unit, integration, recipe, example, and property-based testing
+- Comprehensive test suite covering unit, integration, recipe, example, and property-based testing
 - Parallel step execution, tag filtering, JSONL audit logs
 - Recipe composition via `extends`, pre/post/on_error hooks
 - Safe condition language with recursive descent parser

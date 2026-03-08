@@ -112,6 +112,7 @@ impl CLISubprocessAdapter {
         }
         let mut child = cmd
             .current_dir(actual_cwd)
+            .env_remove("CLAUDECODE")
             .envs(&child_env)
             .stdout(log_fh)
             .stderr(std::process::Stdio::inherit())
@@ -244,6 +245,7 @@ impl Adapter for CLISubprocessAdapter {
             Command::new("timeout")
                 .args([&secs.to_string(), "/bin/bash", "-c", command])
                 .current_dir(effective_dir)
+                .env_remove("CLAUDECODE")
                 .envs(&child_env)
                 .output()
                 .with_context(|| "Failed to execute bash step with timeout")?
@@ -251,6 +253,7 @@ impl Adapter for CLISubprocessAdapter {
             Command::new("/bin/bash")
                 .args(["-c", command])
                 .current_dir(effective_dir)
+                .env_remove("CLAUDECODE")
                 .envs(&child_env)
                 .output()
                 .with_context(|| "Failed to execute bash step")?

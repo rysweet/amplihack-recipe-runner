@@ -96,15 +96,7 @@ Every recipe has corresponding tests. Start with [`01-hello-world.yaml`](example
 cargo test
 ```
 
-**216 tests** across 5 test suites:
-
-| Suite | Tests | Covers |
-|---|---|---|
-| Unit tests | 53 | Parser, context, runner, discovery, agent resolver |
-| Integration tests | 14 | Full lifecycle, fail-fast, sub-recipes |
-| Recipe tests | 91 | All control flow and IO mechanisms |
-| Feature tests | 23 | New features + property-based fuzzing (proptest) |
-| Example tests | 35 | All 34 recipes: parse, validate, dry-run, execute |
+Comprehensive test suite covering unit, integration, recipe, feature, and example tests.
 
 ## Creating a Recipe
 

@@ -60,7 +60,7 @@ Hook commands receive context variables via template substitution.
 | `context`           | map             | no       | —       | Context overrides passed to sub-recipe                   |
 | `continue_on_error` | bool            | no       | `false` | Continue execution if this step fails                    |
 | `when_tags`         | list of strings | no       | `[]`    | Step only runs when these tags match active tag filters  |
-| `parallel_group`    | string          | no       | —       | Group name for parallel execution (future)               |
+| `parallel_group`    | string          | no       | —       | Group name for parallel execution                        |
 
 > **Note:** The `context` field on a step is serialised with `#[serde(rename = "context")]` from the internal `sub_context` field. In YAML you write `context:`.
 
