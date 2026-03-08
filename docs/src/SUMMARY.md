@@ -11,6 +11,10 @@
 # Examples
 - [Tutorials](examples-tutorials.md)
 - [Workflow Patterns](examples-patterns.md)
+- [Testing & Edge Cases](testing-recipes.md)
+
+# Production Recipes
+- [amplihack Recipes](production-recipes.md)
 
 # Reference
 - [Architecture](architecture.md)
