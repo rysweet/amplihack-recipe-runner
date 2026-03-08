@@ -2,7 +2,7 @@
 name = "recipe-runner-rs"
 version = "0.1.0"
 edition = "2024"
-description = "Rust implementation of the amplihack recipe runner"
+description = "Code-enforced YAML workflow execution engine for amplihack"
 license = "MIT"
 
 [dependencies]
