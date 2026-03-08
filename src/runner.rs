@@ -13,6 +13,7 @@ use log::{error, info, warn};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
@@ -29,7 +30,7 @@ pub struct RecipeRunner<A: Adapter> {
     working_dir: String,
     dry_run: bool,
     auto_stage: bool,
-    depth: u32,
+    depth: Cell<u32>,
     recipe_search_dirs: Vec<PathBuf>,
 }
 
@@ -41,7 +42,7 @@ impl<A: Adapter> RecipeRunner<A> {
             working_dir: ".".to_string(),
             dry_run: false,
             auto_stage: true,
-            depth: 0,
+            depth: Cell::new(0),
             recipe_search_dirs: Vec::new(),
         }
     }
@@ -72,8 +73,8 @@ impl<A: Adapter> RecipeRunner<A> {
     }
 
     #[allow(dead_code)]
-    fn with_depth(mut self, depth: u32) -> Self {
-        self.depth = depth;
+    pub fn with_depth(self, depth: u32) -> Self {
+        self.depth.set(depth);
         self
     }
 
@@ -300,7 +301,8 @@ impl<A: Adapter> RecipeRunner<A> {
     }
 
     fn execute_sub_recipe(&self, step: &Step, ctx: &mut RecipeContext) -> Result<String, StepExecutionError> {
-        if self.depth >= MAX_RECIPE_DEPTH {
+        let current_depth = self.depth.get();
+        if current_depth >= MAX_RECIPE_DEPTH {
             return Err(StepExecutionError {
                 step_id: step.id.clone(),
                 message: format!(
@@ -341,9 +343,10 @@ impl<A: Adapter> RecipeRunner<A> {
             }
         }
 
-        // Build a sub-runner that shares the adapter but increments depth.
-        // Since Adapter is behind a reference, we use the parent's adapter.
-        let sub_result = self.execute_with_depth(&sub_recipe, Some(merged), self.depth + 1);
+        // Increment depth, execute, then restore
+        self.depth.set(current_depth + 1);
+        let sub_result = self.execute_with_depth(&sub_recipe, Some(merged), current_depth + 1);
+        self.depth.set(current_depth);
 
         if !sub_result.success {
             return Err(StepExecutionError {
@@ -360,7 +363,7 @@ impl<A: Adapter> RecipeRunner<A> {
         info!(
             "Sub-recipe '{}' completed successfully (depth {})",
             recipe_name,
-            self.depth + 1
+            current_depth + 1
         );
         Ok(format!("{}", sub_result))
     }
@@ -370,7 +373,7 @@ impl<A: Adapter> RecipeRunner<A> {
         &self,
         recipe: &Recipe,
         user_context: Option<HashMap<String, Value>>,
-        depth: u32,
+        _depth: u32,
     ) -> RecipeResult {
         let mut initial: HashMap<String, Value> = recipe.context.clone();
         if let Some(uc) = user_context {
@@ -382,13 +385,7 @@ impl<A: Adapter> RecipeRunner<A> {
         let mut success = true;
 
         for step in &recipe.steps {
-            // Temporarily shadow depth for sub-recipe steps
-            let result = if self.depth != depth {
-                // We're executing at a different depth — create step result inline
-                self.execute_step(step, &mut ctx)
-            } else {
-                self.execute_step(step, &mut ctx)
-            };
+            let result = self.execute_step(step, &mut ctx);
             let failed = result.status == StepStatus::Failed;
             step_results.push(result);
 
