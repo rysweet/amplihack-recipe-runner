@@ -7,16 +7,12 @@ use regex::Regex;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-static SAFE_NAME_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_-]+$").unwrap());
+static SAFE_NAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_-]+$").unwrap());
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentResolveError {
     #[error("Agent '{agent_ref}' not found. Searched: {searched}")]
-    NotFound {
-        agent_ref: String,
-        searched: String,
-    },
+    NotFound { agent_ref: String, searched: String },
 
     #[error("Invalid agent reference: {0}")]
     InvalidReference(String),
@@ -28,8 +24,14 @@ fn default_search_paths() -> Vec<PathBuf> {
         home.join(".amplihack").join(".claude").join("agents"),
         PathBuf::from(".claude").join("agents"),
         PathBuf::from("amplifier-bundle").join("agents"),
-        PathBuf::from("src").join("amplihack").join("amplifier-bundle").join("agents"),
-        PathBuf::from("src").join("amplihack").join(".claude").join("agents"),
+        PathBuf::from("src")
+            .join("amplihack")
+            .join("amplifier-bundle")
+            .join("agents"),
+        PathBuf::from("src")
+            .join("amplihack")
+            .join(".claude")
+            .join("agents"),
     ]
 }
 
@@ -84,11 +86,23 @@ impl AgentResolver {
         // Build candidate paths
         let mut candidates: Vec<PathBuf> = Vec::new();
         if let Some(cat) = category {
-            candidates.push(PathBuf::from(namespace).join(cat).join(format!("{}.md", name)));
+            candidates.push(
+                PathBuf::from(namespace)
+                    .join(cat)
+                    .join(format!("{}.md", name)),
+            );
             candidates.push(PathBuf::from(cat).join(format!("{}.md", name)));
         }
-        candidates.push(PathBuf::from(namespace).join("core").join(format!("{}.md", name)));
-        candidates.push(PathBuf::from(namespace).join("specialized").join(format!("{}.md", name)));
+        candidates.push(
+            PathBuf::from(namespace)
+                .join("core")
+                .join(format!("{}.md", name)),
+        );
+        candidates.push(
+            PathBuf::from(namespace)
+                .join("specialized")
+                .join(format!("{}.md", name)),
+        );
         candidates.push(PathBuf::from("core").join(format!("{}.md", name)));
         candidates.push(PathBuf::from("specialized").join(format!("{}.md", name)));
         candidates.push(PathBuf::from(format!("{}.md", name)));
@@ -104,12 +118,12 @@ impl AgentResolver {
                 searched.push(full.display().to_string());
                 if full.is_file() {
                     // Defense in depth: verify resolved path is inside search directory
-                    if let Ok(resolved_full) = full.canonicalize() {
-                        if resolved_full.starts_with(&resolved_base) {
-                            match std::fs::read_to_string(&full) {
-                                Ok(content) => return Ok(content),
-                                Err(_) => continue,
-                            }
+                    if let Ok(resolved_full) = full.canonicalize()
+                        && resolved_full.starts_with(&resolved_base)
+                    {
+                        match std::fs::read_to_string(&full) {
+                            Ok(content) => return Ok(content),
+                            Err(_) => continue,
                         }
                     }
                 }

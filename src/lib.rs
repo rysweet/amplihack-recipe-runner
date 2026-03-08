@@ -8,10 +8,10 @@ pub mod runner;
 
 // Public API convenience functions
 
+use adapters::Adapter;
 use models::{Recipe, RecipeResult};
 use parser::{RecipeParser, resolve_extends};
 use runner::RecipeRunner;
-use adapters::Adapter;
 use serde_json::Value;
 use std::collections::HashMap;
 

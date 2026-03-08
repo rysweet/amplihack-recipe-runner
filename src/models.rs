@@ -105,8 +105,12 @@ impl Default for RecursionConfig {
     }
 }
 
-fn default_max_depth() -> u32 { 6 }
-fn default_max_total_steps() -> u32 { 200 }
+fn default_max_depth() -> u32 {
+    6
+}
+fn default_max_total_steps() -> u32 {
+    200
+}
 
 /// Pre/post step hook commands.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

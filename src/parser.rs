@@ -11,15 +11,38 @@ const MAX_YAML_SIZE_BYTES: usize = 1_000_000;
 
 /// Top-level fields recognized by the parser.
 const KNOWN_TOP_FIELDS: &[&str] = &[
-    "name", "description", "version", "author", "tags", "context", "steps",
-    "recursion", "output", "hooks", "extends",
+    "name",
+    "description",
+    "version",
+    "author",
+    "tags",
+    "context",
+    "steps",
+    "recursion",
+    "output",
+    "hooks",
+    "extends",
 ];
 
 /// Step-level fields recognized by the parser.
 const KNOWN_STEP_FIELDS: &[&str] = &[
-    "id", "type", "agent", "prompt", "command", "output", "condition",
-    "parse_json", "mode", "working_dir", "timeout", "auto_stage", "recipe", "context",
-    "continue_on_error", "parallel_group", "when_tags",
+    "id",
+    "type",
+    "agent",
+    "prompt",
+    "command",
+    "output",
+    "condition",
+    "parse_json",
+    "mode",
+    "working_dir",
+    "timeout",
+    "auto_stage",
+    "recipe",
+    "context",
+    "continue_on_error",
+    "parallel_group",
+    "when_tags",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -151,43 +174,42 @@ impl RecipeParser {
         }
 
         // Check for unrecognized fields if raw YAML is provided
-        if let Some(yaml_str) = raw_yaml {
-            if let Ok(data) = serde_yaml::from_str::<serde_yaml::Value>(yaml_str) {
-                if let Some(map) = data.as_mapping() {
-                    let known: HashSet<&str> = KNOWN_TOP_FIELDS.iter().copied().collect();
-                    for key in map.keys() {
-                        if let Some(key_str) = key.as_str() {
-                            if !known.contains(key_str) {
-                                warnings.push(format!(
-                                    "Unrecognized top-level field '{}' (possible typo)",
-                                    key_str
-                                ));
-                            }
-                        }
-                    }
+        if let Some(yaml_str) = raw_yaml
+            && let Ok(data) = serde_yaml::from_str::<serde_yaml::Value>(yaml_str)
+            && let Some(map) = data.as_mapping()
+        {
+            let known: HashSet<&str> = KNOWN_TOP_FIELDS.iter().copied().collect();
+            for key in map.keys() {
+                if let Some(key_str) = key.as_str()
+                    && !known.contains(key_str)
+                {
+                    warnings.push(format!(
+                        "Unrecognized top-level field '{}' (possible typo)",
+                        key_str
+                    ));
+                }
+            }
 
-                    // Check step-level fields
-                    let step_known: HashSet<&str> = KNOWN_STEP_FIELDS.iter().copied().collect();
-                    if let Some(steps) = map.get(&serde_yaml::Value::String("steps".to_string())) {
-                        if let Some(steps_seq) = steps.as_sequence() {
-                            for (i, step_raw) in steps_seq.iter().enumerate() {
-                                if let Some(step_map) = step_raw.as_mapping() {
-                                    let default_sid = format!("index {}", i);
-                                    let sid = step_map
-                                        .get(&serde_yaml::Value::String("id".to_string()))
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or(&default_sid);
-                                    for key in step_map.keys() {
-                                        if let Some(key_str) = key.as_str() {
-                                            if !step_known.contains(key_str) {
-                                                warnings.push(format!(
-                                                    "Step '{}': unrecognized field '{}' (possible typo)",
-                                                    sid, key_str
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
+            // Check step-level fields
+            let step_known: HashSet<&str> = KNOWN_STEP_FIELDS.iter().copied().collect();
+            if let Some(steps) = map.get(serde_yaml::Value::String("steps".to_string()))
+                && let Some(steps_seq) = steps.as_sequence()
+            {
+                for (i, step_raw) in steps_seq.iter().enumerate() {
+                    if let Some(step_map) = step_raw.as_mapping() {
+                        let default_sid = format!("index {}", i);
+                        let sid = step_map
+                            .get(serde_yaml::Value::String("id".to_string()))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&default_sid);
+                        for key in step_map.keys() {
+                            if let Some(key_str) = key.as_str()
+                                && !step_known.contains(key_str)
+                            {
+                                warnings.push(format!(
+                                    "Step '{}': unrecognized field '{}' (possible typo)",
+                                    sid, key_str
+                                ));
                             }
                         }
                     }
@@ -223,10 +245,12 @@ pub fn resolve_extends(recipe: &mut Recipe, search_dirs: &[PathBuf]) -> Result<(
         None => return Ok(()),
     };
 
-    let parent_path = discovery::find_recipe(&parent_name, Some(search_dirs))
-        .ok_or_else(|| ParseError::Extends(format!(
-            "Parent recipe '{}' not found in search directories", parent_name
-        )))?;
+    let parent_path = discovery::find_recipe(&parent_name, Some(search_dirs)).ok_or_else(|| {
+        ParseError::Extends(format!(
+            "Parent recipe '{}' not found in search directories",
+            parent_name
+        ))
+    })?;
 
     let parser = RecipeParser::new();
     let parent = parser.parse_file(&parent_path)?;

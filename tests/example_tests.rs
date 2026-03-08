@@ -2,7 +2,6 @@
 ///
 /// Validates that every recipe under examples/ and recipes/testing/ parses,
 /// validates, dry-runs, and executes correctly with a mock adapter.
-
 use recipe_runner_rs::adapters::Adapter;
 use recipe_runner_rs::models::{StepStatus, StepType};
 use recipe_runner_rs::parser::RecipeParser;
@@ -25,13 +24,12 @@ impl Adapter for MockAdapter {
         _working_dir: &str,
     ) -> Result<String, anyhow::Error> {
         if prompt.contains("JSON") || prompt.contains("json") || prompt.contains("analyze") {
-            Ok(r#"{"status": "ok", "score": 85, "issues": [], "recommendation": "approved"}"#
-                .to_string())
+            Ok(
+                r#"{"status": "ok", "score": 85, "issues": [], "recommendation": "approved"}"#
+                    .to_string(),
+            )
         } else {
-            Ok(format!(
-                "[mock-agent] {}",
-                &prompt[..prompt.len().min(100)]
-            ))
+            Ok(format!("[mock-agent] {}", &prompt[..prompt.len().min(100)]))
         }
     }
 
@@ -48,10 +46,7 @@ impl Adapter for MockAdapter {
                 .output()?;
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         } else {
-            Ok(format!(
-                "[mock-bash] {}",
-                &command[..command.len().min(80)]
-            ))
+            Ok(format!("[mock-bash] {}", &command[..command.len().min(80)]))
         }
     }
 
@@ -75,10 +70,7 @@ impl Adapter for FailOnExitAdapter {
         _: Option<&str>,
         _: &str,
     ) -> Result<String, anyhow::Error> {
-        Ok(format!(
-            "[mock-agent] {}",
-            &prompt[..prompt.len().min(100)]
-        ))
+        Ok(format!("[mock-agent] {}", &prompt[..prompt.len().min(100)]))
     }
 
     fn execute_bash_step(
@@ -97,10 +89,7 @@ impl Adapter for FailOnExitAdapter {
                 .output()?;
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         } else {
-            Ok(format!(
-                "[mock-bash] {}",
-                &command[..command.len().min(80)]
-            ))
+            Ok(format!("[mock-bash] {}", &command[..command.len().min(80)]))
         }
     }
 
@@ -152,11 +141,7 @@ fn parse_validate_dryrun(rel_path: &str) {
     let recipe = parse_and_validate(rel_path);
     let runner = RecipeRunner::new(MockAdapter).with_dry_run(true);
     let result = runner.execute(&recipe, None);
-    assert!(
-        result.success,
-        "{} dry-run failed: {:?}",
-        rel_path, result
-    );
+    assert!(result.success, "{} dry-run failed: {:?}", rel_path, result);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -308,7 +293,11 @@ fn test_tutorial_07_error_handling() {
     let result = runner.execute(&recipe, None);
 
     // Recipe overall succeeds because the failure is contained
-    assert!(result.success, "recipe should succeed overall: {:?}", result);
+    assert!(
+        result.success,
+        "recipe should succeed overall: {:?}",
+        result
+    );
 
     // Step 1 succeeds, step 2 fails (but continues), step 3 and 4 run
     assert_eq!(result.step_results[0].status, StepStatus::Completed);
@@ -356,14 +345,8 @@ fn test_tutorial_10_parallel_groups() {
     assert_eq!(recipe.name, "parallel-groups");
 
     // Verify parallel_group is parsed
-    assert_eq!(
-        recipe.steps[1].parallel_group.as_deref(),
-        Some("build")
-    );
-    assert_eq!(
-        recipe.steps[2].parallel_group.as_deref(),
-        Some("build")
-    );
+    assert_eq!(recipe.steps[1].parallel_group.as_deref(), Some("build"));
+    assert_eq!(recipe.steps[2].parallel_group.as_deref(), Some("build"));
 
     // Dry-run succeeds
     parse_validate_dryrun("examples/tutorials/10-parallel-groups.yaml");
@@ -500,7 +483,11 @@ fn test_testing_all_condition_operators() {
 
     let runner = RecipeRunner::new(MockAdapter);
     let result = runner.execute(&recipe, None);
-    assert!(result.success, "all-condition-operators failed: {:?}", result);
+    assert!(
+        result.success,
+        "all-condition-operators failed: {:?}",
+        result
+    );
 
     // ALL steps should complete (none skipped) since all conditions are true
     for sr in &result.step_results {
@@ -619,11 +606,7 @@ fn test_testing_json_extraction() {
     // All 3 parse_json strategies should produce parsed objects
     for name in &["raw_json_out", "fenced_json_out", "mixed_json_out"] {
         let val = result.context.get(*name);
-        assert!(
-            val.is_some(),
-            "context should contain '{}'",
-            name
-        );
+        assert!(val.is_some(), "context should contain '{}'", name);
         assert!(
             val.unwrap().is_object(),
             "'{}' should be a parsed JSON object, got: {:?}",
@@ -640,11 +623,7 @@ fn test_testing_empty_and_edge_cases() {
 
     let runner = RecipeRunner::new(MockAdapter);
     let result = runner.execute(&recipe, None);
-    assert!(
-        result.success,
-        "empty-and-edge-cases failed: {:?}",
-        result
-    );
+    assert!(result.success, "empty-and-edge-cases failed: {:?}", result);
 
     // Steps with falsy conditions should be skipped
     // empty_str → skipped, zero_val → skipped, false_val → skipped
@@ -842,7 +821,11 @@ fn test_all_recipes_dry_run() {
     assert!(!files.is_empty(), "no recipe files found");
 
     // Provide search dirs so extends resolution works (e.g., 11-extends.yaml → base.yaml)
-    let search_dirs = vec![tutorials_dir(), manifest_dir().join("examples"), manifest_dir().join("recipes")];
+    let search_dirs = vec![
+        tutorials_dir(),
+        manifest_dir().join("examples"),
+        manifest_dir().join("recipes"),
+    ];
 
     for path in &files {
         let yaml = std::fs::read_to_string(path).unwrap();

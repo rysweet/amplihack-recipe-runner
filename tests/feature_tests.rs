@@ -1,6 +1,5 @@
 /// Tests for new features: continue_on_error, recursion limits, hooks,
 /// tag filtering, audit log, timing, and property-based tests.
-
 use recipe_runner_rs::adapters::Adapter;
 use recipe_runner_rs::context::RecipeContext;
 use recipe_runner_rs::models::StepStatus;
@@ -13,7 +12,12 @@ use std::collections::HashMap;
 struct MockAdapter;
 impl Adapter for MockAdapter {
     fn execute_agent_step(
-        &self, prompt: &str, _: Option<&str>, _: Option<&str>, _: Option<&str>, _: &str,
+        &self,
+        prompt: &str,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: &str,
     ) -> Result<String, anyhow::Error> {
         if prompt.contains("FAIL") {
             anyhow::bail!("Simulated failure");
@@ -21,15 +25,22 @@ impl Adapter for MockAdapter {
         Ok(format!("[mock-agent] {}", &prompt[..prompt.len().min(60)]))
     }
     fn execute_bash_step(
-        &self, command: &str, _: &str, _: Option<u64>,
+        &self,
+        command: &str,
+        _: &str,
+        _: Option<u64>,
     ) -> Result<String, anyhow::Error> {
         if command.contains("FAIL") {
             anyhow::bail!("Simulated failure");
         }
         Ok(format!("[mock-bash] {}", command))
     }
-    fn is_available(&self) -> bool { true }
-    fn name(&self) -> &str { "mock" }
+    fn is_available(&self) -> bool {
+        true
+    }
+    fn name(&self) -> &str {
+        "mock"
+    }
 }
 
 fn parse_and_run(yaml: &str) -> recipe_runner_rs::models::RecipeResult {
@@ -44,7 +55,8 @@ fn parse_and_run(yaml: &str) -> recipe_runner_rs::models::RecipeResult {
 
 #[test]
 fn test_continue_on_error_allows_subsequent_steps() {
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: will-fail
@@ -54,7 +66,8 @@ steps:
     command: "echo ok"
   - id: also-runs
     command: "echo done"
-"#);
+"#,
+    );
     assert!(r.success);
     assert_eq!(r.step_results.len(), 3);
     assert_eq!(r.step_results[0].status, StepStatus::Failed);
@@ -64,14 +77,16 @@ steps:
 
 #[test]
 fn test_continue_on_error_default_false_still_fails() {
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: will-fail
     command: "FAIL"
   - id: never-runs
     command: "echo ok"
-"#);
+"#,
+    );
     assert!(!r.success);
     assert_eq!(r.step_results.len(), 1);
     assert_eq!(r.step_results[0].status, StepStatus::Failed);
@@ -79,7 +94,8 @@ steps:
 
 #[test]
 fn test_continue_on_error_with_parse_json() {
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: bad-json
@@ -89,7 +105,8 @@ steps:
     continue_on_error: true
   - id: still-runs
     command: "echo ok"
-"#);
+"#,
+    );
     assert!(r.success);
     assert_eq!(r.step_results[0].status, StepStatus::Failed);
     assert_eq!(r.step_results[1].status, StepStatus::Completed);
@@ -102,37 +119,49 @@ steps:
 #[test]
 fn test_recipe_level_recursion_depth_limit() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("self-ref.yaml"), r#"
+    std::fs::write(
+        tmp.path().join("self-ref.yaml"),
+        r#"
 name: self-ref
 steps:
   - id: recurse
     recipe: "self-ref"
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let parser = RecipeParser::new();
     // Recipe with max_depth: 2 (stricter than default 6)
-    let recipe = parser.parse(r#"
+    let recipe = parser
+        .parse(
+            r#"
 name: parent
 recursion:
   max_depth: 2
 steps:
   - id: start
     recipe: "self-ref"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
-    let runner = RecipeRunner::new(MockAdapter)
-        .with_recipe_search_dirs(vec![tmp.path().to_path_buf()]);
+    let runner =
+        RecipeRunner::new(MockAdapter).with_recipe_search_dirs(vec![tmp.path().to_path_buf()]);
     let r = runner.execute(&recipe, None);
     assert!(!r.success);
     // Error should mention the sub-recipe failure (depth guard is inside the sub-recipe)
     let last_error = &r.step_results.last().unwrap().error;
-    assert!(last_error.contains("failed") || last_error.contains("depth"),
-        "expected depth/failure error, got: {}", last_error);
+    assert!(
+        last_error.contains("failed") || last_error.contains("depth"),
+        "expected depth/failure error, got: {}",
+        last_error
+    );
 }
 
 #[test]
 fn test_total_step_limit_enforced() {
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 recursion:
   max_total_steps: 3
@@ -145,7 +174,8 @@ steps:
     command: "echo 3"
   - id: s4
     command: "echo 4"
-"#);
+"#,
+    );
     assert!(!r.success);
     assert_eq!(r.step_results.len(), 4);
     assert_eq!(r.step_results[3].status, StepStatus::Failed);
@@ -155,7 +185,9 @@ steps:
 #[test]
 fn test_recursion_config_defaults() {
     let parser = RecipeParser::new();
-    let recipe = parser.parse("name: t\nsteps:\n  - id: s1\n    command: echo").unwrap();
+    let recipe = parser
+        .parse("name: t\nsteps:\n  - id: s1\n    command: echo")
+        .unwrap();
     assert_eq!(recipe.recursion.max_depth, 6);
     assert_eq!(recipe.recursion.max_total_steps, 200);
 }
@@ -167,7 +199,9 @@ fn test_recursion_config_defaults() {
 #[test]
 fn test_hooks_parsed_from_yaml() {
     let parser = RecipeParser::new();
-    let recipe = parser.parse(r#"
+    let recipe = parser
+        .parse(
+            r#"
 name: t
 hooks:
   pre_step: "echo pre"
@@ -176,7 +210,9 @@ hooks:
 steps:
   - id: s1
     command: "echo hello"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
     assert_eq!(recipe.hooks.pre_step.as_deref(), Some("echo pre"));
     assert_eq!(recipe.hooks.post_step.as_deref(), Some("echo post"));
     assert_eq!(recipe.hooks.on_error.as_deref(), Some("echo err"));
@@ -185,7 +221,9 @@ steps:
 #[test]
 fn test_hooks_default_to_none() {
     let parser = RecipeParser::new();
-    let recipe = parser.parse("name: t\nsteps:\n  - id: s1\n    command: echo").unwrap();
+    let recipe = parser
+        .parse("name: t\nsteps:\n  - id: s1\n    command: echo")
+        .unwrap();
     assert!(recipe.hooks.pre_step.is_none());
     assert!(recipe.hooks.post_step.is_none());
     assert!(recipe.hooks.on_error.is_none());
@@ -198,7 +236,9 @@ fn test_hooks_default_to_none() {
 #[test]
 fn test_include_tags_runs_only_matching() {
     let parser = RecipeParser::new();
-    let recipe = parser.parse(r#"
+    let recipe = parser
+        .parse(
+            r#"
 name: t
 steps:
   - id: tagged
@@ -209,21 +249,24 @@ steps:
   - id: wrong-tag
     command: "echo wrong"
     when_tags: ["slow"]
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
-    let runner = RecipeRunner::new(MockAdapter)
-        .with_tags(vec!["fast".to_string()], vec![]);
+    let runner = RecipeRunner::new(MockAdapter).with_tags(vec!["fast".to_string()], vec![]);
     let r = runner.execute(&recipe, None);
     assert!(r.success);
     assert_eq!(r.step_results[0].status, StepStatus::Completed); // "tagged" matches
     assert_eq!(r.step_results[1].status, StepStatus::Completed); // "untagged" has no when_tags
-    assert_eq!(r.step_results[2].status, StepStatus::Skipped);   // "wrong-tag" doesn't match
+    assert_eq!(r.step_results[2].status, StepStatus::Skipped); // "wrong-tag" doesn't match
 }
 
 #[test]
 fn test_exclude_tags_skips_matching() {
     let parser = RecipeParser::new();
-    let recipe = parser.parse(r#"
+    let recipe = parser
+        .parse(
+            r#"
 name: t
 steps:
   - id: excluded
@@ -231,10 +274,11 @@ steps:
     when_tags: ["slow"]
   - id: included
     command: "echo yes"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
-    let runner = RecipeRunner::new(MockAdapter)
-        .with_tags(vec![], vec!["slow".to_string()]);
+    let runner = RecipeRunner::new(MockAdapter).with_tags(vec![], vec!["slow".to_string()]);
     let r = runner.execute(&recipe, None);
     assert!(r.success);
     assert_eq!(r.step_results[0].status, StepStatus::Skipped);
@@ -247,24 +291,28 @@ steps:
 
 #[test]
 fn test_step_results_have_duration() {
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
     command: "echo hello"
-"#);
+"#,
+    );
     assert!(r.step_results[0].duration.is_some());
     assert!(r.duration.is_some());
 }
 
 #[test]
 fn test_recipe_result_serializes_to_json() {
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
     command: "echo hello"
-"#);
+"#,
+    );
     let json = serde_json::to_string_pretty(&r).unwrap();
     assert!(json.contains("recipe_name"));
     assert!(json.contains("step_results"));
@@ -279,17 +327,20 @@ steps:
 fn test_audit_log_creates_jsonl_file() {
     let tmp = tempfile::tempdir().unwrap();
     let parser = RecipeParser::new();
-    let recipe = parser.parse(r#"
+    let recipe = parser
+        .parse(
+            r#"
 name: "audit-test"
 steps:
   - id: s1
     command: "echo hello"
   - id: s2
     command: "echo world"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
-    let runner = RecipeRunner::new(MockAdapter)
-        .with_audit_dir(tmp.path().to_path_buf());
+    let runner = RecipeRunner::new(MockAdapter).with_audit_dir(tmp.path().to_path_buf());
     runner.execute(&recipe, None);
 
     // Should have created a .jsonl file
@@ -319,7 +370,8 @@ steps:
 
 #[test]
 fn test_parallel_group_basic() {
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: a
@@ -330,7 +382,8 @@ steps:
     command: "echo b"
     parallel_group: "p1"
     output: "out_b"
-"#);
+"#,
+    );
     assert!(r.success);
     assert_eq!(r.step_results.len(), 2);
     assert_eq!(r.step_results[0].status, StepStatus::Completed);
@@ -342,7 +395,8 @@ steps:
 
 #[test]
 fn test_parallel_group_mixed() {
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: seq1
@@ -359,7 +413,8 @@ steps:
   - id: seq2
     command: "echo last"
     output: "r4"
-"#);
+"#,
+    );
     assert!(r.success);
     assert_eq!(r.step_results.len(), 4);
     assert_eq!(r.step_results[0].status, StepStatus::Completed); // seq1
@@ -375,7 +430,8 @@ steps:
 
 #[test]
 fn test_parallel_group_failure() {
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: ok
@@ -386,7 +442,8 @@ steps:
     parallel_group: "g1"
   - id: should-not-run
     command: "echo after"
-"#);
+"#,
+    );
     assert!(!r.success);
     // Both parallel steps should have results (they run concurrently)
     assert_eq!(r.step_results.len(), 2);
@@ -403,20 +460,26 @@ steps:
 #[test]
 fn test_extends_field_parsed() {
     let parser = RecipeParser::new();
-    let recipe = parser.parse(r#"
+    let recipe = parser
+        .parse(
+            r#"
 name: child
 extends: "parent-recipe"
 steps:
   - id: s1
     command: echo
-"#).unwrap();
+"#,
+        )
+        .unwrap();
     assert_eq!(recipe.extends.as_deref(), Some("parent-recipe"));
 }
 
 #[test]
 fn test_parallel_group_parsed() {
     let parser = RecipeParser::new();
-    let recipe = parser.parse(r#"
+    let recipe = parser
+        .parse(
+            r#"
 name: t
 steps:
   - id: a
@@ -427,7 +490,9 @@ steps:
     parallel_group: "phase1"
   - id: c
     command: "echo c"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
     assert_eq!(recipe.steps[0].parallel_group.as_deref(), Some("phase1"));
     assert_eq!(recipe.steps[1].parallel_group.as_deref(), Some("phase1"));
     assert!(recipe.steps[2].parallel_group.is_none());

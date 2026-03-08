@@ -12,7 +12,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "recipe-runner", version, about = "Execute amplihack YAML recipes")]
+#[command(
+    name = "recipe-runner",
+    version,
+    about = "Execute amplihack YAML recipes"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -84,10 +88,10 @@ enum Commands {
 /// Parse a context value string, auto-detecting type.
 fn parse_context_value(raw: &str) -> Value {
     // Try JSON first (handles objects, arrays, booleans, numbers)
-    if let Ok(v) = serde_json::from_str::<Value>(raw) {
-        if !v.is_string() {
-            return v;
-        }
+    if let Ok(v) = serde_json::from_str::<Value>(raw)
+        && !v.is_string()
+    {
+        return v;
     }
     // Try boolean
     match raw {
@@ -100,10 +104,10 @@ fn parse_context_value(raw: &str) -> Value {
         return Value::Number(serde_json::Number::from(n));
     }
     // Try float
-    if let Ok(n) = raw.parse::<f64>() {
-        if let Some(num) = serde_json::Number::from_f64(n) {
-            return Value::Number(num);
-        }
+    if let Ok(n) = raw.parse::<f64>()
+        && let Some(num) = serde_json::Number::from_f64(n)
+    {
+        return Value::Number(num);
     }
     Value::String(raw.to_string())
 }
@@ -116,17 +120,22 @@ fn main() -> anyhow::Result<()> {
     // Handle subcommands
     if let Some(Commands::List { recipe_dirs }) = &cli.command {
         let dirs: Vec<PathBuf> = recipe_dirs.iter().map(PathBuf::from).collect();
-        let search = if dirs.is_empty() { None } else { Some(dirs.as_slice()) };
+        let search = if dirs.is_empty() {
+            None
+        } else {
+            Some(dirs.as_slice())
+        };
         let recipes = discovery::list_recipes(search);
         if recipes.is_empty() {
             println!("No recipes found.");
         } else {
-            println!("{:<30} {:<10} {}", "NAME", "VERSION", "DESCRIPTION");
+            println!("{:<30} {:<10} DESCRIPTION", "NAME", "VERSION");
             println!("{}", "-".repeat(72));
             for r in &recipes {
                 println!(
                     "{:<30} {:<10} {}",
-                    r.name, r.version,
+                    r.name,
+                    r.version,
                     &r.description[..r.description.len().min(60)]
                 );
             }
@@ -136,9 +145,11 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Require recipe path for all other operations
-    let recipe_path = cli.recipe.ok_or_else(|| anyhow::anyhow!(
-        "Recipe path is required. Use `recipe-runner <path>` or `recipe-runner list`."
-    ))?;
+    let recipe_path = cli.recipe.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Recipe path is required. Use `recipe-runner <path>` or `recipe-runner list`."
+        )
+    })?;
 
     // Parse context overrides with type detection
     let mut user_context: HashMap<String, Value> = HashMap::new();
@@ -177,13 +188,31 @@ fn main() -> anyhow::Result<()> {
         println!("\nSteps ({}):", recipe.steps.len());
         for step in &recipe.steps {
             let ty = format!("{:?}", step.effective_type());
-            let cond = step.condition.as_deref().map(|c| format!(" [if {}]", c)).unwrap_or_default();
-            let out = step.output.as_deref().map(|o| format!(" → {}", o)).unwrap_or_default();
+            let cond = step
+                .condition
+                .as_deref()
+                .map(|c| format!(" [if {}]", c))
+                .unwrap_or_default();
+            let out = step
+                .output
+                .as_deref()
+                .map(|o| format!(" → {}", o))
+                .unwrap_or_default();
             let pj = if step.parse_json { " (parse_json)" } else { "" };
-            let coe = if step.continue_on_error { " (continue_on_error)" } else { "" };
-            println!("  {:>3}. [{:<6}] {}{}{}{}{}", 
+            let coe = if step.continue_on_error {
+                " (continue_on_error)"
+            } else {
+                ""
+            };
+            println!(
+                "  {:>3}. [{:<6}] {}{}{}{}{}",
                 recipe.steps.iter().position(|s| s.id == step.id).unwrap() + 1,
-                ty.to_lowercase(), step.id, cond, out, pj, coe
+                ty.to_lowercase(),
+                step.id,
+                cond,
+                out,
+                pj,
+                coe
             );
         }
         return Ok(());
@@ -191,14 +220,20 @@ fn main() -> anyhow::Result<()> {
 
     // --validate-only: parse + validate
     if cli.validate_only {
-        let warnings = parser.validate_with_yaml(
-            &recipe,
-            Some(&std::fs::read_to_string(&recipe_path)?),
-        );
+        let warnings =
+            parser.validate_with_yaml(&recipe, Some(&std::fs::read_to_string(&recipe_path)?));
         if warnings.is_empty() {
-            println!("✓ Recipe '{}' is valid ({} steps)", recipe.name, recipe.steps.len());
+            println!(
+                "✓ Recipe '{}' is valid ({} steps)",
+                recipe.name,
+                recipe.steps.len()
+            );
         } else {
-            println!("⚠ Recipe '{}' has {} warning(s):", recipe.name, warnings.len());
+            println!(
+                "⚠ Recipe '{}' has {} warning(s):",
+                recipe.name,
+                warnings.len()
+            );
             for w in &warnings {
                 println!("  - {}", w);
             }

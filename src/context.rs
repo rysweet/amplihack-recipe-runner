@@ -105,24 +105,24 @@ pub enum ConditionError {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Token {
-    String(String),    // quoted string literal
-    Number(f64),       // numeric literal
-    Ident(String),     // variable name (may contain dots)
-    Eq,                // ==
-    NotEq,             // !=
-    Lt,                // <
-    LtEq,              // <=
-    Gt,                // >
-    GtEq,              // >=
-    In,                // in
-    NotIn,             // not in
-    And,               // and
-    Or,                // or
-    Not,               // not (standalone, not followed by 'in')
-    LParen,            // (
-    RParen,            // )
-    Comma,             // ,
-    Dot,               // .  (for method calls)
+    String(String), // quoted string literal
+    Number(f64),    // numeric literal
+    Ident(String),  // variable name (may contain dots)
+    Eq,             // ==
+    NotEq,          // !=
+    Lt,             // <
+    LtEq,           // <=
+    Gt,             // >
+    GtEq,           // >=
+    In,             // in
+    NotIn,          // not in
+    And,            // and
+    Or,             // or
+    Not,            // not (standalone, not followed by 'in')
+    LParen,         // (
+    RParen,         // )
+    Comma,          // ,
+    Dot,            // .  (for method calls)
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, ConditionError> {
@@ -133,23 +133,42 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ConditionError> {
     while i < chars.len() {
         match chars[i] {
             ' ' | '\t' | '\n' | '\r' => i += 1,
-            '(' => { tokens.push(Token::LParen); i += 1; }
-            ')' => { tokens.push(Token::RParen); i += 1; }
-            ',' => { tokens.push(Token::Comma); i += 1; }
+            '(' => {
+                tokens.push(Token::LParen);
+                i += 1;
+            }
+            ')' => {
+                tokens.push(Token::RParen);
+                i += 1;
+            }
+            ',' => {
+                tokens.push(Token::Comma);
+                i += 1;
+            }
             '=' if i + 1 < chars.len() && chars[i + 1] == '=' => {
-                tokens.push(Token::Eq); i += 2;
+                tokens.push(Token::Eq);
+                i += 2;
             }
             '!' if i + 1 < chars.len() && chars[i + 1] == '=' => {
-                tokens.push(Token::NotEq); i += 2;
+                tokens.push(Token::NotEq);
+                i += 2;
             }
             '<' if i + 1 < chars.len() && chars[i + 1] == '=' => {
-                tokens.push(Token::LtEq); i += 2;
+                tokens.push(Token::LtEq);
+                i += 2;
             }
-            '<' => { tokens.push(Token::Lt); i += 1; }
+            '<' => {
+                tokens.push(Token::Lt);
+                i += 1;
+            }
             '>' if i + 1 < chars.len() && chars[i + 1] == '=' => {
-                tokens.push(Token::GtEq); i += 2;
+                tokens.push(Token::GtEq);
+                i += 2;
             }
-            '>' => { tokens.push(Token::Gt); i += 1; }
+            '>' => {
+                tokens.push(Token::Gt);
+                i += 1;
+            }
             '\'' | '"' => {
                 let quote = chars[i];
                 i += 1;
@@ -169,16 +188,25 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ConditionError> {
                 i += 1; // skip closing quote
                 tokens.push(Token::String(s));
             }
-            c if c.is_ascii_digit() || (c == '-' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit()) => {
+            c if c.is_ascii_digit()
+                || (c == '-' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit()) =>
+            {
                 let start = i;
-                if c == '-' { i += 1; }
+                if c == '-' {
+                    i += 1;
+                }
                 while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
                     i += 1;
                 }
                 let num_str: String = chars[start..i].iter().collect();
                 match num_str.parse::<f64>() {
                     Ok(n) => tokens.push(Token::Number(n)),
-                    Err(_) => return Err(ConditionError::Parse(format!("invalid number: {}", num_str))),
+                    Err(_) => {
+                        return Err(ConditionError::Parse(format!(
+                            "invalid number: {}",
+                            num_str
+                        )));
+                    }
                 }
             }
             c if c.is_ascii_alphanumeric() || c == '_' => {
@@ -193,10 +221,14 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ConditionError> {
                     "not" => {
                         // Look ahead for "not in"
                         let mut j = i;
-                        while j < chars.len() && chars[j] == ' ' { j += 1; }
+                        while j < chars.len() && chars[j] == ' ' {
+                            j += 1;
+                        }
                         if j + 2 <= chars.len() {
-                            let next: String = chars[j..j+2].iter().collect();
-                            if next == "in" && (j + 2 >= chars.len() || !chars[j+2].is_ascii_alphanumeric()) {
+                            let next: String = chars[j..j + 2].iter().collect();
+                            if next == "in"
+                                && (j + 2 >= chars.len() || !chars[j + 2].is_ascii_alphanumeric())
+                            {
                                 tokens.push(Token::NotIn);
                                 i = j + 2;
                             } else {
@@ -217,7 +249,12 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ConditionError> {
                 tokens.push(Token::Dot);
                 i += 1;
             }
-            c => return Err(ConditionError::Parse(format!("unexpected character: '{}'", c))),
+            c => {
+                return Err(ConditionError::Parse(format!(
+                    "unexpected character: '{}'",
+                    c
+                )));
+            }
         }
     }
 
@@ -232,7 +269,11 @@ struct ExprParser<'a> {
 
 impl<'a> ExprParser<'a> {
     fn new(tokens: &'a [Token], data: &'a HashMap<String, Value>) -> Self {
-        Self { tokens, pos: 0, data }
+        Self {
+            tokens,
+            pos: 0,
+            data,
+        }
     }
 
     fn peek(&self) -> Option<&Token> {
@@ -300,7 +341,10 @@ impl<'a> ExprParser<'a> {
             Some(Token::LtEq) => {
                 self.advance();
                 let rhs = self.parse_primary()?;
-                Ok(matches!(compare_values(&lhs, &rhs), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)))
+                Ok(matches!(
+                    compare_values(&lhs, &rhs),
+                    Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                ))
             }
             Some(Token::Gt) => {
                 self.advance();
@@ -310,7 +354,10 @@ impl<'a> ExprParser<'a> {
             Some(Token::GtEq) => {
                 self.advance();
                 let rhs = self.parse_primary()?;
-                Ok(matches!(compare_values(&lhs, &rhs), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)))
+                Ok(matches!(
+                    compare_values(&lhs, &rhs),
+                    Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+                ))
             }
             Some(Token::In) => {
                 self.advance();
@@ -339,7 +386,11 @@ impl<'a> ExprParser<'a> {
                     self.advance();
                     name
                 }
-                _ => return Err(ConditionError::Parse("expected method name after '.'".to_string())),
+                _ => {
+                    return Err(ConditionError::Parse(
+                        "expected method name after '.'".to_string(),
+                    ));
+                }
             };
 
             if !SAFE_METHOD_NAMES.contains(&method_name.as_str()) {
@@ -352,7 +403,8 @@ impl<'a> ExprParser<'a> {
             // Parse args: '(' [arg, ...] ')'
             if self.peek() != Some(&Token::LParen) {
                 return Err(ConditionError::Parse(format!(
-                    "expected '(' after method name '{}'", method_name
+                    "expected '(' after method name '{}'",
+                    method_name
                 )));
             }
             self.advance(); // consume '('
@@ -425,8 +477,13 @@ impl<'a> ExprParser<'a> {
                 self.advance();
                 Ok(Value::Bool(result))
             }
-            Some(tok) => Err(ConditionError::Parse(format!("unexpected token: {:?}", tok))),
-            None => Err(ConditionError::Parse("unexpected end of expression".to_string())),
+            Some(tok) => Err(ConditionError::Parse(format!(
+                "unexpected token: {:?}",
+                tok
+            ))),
+            None => Err(ConditionError::Parse(
+                "unexpected end of expression".to_string(),
+            )),
         }
     }
 
@@ -459,9 +516,19 @@ const SAFE_CALL_NAMES: &[&str] = &["int", "str", "len", "bool", "float", "min", 
 
 /// Safe method names (side-effect-free string methods).
 const SAFE_METHOD_NAMES: &[&str] = &[
-    "strip", "lstrip", "rstrip", "lower", "upper", "title",
-    "startswith", "endswith", "replace", "split", "join",
-    "count", "find",
+    "strip",
+    "lstrip",
+    "rstrip",
+    "lower",
+    "upper",
+    "title",
+    "startswith",
+    "endswith",
+    "replace",
+    "split",
+    "join",
+    "count",
+    "find",
 ];
 
 /// Apply a safe built-in function.
@@ -472,7 +539,13 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, ConditionError> {
             let n = match arg {
                 Value::Number(n) => n.as_i64().unwrap_or(0),
                 Value::String(s) => s.trim().parse::<i64>().unwrap_or(0),
-                Value::Bool(b) => if *b { 1 } else { 0 },
+                Value::Bool(b) => {
+                    if *b {
+                        1
+                    } else {
+                        0
+                    }
+                }
                 _ => 0,
             };
             Ok(Value::Number(serde_json::Number::from(n)))
@@ -482,7 +555,13 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, ConditionError> {
             let n = match arg {
                 Value::Number(n) => n.as_f64().unwrap_or(0.0),
                 Value::String(s) => s.trim().parse::<f64>().unwrap_or(0.0),
-                Value::Bool(b) => if *b { 1.0 } else { 0.0 },
+                Value::Bool(b) => {
+                    if *b {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
                 _ => 0.0,
             };
             Ok(serde_json::Number::from_f64(n)
@@ -513,7 +592,9 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, ConditionError> {
         }
         "min" => {
             if args.len() < 2 {
-                return Err(ConditionError::Parse("min() requires at least 2 arguments".to_string()));
+                return Err(ConditionError::Parse(
+                    "min() requires at least 2 arguments".to_string(),
+                ));
             }
             let mut best = &args[0];
             for arg in &args[1..] {
@@ -525,7 +606,9 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, ConditionError> {
         }
         "max" => {
             if args.len() < 2 {
-                return Err(ConditionError::Parse("max() requires at least 2 arguments".to_string()));
+                return Err(ConditionError::Parse(
+                    "max() requires at least 2 arguments".to_string(),
+                ));
             }
             let mut best = &args[0];
             for arg in &args[1..] {
@@ -536,7 +619,8 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, ConditionError> {
             Ok(best.clone())
         }
         _ => Err(ConditionError::Unsafe(format!(
-            "function '{}' is not allowed", name
+            "function '{}' is not allowed",
+            name
         ))),
     }
 }
@@ -545,9 +629,12 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, ConditionError> {
 fn apply_method(value: &Value, method: &str, args: &[Value]) -> Result<Value, ConditionError> {
     let s = match value {
         Value::String(s) => s.as_str(),
-        _ => return Err(ConditionError::Parse(format!(
-            "method '.{}()' can only be called on strings", method
-        ))),
+        _ => {
+            return Err(ConditionError::Parse(format!(
+                "method '.{}()' can only be called on strings",
+                method
+            )));
+        }
     };
 
     match method {
@@ -557,7 +644,8 @@ fn apply_method(value: &Value, method: &str, args: &[Value]) -> Result<Value, Co
         "lower" => Ok(Value::String(s.to_lowercase())),
         "upper" => Ok(Value::String(s.to_uppercase())),
         "title" => {
-            let titled = s.split_whitespace()
+            let titled = s
+                .split_whitespace()
                 .map(|word| {
                     let mut chars = word.chars();
                     match chars.next() {
@@ -587,7 +675,9 @@ fn apply_method(value: &Value, method: &str, args: &[Value]) -> Result<Value, Co
             let parts: Vec<Value> = if let Some(sep) = sep {
                 s.split(sep).map(|p| Value::String(p.to_string())).collect()
             } else {
-                s.split_whitespace().map(|p| Value::String(p.to_string())).collect()
+                s.split_whitespace()
+                    .map(|p| Value::String(p.to_string()))
+                    .collect()
             };
             Ok(Value::Array(parts))
         }
@@ -595,7 +685,8 @@ fn apply_method(value: &Value, method: &str, args: &[Value]) -> Result<Value, Co
             // join is called on separator with iterable arg
             let arr = args.first().and_then(|a| a.as_array());
             if let Some(arr) = arr {
-                let joined: String = arr.iter()
+                let joined: String = arr
+                    .iter()
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
                     .collect::<Vec<_>>()
                     .join(s);
@@ -606,7 +697,9 @@ fn apply_method(value: &Value, method: &str, args: &[Value]) -> Result<Value, Co
         }
         "count" => {
             let sub = args.first().and_then(|a| a.as_str()).unwrap_or("");
-            Ok(Value::Number(serde_json::Number::from(s.matches(sub).count() as i64)))
+            Ok(Value::Number(serde_json::Number::from(
+                s.matches(sub).count() as i64,
+            )))
         }
         "find" => {
             let sub = args.first().and_then(|a| a.as_str()).unwrap_or("");
@@ -614,7 +707,8 @@ fn apply_method(value: &Value, method: &str, args: &[Value]) -> Result<Value, Co
             Ok(Value::Number(serde_json::Number::from(idx)))
         }
         _ => Err(ConditionError::Unsafe(format!(
-            "method '.{}()' is not allowed", method
+            "method '.{}()' is not allowed",
+            method
         ))),
     }
 }
@@ -641,7 +735,7 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Number(na), Value::Number(nb)) => na.as_f64() == nb.as_f64(),
         (Value::Bool(ba), Value::Bool(bb)) => ba == bb,
         (Value::Null, Value::Null) => true,
-        _ => a.to_string() == b.to_string(),
+        _ => *a == *b,
     }
 }
 
@@ -741,10 +835,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_and_or() {
-        let c = ctx(vec![
-            ("a", json!("yes")),
-            ("b", json!("")),
-        ]);
+        let c = ctx(vec![("a", json!("yes")), ("b", json!(""))]);
         assert!(!c.evaluate("a and b").unwrap());
         assert!(c.evaluate("a or b").unwrap());
     }
@@ -802,7 +893,10 @@ mod tests {
     #[test]
     fn test_evaluate_method_replace() {
         let c = ctx(vec![("text", json!("hello world"))]);
-        assert!(c.evaluate("text.replace('world', 'rust') == 'hello rust'").unwrap());
+        assert!(
+            c.evaluate("text.replace('world', 'rust') == 'hello rust'")
+                .unwrap()
+        );
     }
 
     #[test]

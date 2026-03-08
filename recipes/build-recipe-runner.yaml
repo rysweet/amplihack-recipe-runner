@@ -1,243 +1,638 @@
 name: "build-recipe-runner"
 description: |
-  Builds the Rust recipe runner from scratch — scaffolds the project,
-  generates core modules via agent, compiles, tests, and produces a
-  release binary.
-version: "1.0.0"
+  Complete specification recipe for replicating the amplihack recipe runner
+  from scratch. Contains precise type definitions, algorithm specifications,
+  and test requirements for every module. An agent executing this recipe
+  should produce a functionally identical recipe runner.
+version: "2.0.0"
 
 context:
   repo_path: "."
   project_name: "recipe-runner-rs"
-  rust_edition: "2024"
+  binary_name: "recipe-runner-rs"
 
-# ---------------------------------------------------------------------------
-# Phase 1 — Prerequisites
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Phase 1 — Prerequisites & Scaffold
+# ===========================================================================
 steps:
-  - id: "check-rust"
-    type: "bash"
+  - id: "check-toolchain"
+    command: "rustc --version && cargo --version && git --version"
     working_dir: "{{repo_path}}"
-    command: |
-      rustc --version && cargo --version
-    output: "rust_version"
+    output: "toolchain_info"
 
-  - id: "check-git"
-    type: "bash"
-    working_dir: "{{repo_path}}"
+  - id: "scaffold-project"
     command: |
-      git --version
-    output: "git_version"
-
-  # -------------------------------------------------------------------------
-  # Phase 2 — Scaffold
-  # -------------------------------------------------------------------------
-  - id: "create-project"
-    type: "bash"
+      if [ ! -f Cargo.toml ]; then
+        cargo init --name {{project_name}}
+        mkdir -p src/adapters
+      fi
     working_dir: "{{repo_path}}"
-    condition: "not __import__('os').path.exists('Cargo.toml')"
-    command: |
-      cargo init --name {{project_name}}
-    output: "init_result"
 
   - id: "add-dependencies"
-    type: "bash"
-    working_dir: "{{repo_path}}"
     command: |
-      cargo add clap --features derive && \
       cargo add serde --features derive && \
-      cargo add serde_yaml && \
       cargo add serde_json && \
-      cargo add shell-escape && \
-      cargo add sha2 && \
-      cargo add hex && \
-      cargo add tempfile && \
-      cargo add regex && \
+      cargo add serde_yaml && \
+      cargo add clap --features derive && \
       cargo add anyhow && \
       cargo add thiserror && \
+      cargo add regex && \
+      cargo add shell-escape && \
       cargo add log && \
       cargo add env_logger && \
+      cargo add dirs && \
+      cargo add sha2 && \
+      cargo add hex && \
       cargo add uuid --features v4 && \
       cargo add which && \
-      cargo add dirs
-    output: "deps_result"
+      cargo add tempfile && \
+      cargo add proptest --dev
+    working_dir: "{{repo_path}}"
 
-  # -------------------------------------------------------------------------
-  # Phase 3 — Core Implementation
-  # -------------------------------------------------------------------------
+  # =========================================================================
+  # Phase 2 — models.rs (Data Structures)
+  # =========================================================================
   - id: "create-models"
     agent: "amplihack:core:builder"
     working_dir: "{{repo_path}}"
     prompt: |
-      Create src/models.rs for the recipe runner.  Define all data structures:
-        - Recipe (name, description, version, context, steps, recursion, output)
-        - Step (id, step_type, agent, prompt, command, condition, output,
-          working_dir, parse_json, mode, timeout)
-        - RecipeContext (defaults HashMap, runtime overrides)
-        - RecursionGuard (max_depth, max_total_steps)
-        - RecipeOutput (format, template)
-        - StepResult (step_id, status, output_value, duration)
-      Use serde Serialize/Deserialize derives.  Keep types simple and public.
-    output: "models_code"
+      Create src/models.rs with these exact types. Use serde Serialize/Deserialize.
 
-  - id: "create-parser"
-    agent: "amplihack:core:builder"
+      ```rust
+      #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+      pub enum StepType { Bash, Agent, Recipe }
+
+      #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+      pub enum StepStatus { Pending, Running, Completed, Skipped, Failed }
+
+      #[derive(Debug, Clone, Serialize, Deserialize)]
+      pub struct Step {
+          pub id: String,
+          #[serde(rename = "type")] pub step_type: Option<StepType>,
+          pub command: Option<String>,
+          pub agent: Option<String>,
+          pub prompt: Option<String>,
+          pub output: Option<String>,
+          pub condition: Option<String>,
+          #[serde(default)] pub parse_json: bool,
+          pub mode: Option<String>,
+          pub working_dir: Option<String>,
+          pub timeout: Option<u64>,
+          pub auto_stage: Option<bool>,
+          pub recipe: Option<String>,
+          #[serde(rename = "context")] pub sub_context: Option<HashMap<String, Value>>,
+          #[serde(default)] pub continue_on_error: bool,
+          pub parallel_group: Option<String>,
+          pub when_tags: Option<Vec<String>>,
+      }
+
+      #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+      pub struct RecursionConfig {
+          #[serde(default = "default_max_depth")] pub max_depth: u32,  // default 3
+          #[serde(default)] pub max_total_steps: u32,                  // default 0 = unlimited
+      }
+
+      #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+      pub struct RecipeHooks {
+          pub pre_step: Option<String>,
+          pub post_step: Option<String>,
+          pub on_error: Option<String>,
+      }
+
+      #[derive(Debug, Clone, Serialize, Deserialize)]
+      pub struct Recipe {
+          pub name: String,
+          pub steps: Vec<Step>,
+          pub description: Option<String>,
+          pub version: Option<String>,
+          pub author: Option<String>,
+          pub tags: Option<Vec<String>>,
+          pub context: Option<HashMap<String, Value>>,
+          #[serde(default)] pub recursion: RecursionConfig,
+          #[serde(default)] pub hooks: RecipeHooks,
+          pub extends: Option<String>,
+      }
+
+      #[derive(Debug, Clone, Serialize)]
+      pub struct StepResult {
+          pub step_id: String,
+          pub status: StepStatus,
+          #[serde(default)] pub output: String,
+          #[serde(default)] pub error: String,
+          pub duration: Option<Duration>,
+      }
+
+      #[derive(Debug, Clone, Serialize)]
+      pub struct RecipeResult {
+          pub recipe_name: String,
+          pub success: bool,
+          pub step_results: Vec<StepResult>,
+          pub context: HashMap<String, Value>,
+          pub duration: Option<Duration>,
+      }
+
+      #[derive(Debug, Clone, thiserror::Error)]
+      #[error("Step '{step_id}': {message}")]
+      pub struct StepExecutionError {
+          pub step_id: String,
+          pub message: String,
+      }
+      ```
+
+      Step::effective_type() -> StepType must infer type when step_type is None:
+      1. If recipe field is Some → Recipe
+      2. If agent field is Some → Agent
+      3. If prompt is Some but command is None → Agent
+      4. Otherwise → Bash
+
+      Implement Display for RecipeResult showing recipe_name, success, step count.
+    output: "models_done"
+
+  - id: "verify-models"
+    command: "cargo build 2>&1"
     working_dir: "{{repo_path}}"
-    prompt: |
-      Create src/parser.rs — a YAML parser that:
-        1. Reads a recipe file from disk with std::fs::read_to_string.
-        2. Deserialises into the Recipe struct from models.rs using serde_yaml.
-        3. Validates required fields (name, steps non-empty).
-        4. Returns anyhow::Result<Recipe>.
-    output: "parser_code"
 
+  # =========================================================================
+  # Phase 3 — context.rs (Template Engine + Condition Evaluator)
+  # =========================================================================
   - id: "create-context"
     agent: "amplihack:core:builder"
     working_dir: "{{repo_path}}"
     prompt: |
-      Create src/context.rs with:
-        1. A TemplateEngine that replaces {{variable}} placeholders in strings
-           using a HashMap<String, String> of current context values.
-        2. A ConditionEvaluator that handles simple conditions:
-           - "not <path_exists>" checks
-           - "which <binary>" checks (using the `which` crate)
-           - "'substring' in variable_name" checks
-           - Boolean true/false/empty-string checks
-        3. Return types use anyhow::Result.
-    output: "context_code"
+      Create src/context.rs — the template engine and safe condition evaluator.
+      This is the most complex module (~900 lines).
 
-  - id: "create-runner"
+      ## RecipeContext struct
+      - data: HashMap<String, Value> (serde_json::Value)
+      - new(initial: HashMap<String, Value>) -> Self
+      - get(key: &str) -> Option<&Value>: supports dot-notation (a.b.c)
+      - set(key: &str, value: Value)
+      - render(template: &str) -> String: replaces {{var}} with context values
+      - render_shell(template: &str) -> String: like render but wraps values
+        in shell_escape::escape() for safe shell interpolation
+      - evaluate(condition: &str) -> Result<bool, ConditionError>
+      - to_map() -> HashMap<String, Value>: clone the data
+
+      ## Condition Evaluator (hand-rolled tokenizer + recursive descent parser)
+
+      ### Tokenizer
+      Tokens: String(quoted), Number(f64), Ident(name), Bool(true/false),
+      None, Eq, NotEq, Lt, LtEq, Gt, GtEq, And, Or, Not, In, NotIn,
+      LParen, RParen, Dot, Comma
+
+      - Double or single quoted strings
+      - Numbers: integers and floats (all stored as f64)
+      - Keywords: true, false, none, and, or, not, in
+      - Identifiers: [a-zA-Z_][a-zA-Z0-9_]*
+
+      ### Parser (recursive descent, precedence low-to-high)
+      1. or_expr: and_expr ("or" and_expr)*
+      2. and_expr: not_expr ("and" not_expr)*
+      3. not_expr: "not" not_expr | comparison
+      4. comparison: primary (op primary)? — ops: ==, !=, <, <=, >, >=, in, not in
+      5. primary: literal | ident (with optional postfix calls/methods)
+      6. postfix: .method(args) or function(args)
+
+      ### Safe functions (whitelist only, unknown names → null):
+      int(v), str(v), len(v), bool(v), float(v), min(a,b), max(a,b)
+
+      ### Safe methods (whitelist only):
+      .strip(), .lower(), .upper(), .startswith(s), .endswith(s),
+      .replace(old,new), .split(sep), .join(arr), .count(sub), .find(sub)
+
+      ### Safety: block dunder access (__), only whitelisted calls allowed
+
+      ### Truthiness: null/false/0/0.0/""/empty-array = falsy, everything else truthy
+
+      ### Important: all numbers are f64. str(42) produces "42" not "42.0" — wait,
+      actually in this implementation str(Number) produces the serde_json display
+      which for f64 42.0 produces "42.0". This is a known gotcha.
+
+      ## ConditionError enum
+      - Unsafe(String): blocked access (dunder, unknown function)
+      - Parse(String): syntax error
+    output: "context_done"
+
+  - id: "verify-context"
+    command: "cargo build 2>&1"
+    working_dir: "{{repo_path}}"
+
+  # =========================================================================
+  # Phase 4 — parser.rs (YAML Parser with Validation)
+  # =========================================================================
+  - id: "create-parser"
     agent: "amplihack:core:builder"
     working_dir: "{{repo_path}}"
     prompt: |
-      Create src/runner.rs — the main execution engine:
-        1. RecipeRunner struct holds the parsed Recipe, resolved context, and
-           a vector of StepResult.
-        2. run() iterates steps sequentially:
-           a. Evaluate condition — skip if false.
-           b. Expand templates in command/prompt/working_dir.
-           c. Dispatch to bash executor (std::process::Command) for type=bash.
-           d. Dispatch to agent resolver for agent steps.
-           e. Capture stdout/stderr, elapsed time, exit code.
-           f. Store output in context for subsequent steps.
-           g. On non-zero exit for bash steps, fail fast with anyhow error.
-        3. Return a summary Vec<StepResult>.
-    output: "runner_code"
+      Create src/parser.rs — YAML recipe parser with validation.
 
-  - id: "create-agent-resolver"
-    agent: "amplihack:core:builder"
+      ## ParseError enum (thiserror)
+      - FileNotFound(String)
+      - FileTooLarge { path, size, max } — max is 1MB (1_048_576 bytes)
+      - Invalid(String) — validation errors
+      - Io(#[from] std::io::Error)
+      - Yaml(#[from] serde_yaml::Error)
+      - Extends(String) — extends resolution error
+
+      ## RecipeParser struct
+      - new() -> Self
+      - parse_file(path: &Path) -> Result<Recipe, ParseError>:
+        1. Check file exists (FileNotFound)
+        2. Check size <= 1MB (FileTooLarge)
+        3. Read file, call parse()
+      - parse(yaml_content: &str) -> Result<Recipe, ParseError>:
+        1. Deserialize with serde_yaml
+        2. Validate: name non-empty, steps non-empty, no duplicate step IDs
+        3. Return Recipe
+      - validate(recipe: &Recipe) -> Vec<String>: warnings only
+      - validate_with_yaml(recipe: &Recipe, raw_yaml: Option<&str>) -> Vec<String>:
+        Check for unrecognized fields using these known lists:
+
+      KNOWN_TOP_FIELDS: name, description, version, author, tags, context,
+        steps, output, recursion, hooks, extends
+
+      KNOWN_STEP_FIELDS: id, type, command, agent, prompt, output, condition,
+        parse_json, mode, working_dir, timeout, auto_stage, recipe, context,
+        continue_on_error, parallel_group, when_tags
+
+      For each unknown field, generate a warning with the field name.
+      Check both top-level and per-step fields.
+
+      ## resolve_extends function
+      pub fn resolve_extends(recipe: &mut Recipe, search_dirs: &[PathBuf])
+        -> Result<(), ParseError>
+      - If recipe.extends is Some, find parent recipe via find_recipe()
+      - Parse parent, merge: parent context is base (child overrides),
+        parent steps prepended before child steps, tags merged as union,
+        recursion/hooks: child overrides if set
+      - Single-level only (no recursive extends)
+    output: "parser_done"
+
+  - id: "verify-parser"
+    command: "cargo build 2>&1"
     working_dir: "{{repo_path}}"
-    prompt: |
-      Create src/agent_resolver.rs:
-        - Resolve agent identifiers like "amplihack:core:builder" into an
-          executable path or command by searching:
-            1. ~/.amplihack/.claude/agents/<namespace>/<name>.md
-            2. A configurable agents directory passed at runtime.
-        - AgentResolver::resolve(agent_id: &str) -> Result<PathBuf>
-        - Use the `dirs` crate for home directory lookup.
-    output: "agent_resolver_code"
 
-  - id: "create-discovery"
-    agent: "amplihack:core:builder"
-    working_dir: "{{repo_path}}"
-    prompt: |
-      Create src/discovery.rs:
-        - discover_recipes(dir: &Path) -> Vec<PathBuf>
-          Walks a directory tree and returns all .yaml/.yml files.
-        - Use std::fs::read_dir recursively.
-        - Filter by extension (.yaml or .yml).
-    output: "discovery_code"
-
+  # =========================================================================
+  # Phase 5 — adapters (Adapter Trait + CLI Subprocess)
+  # =========================================================================
   - id: "create-adapters"
     agent: "amplihack:core:builder"
     working_dir: "{{repo_path}}"
     prompt: |
-      Create src/adapters/mod.rs and src/adapters/cli_subprocess.rs:
-        mod.rs — re-exports CliSubprocess.
-        cli_subprocess.rs — wraps std::process::Command:
-          - run(command: &str, working_dir: &Path, env: HashMap)
-            -> Result<SubprocessOutput>
-          - SubprocessOutput { stdout, stderr, exit_code, duration }
-          - Streams stderr to log::warn in real time.
-          - Uses shell-escape for safe argument handling.
-    output: "adapters_code"
+      Create src/adapters/mod.rs and src/adapters/cli_subprocess.rs.
 
+      ## mod.rs — Adapter trait
+      ```rust
+      pub trait Adapter: Sync {
+          fn execute_agent_step(&self, prompt: &str, agent_name: Option<&str>,
+              system_prompt: Option<&str>, mode: Option<&str>,
+              working_dir: &str) -> Result<String, anyhow::Error>;
+          fn execute_bash_step(&self, command: &str, working_dir: &str,
+              timeout: Option<u64>) -> Result<String, anyhow::Error>;
+          fn is_available(&self) -> bool;
+          fn name(&self) -> &str;
+      }
+      ```
+      Adapter must be Sync for parallel step execution (std::thread::scope).
+
+      ## cli_subprocess.rs — CLISubprocessAdapter
+      Production adapter that spawns claude CLI as subprocess.
+
+      Key behaviors:
+      1. Creates temp dir per agent step for isolation
+      2. Writes prompt to temp_dir/prompt.md
+      3. Spawns: claude -p --output-file temp_dir/output.md
+         with --non-interactive flag appended to prompt
+      4. Sets env vars: AMPLIHACK_SESSION_DEPTH (incremented),
+         AMPLIHACK_TREE_ID (uuid if not set), AMPLIHACK_MAX_DEPTH
+      5. Heartbeat thread: monitors output file size every 2s,
+         prints progress to stderr
+      6. Timeout enforcement: if timeout set, heartbeat thread checks
+         deadline. On timeout: SIGTERM (kill -15), wait 5s, SIGKILL (kill -9)
+      7. For bash steps: spawns sh -c with the command string
+
+      Struct fields: cli (binary name), working_dir
+      Builder: new(), with_binary(), with_working_dir()
+    output: "adapters_done"
+
+  - id: "verify-adapters"
+    command: "cargo build 2>&1"
+    working_dir: "{{repo_path}}"
+
+  # =========================================================================
+  # Phase 6 — agent_resolver.rs
+  # =========================================================================
+  - id: "create-agent-resolver"
+    agent: "amplihack:core:builder"
+    working_dir: "{{repo_path}}"
+    prompt: |
+      Create src/agent_resolver.rs — resolves agent references to markdown files.
+
+      ## AgentResolveError (thiserror)
+      - NotFound { agent_ref, searched: Vec<String> }
+      - InvalidReference(String)
+
+      ## AgentResolver struct
+      - search_paths: Vec<PathBuf>
+      - new(search_paths: Option<Vec<PathBuf>>) -> Self
+        Default paths: ~/.amplihack/.claude/agents, .claude/agents
+      - resolve(agent_ref: &str) -> Result<String, AgentResolveError>:
+        Parse ref as "namespace:name" or "namespace:category:name"
+        Search each search_path for: {namespace}/{name}.md or
+        {namespace}/{category}/{name}.md
+        Read and return file contents.
+        SECURITY: after resolving, canonicalize path and verify it's
+        inside the search directory (path traversal protection).
+    output: "resolver_done"
+
+  - id: "verify-resolver"
+    command: "cargo build 2>&1"
+    working_dir: "{{repo_path}}"
+
+  # =========================================================================
+  # Phase 7 — discovery.rs
+  # =========================================================================
+  - id: "create-discovery"
+    agent: "amplihack:core:builder"
+    working_dir: "{{repo_path}}"
+    prompt: |
+      Create src/discovery.rs — recipe discovery with SHA-256 manifest.
+
+      ## RecipeInfo struct
+      name, path (PathBuf), description (Option), version (Option),
+      step_count (usize), tags (Vec<String>), sha256 (String)
+
+      ## Functions
+      - discover_recipes(search_dirs: Option<&[PathBuf]>) -> HashMap<String, RecipeInfo>
+        Walks each dir for *.yaml/*.yml files, parses name/desc/version/steps,
+        computes SHA-256. Last dir wins on name collisions.
+        Default dirs: ~/.amplihack/.claude/recipes, amplifier-bundle/recipes,
+        src/amplihack/amplifier-bundle/recipes, .claude/recipes
+
+      - list_recipes(dirs) -> Vec<RecipeInfo>: sorted by name
+      - find_recipe(name, dirs) -> Option<PathBuf>: find by recipe name
+      - verify_global_installation() -> serde_json::Value: JSON report
+      - check_upstream_changes(local_dir) -> Vec<HashMap<String, String>>:
+        Compare local SHA-256 manifest against files on disk
+      - update_manifest(local_dir) -> Result<PathBuf>:
+        Write _recipe_manifest.json with name→sha256 map
+      - sync_upstream(repo_url, branch, remote_name) -> Result<Value>:
+        Git fetch + diff
+
+      ## DiscoveryCache struct
+      - cache, last_updated (Instant), ttl (Duration, default 30s), search_dirs
+      - get_or_discover(): returns cached if TTL not expired and dirs unchanged
+      - invalidate(): force refresh
+      - cached_discover_recipes(): module-level convenience via LazyLock<Mutex>
+    output: "discovery_done"
+
+  - id: "verify-discovery"
+    command: "cargo build 2>&1"
+    working_dir: "{{repo_path}}"
+
+  # =========================================================================
+  # Phase 8 — runner.rs (Execution Engine)
+  # =========================================================================
+  - id: "create-runner"
+    agent: "amplihack:core:builder"
+    working_dir: "{{repo_path}}"
+    prompt: |
+      Create src/runner.rs — the core execution engine (~1150 lines).
+
+      ## ExecutionListener trait
+      - on_step_start(step_id, step_type) — default no-op
+      - on_step_complete(result) — default no-op
+      - on_output(step_id, line) — default no-op
+      Implementations: NullListener (no-op), StderrListener (prints to stderr)
+
+      ## RecipeRunner<A: Adapter> struct
+      Fields: adapter, agent_resolver (AgentResolver), working_dir,
+      dry_run, auto_stage (default true), depth (Cell<u32>),
+      total_steps (Cell<u32>), max_depth (Cell<u32>),
+      max_total_steps (Cell<u32>), recipe_search_dirs (Vec<PathBuf>),
+      audit_dir (Option<PathBuf>), active_tags/exclude_tags (Vec<String>),
+      listener (Box<dyn ExecutionListener>)
+
+      Use Cell<u32> for depth/total_steps/max_depth/max_total_steps because
+      execute() takes &self but depth tracking requires mutation.
+      Cell is safe because execution is single-threaded.
+
+      Builder: new(adapter) then .with_working_dir(), .with_dry_run(),
+      .with_auto_stage(), .with_agent_resolver(), .with_recipe_search_dirs(),
+      .with_depth(), .with_audit_dir(), .with_tags(), .with_listener()
+
+      ## execute(&self, recipe, user_context) -> RecipeResult
+      1. Clone recipe, resolve_extends if set
+      2. Apply recursion limits from recipe.recursion
+      3. Check depth <= max_depth, else error
+      4. Merge recipe.context + user_context into RecipeContext
+      5. Create audit log file if audit_dir set
+      6. Group consecutive steps with same parallel_group
+      7. For sequential steps: execute_single_step()
+      8. For parallel groups: execute_parallel_group() using std::thread::scope
+      9. After each step: write audit entry, update context, check continue_on_error
+      10. Return RecipeResult with timing
+
+      ## execute_single_step (private)
+      1. Check tag filter (skip if step.when_tags not in active_tags or in exclude_tags)
+      2. Run pre_step hook if set
+      3. Evaluate condition (skip if false, fail if evaluation errors)
+      4. Dry run: return mock output (mock JSON for parse_json steps)
+      5. Dispatch by type: bash→adapter.execute_bash_step,
+         agent→adapter.execute_agent_step, recipe→execute_sub_recipe
+      6. If parse_json: try extract_json (3 strategies), retry once if failed
+      7. Store output in context
+      8. Git auto-stage after agent steps (git add -A)
+      9. Run post_step hook (or on_error hook on failure)
+      10. Return StepResult with timing
+
+      ## execute_sub_recipe (private)
+      Check depth < max_depth. Find recipe by name. Parse it.
+      Create child RecipeRunner with depth+1. Execute. If failed, error.
+
+      ## extract_json (private static)
+      3 strategies: 1) direct parse, 2) markdown fence regex, 3) balanced braces
+
+      ## execute_parallel_group (private)
+      Use std::thread::scope. Only bash steps run in parallel threads.
+      Non-bash steps fall back to sequential on main thread.
+      Results collected in step order (not completion order) for determinism.
+
+      ## Audit log
+      JSONL format. Each entry: step_id, status, duration_ms, error, output_len.
+      One file per recipe run in audit_dir.
+    output: "runner_done"
+
+  - id: "verify-runner"
+    command: "cargo build 2>&1"
+    working_dir: "{{repo_path}}"
+
+  # =========================================================================
+  # Phase 9 — lib.rs + main.rs
+  # =========================================================================
   - id: "create-lib"
     agent: "amplihack:core:builder"
     working_dir: "{{repo_path}}"
     prompt: |
-      Create src/lib.rs that declares and re-exports all public modules:
-        pub mod models;
-        pub mod parser;
-        pub mod context;
-        pub mod runner;
-        pub mod agent_resolver;
-        pub mod discovery;
-        pub mod adapters;
-    output: "lib_code"
+      Create src/lib.rs — public API re-exports:
+      ```rust
+      pub mod adapters;
+      pub mod agent_resolver;
+      pub mod context;
+      pub mod discovery;
+      pub mod models;
+      pub mod parser;
+      pub mod runner;
+      ```
+      Plus convenience functions:
+      - parse_recipe(yaml: &str) -> Result<Recipe, ParseError>
+      - run_recipe<A: Adapter>(yaml, adapter, user_context, dry_run) -> Result<RecipeResult, ParseError>
+      - run_recipe_by_name<A: Adapter>(name, adapter, ctx, dry_run) -> Result<RecipeResult, Box<dyn Error>>
+      - validate_recipe(yaml: &str) -> Result<Vec<String>, ParseError>
+    output: "lib_done"
 
   - id: "create-main"
     agent: "amplihack:core:builder"
     working_dir: "{{repo_path}}"
     prompt: |
-      Create src/main.rs with a clap-based CLI:
-        Subcommands:
-          run   — Execute a recipe file (--recipe <path>, --context key=value repeatable)
-          list  — Discover and list recipes in a directory (--dir <path>)
-          validate — Parse and validate a recipe without executing
-        Use env_logger for log initialisation.
-        Exit with code 1 on any error, printing it to stderr.
-    output: "main_code"
+      Create src/main.rs — clap CLI with these subcommands and flags:
 
-  # -------------------------------------------------------------------------
-  # Phase 4 — Verify
-  # -------------------------------------------------------------------------
-  - id: "build"
-    type: "bash"
+      Usage: recipe-runner-rs [OPTIONS] [RECIPE] [COMMAND]
+      Commands: list (discover recipes)
+
+      Global options:
+      -C, --working-dir <DIR>: working directory (default ".")
+      -R, --recipe-dir <DIR>: recipe search dirs (repeatable)
+      --set <KEY=VALUE>: context overrides (smart type parsing)
+      --dry-run: parse+validate without executing
+      --no-auto-stage: disable git auto-staging
+      --validate-only: parse+validate, print warnings, exit
+      --explain: show recipe structure and exit
+      --progress: stderr progress events
+      --include-tags <TAGS>: comma-separated include filter
+      --exclude-tags <TAGS>: comma-separated exclude filter
+      --audit-dir <DIR>: JSONL audit log directory
+      --output-format <text|json>: output format
+
+      Smart context value parsing (parse_context_value):
+      Try in order: JSON → bool → int → float → string
+
+      Exit codes: 0=success, 1=recipe failed, 2=parse error
+    output: "main_done"
+
+  - id: "verify-main"
+    command: "cargo build 2>&1"
     working_dir: "{{repo_path}}"
-    command: |
-      cargo build 2>&1
-    output: "build_result"
 
-  - id: "test"
-    type: "bash"
+  # =========================================================================
+  # Phase 10 — Tests
+  # =========================================================================
+  - id: "create-unit-tests"
+    agent: "amplihack:core:builder"
     working_dir: "{{repo_path}}"
-    command: |
-      cargo test 2>&1
-    output: "test_result"
+    prompt: |
+      Add comprehensive unit tests to each module (in #[cfg(test)] mod tests blocks):
 
+      context.rs tests (~20 tests):
+      - Template rendering with simple vars, nested dot-notation, missing vars
+      - Shell-escaped rendering (verify quotes around values)
+      - Condition evaluator: all operators (==, !=, <, <=, >, >=, in, not in)
+      - Boolean operators (and, or, not)
+      - Safe functions: int(), str(), len(), bool(), float(), min(), max()
+      - Safe methods: strip(), lower(), upper(), startswith(), endswith()
+      - Dunder blocking (__class__, __import__)
+      - Unknown identifiers resolve to null (falsy)
+
+      parser.rs tests (~8 tests):
+      - Parse valid YAML
+      - File too large rejection
+      - Duplicate step ID detection
+      - Unrecognized field warnings
+      - Step type inference
+
+      runner.rs tests (~7 tests):
+      - Execute simple recipe with mock adapter
+      - Condition skip
+      - Dry run mode
+      - JSON extraction (3 strategies)
+      - Fail-fast behavior
+      - Sub-recipe execution with depth guard
+
+      agent_resolver.rs tests (~6 tests):
+      - Resolve valid agent ref
+      - Path traversal rejection
+      - Not found error
+      - Two-part and three-part refs
+
+      discovery.rs tests (~6 tests):
+      - Discover from temp dir
+      - SHA-256 manifest
+      - Empty dir returns empty map
+      - Cache tests (hit, miss, invalidate)
+    output: "unit_tests_done"
+
+  - id: "run-tests"
+    command: "cargo test 2>&1"
+    working_dir: "{{repo_path}}"
+    output: "test_results"
+
+  - id: "fix-test-failures"
+    agent: "amplihack:core:builder"
+    working_dir: "{{repo_path}}"
+    condition: "'FAILED' in test_results"
+    prompt: |
+      The test run had failures. Here are the results:
+      {{test_results}}
+
+      Fix ALL test failures. Do not skip or disable tests.
+      The failures indicate bugs in the implementation — fix the
+      implementation, not the tests (unless the test assertion itself
+      is wrong based on the specification above).
+    output: "fixes_done"
+
+  - id: "rerun-tests"
+    command: "cargo test 2>&1"
+    working_dir: "{{repo_path}}"
+    condition: "'FAILED' in test_results"
+    output: "test_results_2"
+
+  # =========================================================================
+  # Phase 11 — Quality Gates
+  # =========================================================================
   - id: "clippy"
-    type: "bash"
+    command: "cargo clippy --all-targets -- -D warnings 2>&1"
     working_dir: "{{repo_path}}"
-    condition: "which cargo-clippy"
-    command: |
-      cargo clippy -- -D warnings 2>&1
     output: "clippy_result"
 
-  # -------------------------------------------------------------------------
-  # Phase 5 — Package
-  # -------------------------------------------------------------------------
-  - id: "build-release"
-    type: "bash"
+  - id: "fix-clippy"
+    agent: "amplihack:core:builder"
     working_dir: "{{repo_path}}"
-    command: |
-      cargo build --release 2>&1
+    condition: "'error' in clippy_result"
+    prompt: |
+      Fix these clippy warnings/errors:
+      {{clippy_result}}
+      Run cargo clippy --fix --allow-dirty if possible, otherwise fix manually.
+    output: "clippy_fixes"
+
+  - id: "format-check"
+    command: "cargo fmt && cargo fmt --check 2>&1"
+    working_dir: "{{repo_path}}"
+
+  - id: "build-release"
+    command: "cargo build --release 2>&1"
+    working_dir: "{{repo_path}}"
     output: "release_result"
 
   - id: "verify-binary"
-    type: "bash"
+    command: "./target/release/{{binary_name}} --help 2>&1"
     working_dir: "{{repo_path}}"
-    command: |
-      ./target/release/{{project_name}} --help
     output: "help_output"
 
-output:
-  format: "markdown"
-  template: |
-    ## Build Complete
-
-    **Rust**: {{rust_version}}
-    **Binary**: target/release/{{project_name}}
-
-    ```
-    {{help_output}}
-    ```
+  - id: "verify-validate"
+    command: |
+      echo 'name: test
+      steps:
+        - id: s1
+          command: echo hi' | ./target/release/{{binary_name}} /dev/stdin --validate-only 2>&1
+    working_dir: "{{repo_path}}"
+    output: "validate_output"

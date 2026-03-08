@@ -10,12 +10,11 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const NON_INTERACTIVE_FOOTER: &str =
-    "\n\nIMPORTANT: Proceed autonomously. Do not ask questions. \
+const NON_INTERACTIVE_FOOTER: &str = "\n\nIMPORTANT: Proceed autonomously. Do not ask questions. \
      Make reasonable decisions and continue.";
 
 pub struct CLISubprocessAdapter {
@@ -47,9 +46,8 @@ impl CLISubprocessAdapter {
     /// - Propagates session tree env vars, incrementing depth by 1.
     /// - Generates a tree ID if none exists.
     fn build_child_env() -> HashMap<String, String> {
-        let mut child_env: HashMap<String, String> = env::vars()
-            .filter(|(k, _)| k != "CLAUDECODE")
-            .collect();
+        let mut child_env: HashMap<String, String> =
+            env::vars().filter(|(k, _)| k != "CLAUDECODE").collect();
 
         let current_depth: u32 = env::var("AMPLIHACK_SESSION_DEPTH")
             .ok()
@@ -60,7 +58,10 @@ impl CLISubprocessAdapter {
             .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string()[..8].to_string());
 
         child_env.insert("AMPLIHACK_TREE_ID".to_string(), tree_id);
-        child_env.insert("AMPLIHACK_SESSION_DEPTH".to_string(), (current_depth + 1).to_string());
+        child_env.insert(
+            "AMPLIHACK_SESSION_DEPTH".to_string(),
+            (current_depth + 1).to_string(),
+        );
         child_env.insert(
             "AMPLIHACK_MAX_DEPTH".to_string(),
             env::var("AMPLIHACK_MAX_DEPTH").unwrap_or_else(|_| "3".to_string()),
@@ -126,24 +127,25 @@ impl CLISubprocessAdapter {
             let mut last_activity = Instant::now();
             while !stop_clone.load(Ordering::Relaxed) {
                 // Check timeout deadline
-                if let Some(dl) = deadline {
-                    if Instant::now() >= dl {
-                        eprintln!(
-                            "  [agent] TIMEOUT after {}s — killing process {}",
-                            timeout.unwrap_or(0), child_pid
-                        );
-                        timed_out_clone.store(true, Ordering::SeqCst);
-                        // Send SIGTERM via kill
-                        let _ = Command::new("kill")
-                            .args(["-15", &child_pid.to_string()])
-                            .output();
-                        // Give 5s grace, then SIGKILL
-                        std::thread::sleep(Duration::from_secs(5));
-                        let _ = Command::new("kill")
-                            .args(["-9", &child_pid.to_string()])
-                            .output();
-                        return;
-                    }
+                if let Some(dl) = deadline
+                    && Instant::now() >= dl
+                {
+                    eprintln!(
+                        "  [agent] TIMEOUT after {}s — killing process {}",
+                        timeout.unwrap_or(0),
+                        child_pid
+                    );
+                    timed_out_clone.store(true, Ordering::SeqCst);
+                    // Send SIGTERM via kill
+                    let _ = Command::new("kill")
+                        .args(["-15", &child_pid.to_string()])
+                        .output();
+                    // Give 5s grace, then SIGKILL
+                    std::thread::sleep(Duration::from_secs(5));
+                    let _ = Command::new("kill")
+                        .args(["-9", &child_pid.to_string()])
+                        .output();
+                    return;
                 }
 
                 if let Ok(meta) = std::fs::metadata(&output_path) {

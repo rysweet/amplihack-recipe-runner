@@ -15,7 +15,6 @@
 ///  11. Agent resolver
 ///  12. Real recipe patterns (modeled on default-workflow, quality-audit, etc.)
 ///  13. Security (injection, dunder, path traversal)
-
 use recipe_runner_rs::adapters::Adapter;
 use recipe_runner_rs::agent_resolver::AgentResolver;
 use recipe_runner_rs::context::RecipeContext;
@@ -25,8 +24,8 @@ use recipe_runner_rs::parser::RecipeParser;
 use recipe_runner_rs::runner::RecipeRunner;
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Configurable mock adapter
@@ -52,7 +51,8 @@ impl RecordingAdapter {
     }
 
     fn on(mut self, pattern: &str, response: &str) -> Self {
-        self.responses.push((pattern.to_string(), response.to_string()));
+        self.responses
+            .push((pattern.to_string(), response.to_string()));
         self
     }
 
@@ -74,8 +74,12 @@ impl RecordingAdapter {
 
 impl Adapter for RecordingAdapter {
     fn execute_agent_step(
-        &self, prompt: &str, _agent_name: Option<&str>,
-        _system_prompt: Option<&str>, _mode: Option<&str>, _working_dir: &str,
+        &self,
+        prompt: &str,
+        _agent_name: Option<&str>,
+        _system_prompt: Option<&str>,
+        _mode: Option<&str>,
+        _working_dir: &str,
     ) -> Result<String, anyhow::Error> {
         self.agent_calls.fetch_add(1, Ordering::SeqCst);
         for pat in &self.fail_patterns {
@@ -92,7 +96,10 @@ impl Adapter for RecordingAdapter {
     }
 
     fn execute_bash_step(
-        &self, command: &str, _working_dir: &str, _timeout: Option<u64>,
+        &self,
+        command: &str,
+        _working_dir: &str,
+        _timeout: Option<u64>,
     ) -> Result<String, anyhow::Error> {
         self.bash_calls.fetch_add(1, Ordering::SeqCst);
         for pat in &self.fail_patterns {
@@ -108,8 +115,12 @@ impl Adapter for RecordingAdapter {
         Ok(format!("[bash] {}", command))
     }
 
-    fn is_available(&self) -> bool { true }
-    fn name(&self) -> &str { "recording-mock" }
+    fn is_available(&self) -> bool {
+        true
+    }
+    fn name(&self) -> &str {
+        "recording-mock"
+    }
 }
 
 fn parse_and_run(yaml: &str, adapter: RecordingAdapter) -> recipe_runner_rs::models::RecipeResult {
@@ -119,7 +130,9 @@ fn parse_and_run(yaml: &str, adapter: RecordingAdapter) -> recipe_runner_rs::mod
 }
 
 fn parse_and_run_ctx(
-    yaml: &str, adapter: RecordingAdapter, ctx: HashMap<String, serde_json::Value>,
+    yaml: &str,
+    adapter: RecordingAdapter,
+    ctx: HashMap<String, serde_json::Value>,
 ) -> recipe_runner_rs::models::RecipeResult {
     let parser = RecipeParser::new();
     let recipe = parser.parse(yaml).unwrap();
@@ -133,12 +146,15 @@ fn parse_and_run_ctx(
 #[test]
 fn test_bash_step_routes_to_bash_adapter() {
     let adapter = RecordingAdapter::new();
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
     command: "echo hello"
-"#, adapter);
+"#,
+        adapter,
+    );
     assert!(r.success);
     // Mock's bash handler ran
     assert!(r.step_results[0].output.contains("[bash]"));
@@ -147,13 +163,16 @@ steps:
 #[test]
 fn test_agent_step_routes_to_agent_adapter() {
     let adapter = RecordingAdapter::new();
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
     agent: "amplihack:core:builder"
     prompt: "Build it"
-"#, adapter);
+"#,
+        adapter,
+    );
     assert!(r.success);
     assert!(r.step_results[0].output.contains("[agent]"));
 }
@@ -161,12 +180,15 @@ steps:
 #[test]
 fn test_prompt_only_infers_agent() {
     let adapter = RecordingAdapter::new();
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
     prompt: "Analyze this codebase"
-"#, adapter);
+"#,
+        adapter,
+    );
     assert!(r.success);
     assert!(r.step_results[0].output.contains("[agent]"));
 }
@@ -174,14 +196,17 @@ steps:
 #[test]
 fn test_explicit_type_overrides_inference() {
     let adapter = RecordingAdapter::new();
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
     type: bash
     prompt: "this is a bash step despite having prompt"
     command: "echo forced-bash"
-"#, adapter);
+"#,
+        adapter,
+    );
     assert!(r.success);
     assert!(r.step_results[0].output.contains("[bash]"));
 }
@@ -205,7 +230,8 @@ steps:
 
 #[test]
 fn test_condition_eq_skip_and_run() {
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 context:
   mode: "fast"
@@ -216,14 +242,17 @@ steps:
   - id: skip
     command: "echo no"
     condition: "mode == 'slow'"
-"#, RecordingAdapter::new());
+"#,
+        RecordingAdapter::new(),
+    );
     assert_eq!(r.step_results[0].status, StepStatus::Completed);
     assert_eq!(r.step_results[1].status, StepStatus::Skipped);
 }
 
 #[test]
 fn test_condition_neq() {
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 context:
   phase: "design"
@@ -231,13 +260,16 @@ steps:
   - id: s1
     command: "echo yes"
     condition: "phase != 'done'"
-"#, RecordingAdapter::new());
+"#,
+        RecordingAdapter::new(),
+    );
     assert_eq!(r.step_results[0].status, StepStatus::Completed);
 }
 
 #[test]
 fn test_condition_numeric_comparisons() {
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 context:
   cycle: 3
@@ -258,7 +290,9 @@ steps:
   - id: skip-gt
     command: "echo no"
     condition: "cycle > max"
-"#, RecordingAdapter::new());
+"#,
+        RecordingAdapter::new(),
+    );
     assert!(r.success);
     assert_eq!(r.step_results[0].status, StepStatus::Completed);
     assert_eq!(r.step_results[1].status, StepStatus::Completed);
@@ -269,7 +303,8 @@ steps:
 
 #[test]
 fn test_condition_in_and_not_in() {
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 context:
   tags: "security,reliability,dead_code"
@@ -283,7 +318,9 @@ steps:
   - id: skip
     command: "echo skip"
     condition: "'missing' in tags"
-"#, RecordingAdapter::new());
+"#,
+        RecordingAdapter::new(),
+    );
     assert_eq!(r.step_results[0].status, StepStatus::Completed);
     assert_eq!(r.step_results[1].status, StepStatus::Completed);
     assert_eq!(r.step_results[2].status, StepStatus::Skipped);
@@ -291,7 +328,8 @@ steps:
 
 #[test]
 fn test_condition_boolean_ops_and_or_not() {
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 context:
   a: "yes"
@@ -310,7 +348,9 @@ steps:
   - id: complex
     command: "echo yes"
     condition: "(a or b) and (c or b)"
-"#, RecordingAdapter::new());
+"#,
+        RecordingAdapter::new(),
+    );
     assert_eq!(r.step_results[0].status, StepStatus::Skipped);
     assert_eq!(r.step_results[1].status, StepStatus::Completed);
     assert_eq!(r.step_results[2].status, StepStatus::Completed);
@@ -319,7 +359,8 @@ steps:
 
 #[test]
 fn test_condition_truthiness_rules() {
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 context:
   nonempty: "text"
@@ -350,7 +391,9 @@ steps:
   - id: missing
     command: "echo n"
     condition: "undefined_var"
-"#, RecordingAdapter::new());
+"#,
+        RecordingAdapter::new(),
+    );
     assert_eq!(r.step_results[0].status, StepStatus::Completed);
     assert_eq!(r.step_results[1].status, StepStatus::Skipped);
     assert_eq!(r.step_results[2].status, StepStatus::Skipped);
@@ -362,7 +405,8 @@ steps:
 
 #[test]
 fn test_condition_function_calls_in_conditions() {
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 context:
   count_str: "7"
@@ -378,16 +422,24 @@ steps:
   - id: str-cast
     command: "echo y"
     condition: "str(num) == '42'"
-"#, RecordingAdapter::new());
+"#,
+        RecordingAdapter::new(),
+    );
     assert!(r.success);
     for sr in &r.step_results {
-        assert_eq!(sr.status, StepStatus::Completed, "step {} should run", sr.step_id);
+        assert_eq!(
+            sr.status,
+            StepStatus::Completed,
+            "step {} should run",
+            sr.step_id
+        );
     }
 }
 
 #[test]
 fn test_condition_method_calls_in_conditions() {
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 context:
   raw: "  NOT_CONVERGED  "
@@ -414,10 +466,17 @@ steps:
   - id: find
     command: "echo y"
     condition: "path.find('user') == 6"
-"#, RecordingAdapter::new());
+"#,
+        RecordingAdapter::new(),
+    );
     assert!(r.success);
     for sr in &r.step_results {
-        assert_eq!(sr.status, StepStatus::Completed, "step {} should run", sr.step_id);
+        assert_eq!(
+            sr.status,
+            StepStatus::Completed,
+            "step {} should run",
+            sr.step_id
+        );
     }
 }
 
@@ -428,23 +487,30 @@ steps:
 #[test]
 fn test_template_rendering_in_command() {
     let adapter = RecordingAdapter::new();
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 context:
   name: "world"
 steps:
   - id: s1
     command: "echo hello {{name}}"
-"#, adapter);
+"#,
+        adapter,
+    );
     // The rendered command should contain "hello world"
-    assert!(r.step_results[0].output.contains("hello world"),
-        "got: {}", r.step_results[0].output);
+    assert!(
+        r.step_results[0].output.contains("hello world"),
+        "got: {}",
+        r.step_results[0].output
+    );
 }
 
 #[test]
 fn test_template_rendering_in_prompt() {
     let adapter = RecordingAdapter::new().on("Review world", "reviewed");
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 context:
   target: "world"
@@ -452,7 +518,9 @@ steps:
   - id: s1
     prompt: "Review {{target}}"
     output: "review"
-"#, adapter);
+"#,
+        adapter,
+    );
     assert!(r.success);
     assert_eq!(r.context.get("review").unwrap(), "reviewed");
 }
@@ -460,15 +528,22 @@ steps:
 #[test]
 fn test_missing_var_renders_empty() {
     let adapter = RecordingAdapter::new();
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
     command: "echo prefix-{{undefined}}-suffix"
-"#, adapter);
+"#,
+        adapter,
+    );
     // bash commands go through render_shell which escapes empty strings to ''
-    assert!(r.step_results[0].output.contains("prefix-") && r.step_results[0].output.contains("-suffix"),
-        "missing var should render as empty, got: {}", r.step_results[0].output);
+    assert!(
+        r.step_results[0].output.contains("prefix-")
+            && r.step_results[0].output.contains("-suffix"),
+        "missing var should render as empty, got: {}",
+        r.step_results[0].output
+    );
 }
 
 #[test]
@@ -478,7 +553,8 @@ fn test_context_accumulation_across_steps() {
         .on("step-one-output", "step-two-output")
         .on("step-two-output", "step-three-output");
 
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
@@ -490,7 +566,9 @@ steps:
   - id: s3
     command: "echo {{out2}}"
     output: "out3"
-"#, adapter);
+"#,
+        adapter,
+    );
     assert!(r.success);
     assert!(r.context.contains_key("out1"));
     assert!(r.context.contains_key("out2"));
@@ -503,7 +581,8 @@ fn test_user_context_overrides_recipe_defaults() {
     let mut ctx = HashMap::new();
     ctx.insert("setting".to_string(), json!("custom-val"));
 
-    let r = parse_and_run_ctx(r#"
+    let r = parse_and_run_ctx(
+        r#"
 name: t
 context:
   setting: "default-val"
@@ -511,17 +590,20 @@ steps:
   - id: s1
     command: "echo {{setting}}"
     output: "out"
-"#, adapter, ctx);
+"#,
+        adapter,
+        ctx,
+    );
     assert!(r.success);
     assert_eq!(r.context.get("out").unwrap(), "got-custom");
 }
 
 #[test]
 fn test_json_value_stored_in_context_is_accessible() {
-    let adapter = RecordingAdapter::new()
-        .on("analyze", r#"{"status": "ok", "count": 5}"#);
+    let adapter = RecordingAdapter::new().on("analyze", r#"{"status": "ok", "count": 5}"#);
 
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
@@ -531,7 +613,9 @@ steps:
   - id: s2
     command: "echo status is {{result}}"
     output: "out"
-"#, adapter);
+"#,
+        adapter,
+    );
     assert!(r.success);
 }
 
@@ -541,16 +625,18 @@ steps:
 
 #[test]
 fn test_json_strategy_1_direct_parse() {
-    let adapter = RecordingAdapter::new()
-        .on("give json", r#"{"key": "value"}"#);
-    let r = parse_and_run(r#"
+    let adapter = RecordingAdapter::new().on("give json", r#"{"key": "value"}"#);
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
     prompt: "give json"
     parse_json: true
     output: "data"
-"#, adapter);
+"#,
+        adapter,
+    );
     assert!(r.success);
     assert_eq!(r.context["data"], json!({"key": "value"}));
 }
@@ -559,14 +645,17 @@ steps:
 fn test_json_strategy_2_markdown_fence() {
     let fenced = "Here is the analysis:\n```json\n{\"items\": [1,2,3]}\n```\nDone.";
     let adapter = RecordingAdapter::new().on("fenced", fenced);
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
     prompt: "fenced"
     parse_json: true
     output: "data"
-"#, adapter);
+"#,
+        adapter,
+    );
     assert!(r.success);
     assert_eq!(r.context["data"], json!({"items": [1,2,3]}));
 }
@@ -575,14 +664,17 @@ steps:
 fn test_json_strategy_2_fence_without_json_label() {
     let fenced = "Result:\n```\n{\"x\": 42}\n```";
     let adapter = RecordingAdapter::new().on("unlabeled", fenced);
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
     prompt: "unlabeled"
     parse_json: true
     output: "data"
-"#, adapter);
+"#,
+        adapter,
+    );
     assert!(r.success);
     assert_eq!(r.context["data"], json!({"x": 42}));
 }
@@ -591,14 +683,17 @@ steps:
 fn test_json_strategy_3_balanced_braces() {
     let mixed = "Some preamble text... {\"found\": true} ...and trailing text";
     let adapter = RecordingAdapter::new().on("balanced", mixed);
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
     prompt: "balanced"
     parse_json: true
     output: "data"
-"#, adapter);
+"#,
+        adapter,
+    );
     assert!(r.success);
     assert_eq!(r.context["data"], json!({"found": true}));
 }
@@ -607,14 +702,17 @@ steps:
 fn test_json_strategy_3_balanced_array() {
     let mixed = "Got: [1, 2, 3] done";
     let adapter = RecordingAdapter::new().on("arr", mixed);
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
     prompt: "arr"
     parse_json: true
     output: "data"
-"#, adapter);
+"#,
+        adapter,
+    );
     assert!(r.success);
     assert_eq!(r.context["data"], json!([1, 2, 3]));
 }
@@ -623,14 +721,17 @@ steps:
 fn test_json_strategy_3_nested_braces() {
     let nested = r#"Here: {"outer": {"inner": [1, {"deep": true}]}} done"#;
     let adapter = RecordingAdapter::new().on("nested", nested);
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
     prompt: "nested"
     parse_json: true
     output: "data"
-"#, adapter);
+"#,
+        adapter,
+    );
     assert!(r.success);
     assert_eq!(r.context["data"]["outer"]["inner"][1]["deep"], json!(true));
 }
@@ -639,17 +740,19 @@ steps:
 fn test_json_retry_on_failure() {
     // First call returns non-JSON (falls through to default),
     // second call (retry) matches "IMPORTANT" substring and returns valid JSON.
-    let adapter = RecordingAdapter::new()
-        .on("IMPORTANT", r#"{"retry": "success"}"#);
+    let adapter = RecordingAdapter::new().on("IMPORTANT", r#"{"retry": "success"}"#);
 
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
     prompt: "first attempt"
     parse_json: true
     output: "data"
-"#, adapter);
+"#,
+        adapter,
+    );
     assert!(r.success, "retry should have rescued: {:?}", r.step_results);
     assert_eq!(r.context["data"], json!({"retry": "success"}));
 }
@@ -658,14 +761,17 @@ steps:
 fn test_json_parse_fails_after_retry_exhausted() {
     // Both first try and retry return non-JSON
     let adapter = RecordingAdapter::new();
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
     prompt: "gibberish"
     parse_json: true
     output: "data"
-"#, adapter);
+"#,
+        adapter,
+    );
     assert!(!r.success);
     assert_eq!(r.step_results[0].status, StepStatus::Failed);
     assert!(r.step_results[0].error.contains("parse_json failed"));
@@ -675,16 +781,24 @@ steps:
 fn test_json_with_escaped_quotes_in_strings() {
     let escaped = r#"{"message": "He said \"hello\" to her"}"#;
     let adapter = RecordingAdapter::new().on("escaped", escaped);
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
     prompt: "escaped"
     parse_json: true
     output: "data"
-"#, adapter);
+"#,
+        adapter,
+    );
     assert!(r.success);
-    assert!(r.context["data"]["message"].as_str().unwrap().contains("hello"));
+    assert!(
+        r.context["data"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("hello")
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -694,24 +808,31 @@ steps:
 #[test]
 fn test_sub_recipe_basic_execution() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("child.yaml"), r#"
+    std::fs::write(
+        tmp.path().join("child.yaml"),
+        r#"
 name: child
 steps:
   - id: c1
     command: "echo child ran"
     output: "child_output"
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let adapter = RecordingAdapter::new();
     let parser = RecipeParser::new();
-    let recipe = parser.parse(r#"
+    let recipe = parser
+        .parse(
+            r#"
 name: parent
 steps:
   - id: p1
     recipe: "child"
-"#).unwrap();
-    let runner = RecipeRunner::new(adapter)
-        .with_recipe_search_dirs(vec![tmp.path().to_path_buf()]);
+"#,
+        )
+        .unwrap();
+    let runner = RecipeRunner::new(adapter).with_recipe_search_dirs(vec![tmp.path().to_path_buf()]);
     let result = runner.execute(&recipe, None);
     assert!(result.success);
 }
@@ -719,18 +840,23 @@ steps:
 #[test]
 fn test_sub_recipe_context_merge() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("greeter.yaml"), r#"
+    std::fs::write(
+        tmp.path().join("greeter.yaml"),
+        r#"
 name: greeter
 steps:
   - id: greet
     command: "echo hello {{who}}"
     output: "greeting"
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    let adapter = RecordingAdapter::new()
-        .on("hello Alice", "greeted Alice");
+    let adapter = RecordingAdapter::new().on("hello Alice", "greeted Alice");
     let parser = RecipeParser::new();
-    let recipe = parser.parse(r#"
+    let recipe = parser
+        .parse(
+            r#"
 name: parent
 context:
   who: "Alice"
@@ -739,9 +865,10 @@ steps:
     recipe: "greeter"
     context:
       who: "{{who}}"
-"#).unwrap();
-    let runner = RecipeRunner::new(adapter)
-        .with_recipe_search_dirs(vec![tmp.path().to_path_buf()]);
+"#,
+        )
+        .unwrap();
+    let runner = RecipeRunner::new(adapter).with_recipe_search_dirs(vec![tmp.path().to_path_buf()]);
     let result = runner.execute(&recipe, None);
     assert!(result.success);
     // Context should flow back from sub-recipe
@@ -752,35 +879,48 @@ steps:
 fn test_sub_recipe_depth_guard() {
     // Create a recipe that recurses into itself
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("loop.yaml"), r#"
+    std::fs::write(
+        tmp.path().join("loop.yaml"),
+        r#"
 name: loop
 steps:
   - id: recurse
     recipe: "loop"
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let adapter = RecordingAdapter::new();
     let parser = RecipeParser::new();
-    let recipe = parser.parse(r#"
+    let recipe = parser
+        .parse(
+            r#"
 name: starter
 steps:
   - id: start
     recipe: "loop"
-"#).unwrap();
-    let runner = RecipeRunner::new(adapter)
-        .with_recipe_search_dirs(vec![tmp.path().to_path_buf()]);
+"#,
+        )
+        .unwrap();
+    let runner = RecipeRunner::new(adapter).with_recipe_search_dirs(vec![tmp.path().to_path_buf()]);
     let result = runner.execute(&recipe, None);
-    assert!(!result.success, "recursive recipe should fail at depth limit");
+    assert!(
+        !result.success,
+        "recursive recipe should fail at depth limit"
+    );
 }
 
 #[test]
 fn test_sub_recipe_not_found() {
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
     recipe: "does-not-exist"
-"#, RecordingAdapter::new());
+"#,
+        RecordingAdapter::new(),
+    );
     assert!(!r.success);
     assert!(r.step_results[0].error.contains("not found"));
 }
@@ -788,33 +928,44 @@ steps:
 #[test]
 fn test_chained_sub_recipes() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("step-a.yaml"), r#"
+    std::fs::write(
+        tmp.path().join("step-a.yaml"),
+        r#"
 name: step-a
 steps:
   - id: a1
     command: "echo a"
     output: "a_out"
-"#).unwrap();
-    std::fs::write(tmp.path().join("step-b.yaml"), r#"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("step-b.yaml"),
+        r#"
 name: step-b
 steps:
   - id: b1
     command: "echo b uses {{a_out}}"
     output: "b_out"
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let adapter = RecordingAdapter::new();
     let parser = RecipeParser::new();
-    let recipe = parser.parse(r#"
+    let recipe = parser
+        .parse(
+            r#"
 name: chain
 steps:
   - id: run-a
     recipe: "step-a"
   - id: run-b
     recipe: "step-b"
-"#).unwrap();
-    let runner = RecipeRunner::new(adapter)
-        .with_recipe_search_dirs(vec![tmp.path().to_path_buf()]);
+"#,
+        )
+        .unwrap();
+    let runner = RecipeRunner::new(adapter).with_recipe_search_dirs(vec![tmp.path().to_path_buf()]);
     let result = runner.execute(&recipe, None);
     assert!(result.success);
     assert!(result.context.contains_key("a_out"));
@@ -828,7 +979,8 @@ steps:
 #[test]
 fn test_fail_fast_stops_on_first_error() {
     let adapter = RecordingAdapter::new().fail_on("bad-cmd");
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: good
@@ -837,7 +989,9 @@ steps:
     command: "bad-cmd"
   - id: unreachable
     command: "echo never"
-"#, adapter);
+"#,
+        adapter,
+    );
     assert!(!r.success);
     assert_eq!(r.step_results.len(), 2);
     assert_eq!(r.step_results[1].status, StepStatus::Failed);
@@ -846,12 +1000,15 @@ steps:
 #[test]
 fn test_adapter_failure_in_agent_step() {
     let adapter = RecordingAdapter::new().fail_on("crash");
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
     prompt: "crash the agent"
-"#, adapter);
+"#,
+        adapter,
+    );
     assert!(!r.success);
     assert!(r.step_results[0].error.contains("Simulated agent failure"));
 }
@@ -859,13 +1016,16 @@ steps:
 #[test]
 fn test_condition_evaluation_error_fails_step() {
     // Use an expression the evaluator can't handle
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
     command: "echo hello"
     condition: "__import__('os')"
-"#, RecordingAdapter::new());
+"#,
+        RecordingAdapter::new(),
+    );
     assert!(!r.success);
     assert!(r.step_results[0].error.contains("Condition error"));
 }
@@ -874,15 +1034,35 @@ steps:
 fn test_unavailable_adapter_fails_gracefully() {
     struct UnavailableAdapter;
     impl Adapter for UnavailableAdapter {
-        fn execute_agent_step(&self, _: &str, _: Option<&str>, _: Option<&str>,
-            _: Option<&str>, _: &str) -> Result<String, anyhow::Error> { Ok("".into()) }
-        fn execute_bash_step(&self, _: &str, _: &str, _: Option<u64>)
-            -> Result<String, anyhow::Error> { Ok("".into()) }
-        fn is_available(&self) -> bool { false }
-        fn name(&self) -> &str { "unavailable" }
+        fn execute_agent_step(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: &str,
+        ) -> Result<String, anyhow::Error> {
+            Ok("".into())
+        }
+        fn execute_bash_step(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<u64>,
+        ) -> Result<String, anyhow::Error> {
+            Ok("".into())
+        }
+        fn is_available(&self) -> bool {
+            false
+        }
+        fn name(&self) -> &str {
+            "unavailable"
+        }
     }
     let parser = RecipeParser::new();
-    let recipe = parser.parse("name: t\nsteps:\n  - id: s1\n    command: echo").unwrap();
+    let recipe = parser
+        .parse("name: t\nsteps:\n  - id: s1\n    command: echo")
+        .unwrap();
     let r = RecipeRunner::new(UnavailableAdapter).execute(&recipe, None);
     assert!(!r.success);
     assert!(r.step_results.is_empty());
@@ -896,7 +1076,9 @@ fn test_unavailable_adapter_fails_gracefully() {
 fn test_dry_run_completes_all_steps() {
     let adapter = RecordingAdapter::new();
     let parser = RecipeParser::new();
-    let recipe = parser.parse(r#"
+    let recipe = parser
+        .parse(
+            r#"
 name: t
 steps:
   - id: s1
@@ -905,7 +1087,9 @@ steps:
     prompt: "do thing"
   - id: s3
     command: "echo c"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
     let runner = RecipeRunner::new(adapter).with_dry_run(true);
     let r = runner.execute(&recipe, None);
     assert!(r.success);
@@ -920,21 +1104,25 @@ steps:
 fn test_dry_run_parse_json_produces_valid_json() {
     let adapter = RecordingAdapter::new();
     let parser = RecipeParser::new();
-    let recipe = parser.parse(r#"
+    let recipe = parser
+        .parse(
+            r#"
 name: t
 steps:
   - id: s1
     prompt: "analyze"
     parse_json: true
     output: "data"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
     let runner = RecipeRunner::new(adapter).with_dry_run(true);
     let r = runner.execute(&recipe, None);
     assert!(r.success);
     // The output should be valid JSON with dry_run flag
     let out = &r.step_results[0].output;
-    let parsed: serde_json::Value = serde_json::from_str(out)
-        .expect("dry run parse_json should produce valid JSON");
+    let parsed: serde_json::Value =
+        serde_json::from_str(out).expect("dry run parse_json should produce valid JSON");
     assert_eq!(parsed["dry_run"], json!(true));
 }
 
@@ -944,14 +1132,18 @@ fn test_dry_run_does_not_call_adapter() {
     let agent_calls = adapter.agent_calls.clone();
     let bash_calls = adapter.bash_calls.clone();
     let parser = RecipeParser::new();
-    let recipe = parser.parse(r#"
+    let recipe = parser
+        .parse(
+            r#"
 name: t
 steps:
   - id: s1
     command: "echo a"
   - id: s2
     prompt: "do thing"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
     let runner = RecipeRunner::new(adapter).with_dry_run(true);
     runner.execute(&recipe, None);
     assert_eq!(agent_calls.load(Ordering::SeqCst), 0);
@@ -965,7 +1157,11 @@ steps:
 #[test]
 fn test_parser_rejects_empty_name() {
     let parser = RecipeParser::new();
-    assert!(parser.parse("name: \"\"\nsteps:\n  - id: s1\n    command: echo").is_err());
+    assert!(
+        parser
+            .parse("name: \"\"\nsteps:\n  - id: s1\n    command: echo")
+            .is_err()
+    );
 }
 
 #[test]
@@ -977,14 +1173,16 @@ fn test_parser_rejects_no_steps() {
 #[test]
 fn test_parser_rejects_duplicate_ids() {
     let parser = RecipeParser::new();
-    let r = parser.parse(r#"
+    let r = parser.parse(
+        r#"
 name: t
 steps:
   - id: dup
     command: echo 1
   - id: dup
     command: echo 2
-"#);
+"#,
+    );
     assert!(r.is_err());
     assert!(r.unwrap_err().to_string().contains("Duplicate"));
 }
@@ -992,12 +1190,14 @@ steps:
 #[test]
 fn test_parser_rejects_empty_step_id() {
     let parser = RecipeParser::new();
-    let r = parser.parse(r#"
+    let r = parser.parse(
+        r#"
 name: t
 steps:
   - id: ""
     command: echo
-"#);
+"#,
+    );
     assert!(r.is_err());
 }
 
@@ -1005,19 +1205,26 @@ steps:
 fn test_parser_file_size_limit() {
     let parser = RecipeParser::new();
     // Just over 1MB should fail
-    let huge = format!("name: t\nsteps:\n  - id: s1\n    command: echo\n#{}", "x".repeat(1_000_001));
+    let huge = format!(
+        "name: t\nsteps:\n  - id: s1\n    command: echo\n#{}",
+        "x".repeat(1_000_001)
+    );
     assert!(parser.parse(&huge).is_err());
 }
 
 #[test]
 fn test_validate_detects_missing_prompt_on_agent() {
     let parser = RecipeParser::new();
-    let recipe = parser.parse(r#"
+    let recipe = parser
+        .parse(
+            r#"
 name: t
 steps:
   - id: s1
     agent: "amplihack:builder"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
     let warnings = parser.validate(&recipe);
     assert!(warnings.iter().any(|w| w.contains("prompt")));
 }
@@ -1025,12 +1232,16 @@ steps:
 #[test]
 fn test_validate_detects_missing_command_on_bash() {
     let parser = RecipeParser::new();
-    let recipe = parser.parse(r#"
+    let recipe = parser
+        .parse(
+            r#"
 name: t
 steps:
   - id: s1
     type: bash
-"#).unwrap();
+"#,
+        )
+        .unwrap();
     let warnings = parser.validate(&recipe);
     assert!(warnings.iter().any(|w| w.contains("command")));
 }
@@ -1062,13 +1273,20 @@ fn test_validate_detects_unrecognized_step_fields() {
 fn test_discovery_finds_recipes_across_dirs() {
     let dir1 = tempfile::tempdir().unwrap();
     let dir2 = tempfile::tempdir().unwrap();
-    std::fs::write(dir1.path().join("r1.yaml"),
-        "name: r1\nsteps:\n  - id: s1\n    command: echo").unwrap();
-    std::fs::write(dir2.path().join("r2.yaml"),
-        "name: r2\nsteps:\n  - id: s1\n    command: echo").unwrap();
+    std::fs::write(
+        dir1.path().join("r1.yaml"),
+        "name: r1\nsteps:\n  - id: s1\n    command: echo",
+    )
+    .unwrap();
+    std::fs::write(
+        dir2.path().join("r2.yaml"),
+        "name: r2\nsteps:\n  - id: s1\n    command: echo",
+    )
+    .unwrap();
 
     let recipes = discovery::discover_recipes(Some(&[
-        dir1.path().to_path_buf(), dir2.path().to_path_buf()
+        dir1.path().to_path_buf(),
+        dir2.path().to_path_buf(),
     ]));
     assert_eq!(recipes.len(), 2);
 }
@@ -1077,35 +1295,48 @@ fn test_discovery_finds_recipes_across_dirs() {
 fn test_discovery_last_dir_wins_on_name_collision() {
     let dir1 = tempfile::tempdir().unwrap();
     let dir2 = tempfile::tempdir().unwrap();
-    std::fs::write(dir1.path().join("shared.yaml"),
-        "name: shared\ndescription: from-dir1\nsteps:\n  - id: s1\n    command: echo").unwrap();
-    std::fs::write(dir2.path().join("shared.yaml"),
-        "name: shared\ndescription: from-dir2\nsteps:\n  - id: s1\n    command: echo").unwrap();
+    std::fs::write(
+        dir1.path().join("shared.yaml"),
+        "name: shared\ndescription: from-dir1\nsteps:\n  - id: s1\n    command: echo",
+    )
+    .unwrap();
+    std::fs::write(
+        dir2.path().join("shared.yaml"),
+        "name: shared\ndescription: from-dir2\nsteps:\n  - id: s1\n    command: echo",
+    )
+    .unwrap();
 
     let recipes = discovery::discover_recipes(Some(&[
-        dir1.path().to_path_buf(), dir2.path().to_path_buf()
+        dir1.path().to_path_buf(),
+        dir2.path().to_path_buf(),
     ]));
     assert_eq!(recipes["shared"].description, "from-dir2");
 }
 
 #[test]
 fn test_discovery_skips_nonexistent_dirs() {
-    let recipes = discovery::discover_recipes(Some(&[
-        std::path::PathBuf::from("/nonexistent/path/abc123")
-    ]));
+    let recipes = discovery::discover_recipes(Some(&[std::path::PathBuf::from(
+        "/nonexistent/path/abc123",
+    )]));
     assert!(recipes.is_empty());
 }
 
 #[test]
 fn test_discovery_manifest_detects_modifications() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("recipe.yaml"),
-        "name: recipe\nsteps:\n  - id: s1\n    command: echo v1").unwrap();
+    std::fs::write(
+        tmp.path().join("recipe.yaml"),
+        "name: recipe\nsteps:\n  - id: s1\n    command: echo v1",
+    )
+    .unwrap();
     discovery::update_manifest(Some(tmp.path())).unwrap();
 
     // Modify file
-    std::fs::write(tmp.path().join("recipe.yaml"),
-        "name: recipe\nsteps:\n  - id: s1\n    command: echo v2").unwrap();
+    std::fs::write(
+        tmp.path().join("recipe.yaml"),
+        "name: recipe\nsteps:\n  - id: s1\n    command: echo v2",
+    )
+    .unwrap();
     let changes = discovery::check_upstream_changes(Some(tmp.path()));
     assert!(!changes.is_empty());
     assert_eq!(changes[0]["status"], "modified");
@@ -1114,37 +1345,63 @@ fn test_discovery_manifest_detects_modifications() {
 #[test]
 fn test_discovery_manifest_detects_new_files() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("old.yaml"),
-        "name: old\nsteps:\n  - id: s1\n    command: echo").unwrap();
+    std::fs::write(
+        tmp.path().join("old.yaml"),
+        "name: old\nsteps:\n  - id: s1\n    command: echo",
+    )
+    .unwrap();
     discovery::update_manifest(Some(tmp.path())).unwrap();
 
-    std::fs::write(tmp.path().join("new.yaml"),
-        "name: new\nsteps:\n  - id: s1\n    command: echo").unwrap();
+    std::fs::write(
+        tmp.path().join("new.yaml"),
+        "name: new\nsteps:\n  - id: s1\n    command: echo",
+    )
+    .unwrap();
     let changes = discovery::check_upstream_changes(Some(tmp.path()));
-    assert!(changes.iter().any(|c| c["name"] == "new" && c["status"] == "new"));
+    assert!(
+        changes
+            .iter()
+            .any(|c| c["name"] == "new" && c["status"] == "new")
+    );
 }
 
 #[test]
 fn test_discovery_manifest_detects_deleted_files() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("victim.yaml"),
-        "name: victim\nsteps:\n  - id: s1\n    command: echo").unwrap();
+    std::fs::write(
+        tmp.path().join("victim.yaml"),
+        "name: victim\nsteps:\n  - id: s1\n    command: echo",
+    )
+    .unwrap();
     discovery::update_manifest(Some(tmp.path())).unwrap();
 
     std::fs::remove_file(tmp.path().join("victim.yaml")).unwrap();
     let changes = discovery::check_upstream_changes(Some(tmp.path()));
-    assert!(changes.iter().any(|c| c["name"] == "victim" && c["status"] == "deleted"));
+    assert!(
+        changes
+            .iter()
+            .any(|c| c["name"] == "victim" && c["status"] == "deleted")
+    );
 }
 
 #[test]
 fn test_list_recipes_returns_sorted() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("z-last.yaml"),
-        "name: z-last\nsteps:\n  - id: s1\n    command: echo").unwrap();
-    std::fs::write(tmp.path().join("a-first.yaml"),
-        "name: a-first\nsteps:\n  - id: s1\n    command: echo").unwrap();
-    std::fs::write(tmp.path().join("m-middle.yaml"),
-        "name: m-middle\nsteps:\n  - id: s1\n    command: echo").unwrap();
+    std::fs::write(
+        tmp.path().join("z-last.yaml"),
+        "name: z-last\nsteps:\n  - id: s1\n    command: echo",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("a-first.yaml"),
+        "name: a-first\nsteps:\n  - id: s1\n    command: echo",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("m-middle.yaml"),
+        "name: m-middle\nsteps:\n  - id: s1\n    command: echo",
+    )
+    .unwrap();
 
     let list = discovery::list_recipes(Some(&[tmp.path().to_path_buf()]));
     assert_eq!(list[0].name, "a-first");
@@ -1175,7 +1432,10 @@ fn test_agent_resolver_three_part_ref() {
     std::fs::write(dir.join("optimizer.md"), "Optimize.").unwrap();
 
     let resolver = AgentResolver::new(Some(vec![tmp.path().to_path_buf()]));
-    assert_eq!(resolver.resolve("ns:specialized:optimizer").unwrap(), "Optimize.");
+    assert_eq!(
+        resolver.resolve("ns:specialized:optimizer").unwrap(),
+        "Optimize."
+    );
 }
 
 #[test]
@@ -1204,18 +1464,24 @@ fn test_agent_resolver_rejects_four_parts() {
 #[test]
 fn test_shell_injection_via_template_is_escaped() {
     let adapter = RecordingAdapter::new();
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 context:
   user_input: "hello; rm -rf /"
 steps:
   - id: s1
     command: "echo {{user_input}}"
-"#, adapter);
+"#,
+        adapter,
+    );
     // render_shell wraps values in single quotes for safety
     let cmd = &r.step_results[0].output;
-    assert!(cmd.contains("'hello; rm -rf /'") || cmd.contains("'hello;"),
-        "shell injection should be escaped with quotes, got: {}", cmd);
+    assert!(
+        cmd.contains("'hello; rm -rf /'") || cmd.contains("'hello;"),
+        "shell injection should be escaped with quotes, got: {}",
+        cmd
+    );
 }
 
 #[test]
@@ -1253,12 +1519,19 @@ fn test_unsafe_method_blocked() {
 #[test]
 fn test_workflow_pattern_multiphase() {
     let adapter = RecordingAdapter::new()
-        .on("Clarify requirements", r#"{"requirements": "Build auth", "scope": "login+logout"}"#)
-        .on("Design solution", r#"{"design": "JWT tokens", "components": ["auth", "middleware"]}"#)
+        .on(
+            "Clarify requirements",
+            r#"{"requirements": "Build auth", "scope": "login+logout"}"#,
+        )
+        .on(
+            "Design solution",
+            r#"{"design": "JWT tokens", "components": ["auth", "middleware"]}"#,
+        )
         .on("Implement", "Implementation complete")
         .on("Review code", r#"{"issues": 0, "status": "approved"}"#);
 
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: "mini-workflow"
 description: "Simplified default-workflow pattern"
 version: "1.0.0"
@@ -1293,14 +1566,20 @@ steps:
   - id: "step-05-skip-if-no-issues"
     command: "echo No fixes needed"
     condition: "not review"
-"#, adapter);
+"#,
+        adapter,
+    );
 
     assert!(r.success);
     assert_eq!(r.step_results.len(), 6);
     // Steps 0-4 should complete, step 5 should skip (review is truthy)
     for i in 0..5 {
-        assert_eq!(r.step_results[i].status, StepStatus::Completed,
-            "step {} should complete", r.step_results[i].step_id);
+        assert_eq!(
+            r.step_results[i].status,
+            StepStatus::Completed,
+            "step {} should complete",
+            r.step_results[i].step_id
+        );
     }
     assert_eq!(r.step_results[5].status, StepStatus::Skipped);
 }
@@ -1310,12 +1589,19 @@ steps:
 #[test]
 fn test_quality_audit_loop_pattern() {
     let adapter = RecordingAdapter::new()
-        .on("SEEK", r#"{"findings": [{"severity": "medium", "desc": "unused import"}], "count": 1}"#)
+        .on(
+            "SEEK",
+            r#"{"findings": [{"severity": "medium", "desc": "unused import"}], "count": 1}"#,
+        )
         .on("VALIDATE", r#"{"confirmed": 1, "false_positives": 0}"#)
         .on("FIX", r#"{"fixed": 1, "remaining": 0}"#)
-        .on("CONVERGE", r#"{"status": "CONVERGED", "remaining_issues": 0}"#);
+        .on(
+            "CONVERGE",
+            r#"{"status": "CONVERGED", "remaining_issues": 0}"#,
+        );
 
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: "quality-loop"
 version: "1.0.0"
 context:
@@ -1352,9 +1638,15 @@ steps:
 
   - id: "final"
     command: "echo audit complete"
-"#, adapter);
+"#,
+        adapter,
+    );
 
-    assert!(r.success, "quality loop should complete: {:?}", r.step_results);
+    assert!(
+        r.success,
+        "quality loop should complete: {:?}",
+        r.step_results
+    );
     // seek-2 should be skipped because convergence is still "NOT_CONVERGED"
     // (the string in context, not the parsed JSON result)
     assert_eq!(r.step_results[5].status, StepStatus::Completed);
@@ -1367,21 +1659,30 @@ fn test_oxidizer_pattern_with_sub_recipes() {
     let tmp = tempfile::tempdir().unwrap();
 
     // Quality audit sub-recipe
-    std::fs::write(tmp.path().join("quality-check.yaml"), r#"
+    std::fs::write(
+        tmp.path().join("quality-check.yaml"),
+        r#"
 name: quality-check
 steps:
   - id: audit
     command: "echo auditing {{target}}"
     output: "audit_result"
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let adapter = RecordingAdapter::new()
-        .on("Analyze Python", r#"{"modules": ["models", "parser", "runner"], "total_loc": 1200}"#)
+        .on(
+            "Analyze Python",
+            r#"{"modules": ["models", "parser", "runner"], "total_loc": 1200}"#,
+        )
         .on("Generate tests", "tests generated")
         .on("Port module", "module ported");
 
     let parser = RecipeParser::new();
-    let recipe = parser.parse(r#"
+    let recipe = parser
+        .parse(
+            r#"
 name: "mini-oxidizer"
 version: "1.0.0"
 context:
@@ -1411,12 +1712,17 @@ steps:
 
   - id: "done"
     command: "echo oxidizer pass complete"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
-    let runner = RecipeRunner::new(adapter)
-        .with_recipe_search_dirs(vec![tmp.path().to_path_buf()]);
+    let runner = RecipeRunner::new(adapter).with_recipe_search_dirs(vec![tmp.path().to_path_buf()]);
     let result = runner.execute(&recipe, None);
-    assert!(result.success, "oxidizer pattern should succeed: {:?}", result);
+    assert!(
+        result.success,
+        "oxidizer pattern should succeed: {:?}",
+        result
+    );
     assert!(result.context.contains_key("analysis"));
     assert!(result.context.contains_key("audit_result"));
 }
@@ -1428,19 +1734,24 @@ steps:
 #[test]
 fn test_mixed_bash_agent_recipe_steps() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("helper.yaml"), r#"
+    std::fs::write(
+        tmp.path().join("helper.yaml"),
+        r#"
 name: helper
 steps:
   - id: h1
     command: "echo helped"
     output: "help_out"
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    let adapter = RecordingAdapter::new()
-        .on("Review", "looks good");
+    let adapter = RecordingAdapter::new().on("Review", "looks good");
 
     let parser = RecipeParser::new();
-    let recipe = parser.parse(r#"
+    let recipe = parser
+        .parse(
+            r#"
 name: mixed
 steps:
   - id: bash-setup
@@ -1453,10 +1764,11 @@ steps:
     recipe: "helper"
   - id: bash-final
     command: "echo done with {{help_out}}"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
-    let runner = RecipeRunner::new(adapter)
-        .with_recipe_search_dirs(vec![tmp.path().to_path_buf()]);
+    let runner = RecipeRunner::new(adapter).with_recipe_search_dirs(vec![tmp.path().to_path_buf()]);
     let r = runner.execute(&recipe, None);
     assert!(r.success);
     assert_eq!(r.step_results.len(), 4);
@@ -1471,12 +1783,15 @@ steps:
 
 #[test]
 fn test_empty_command_string() {
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
     command: ""
-"#, RecordingAdapter::new());
+"#,
+        RecordingAdapter::new(),
+    );
     // Empty command should still execute (adapter gets "")
     assert!(r.success);
 }
@@ -1485,13 +1800,16 @@ steps:
 fn test_very_long_output_stored_in_context() {
     let long_output = "x".repeat(100_000);
     let adapter = RecordingAdapter::new().on("big", &long_output);
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
     command: "echo big"
     output: "big_data"
-"#, adapter);
+"#,
+        adapter,
+    );
     assert!(r.success);
     let stored = r.context["big_data"].as_str().unwrap();
     assert_eq!(stored.len(), 100_000);
@@ -1499,7 +1817,8 @@ steps:
 
 #[test]
 fn test_unicode_in_templates_and_conditions() {
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 context:
   greeting: "こんにちは世界"
@@ -1508,7 +1827,9 @@ steps:
     command: "echo {{greeting}}"
     condition: "'世界' in greeting"
     output: "out"
-"#, RecordingAdapter::new());
+"#,
+        RecordingAdapter::new(),
+    );
     assert!(r.success);
     assert_eq!(r.step_results[0].status, StepStatus::Completed);
 }
@@ -1516,7 +1837,8 @@ steps:
 #[test]
 fn test_multiline_command() {
     let adapter = RecordingAdapter::new();
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
@@ -1524,14 +1846,17 @@ steps:
       echo "line one" &&
       echo "line two" &&
       echo "line three"
-"#, adapter);
+"#,
+        adapter,
+    );
     assert!(r.success);
 }
 
 #[test]
 fn test_multiline_prompt() {
     let adapter = RecordingAdapter::new();
-    let r = parse_and_run(r#"
+    let r = parse_and_run(
+        r#"
 name: t
 steps:
   - id: s1
@@ -1546,7 +1871,9 @@ steps:
     output: "review"
 context:
   target: "src/"
-"#, adapter);
+"#,
+        adapter,
+    );
     assert!(r.success);
 }
 
@@ -1569,7 +1896,10 @@ steps:
     let parser = RecipeParser::new();
     let recipe = parser.parse(yaml).unwrap();
     assert_eq!(recipe.name, "full-metadata");
-    assert_eq!(recipe.description, "A recipe with every metadata field populated");
+    assert_eq!(
+        recipe.description,
+        "A recipe with every metadata field populated"
+    );
     assert_eq!(recipe.version, "3.1.4");
     assert_eq!(recipe.author, "Test Suite");
     assert_eq!(recipe.tags, vec!["test", "comprehensive", "metadata"]);
@@ -1753,6 +2083,9 @@ fn test_shell_render_prevents_injection() {
     let ctx = RecipeContext::new(data);
     let rendered = ctx.render_shell("echo {{input}}");
     // Should be escaped — wrapped in single quotes
-    assert!(rendered.contains("'") || rendered.contains("\\$"),
-        "dangerous input should be quoted/escaped, got: {}", rendered);
+    assert!(
+        rendered.contains("'") || rendered.contains("\\$"),
+        "dangerous input should be quoted/escaped, got: {}",
+        rendered
+    );
 }

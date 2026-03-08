@@ -76,7 +76,11 @@ pub fn discover_recipes(search_dirs: Option<&[PathBuf]>) -> HashMap<String, Reci
                 dir_count += 1;
             }
         }
-        debug!("  Discovered {} recipes in {}", dir_count, search_dir.display());
+        debug!(
+            "  Discovered {} recipes in {}",
+            dir_count,
+            search_dir.display()
+        );
     }
 
     if recipes.is_empty() {
@@ -136,7 +140,10 @@ impl DiscoveryCache {
         let empty = self.search_dirs.is_empty() && self.cache.is_empty();
 
         if empty || expired || dirs_changed {
-            debug!("DiscoveryCache miss (empty={}, expired={}, dirs_changed={})", empty, expired, dirs_changed);
+            debug!(
+                "DiscoveryCache miss (empty={}, expired={}, dirs_changed={})",
+                empty, expired, dirs_changed
+            );
             self.cache = discover_recipes(Some(dirs));
             self.search_dirs = dirs.to_vec();
             self.last_updated = Instant::now();
@@ -159,9 +166,8 @@ impl DiscoveryCache {
 /// Uses a module-level `Mutex<DiscoveryCache>` so callers don't need to manage
 /// their own cache instance.  The default TTL is 30 seconds.
 pub fn cached_discover_recipes(dirs: &[PathBuf]) -> HashMap<String, RecipeInfo> {
-    static CACHE: std::sync::LazyLock<Mutex<DiscoveryCache>> = std::sync::LazyLock::new(|| {
-        Mutex::new(DiscoveryCache::new(Duration::from_secs(30)))
-    });
+    static CACHE: std::sync::LazyLock<Mutex<DiscoveryCache>> =
+        std::sync::LazyLock::new(|| Mutex::new(DiscoveryCache::new(Duration::from_secs(30))));
 
     let mut cache = CACHE.lock().expect("DiscoveryCache mutex poisoned");
     cache.get_or_discover(dirs).clone()
@@ -226,7 +232,10 @@ pub fn verify_global_installation() -> serde_json::Value {
 
 /// Compare local recipe files against their content hashes.
 pub fn check_upstream_changes(local_dir: Option<&Path>) -> Vec<HashMap<String, String>> {
-    let recipe_dir = match local_dir.map(|p| p.to_path_buf()).or_else(find_first_recipe_dir) {
+    let recipe_dir = match local_dir
+        .map(|p| p.to_path_buf())
+        .or_else(find_first_recipe_dir)
+    {
         Some(d) => d,
         None => return vec![],
     };
@@ -291,7 +300,9 @@ pub fn update_manifest(local_dir: Option<&Path>) -> Result<PathBuf, std::io::Err
     let recipe_dir = local_dir
         .map(|p| p.to_path_buf())
         .or_else(find_first_recipe_dir)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No recipe directory found"))?;
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "No recipe directory found")
+        })?;
 
     let mut manifest = HashMap::new();
     let mut entries: Vec<PathBuf> = std::fs::read_dir(&recipe_dir)?
@@ -340,9 +351,7 @@ pub fn sync_upstream(
     }
 
     // Fetch
-    Command::new("git")
-        .args(["fetch", &remote, br])
-        .output()?;
+    Command::new("git").args(["fetch", &remote, br]).output()?;
 
     // Diff
     let upstream_ref = format!("{}/{}", remote, br);
@@ -390,30 +399,30 @@ fn load_recipe_info(yaml_path: &Path) -> Option<RecipeInfo> {
     let map = data.as_mapping()?;
 
     let name = map
-        .get(&serde_yaml::Value::String("name".to_string()))?
+        .get(serde_yaml::Value::String("name".to_string()))?
         .as_str()?
         .to_string();
 
     let description = map
-        .get(&serde_yaml::Value::String("description".to_string()))
+        .get(serde_yaml::Value::String("description".to_string()))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
 
     let version = map
-        .get(&serde_yaml::Value::String("version".to_string()))
+        .get(serde_yaml::Value::String("version".to_string()))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
 
     let steps = map
-        .get(&serde_yaml::Value::String("steps".to_string()))
+        .get(serde_yaml::Value::String("steps".to_string()))
         .and_then(|v| v.as_sequence())
         .map(|s| s.len())
         .unwrap_or(0);
 
     let tags = map
-        .get(&serde_yaml::Value::String("tags".to_string()))
+        .get(serde_yaml::Value::String("tags".to_string()))
         .and_then(|v| v.as_sequence())
         .map(|seq| {
             seq.iter()
@@ -424,7 +433,9 @@ fn load_recipe_info(yaml_path: &Path) -> Option<RecipeInfo> {
 
     Some(RecipeInfo {
         name,
-        path: yaml_path.canonicalize().unwrap_or_else(|_| yaml_path.to_path_buf()),
+        path: yaml_path
+            .canonicalize()
+            .unwrap_or_else(|_| yaml_path.to_path_buf()),
         description,
         version,
         step_count: steps,
@@ -447,23 +458,17 @@ fn file_hash(path: &Path) -> String {
 
 fn load_manifest(recipe_dir: &Path) -> HashMap<String, String> {
     let manifest_path = recipe_dir.join("_recipe_manifest.json");
-    if manifest_path.is_file() {
-        if let Ok(text) = std::fs::read_to_string(&manifest_path) {
-            if let Ok(map) = serde_json::from_str(&text) {
-                return map;
-            }
-        }
+    if manifest_path.is_file()
+        && let Ok(text) = std::fs::read_to_string(&manifest_path)
+        && let Ok(map) = serde_json::from_str(&text)
+    {
+        return map;
     }
     HashMap::new()
 }
 
 fn find_first_recipe_dir() -> Option<PathBuf> {
-    for d in default_search_dirs() {
-        if d.is_dir() {
-            return Some(d);
-        }
-    }
-    None
+    default_search_dirs().into_iter().find(|d| d.is_dir())
 }
 
 #[cfg(test)]
@@ -620,7 +625,11 @@ steps:
         .unwrap();
 
         let result = cache.get_or_discover(&dirs);
-        assert_eq!(result.len(), 2, "expired cache must re-scan and find new recipe");
+        assert_eq!(
+            result.len(),
+            2,
+            "expired cache must re-scan and find new recipe"
+        );
     }
 
     #[test]
@@ -635,8 +644,14 @@ steps:
 
         // Switch to dir2 — dirs changed so cache must miss
         let result = cache.get_or_discover(&[tmp2.path().to_path_buf()]);
-        assert!(!result.contains_key("dir1-recipe"), "old dir results must not appear");
-        assert!(result.contains_key("dir2-recipe"), "new dir results must appear");
+        assert!(
+            !result.contains_key("dir1-recipe"),
+            "old dir results must not appear"
+        );
+        assert!(
+            result.contains_key("dir2-recipe"),
+            "new dir results must appear"
+        );
     }
 
     #[test]

@@ -4,16 +4,18 @@
 /// accumulation, conditional execution, template rendering, and fail-fast behavior.
 /// Direct port from Python `amplihack.recipes.runner`.
 use crate::adapters::Adapter;
-use crate::agent_resolver::{AgentResolver, AgentResolveError};
+use crate::agent_resolver::{AgentResolveError, AgentResolver};
 use crate::context::RecipeContext;
 use crate::discovery;
-use crate::models::{Recipe, RecipeResult, Step, StepExecutionError, StepResult, StepStatus, StepType};
+use crate::models::{
+    Recipe, RecipeResult, Step, StepExecutionError, StepResult, StepStatus, StepType,
+};
 use crate::parser::{RecipeParser, resolve_extends};
 use log::{error, info, warn};
 use regex::Regex;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -27,9 +29,15 @@ static JSON_FENCE_RE: LazyLock<Regex> =
 
 /// Callback trait for step execution progress events.
 pub trait ExecutionListener {
-    fn on_step_start(&self, step_id: &str, step_type: StepType) { let _ = (step_id, step_type); }
-    fn on_step_complete(&self, result: &StepResult) { let _ = result; }
-    fn on_output(&self, step_id: &str, line: &str) { let _ = (step_id, line); }
+    fn on_step_start(&self, step_id: &str, step_type: StepType) {
+        let _ = (step_id, step_type);
+    }
+    fn on_step_complete(&self, result: &StepResult) {
+        let _ = result;
+    }
+    fn on_output(&self, step_id: &str, line: &str) {
+        let _ = (step_id, line);
+    }
 }
 
 /// No-op listener.
@@ -49,7 +57,10 @@ impl ExecutionListener for StderrListener {
             StepStatus::Failed => "✗",
             _ => "?",
         };
-        let dur = result.duration.map(|d| format!(" ({:.1}s)", d.as_secs_f64())).unwrap_or_default();
+        let dur = result
+            .duration
+            .map(|d| format!(" ({:.1}s)", d.as_secs_f64()))
+            .unwrap_or_default();
         eprintln!("  {} {}{}", icon, result.step_id, dur);
     }
 }
@@ -147,17 +158,17 @@ impl<A: Adapter> RecipeRunner<A> {
     ) -> RecipeResult {
         // Resolve extends (single-level inheritance) if set
         let mut recipe = recipe.clone();
-        if recipe.extends.is_some() {
-            if let Err(e) = resolve_extends(&mut recipe, &self.recipe_search_dirs) {
-                error!("Failed to resolve extends: {}", e);
-                return RecipeResult {
-                    recipe_name: recipe.name.clone(),
-                    success: false,
-                    step_results: vec![],
-                    context: HashMap::new(),
-                    duration: None,
-                };
-            }
+        if recipe.extends.is_some()
+            && let Err(e) = resolve_extends(&mut recipe, &self.recipe_search_dirs)
+        {
+            error!("Failed to resolve extends: {}", e);
+            return RecipeResult {
+                recipe_name: recipe.name.clone(),
+                success: false,
+                step_results: vec![],
+                context: HashMap::new(),
+                duration: None,
+            };
         }
 
         // Apply recipe-level recursion limits
@@ -193,7 +204,11 @@ impl<A: Adapter> RecipeRunner<A> {
         while step_idx < recipe.steps.len() {
             if recipe.steps[step_idx].parallel_group.is_some() {
                 // Collect consecutive steps sharing the same parallel_group
-                let group_name = recipe.steps[step_idx].parallel_group.as_ref().unwrap().clone();
+                let group_name = recipe.steps[step_idx]
+                    .parallel_group
+                    .as_ref()
+                    .unwrap()
+                    .clone();
                 let group_start = step_idx;
                 while step_idx < recipe.steps.len()
                     && recipe.steps[step_idx].parallel_group.as_deref() == Some(&group_name)
@@ -229,9 +244,8 @@ impl<A: Adapter> RecipeRunner<A> {
                 }
 
                 // Execute group (bash steps in parallel, others sequential)
-                let group_results = self.execute_parallel_group(
-                    &group_steps, &recipe, &ctx, &*self.listener,
-                );
+                let group_results =
+                    self.execute_parallel_group(&group_steps, &recipe, &ctx, &*self.listener);
 
                 // Merge results into context in step order for determinism
                 let mut group_failed = false;
@@ -249,12 +263,10 @@ impl<A: Adapter> RecipeRunner<A> {
                     self.write_audit_entry(&audit_file, &result);
 
                     // Store output in context in step order
-                    if !failed {
-                        if let Some(ref output_key) = gs.output {
-                            let value = serde_json::from_str(&result.output)
-                                .unwrap_or(Value::String(result.output.clone()));
-                            ctx.set(output_key, value);
-                        }
+                    if !failed && let Some(ref output_key) = gs.output {
+                        let value = serde_json::from_str(&result.output)
+                            .unwrap_or(Value::String(result.output.clone()));
+                        ctx.set(output_key, value);
                     }
 
                     if failed && !gs.continue_on_error {
@@ -382,7 +394,10 @@ impl<A: Adapter> RecipeRunner<A> {
         if let Some(cmd) = hook {
             let rendered = ctx.render(cmd);
             info!("Running {} hook for step '{}'", hook_name, step_id);
-            if let Err(e) = self.adapter.execute_bash_step(&rendered, &self.working_dir, Some(30)) {
+            if let Err(e) = self
+                .adapter
+                .execute_bash_step(&rendered, &self.working_dir, Some(30))
+            {
                 warn!("{} hook failed for step '{}': {}", hook_name, step_id, e);
             }
         }
@@ -532,8 +547,8 @@ impl<A: Adapter> RecipeRunner<A> {
         // Store output in context
         if let Some(ref output_key) = step.output {
             // Try to parse as JSON value, fall back to string
-            let value = serde_json::from_str(&final_output)
-                .unwrap_or(Value::String(final_output.clone()));
+            let value =
+                serde_json::from_str(&final_output).unwrap_or(Value::String(final_output.clone()));
             ctx.set(output_key, value);
         }
 
@@ -551,7 +566,11 @@ impl<A: Adapter> RecipeRunner<A> {
         }
     }
 
-    fn dispatch_step(&self, step: &Step, ctx: &mut RecipeContext) -> Result<String, StepExecutionError> {
+    fn dispatch_step(
+        &self,
+        step: &Step,
+        ctx: &mut RecipeContext,
+    ) -> Result<String, StepExecutionError> {
         let working_dir = step.working_dir.as_deref().unwrap_or(&self.working_dir);
         let st = step.effective_type();
 
@@ -576,7 +595,8 @@ impl<A: Adapter> RecipeRunner<A> {
                     agent_name = Some(agent_ref.as_str());
                     match self.agent_resolver.resolve(agent_ref) {
                         Ok(content) => agent_system_prompt = Some(content),
-                        Err(AgentResolveError::NotFound { .. }) | Err(AgentResolveError::InvalidReference(_)) => {
+                        Err(AgentResolveError::NotFound { .. })
+                        | Err(AgentResolveError::InvalidReference(_)) => {
                             warn!(
                                 "Could not resolve agent '{}', proceeding without system prompt",
                                 agent_ref
@@ -601,7 +621,11 @@ impl<A: Adapter> RecipeRunner<A> {
         }
     }
 
-    fn execute_sub_recipe(&self, step: &Step, ctx: &mut RecipeContext) -> Result<String, StepExecutionError> {
+    fn execute_sub_recipe(
+        &self,
+        step: &Step,
+        ctx: &mut RecipeContext,
+    ) -> Result<String, StepExecutionError> {
         let current_depth = self.depth.get();
         if current_depth >= self.max_depth.get() {
             return Err(StepExecutionError {
@@ -619,16 +643,20 @@ impl<A: Adapter> RecipeRunner<A> {
         })?;
 
         // Use discovery module to find the recipe, falling back to local search dirs
-        let path = self.find_recipe_path(recipe_name).ok_or_else(|| StepExecutionError {
-            step_id: step.id.clone(),
-            message: format!("Sub-recipe '{}' not found", recipe_name),
-        })?;
+        let path = self
+            .find_recipe_path(recipe_name)
+            .ok_or_else(|| StepExecutionError {
+                step_id: step.id.clone(),
+                message: format!("Sub-recipe '{}' not found", recipe_name),
+            })?;
 
         let parser = RecipeParser::new();
-        let sub_recipe = parser.parse_file(Path::new(&path)).map_err(|e| StepExecutionError {
-            step_id: step.id.clone(),
-            message: format!("Failed to parse sub-recipe '{}': {}", recipe_name, e),
-        })?;
+        let sub_recipe = parser
+            .parse_file(Path::new(&path))
+            .map_err(|e| StepExecutionError {
+                step_id: step.id.clone(),
+                message: format!("Failed to parse sub-recipe '{}': {}", recipe_name, e),
+            })?;
 
         // Merge: current context + step-level sub_context overrides
         let mut merged = ctx.to_map();
@@ -722,10 +750,10 @@ impl<A: Adapter> RecipeRunner<A> {
 
     fn find_recipe_path(&self, name: &str) -> Option<String> {
         // First try discovery module
-        if !self.recipe_search_dirs.is_empty() {
-            if let Some(path) = discovery::find_recipe(name, Some(&self.recipe_search_dirs)) {
-                return Some(path.display().to_string());
-            }
+        if !self.recipe_search_dirs.is_empty()
+            && let Some(path) = discovery::find_recipe(name, Some(&self.recipe_search_dirs))
+        {
+            return Some(path.display().to_string());
         }
 
         // Fall back to discovery module default paths
@@ -953,16 +981,15 @@ fn parse_json_output(output: &str, step_id: &str) -> Option<Value> {
     }
 
     // Strategy 2: Extract from markdown fences
-    if let Some(caps) = JSON_FENCE_RE.captures(text) {
-        if let Some(m) = caps.get(1) {
-            if let Ok(v) = serde_json::from_str::<Value>(m.as_str().trim()) {
-                return Some(v);
-            }
-        }
+    if let Some(caps) = JSON_FENCE_RE.captures(text)
+        && let Some(m) = caps.get(1)
+        && let Ok(v) = serde_json::from_str::<Value>(m.as_str().trim())
+    {
+        return Some(v);
     }
 
     // Strategy 3: Find first balanced JSON block
-    for (open_ch, close_ch) in [( '{', '}'), ('[', ']')] {
+    for (open_ch, close_ch) in [('{', '}'), ('[', ']')] {
         if let Some(start) = text.find(open_ch) {
             let mut depth = 0i32;
             let mut in_string = false;
@@ -1000,7 +1027,10 @@ fn parse_json_output(output: &str, step_id: &str) -> Option<Value> {
         }
     }
 
-    warn!("All JSON extraction strategies failed for step '{}'", step_id);
+    warn!(
+        "All JSON extraction strategies failed for step '{}'",
+        step_id
+    );
     None
 }
 
@@ -1013,20 +1043,34 @@ mod tests {
 
     impl Adapter for MockAdapter {
         fn execute_agent_step(
-            &self, prompt: &str, _agent_name: Option<&str>,
-            _system_prompt: Option<&str>, _mode: Option<&str>, _working_dir: &str,
+            &self,
+            prompt: &str,
+            _agent_name: Option<&str>,
+            _system_prompt: Option<&str>,
+            _mode: Option<&str>,
+            _working_dir: &str,
         ) -> Result<String, anyhow::Error> {
-            Ok(format!("Agent response for: {}", &prompt[..prompt.len().min(50)]))
+            Ok(format!(
+                "Agent response for: {}",
+                &prompt[..prompt.len().min(50)]
+            ))
         }
 
         fn execute_bash_step(
-            &self, command: &str, _working_dir: &str, _timeout: Option<u64>,
+            &self,
+            command: &str,
+            _working_dir: &str,
+            _timeout: Option<u64>,
         ) -> Result<String, anyhow::Error> {
             Ok(format!("Bash output for: {}", command))
         }
 
-        fn is_available(&self) -> bool { true }
-        fn name(&self) -> &str { "mock" }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &str {
+            "mock"
+        }
     }
 
     #[test]

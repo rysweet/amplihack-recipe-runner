@@ -11,7 +11,6 @@ use recipe_runner_rs::parser::RecipeParser;
 use recipe_runner_rs::runner::RecipeRunner;
 use serde_json::json;
 use std::collections::HashMap;
-use tempfile;
 
 // -- Mock adapter for integration tests --
 
@@ -27,7 +26,8 @@ impl MockAdapter {
     }
 
     fn with_response(mut self, pattern: &str, response: &str) -> Self {
-        self.responses.insert(pattern.to_string(), response.to_string());
+        self.responses
+            .insert(pattern.to_string(), response.to_string());
         self
     }
 }
@@ -47,7 +47,10 @@ impl Adapter for MockAdapter {
                 return Ok(response.clone());
             }
         }
-        Ok(format!("Mock response for: {}", &prompt[..prompt.len().min(50)]))
+        Ok(format!(
+            "Mock response for: {}",
+            &prompt[..prompt.len().min(50)]
+        ))
     }
 
     fn execute_bash_step(
@@ -133,8 +136,8 @@ steps:
     parse_json: true
     output: "analysis"
 "#;
-    let adapter = MockAdapter::new()
-        .with_response("Return JSON", r#"{"status": "ok", "items": [1, 2, 3]}"#);
+    let adapter =
+        MockAdapter::new().with_response("Return JSON", r#"{"status": "ok", "items": [1, 2, 3]}"#);
 
     let parser = RecipeParser::new();
     let recipe = parser.parse(yaml).unwrap();
@@ -251,8 +254,7 @@ steps:
     let adapter = MockAdapter::new();
     let parser = RecipeParser::new();
     let recipe = parser.parse(parent_yaml).unwrap();
-    let runner = RecipeRunner::new(adapter)
-        .with_recipe_search_dirs(vec![tmp.path().to_path_buf()]);
+    let runner = RecipeRunner::new(adapter).with_recipe_search_dirs(vec![tmp.path().to_path_buf()]);
     let result = runner.execute(&recipe, None);
 
     assert!(result.success, "Sub-recipe execution failed: {:?}", result);
@@ -318,7 +320,8 @@ fn test_discovery_and_manifest() {
     std::fs::write(
         tmp.path().join("recipe-beta.yaml"),
         "name: recipe-beta\ntags:\n  - test\n  - demo\nsteps:\n  - id: s1\n    command: echo b\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     // Discover
     let recipes = discovery::discover_recipes(Some(&[tmp.path().to_path_buf()]));
@@ -344,7 +347,11 @@ fn test_discovery_and_manifest() {
 
     // No changes after creating manifest
     let changes = discovery::check_upstream_changes(Some(tmp.path()));
-    assert!(changes.is_empty(), "Expected no changes, got: {:?}", changes);
+    assert!(
+        changes.is_empty(),
+        "Expected no changes, got: {:?}",
+        changes
+    );
 }
 
 #[test]
@@ -355,7 +362,8 @@ fn test_agent_resolver_integration() {
     std::fs::write(
         agent_dir.join("optimizer.md"),
         "# Optimizer Agent\n\nYou optimize code for performance.",
-    ).unwrap();
+    )
+    .unwrap();
 
     let resolver = AgentResolver::new(Some(vec![tmp.path().to_path_buf()]));
 
@@ -444,7 +452,10 @@ fn test_condition_evaluator_comprehensive() {
     assert!(ctx.evaluate("count <= 42").unwrap());
 
     // Boolean ops
-    assert!(ctx.evaluate("status == 'CONVERGED' and count == 42").unwrap());
+    assert!(
+        ctx.evaluate("status == 'CONVERGED' and count == 42")
+            .unwrap()
+    );
     assert!(ctx.evaluate("status == 'WRONG' or count == 42").unwrap());
     assert!(ctx.evaluate("not empty").unwrap());
 
@@ -484,21 +495,32 @@ steps:
     struct FailAdapter;
     impl Adapter for FailAdapter {
         fn execute_agent_step(
-            &self, _p: &str, _a: Option<&str>, _s: Option<&str>,
-            _m: Option<&str>, _w: &str,
+            &self,
+            _p: &str,
+            _a: Option<&str>,
+            _s: Option<&str>,
+            _m: Option<&str>,
+            _w: &str,
         ) -> Result<String, anyhow::Error> {
             Ok("ok".to_string())
         }
         fn execute_bash_step(
-            &self, cmd: &str, _w: &str, _t: Option<u64>,
+            &self,
+            cmd: &str,
+            _w: &str,
+            _t: Option<u64>,
         ) -> Result<String, anyhow::Error> {
             if cmd.contains("fail") {
                 anyhow::bail!("command failed")
             }
             Ok("ok".to_string())
         }
-        fn is_available(&self) -> bool { true }
-        fn name(&self) -> &str { "fail-mock" }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &str {
+            "fail-mock"
+        }
     }
 
     let parser = RecipeParser::new();

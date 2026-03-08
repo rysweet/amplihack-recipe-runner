@@ -1,11 +1,9 @@
-# amplihack Recipe Runner (Rust)
+# amplihack Recipe Runner
 
 [![CI](https://github.com/rysweet/amplihack-recipe-runner/actions/workflows/ci.yml/badge.svg)](https://github.com/rysweet/amplihack-recipe-runner/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-rysweet.github.io-blue)](https://rysweet.github.io/amplihack-recipe-runner/)
 
 A code-enforced workflow execution engine that reads declarative YAML recipe files and executes them step-by-step using AI agents. Unlike prompt-based workflow instructions that models can interpret loosely or skip, the Recipe Runner controls the execution loop in compiled Rust code — making it physically impossible to skip steps.
-
-Ported from the [amplihack](https://github.com/rysweet/amplihack) Python recipe runner via the Oxidizer workflow ([#2818](https://github.com/rysweet/amplihack/issues/2818)).
 
 ## Quick Start
 
