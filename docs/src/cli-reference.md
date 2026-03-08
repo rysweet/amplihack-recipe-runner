@@ -6,29 +6,10 @@ Complete reference for the `recipe-runner-rs` command-line interface.
 
 ```
 recipe-runner-rs [OPTIONS] [RECIPE] [COMMAND]
-recipe-runner-rs run [OPTIONS] <RECIPE>
 recipe-runner-rs list [OPTIONS]
 ```
 
 ## Subcommands
-
-### `run`
-
-Execute a recipe. This is the default subcommand when a positional `RECIPE` argument is provided.
-
-```bash
-# Explicit subcommand
-recipe-runner-rs run my-recipe.yaml
-
-# Implicit (positional RECIPE triggers run)
-recipe-runner-rs my-recipe.yaml
-```
-
-**Arguments:**
-
-| Argument | Required | Description |
-|----------|----------|-------------|
-| `RECIPE` | Yes | Path or name of the recipe to execute |
 
 ### `list`
 
@@ -50,13 +31,13 @@ Set the working directory for recipe execution.
 
 ```bash
 # Run a recipe from a different directory
-recipe-runner-rs run deploy.yaml --working-dir /home/user/my-project
+recipe-runner-rs deploy.yaml --working-dir /home/user/my-project
 
 # Short form
-recipe-runner-rs run deploy.yaml -C /home/user/my-project
+recipe-runner-rs deploy.yaml -C /home/user/my-project
 
 # Combine with other options
-recipe-runner-rs run build.yaml -C ../other-repo --dry-run
+recipe-runner-rs build.yaml -C ../other-repo --dry-run
 ```
 
 ### `-R, --recipe-dir <DIR>`
@@ -65,16 +46,16 @@ Add a directory to the recipe search path. Can be specified multiple times to se
 
 ```bash
 # Single directory
-recipe-runner-rs run my-recipe --recipe-dir ./recipes
+recipe-runner-rs my-recipe --recipe-dir ./recipes
 
 # Multiple directories (searched in order)
-recipe-runner-rs run my-recipe \
+recipe-runner-rs my-recipe \
   --recipe-dir ./project-recipes \
   --recipe-dir ~/.config/recipes \
   --recipe-dir /opt/shared-recipes
 
 # Short form
-recipe-runner-rs run my-recipe -R ./recipes -R ../shared
+recipe-runner-rs my-recipe -R ./recipes -R ../shared
 
 # Combine with list to discover recipes across directories
 recipe-runner-rs list -R ./recipes -R /opt/shared-recipes
@@ -86,22 +67,22 @@ Override a context variable. Can be specified multiple times to set several vari
 
 ```bash
 # String value
-recipe-runner-rs run deploy.yaml --set environment=production
+recipe-runner-rs deploy.yaml --set environment=production
 
 # Integer value (auto-detected)
-recipe-runner-rs run scale.yaml --set replicas=5
+recipe-runner-rs scale.yaml --set replicas=5
 
 # Float value (auto-detected)
-recipe-runner-rs run tune.yaml --set ratio=0.75
+recipe-runner-rs tune.yaml --set ratio=0.75
 
 # Boolean value (auto-detected)
-recipe-runner-rs run build.yaml --set verbose=true
+recipe-runner-rs build.yaml --set verbose=true
 
 # JSON value (auto-detected)
-recipe-runner-rs run config.yaml --set data='{"host": "localhost", "port": 8080}'
+recipe-runner-rs config.yaml --set data='{"host": "localhost", "port": 8080}'
 
 # Multiple overrides
-recipe-runner-rs run deploy.yaml \
+recipe-runner-rs deploy.yaml \
   --set environment=production \
   --set replicas=3 \
   --set debug=false \
@@ -113,13 +94,13 @@ recipe-runner-rs run deploy.yaml \
 Parse and validate the recipe without executing any steps. Useful for checking recipe correctness before committing to a run.
 
 ```bash
-recipe-runner-rs run deploy.yaml --dry-run
+recipe-runner-rs deploy.yaml --dry-run
 
 # Combine with --set to validate context overrides
-recipe-runner-rs run deploy.yaml --dry-run --set environment=staging
+recipe-runner-rs deploy.yaml --dry-run --set environment=staging
 
 # Combine with --progress to see what steps would run
-recipe-runner-rs run deploy.yaml --dry-run --progress
+recipe-runner-rs deploy.yaml --dry-run --progress
 ```
 
 ### `--no-auto-stage`
@@ -127,10 +108,10 @@ recipe-runner-rs run deploy.yaml --dry-run --progress
 Disable automatic git staging of file changes made during recipe execution.
 
 ```bash
-recipe-runner-rs run codegen.yaml --no-auto-stage
+recipe-runner-rs codegen.yaml --no-auto-stage
 
 # Useful when you want to review changes before staging
-recipe-runner-rs run refactor.yaml --no-auto-stage -C /path/to/repo
+recipe-runner-rs refactor.yaml --no-auto-stage -C /path/to/repo
 ```
 
 ### `--validate-only`
@@ -138,13 +119,13 @@ recipe-runner-rs run refactor.yaml --no-auto-stage -C /path/to/repo
 Parse and validate the recipe, print any warnings, then exit. Does not execute any steps. More thorough than `--dry-run` as it focuses on surfacing validation warnings.
 
 ```bash
-recipe-runner-rs run deploy.yaml --validate-only
+recipe-runner-rs deploy.yaml --validate-only
 
 # Validate a recipe in a specific directory
-recipe-runner-rs run my-recipe --validate-only -R ./recipes
+recipe-runner-rs my-recipe --validate-only -R ./recipes
 
 # Validate with context overrides to check for missing variables
-recipe-runner-rs run deploy.yaml --validate-only --set environment=production
+recipe-runner-rs deploy.yaml --validate-only --set environment=production
 ```
 
 ### `--explain`
@@ -152,10 +133,10 @@ recipe-runner-rs run deploy.yaml --validate-only --set environment=production
 Show the structure of a recipe without executing it. Displays the recipe name, version, and each step with its conditions, agents, and commands.
 
 ```bash
-recipe-runner-rs run deploy.yaml --explain
+recipe-runner-rs deploy.yaml --explain
 
 # Explain a recipe found via search path
-recipe-runner-rs run my-recipe --explain -R ./recipes
+recipe-runner-rs my-recipe --explain -R ./recipes
 ```
 
 Example output:
@@ -182,13 +163,13 @@ Steps:
 Print step progress events to stderr. Emits events when each step starts and completes, useful for monitoring long-running recipes.
 
 ```bash
-recipe-runner-rs run deploy.yaml --progress
+recipe-runner-rs deploy.yaml --progress
 
 # Capture progress separately from output
-recipe-runner-rs run deploy.yaml --progress 2>progress.log
+recipe-runner-rs deploy.yaml --progress 2>progress.log
 
 # Combine with JSON output for machine-readable progress + results
-recipe-runner-rs run deploy.yaml --progress --output-format json
+recipe-runner-rs deploy.yaml --progress --output-format json
 ```
 
 Example stderr output:
@@ -208,13 +189,13 @@ Comma-separated list of tags. Only steps whose `when_tags` match at least one of
 
 ```bash
 # Run only steps tagged "frontend"
-recipe-runner-rs run build.yaml --include-tags frontend
+recipe-runner-rs build.yaml --include-tags frontend
 
 # Run steps tagged "test" or "lint"
-recipe-runner-rs run ci.yaml --include-tags test,lint
+recipe-runner-rs ci.yaml --include-tags test,lint
 
 # Combine with --explain to preview filtered steps
-recipe-runner-rs run ci.yaml --include-tags test --explain
+recipe-runner-rs ci.yaml --include-tags test --explain
 ```
 
 ### `--exclude-tags <TAGS>`
@@ -223,13 +204,13 @@ Comma-separated list of tags. Steps whose `when_tags` match any of the specified
 
 ```bash
 # Skip slow integration tests
-recipe-runner-rs run ci.yaml --exclude-tags slow
+recipe-runner-rs ci.yaml --exclude-tags slow
 
 # Skip multiple categories
-recipe-runner-rs run full-pipeline.yaml --exclude-tags slow,experimental,deprecated
+recipe-runner-rs full-pipeline.yaml --exclude-tags slow,experimental,deprecated
 
 # Include some, exclude others
-recipe-runner-rs run ci.yaml --include-tags test --exclude-tags slow
+recipe-runner-rs ci.yaml --include-tags test --exclude-tags slow
 ```
 
 ### `--audit-dir <DIR>`
@@ -238,10 +219,10 @@ Directory where JSONL audit log files are written. Each recipe run produces one 
 
 ```bash
 # Write audit logs to a directory
-recipe-runner-rs run deploy.yaml --audit-dir ./audit-logs
+recipe-runner-rs deploy.yaml --audit-dir ./audit-logs
 
 # Combine with other options for a fully audited production run
-recipe-runner-rs run deploy.yaml \
+recipe-runner-rs deploy.yaml \
   --audit-dir /var/log/recipe-runner \
   --set environment=production \
   --progress
@@ -258,16 +239,16 @@ Control the output format. Available formats:
 
 ```bash
 # Default text output
-recipe-runner-rs run deploy.yaml
+recipe-runner-rs deploy.yaml
 
 # JSON output for scripting / CI pipelines
-recipe-runner-rs run deploy.yaml --output-format json
+recipe-runner-rs deploy.yaml --output-format json
 
 # Pipe JSON output to jq
-recipe-runner-rs run deploy.yaml --output-format json | jq '.steps[] | select(.status == "failed")'
+recipe-runner-rs deploy.yaml --output-format json | jq '.steps[] | select(.status == "failed")'
 
 # JSON output with progress on stderr
-recipe-runner-rs run deploy.yaml --output-format json --progress 2>/dev/null
+recipe-runner-rs deploy.yaml --output-format json --progress 2>/dev/null
 ```
 
 ## Exit Codes
@@ -280,7 +261,7 @@ recipe-runner-rs run deploy.yaml --output-format json --progress 2>/dev/null
 
 ```bash
 # Check exit code in scripts
-recipe-runner-rs run deploy.yaml
+recipe-runner-rs deploy.yaml
 if [ $? -eq 0 ]; then
   echo "Deploy succeeded"
 elif [ $? -eq 1 ]; then
@@ -290,10 +271,10 @@ elif [ $? -eq 2 ]; then
 fi
 
 # Use && / || for simple chaining
-recipe-runner-rs run build.yaml && recipe-runner-rs run deploy.yaml
+recipe-runner-rs build.yaml && recipe-runner-rs deploy.yaml
 
 # Validate before running
-recipe-runner-rs run deploy.yaml --validate-only && recipe-runner-rs run deploy.yaml
+recipe-runner-rs deploy.yaml --validate-only && recipe-runner-rs deploy.yaml
 ```
 
 ## Smart Context Value Parsing (`--set`)
@@ -310,24 +291,24 @@ When using `--set KEY=VALUE`, the runner automatically determines the value type
 
 ```bash
 # JSON — parsed as a structured object
-recipe-runner-rs run setup.yaml --set config='{"host": "localhost", "port": 8080}'
-recipe-runner-rs run setup.yaml --set tags='["web", "api"]'
+recipe-runner-rs setup.yaml --set config='{"host": "localhost", "port": 8080}'
+recipe-runner-rs setup.yaml --set tags='["web", "api"]'
 
 # Boolean — parsed as bool
-recipe-runner-rs run build.yaml --set release=true
-recipe-runner-rs run build.yaml --set skip_tests=false
+recipe-runner-rs build.yaml --set release=true
+recipe-runner-rs build.yaml --set skip_tests=false
 
 # Integer — parsed as i64
-recipe-runner-rs run scale.yaml --set workers=8
-recipe-runner-rs run scale.yaml --set retries=0
+recipe-runner-rs scale.yaml --set workers=8
+recipe-runner-rs scale.yaml --set retries=0
 
 # Float — parsed as f64
-recipe-runner-rs run tune.yaml --set threshold=0.95
-recipe-runner-rs run tune.yaml --set learning_rate=0.001
+recipe-runner-rs tune.yaml --set threshold=0.95
+recipe-runner-rs tune.yaml --set learning_rate=0.001
 
 # String — fallback for everything else
-recipe-runner-rs run deploy.yaml --set branch=main
-recipe-runner-rs run deploy.yaml --set message="deploy to production"
+recipe-runner-rs deploy.yaml --set branch=main
+recipe-runner-rs deploy.yaml --set message="deploy to production"
 ```
 
 ## Environment Variables
@@ -339,14 +320,14 @@ Additional recipe search directories, separated by colons. These directories are
 ```bash
 # Set via environment
 export RECIPE_RUNNER_RECIPE_DIRS="/opt/recipes:/home/user/.config/recipes"
-recipe-runner-rs run my-recipe
+recipe-runner-rs my-recipe
 
 # Inline for a single invocation
 RECIPE_RUNNER_RECIPE_DIRS=./recipes recipe-runner-rs list
 
 # Combine with --recipe-dir (both are searched)
 export RECIPE_RUNNER_RECIPE_DIRS="/opt/shared-recipes"
-recipe-runner-rs run my-recipe --recipe-dir ./local-recipes
+recipe-runner-rs my-recipe --recipe-dir ./local-recipes
 ```
 
 ## Usage Examples
@@ -355,7 +336,7 @@ recipe-runner-rs run my-recipe --recipe-dir ./local-recipes
 
 ```bash
 # Run a recipe by file path
-recipe-runner-rs run ./recipes/build.yaml
+recipe-runner-rs ./recipes/build.yaml
 
 # Run a recipe by name (searched in recipe directories)
 recipe-runner-rs build
@@ -368,8 +349,8 @@ recipe-runner-rs list
 
 ```bash
 # Validate, then run with JSON output and auditing
-recipe-runner-rs run deploy.yaml --validate-only \
-  && recipe-runner-rs run deploy.yaml \
+recipe-runner-rs deploy.yaml --validate-only \
+  && recipe-runner-rs deploy.yaml \
     --set environment=production \
     --set version="$(git describe --tags)" \
     --output-format json \
@@ -381,15 +362,15 @@ recipe-runner-rs run deploy.yaml --validate-only \
 
 ```bash
 # Preview what a recipe will do
-recipe-runner-rs run refactor.yaml --explain
+recipe-runner-rs refactor.yaml --explain
 
 # Dry-run with overrides to test logic
-recipe-runner-rs run refactor.yaml --dry-run \
+recipe-runner-rs refactor.yaml --dry-run \
   --set target_module=auth \
   --set aggressive=true
 
 # Run without auto-staging to review changes manually
-recipe-runner-rs run refactor.yaml \
+recipe-runner-rs refactor.yaml \
   --set target_module=auth \
   --no-auto-stage
 ```
@@ -398,13 +379,13 @@ recipe-runner-rs run refactor.yaml \
 
 ```bash
 # Run only unit tests
-recipe-runner-rs run ci.yaml --include-tags unit
+recipe-runner-rs ci.yaml --include-tags unit
 
 # Run everything except slow tests
-recipe-runner-rs run ci.yaml --exclude-tags slow,integration
+recipe-runner-rs ci.yaml --exclude-tags slow,integration
 
 # Explain which steps match the filter
-recipe-runner-rs run ci.yaml --include-tags unit --explain
+recipe-runner-rs ci.yaml --include-tags unit --explain
 ```
 
 ### Multi-Directory Recipe Management
@@ -425,11 +406,11 @@ recipe-runner-rs list
 
 ```bash
 # Capture JSON output for downstream processing
-output=$(recipe-runner-rs run analyze.yaml --output-format json)
+output=$(recipe-runner-rs analyze.yaml --output-format json)
 echo "$output" | jq '.summary'
 
 # Run with full observability
-recipe-runner-rs run deploy.yaml \
+recipe-runner-rs deploy.yaml \
   --output-format json \
   --progress \
   --audit-dir ./audit \

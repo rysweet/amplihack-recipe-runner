@@ -88,7 +88,7 @@ jobs:
         run: |
           # Every src/*.rs file should be referenced in the recipe
           missing=0
-          for mod in models parser context runner agent_resolver discovery lib main; do
+          for mod in models parser context runner agent_resolver discovery lib main adapters cli_subprocess; do
             if ! grep -q "$mod" recipes/build-recipe-runner.yaml; then
               echo "ERROR: recipes/build-recipe-runner.yaml missing reference to $mod"
               missing=1

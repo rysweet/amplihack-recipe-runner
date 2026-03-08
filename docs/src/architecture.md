@@ -212,10 +212,9 @@ struct RecipeResult {
 ## CLI Interface (main.rs)
 
 ```
-amplihack-recipe-runner [OPTIONS] [RECIPE] [COMMAND]
+recipe-runner-rs [OPTIONS] [RECIPE] [COMMAND]
 
 Commands:
-  run    Execute a recipe file (default)
   list   List discovered recipes
 
 Arguments:

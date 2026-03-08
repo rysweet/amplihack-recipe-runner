@@ -1053,8 +1053,8 @@ impl<A: Adapter> RecipeRunner<A> {
         if dry_run {
             return StepResult {
                 step_id: step.id.clone(),
-                status: StepStatus::Completed,
-                output: "[dry run]".to_string(),
+                status: StepStatus::Skipped,
+                output: "(dry-run)".to_string(),
                 error: String::new(),
                 duration: Some(step_start.elapsed()),
             };
