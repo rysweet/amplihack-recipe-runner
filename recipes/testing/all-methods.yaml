@@ -5,14 +5,61 @@
 name: "all-methods"
 description: |
   Tests every safe string method in the expression evaluator:
-  startswith(), endswith(), upper(), lower(), strip(),
-  replace(), count(), find(). All conditions are true.
+  strip(), lstrip(), rstrip(), lower(), upper(), title(),
+  startswith(), endswith(), replace(), split(), join(),
+  count(), find(). All conditions are true.
 version: "1.0.0"
 
 context:
   name: "hello"
+  items:
+    - "a"
+    - "b"
+    - "c"
 
 steps:
+  # --- strip() ---
+  - id: "method-strip"
+    type: "bash"
+    condition: '" hello ".strip() == "hello"'
+    command: "echo 'PASS: \" hello \".strip() == hello'"
+    output: "strip_result"
+
+  # --- lstrip() ---
+  - id: "method-lstrip"
+    type: "bash"
+    condition: '"  hello".lstrip() == "hello"'
+    command: "echo 'PASS: \"  hello\".lstrip() == hello'"
+    output: "lstrip_result"
+
+  # --- rstrip() ---
+  - id: "method-rstrip"
+    type: "bash"
+    condition: '"hello  ".rstrip() == "hello"'
+    command: "echo 'PASS: \"hello  \".rstrip() == hello'"
+    output: "rstrip_result"
+
+  # --- lower() ---
+  - id: "method-lower"
+    type: "bash"
+    condition: 'name.lower() == "hello"'
+    command: "echo 'PASS: name.lower() == hello'"
+    output: "lower_result"
+
+  # --- upper() ---
+  - id: "method-upper"
+    type: "bash"
+    condition: 'name.upper() == "HELLO"'
+    command: "echo 'PASS: name.upper() == HELLO'"
+    output: "upper_result"
+
+  # --- title() ---
+  - id: "method-title"
+    type: "bash"
+    condition: '"hello world".title() == "Hello World"'
+    command: "echo 'PASS: \"hello world\".title() == Hello World'"
+    output: "title_result"
+
   # --- startswith() ---
   - id: "method-startswith"
     type: "bash"
@@ -27,33 +74,26 @@ steps:
     command: "echo 'PASS: name.endswith(\"llo\")'"
     output: "endswith_result"
 
-  # --- upper() ---
-  - id: "method-upper"
-    type: "bash"
-    condition: 'name.upper() == "HELLO"'
-    command: "echo 'PASS: name.upper() == HELLO'"
-    output: "upper_result"
-
-  # --- lower() ---
-  - id: "method-lower"
-    type: "bash"
-    condition: 'name.lower() == "hello"'
-    command: "echo 'PASS: name.lower() == hello'"
-    output: "lower_result"
-
-  # --- strip() ---
-  - id: "method-strip"
-    type: "bash"
-    condition: '" hello ".strip() == "hello"'
-    command: "echo 'PASS: \" hello \".strip() == hello'"
-    output: "strip_result"
-
   # --- replace() ---
   - id: "method-replace"
     type: "bash"
     condition: 'name.replace("l", "r") == "herro"'
     command: "echo 'PASS: name.replace(l, r) == herro'"
     output: "replace_result"
+
+  # --- split() ---
+  - id: "method-split"
+    type: "bash"
+    condition: 'len("a,b,c".split(",")) == 3'
+    command: "echo 'PASS: len(\"a,b,c\".split(\",\")) == 3'"
+    output: "split_result"
+
+  # --- join() ---
+  - id: "method-join"
+    type: "bash"
+    condition: '",".join(items) == "a,b,c"'
+    command: "echo 'PASS: \",\".join(items) == a,b,c'"
+    output: "join_result"
 
   # --- count() ---
   - id: "method-count"

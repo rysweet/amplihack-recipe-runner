@@ -40,6 +40,7 @@ impl Adapter for MockAdapter {
         _system_prompt: Option<&str>,
         _mode: Option<&str>,
         _working_dir: &str,
+        _timeout: Option<u64>,
     ) -> Result<String, anyhow::Error> {
         // Find matching response
         for (pattern, response) in &self.responses {
@@ -501,6 +502,7 @@ steps:
             _s: Option<&str>,
             _m: Option<&str>,
             _w: &str,
+            _t: Option<u64>,
         ) -> Result<String, anyhow::Error> {
             Ok("ok".to_string())
         }
@@ -604,11 +606,17 @@ steps:
 
     // Set env var so discovery finds the recipe
     let adapter = MockAdapter::new().with_response("echo from recipe", "done");
-    // run_recipe_by_name uses default discovery dirs, so the temp recipe may not
-    // be found. We verify find_recipe locates it directly, then exercise the
-    // public API (which may return a not-found error depending on env).
-    assert!(discovery::find_recipe("my-recipe", Some(&[tmp.path().to_path_buf()])).is_some());
-    let _result = recipe_runner_rs::run_recipe_by_name("my-recipe", adapter, None, false);
+    // Point default discovery at the temp dir so run_recipe_by_name finds the recipe.
+    // SAFETY: This test is single-threaded and restores the var immediately after use.
+    unsafe {
+        std::env::set_var("RECIPE_RUNNER_RECIPE_DIRS", tmp.path().to_str().unwrap());
+    }
+    let result = recipe_runner_rs::run_recipe_by_name("my-recipe", adapter, None, false);
+    unsafe {
+        std::env::remove_var("RECIPE_RUNNER_RECIPE_DIRS");
+    }
+    let result = result.expect("run_recipe_by_name should find the recipe");
+    assert!(result.success, "recipe should succeed: {:?}", result);
 }
 
 #[test]

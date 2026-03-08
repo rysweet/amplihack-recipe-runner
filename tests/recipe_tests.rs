@@ -80,6 +80,7 @@ impl Adapter for RecordingAdapter {
         _system_prompt: Option<&str>,
         _mode: Option<&str>,
         _working_dir: &str,
+        _timeout: Option<u64>,
     ) -> Result<String, anyhow::Error> {
         self.agent_calls.fetch_add(1, Ordering::SeqCst);
         for pat in &self.fail_patterns {
@@ -1041,6 +1042,7 @@ fn test_unavailable_adapter_fails_gracefully() {
             _: Option<&str>,
             _: Option<&str>,
             _: &str,
+            _: Option<u64>,
         ) -> Result<String, anyhow::Error> {
             Ok("".into())
         }

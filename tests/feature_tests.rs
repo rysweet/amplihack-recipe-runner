@@ -19,6 +19,7 @@ impl Adapter for MockAdapter {
         _: Option<&str>,
         _: Option<&str>,
         _: &str,
+        _: Option<u64>,
     ) -> Result<String, anyhow::Error> {
         if prompt.contains("FAIL") {
             anyhow::bail!("Simulated failure");

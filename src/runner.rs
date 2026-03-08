@@ -525,7 +525,7 @@ impl<A: Adapter> RecipeRunner<A> {
                                     error!(
                                         "Step '{}': parse_json failed on retry. Raw: {}...",
                                         step.id,
-                                        &retry_output[..retry_output.len().min(200)]
+                                        crate::safe_truncate(&retry_output, 200)
                                     );
                                     return StepResult {
                                         step_id: step.id.clone(),
@@ -541,7 +541,7 @@ impl<A: Adapter> RecipeRunner<A> {
                             error!(
                                 "Step '{}': parse_json failed and retry not possible. Raw: {}...",
                                 step.id,
-                                &output[..output.len().min(200)]
+                                crate::safe_truncate(&output, 200)
                             );
                             return StepResult {
                                 step_id: step.id.clone(),
@@ -626,6 +626,7 @@ impl<A: Adapter> RecipeRunner<A> {
                         agent_system_prompt.as_deref(),
                         step.mode.as_deref(),
                         working_dir,
+                        step.timeout,
                     )
                     .map_err(|e| StepExecutionError {
                         step_id: step.id.clone(),
@@ -734,6 +735,7 @@ impl<A: Adapter> RecipeRunner<A> {
         recipe: &Recipe,
         user_context: Option<HashMap<String, Value>>,
     ) -> RecipeResult {
+        let start = std::time::Instant::now();
         let mut initial: HashMap<String, Value> = recipe.context.clone();
         if let Some(uc) = user_context {
             initial.extend(uc);
@@ -901,7 +903,7 @@ impl<A: Adapter> RecipeRunner<A> {
             success,
             step_results,
             context: ctx.to_map(),
-            duration: None,
+            duration: Some(start.elapsed()),
         }
     }
 
@@ -948,6 +950,7 @@ impl<A: Adapter> RecipeRunner<A> {
             None,
             None,
             working_dir,
+            step.timeout,
         ) {
             Ok(output) => Some(output),
             Err(e) => {
@@ -1225,6 +1228,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _mode: Option<&str>,
             _working_dir: &str,
+            _timeout: Option<u64>,
         ) -> Result<String, anyhow::Error> {
             Ok(format!(
                 "Agent response for: {}",

@@ -15,6 +15,7 @@ pub trait Adapter: Sync {
         system_prompt: Option<&str>,
         mode: Option<&str>,
         working_dir: &str,
+        timeout: Option<u64>,
     ) -> Result<String, anyhow::Error>;
 
     /// Execute a bash step and return the output.

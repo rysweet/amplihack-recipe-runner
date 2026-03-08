@@ -52,16 +52,18 @@ src/
 
 ## Features
 
-| Module | Tests | Purpose |
-|---|---|---|
-| `models.rs` | ✅ | Core data structures (Recipe, Step, StepResult) |
-| `parser.rs` | 11 | YAML parsing, validation, typo detection |
-| `context.rs` | 21 | Template engine + safe condition evaluator |
-| `runner.rs` | 10 | Execution engine, hooks, parallel groups |
-| `agent_resolver.rs` | 6 | Agent ref resolution with path traversal protection |
-| `discovery.rs` | 10 | Multi-dir discovery with SHA-256 manifest |
-| `cli_subprocess.rs` | ✅ | CLI subprocess adapter with timeout enforcement |
-| `lib.rs` | ✅ | Public API |
+| Module | Purpose |
+|---|---|
+| `models.rs` | Core data structures (Recipe, Step, StepResult) |
+| `parser.rs` | YAML parsing, validation, typo detection |
+| `context.rs` | Template engine + safe condition evaluator |
+| `runner.rs` | Execution engine, hooks, parallel groups |
+| `agent_resolver.rs` | Agent ref resolution with path traversal protection |
+| `discovery.rs` | Multi-dir discovery with SHA-256 manifest |
+| `cli_subprocess.rs` | CLI subprocess adapter with timeout enforcement |
+| `lib.rs` | Public API |
+
+Run `cargo test` for current test counts.
 
 | Feature | Description |
 |---|---|

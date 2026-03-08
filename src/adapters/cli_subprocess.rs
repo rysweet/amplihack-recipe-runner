@@ -226,8 +226,9 @@ impl Adapter for CLISubprocessAdapter {
         system_prompt: Option<&str>,
         _mode: Option<&str>,
         _working_dir: &str,
+        timeout: Option<u64>,
     ) -> Result<String, anyhow::Error> {
-        self.execute_agent_step_with_timeout(prompt, system_prompt, None)
+        self.execute_agent_step_with_timeout(prompt, system_prompt, timeout)
     }
 
     fn execute_bash_step(

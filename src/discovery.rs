@@ -14,7 +14,15 @@ use std::time::{Duration, Instant};
 
 fn default_search_dirs() -> Vec<PathBuf> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    vec![
+    let mut dirs = Vec::new();
+    if let Ok(extra) = std::env::var("RECIPE_RUNNER_RECIPE_DIRS") {
+        for p in extra.split(':') {
+            if !p.is_empty() {
+                dirs.push(PathBuf::from(p));
+            }
+        }
+    }
+    dirs.extend([
         home.join(".amplihack").join(".claude").join("recipes"),
         PathBuf::from("amplifier-bundle").join("recipes"),
         PathBuf::from("src")
@@ -22,7 +30,8 @@ fn default_search_dirs() -> Vec<PathBuf> {
             .join("amplifier-bundle")
             .join("recipes"),
         PathBuf::from(".claude").join("recipes"),
-    ]
+    ]);
+    dirs
 }
 
 /// Metadata about a discovered recipe file.

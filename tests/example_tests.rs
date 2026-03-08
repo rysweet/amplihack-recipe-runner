@@ -22,6 +22,7 @@ impl Adapter for MockAdapter {
         _system_prompt: Option<&str>,
         _mode: Option<&str>,
         _working_dir: &str,
+        _timeout: Option<u64>,
     ) -> Result<String, anyhow::Error> {
         if prompt.contains("JSON") || prompt.contains("json") || prompt.contains("analyze") {
             Ok(
@@ -69,6 +70,7 @@ impl Adapter for FailOnExitAdapter {
         _: Option<&str>,
         _: Option<&str>,
         _: &str,
+        _: Option<u64>,
     ) -> Result<String, anyhow::Error> {
         Ok(format!("[mock-agent] {}", &prompt[..prompt.len().min(100)]))
     }
@@ -548,7 +550,7 @@ fn test_testing_all_methods() {
             sr.status
         );
     }
-    assert_eq!(result.step_results.len(), 8);
+    assert_eq!(result.step_results.len(), 13);
 }
 
 #[test]
