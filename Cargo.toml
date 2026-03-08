@@ -22,3 +22,6 @@ hex = "0.4"
 uuid = { version = "1", features = ["v4"] }
 which = "7"
 tempfile = "3"
+
+[dev-dependencies]
+proptest = "1.10.0"

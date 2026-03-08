@@ -72,22 +72,12 @@ impl CLISubprocessAdapter {
 
         child_env
     }
-}
 
-impl Default for CLISubprocessAdapter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Adapter for CLISubprocessAdapter {
-    fn execute_agent_step(
+    /// Internal: spawn agent with optional timeout.
+    fn execute_agent_step_with_timeout(
         &self,
         prompt: &str,
-        _agent_name: Option<&str>,
-        _system_prompt: Option<&str>,
-        _mode: Option<&str>,
-        _working_dir: &str,
+        timeout: Option<u64>,
     ) -> Result<String, anyhow::Error> {
         // Use a temp directory to avoid file races with the parent session (#2758)
         let temp_dir = tempfile::tempdir()
@@ -121,18 +111,44 @@ impl Adapter for CLISubprocessAdapter {
             .spawn()
             .with_context(|| format!("Failed to execute '{}'", self.cli))?;
 
-        // Background heartbeat thread
+        let child_pid = child.id();
+
+        // Background heartbeat thread with timeout enforcement
         let stop = Arc::new(AtomicBool::new(false));
+        let timed_out = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
+        let timed_out_clone = timed_out.clone();
         let output_path = output_file.clone();
+        let deadline = timeout.map(|s| Instant::now() + Duration::from_secs(s));
+
         let heartbeat = std::thread::spawn(move || {
             let mut last_size = 0u64;
             let mut last_activity = Instant::now();
             while !stop_clone.load(Ordering::Relaxed) {
+                // Check timeout deadline
+                if let Some(dl) = deadline {
+                    if Instant::now() >= dl {
+                        eprintln!(
+                            "  [agent] TIMEOUT after {}s — killing process {}",
+                            timeout.unwrap_or(0), child_pid
+                        );
+                        timed_out_clone.store(true, Ordering::SeqCst);
+                        // Send SIGTERM via kill
+                        let _ = Command::new("kill")
+                            .args(["-15", &child_pid.to_string()])
+                            .output();
+                        // Give 5s grace, then SIGKILL
+                        std::thread::sleep(Duration::from_secs(5));
+                        let _ = Command::new("kill")
+                            .args(["-9", &child_pid.to_string()])
+                            .output();
+                        return;
+                    }
+                }
+
                 if let Ok(meta) = std::fs::metadata(&output_path) {
                     let current_size = meta.len();
                     if current_size > last_size {
-                        // Print last line as progress
                         if let Ok(file) = std::fs::File::open(&output_path) {
                             let reader = BufReader::new(file);
                             if let Some(Ok(last_line)) = reader.lines().last() {
@@ -155,8 +171,18 @@ impl Adapter for CLISubprocessAdapter {
         });
 
         let status = child.wait()?;
-        stop.store(true, Ordering::Relaxed);
+        stop.store(true, Ordering::SeqCst);
         let _ = heartbeat.join();
+
+        if timed_out.load(Ordering::SeqCst) {
+            let partial = std::fs::read_to_string(&output_file).unwrap_or_default();
+            anyhow::bail!(
+                "Agent step timed out after {}s. Partial output ({} bytes): {}...",
+                timeout.unwrap_or(0),
+                partial.len(),
+                &partial[..partial.len().min(500)]
+            );
+        }
 
         let stdout = std::fs::read_to_string(&output_file).unwrap_or_default();
 
@@ -172,6 +198,25 @@ impl Adapter for CLISubprocessAdapter {
         }
 
         Ok(stdout.trim().to_string())
+    }
+}
+
+impl Default for CLISubprocessAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Adapter for CLISubprocessAdapter {
+    fn execute_agent_step(
+        &self,
+        prompt: &str,
+        _agent_name: Option<&str>,
+        _system_prompt: Option<&str>,
+        _mode: Option<&str>,
+        _working_dir: &str,
+    ) -> Result<String, anyhow::Error> {
+        self.execute_agent_step_with_timeout(prompt, None)
     }
 
     fn execute_bash_step(

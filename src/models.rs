@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -57,6 +58,14 @@ pub struct Step {
     pub recipe: Option<String>,
     #[serde(rename = "context")]
     pub sub_context: Option<HashMap<String, serde_json::Value>>,
+    /// If true, step failure logs a warning but does not abort the recipe.
+    #[serde(default)]
+    pub continue_on_error: bool,
+    /// Steps sharing the same parallel_group execute concurrently.
+    pub parallel_group: Option<String>,
+    /// Tags for conditional step filtering via --include-tags / --exclude-tags.
+    #[serde(default)]
+    pub when_tags: Vec<String>,
 }
 
 impl Step {
@@ -78,6 +87,38 @@ impl Step {
     }
 }
 
+/// Per-recipe recursion limits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecursionConfig {
+    #[serde(default = "default_max_depth")]
+    pub max_depth: u32,
+    #[serde(default = "default_max_total_steps")]
+    pub max_total_steps: u32,
+}
+
+impl Default for RecursionConfig {
+    fn default() -> Self {
+        Self {
+            max_depth: default_max_depth(),
+            max_total_steps: default_max_total_steps(),
+        }
+    }
+}
+
+fn default_max_depth() -> u32 { 6 }
+fn default_max_total_steps() -> u32 { 200 }
+
+/// Pre/post step hook commands.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RecipeHooks {
+    /// Command to run before each step.
+    pub pre_step: Option<String>,
+    /// Command to run after each step.
+    pub post_step: Option<String>,
+    /// Command to run on step error.
+    pub on_error: Option<String>,
+}
+
 /// A parsed recipe definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Recipe {
@@ -94,6 +135,14 @@ pub struct Recipe {
     pub tags: Vec<String>,
     #[serde(default)]
     pub context: HashMap<String, serde_json::Value>,
+    /// Per-recipe recursion limits (max_depth, max_total_steps).
+    #[serde(default)]
+    pub recursion: RecursionConfig,
+    /// Pre/post step hook commands.
+    #[serde(default)]
+    pub hooks: RecipeHooks,
+    /// Inherit steps from another recipe, optionally overriding individual steps.
+    pub extends: Option<String>,
 }
 
 fn default_version() -> String {
@@ -101,17 +150,23 @@ fn default_version() -> String {
 }
 
 /// Result of executing a single step.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StepResult {
     pub step_id: String,
     pub status: StepStatus,
     pub output: String,
     pub error: String,
+    /// Wall-clock duration of this step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<Duration>,
 }
 
 impl fmt::Display for StepResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[{:>9}] {}", self.status, self.step_id)?;
+        if let Some(d) = self.duration {
+            write!(f, " ({:.1}s)", d.as_secs_f64())?;
+        }
         if !self.error.is_empty() {
             write!(f, " -- error: {}", self.error)?;
         }
@@ -120,18 +175,26 @@ impl fmt::Display for StepResult {
 }
 
 /// Result of executing an entire recipe.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RecipeResult {
     pub recipe_name: String,
     pub success: bool,
     pub step_results: Vec<StepResult>,
+    #[serde(skip)]
     pub context: HashMap<String, serde_json::Value>,
+    /// Total wall-clock duration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<Duration>,
 }
 
 impl fmt::Display for RecipeResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let status = if self.success { "SUCCESS" } else { "FAILED" };
-        writeln!(f, "Recipe '{}': {}", self.recipe_name, status)?;
+        write!(f, "Recipe '{}': {}", self.recipe_name, status)?;
+        if let Some(d) = self.duration {
+            write!(f, " ({:.1}s)", d.as_secs_f64())?;
+        }
+        writeln!(f)?;
         for sr in &self.step_results {
             writeln!(f, "  {}", sr)?;
         }

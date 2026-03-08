@@ -45,3 +45,10 @@ pub fn run_recipe_by_name<A: Adapter>(
     let runner = RecipeRunner::new(adapter).with_dry_run(dry_run);
     Ok(runner.execute(&recipe, user_context))
 }
+
+/// Validate a recipe and return warnings.
+pub fn validate_recipe(yaml_content: &str) -> Result<Vec<String>, parser::ParseError> {
+    let parser = RecipeParser::new();
+    let recipe = parser.parse(yaml_content)?;
+    Ok(parser.validate_with_yaml(&recipe, Some(yaml_content)))
+}

@@ -10,13 +10,15 @@ const MAX_YAML_SIZE_BYTES: usize = 1_000_000;
 
 /// Top-level fields recognized by the parser.
 const KNOWN_TOP_FIELDS: &[&str] = &[
-    "name", "description", "version", "author", "tags", "context", "steps", "recursion", "output",
+    "name", "description", "version", "author", "tags", "context", "steps",
+    "recursion", "output", "hooks", "extends",
 ];
 
 /// Step-level fields recognized by the parser.
 const KNOWN_STEP_FIELDS: &[&str] = &[
     "id", "type", "agent", "prompt", "command", "output", "condition",
     "parse_json", "mode", "working_dir", "timeout", "auto_stage", "recipe", "context",
+    "continue_on_error", "parallel_group", "when_tags",
 ];
 
 #[derive(Debug, thiserror::Error)]
