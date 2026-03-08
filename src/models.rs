@@ -175,7 +175,10 @@ pub struct StepResult {
     pub output: String,
     pub error: String,
     /// Wall-clock duration of this step.
-    #[serde(serialize_with = "serialize_duration_secs", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        serialize_with = "serialize_duration_secs",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub duration: Option<Duration>,
 }
 
@@ -201,7 +204,10 @@ pub struct RecipeResult {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub context: HashMap<String, serde_json::Value>,
     /// Total wall-clock duration.
-    #[serde(serialize_with = "serialize_duration_secs", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        serialize_with = "serialize_duration_secs",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub duration: Option<Duration>,
 }
 

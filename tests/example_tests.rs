@@ -556,17 +556,24 @@ fn test_testing_nested_context() {
     let recipe = parse_and_validate("recipes/testing/nested-context.yaml");
     assert_eq!(recipe.name, "nested-context");
 
-    // The condition evaluator treats dots as method-call separators, so
-    // conditions like "config.db.port == 5432" fail (db is not a safe method).
-    // Template substitution ({{config.db.host}}) works, but conditions don't.
-    // The first conditional step fails, aborting the recipe.
+    // With C2-RR-7 fix, dot-notation property access works in conditions,
+    // so conditions like "config.db.port == 5432" now resolve correctly.
     let runner = RecipeRunner::new(MockAdapter);
     let result = runner.execute(&recipe, None);
     assert!(
-        !result.success,
-        "nested-context should fail: dot-notation not supported in conditions"
+        result.success,
+        "nested-context should succeed with dot-notation property access: {:?}",
+        result
     );
-    assert_eq!(result.step_results[0].status, StepStatus::Failed);
+    for sr in &result.step_results {
+        assert_eq!(
+            sr.status,
+            StepStatus::Completed,
+            "step '{}' should be Completed, was {:?}",
+            sr.step_id,
+            sr.status
+        );
+    }
 }
 
 #[test]
@@ -827,6 +834,8 @@ fn test_all_recipes_dry_run() {
         manifest_dir().join("recipes"),
     ];
 
+    let tutorial_dir_prefix = tutorials_dir();
+
     for path in &files {
         let yaml = std::fs::read_to_string(path).unwrap();
         let recipe = parser.parse(&yaml).unwrap();
@@ -840,5 +849,22 @@ fn test_all_recipes_dry_run() {
             path.display(),
             result
         );
+
+        // C2-RD-13: For tutorial recipes, verify non-empty steps and matching name
+        if path.starts_with(&tutorial_dir_prefix) {
+            assert!(
+                !result.step_results.is_empty(),
+                "{}: tutorial recipe produced no step results",
+                path.display()
+            );
+            assert_eq!(
+                result.recipe_name,
+                recipe.name,
+                "{}: result recipe_name '{}' doesn't match parsed recipe name '{}'",
+                path.display(),
+                result.recipe_name,
+                recipe.name
+            );
+        }
     }
 }

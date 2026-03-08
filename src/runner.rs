@@ -726,6 +726,9 @@ impl<A: Adapter> RecipeRunner<A> {
     }
 
     /// Execute a recipe at the current recursion depth.
+    ///
+    /// Uses the same per-step logic as `execute()` — parallel groups, hooks,
+    /// tag filtering, audit logging, and listener notifications are all honored.
     fn execute_with_depth(
         &self,
         recipe: &Recipe,
@@ -740,30 +743,157 @@ impl<A: Adapter> RecipeRunner<A> {
         let mut step_results = Vec::new();
         let mut success = true;
 
-        for step in &recipe.steps {
-            // Check total step limit
-            if self.total_steps.get() >= self.max_total_steps.get() {
-                step_results.push(StepResult {
-                    step_id: step.id.clone(),
-                    status: StepStatus::Failed,
-                    output: String::new(),
-                    error: format!("Total step limit ({}) exceeded", self.max_total_steps.get()),
-                    duration: None,
-                });
-                success = false;
-                break;
-            }
+        let audit_file = self.open_audit_log(&recipe.name);
 
-            let result = self.execute_step(step, &mut ctx);
-            self.total_steps.set(self.total_steps.get() + 1);
-            let failed = result.status == StepStatus::Failed;
+        let mut step_idx = 0;
+        while step_idx < recipe.steps.len() {
+            if recipe.steps[step_idx].parallel_group.is_some() {
+                let group_name = recipe.steps[step_idx]
+                    .parallel_group
+                    .as_ref()
+                    .unwrap()
+                    .clone();
+                let group_start = step_idx;
+                while step_idx < recipe.steps.len()
+                    && recipe.steps[step_idx].parallel_group.as_deref() == Some(&group_name)
+                {
+                    step_idx += 1;
+                }
+                let group_steps: Vec<&Step> = recipe.steps[group_start..step_idx].iter().collect();
 
-            if failed && !step.continue_on_error {
+                if self.total_steps.get() >= self.max_total_steps.get() {
+                    error!(
+                        "Total step limit ({}) reached, stopping execution",
+                        self.max_total_steps.get()
+                    );
+                    step_results.push(StepResult {
+                        step_id: group_steps[0].id.clone(),
+                        status: StepStatus::Failed,
+                        output: String::new(),
+                        error: format!(
+                            "Total step limit ({}) exceeded",
+                            self.max_total_steps.get()
+                        ),
+                        duration: None,
+                    });
+                    success = false;
+                    break;
+                }
+
+                for gs in &group_steps {
+                    self.listener.on_step_start(&gs.id, gs.effective_type());
+                    self.run_hook(&recipe.hooks.pre_step, "pre_step", &gs.id, &ctx);
+                }
+
+                let group_results =
+                    self.execute_parallel_group(&group_steps, recipe, &ctx, &*self.listener);
+
+                let mut group_failed = false;
+                for (gs, result) in group_steps.iter().zip(group_results.into_iter()) {
+                    self.total_steps.set(self.total_steps.get() + 1);
+                    let failed = result.status == StepStatus::Failed;
+
+                    if failed {
+                        self.run_hook(&recipe.hooks.on_error, "on_error", &gs.id, &ctx);
+                    } else {
+                        self.run_hook(&recipe.hooks.post_step, "post_step", &gs.id, &ctx);
+                    }
+
+                    self.listener.on_step_complete(&result);
+                    self.write_audit_entry(&audit_file, &result);
+
+                    if !failed && let Some(ref output_key) = gs.output {
+                        let value = serde_json::from_str(&result.output)
+                            .unwrap_or(Value::String(result.output.clone()));
+                        ctx.set(output_key, value);
+                    }
+
+                    if failed && !gs.continue_on_error {
+                        group_failed = true;
+                    }
+
+                    if failed && gs.continue_on_error {
+                        warn!(
+                            "Step '{}' failed but continue_on_error is set, continuing",
+                            gs.id
+                        );
+                    }
+
+                    step_results.push(result);
+                }
+
+                if group_failed {
+                    success = false;
+                    break;
+                }
+            } else {
+                let step = &recipe.steps[step_idx];
+
+                if self.total_steps.get() >= self.max_total_steps.get() {
+                    error!(
+                        "Total step limit ({}) reached, stopping execution",
+                        self.max_total_steps.get()
+                    );
+                    step_results.push(StepResult {
+                        step_id: step.id.clone(),
+                        status: StepStatus::Failed,
+                        output: String::new(),
+                        error: format!(
+                            "Total step limit ({}) exceeded",
+                            self.max_total_steps.get()
+                        ),
+                        duration: None,
+                    });
+                    success = false;
+                    break;
+                }
+
+                if self.should_skip_by_tags(step) {
+                    info!("Skipping step '{}': excluded by tag filter", step.id);
+                    step_results.push(StepResult {
+                        step_id: step.id.clone(),
+                        status: StepStatus::Skipped,
+                        output: String::new(),
+                        error: String::new(),
+                        duration: None,
+                    });
+                    step_idx += 1;
+                    continue;
+                }
+
+                self.listener.on_step_start(&step.id, step.effective_type());
+                self.run_hook(&recipe.hooks.pre_step, "pre_step", &step.id, &ctx);
+
+                let result = self.execute_step(step, &mut ctx);
+                self.total_steps.set(self.total_steps.get() + 1);
+
+                let failed = result.status == StepStatus::Failed;
+
+                if failed {
+                    self.run_hook(&recipe.hooks.on_error, "on_error", &step.id, &ctx);
+                } else {
+                    self.run_hook(&recipe.hooks.post_step, "post_step", &step.id, &ctx);
+                }
+
+                self.listener.on_step_complete(&result);
+                self.write_audit_entry(&audit_file, &result);
+
+                if failed && !step.continue_on_error {
+                    step_results.push(result);
+                    success = false;
+                    break;
+                }
+
+                if failed && step.continue_on_error {
+                    warn!(
+                        "Step '{}' failed but continue_on_error is set, continuing",
+                        step.id
+                    );
+                }
+
                 step_results.push(result);
-                success = false;
-                break;
+                step_idx += 1;
             }
-            step_results.push(result);
         }
 
         RecipeResult {
@@ -1195,5 +1325,29 @@ steps:
         let text = "Some text before {\"key\": \"value\"} and after";
         let result = parse_json_output(text, "test");
         assert!(result.is_some());
+    }
+
+    /// C2-RD-10: timeout:0 edge case — verify step still executes and completes
+    /// normally. A zero timeout is passed to the adapter as `Some(0)` and the
+    /// adapter decides what to do with it (mock adapter ignores timeout).
+    #[test]
+    fn test_timeout_zero_executes() {
+        let yaml = r#"
+name: "test-timeout-zero"
+steps:
+  - id: "zero-timeout"
+    command: "echo hello"
+    timeout: 0
+    output: "result"
+"#;
+        let parser = RecipeParser::new();
+        let recipe = parser.parse(yaml).unwrap();
+        let runner = RecipeRunner::new(MockAdapter);
+        let result = runner.execute(&recipe, None);
+        assert!(result.success, "timeout:0 step should still succeed");
+        assert_eq!(result.step_results.len(), 1);
+        assert_eq!(result.step_results[0].status, StepStatus::Completed);
+        // Verify the output was stored in context
+        assert!(result.context.contains_key("result"));
     }
 }
