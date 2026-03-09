@@ -132,7 +132,11 @@ impl AgentResolver {
 
         Err(AgentResolveError::NotFound {
             agent_ref: agent_ref.to_string(),
-            searched: searched.join(", "),
+            searched: format!(
+                "{} director{} searched",
+                searched.len(),
+                if searched.len() == 1 { "y" } else { "ies" }
+            ),
         })
     }
 }

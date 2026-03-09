@@ -183,10 +183,16 @@ impl DiscoveryCache {
 /// Thread-safe convenience wrapper around [`DiscoveryCache`].
 ///
 /// Uses a module-level `Mutex<DiscoveryCache>` so callers don't need to manage
-/// their own cache instance.  The default TTL is 30 seconds.
+/// their own cache instance.  The TTL defaults to 30 seconds and can be
+/// overridden via the `RECIPE_RUNNER_CACHE_TTL` environment variable (in seconds).
 pub fn cached_discover_recipes(dirs: &[PathBuf]) -> HashMap<String, RecipeInfo> {
-    static CACHE: std::sync::LazyLock<Mutex<DiscoveryCache>> =
-        std::sync::LazyLock::new(|| Mutex::new(DiscoveryCache::new(Duration::from_secs(30))));
+    static CACHE: std::sync::LazyLock<Mutex<DiscoveryCache>> = std::sync::LazyLock::new(|| {
+        let ttl_secs: u64 = std::env::var("RECIPE_RUNNER_CACHE_TTL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30);
+        Mutex::new(DiscoveryCache::new(Duration::from_secs(ttl_secs)))
+    });
 
     let mut cache = CACHE.lock().expect("DiscoveryCache mutex poisoned");
     cache.get_or_discover(dirs).clone()

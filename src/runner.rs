@@ -30,6 +30,9 @@ static JSON_FENCE_RE: LazyLock<Regex> =
 /// Maximum number of threads to spawn per parallel group.
 const MAX_PARALLEL_STEPS: usize = 50;
 
+/// Maximum size of step output stored in memory (10 MB).
+const MAX_STEP_OUTPUT_BYTES: usize = 10_000_000;
+
 /// Callback trait for step execution progress events.
 pub trait ExecutionListener {
     fn on_step_start(&self, step_id: &str, step_type: StepType) {
@@ -500,7 +503,19 @@ impl<A: Adapter> RecipeRunner<A> {
 
         // Execute the step
         let output = match self.dispatch_step(step, ctx) {
-            Ok(o) => o,
+            Ok(o) => {
+                if o.len() > MAX_STEP_OUTPUT_BYTES {
+                    warn!(
+                        "Step '{}' output truncated from {} to {} bytes",
+                        step.id,
+                        o.len(),
+                        MAX_STEP_OUTPUT_BYTES
+                    );
+                    crate::safe_truncate(&o, MAX_STEP_OUTPUT_BYTES).to_string()
+                } else {
+                    o
+                }
+            }
             Err(e) => {
                 error!("Step '{}' failed: {}", step.id, e);
                 return StepResult {
