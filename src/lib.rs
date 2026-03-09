@@ -1,3 +1,26 @@
+//! # amplihack Recipe Runner
+//!
+//! A Rust library for parsing and executing YAML-defined recipes.
+//! Recipes are declarative workflows composed of bash commands and agent steps,
+//! with support for conditions, output chaining, parallel execution, and inheritance.
+//!
+//! ## Quick Start
+//!
+//! ```no_run
+//! use recipe_runner_rs::adapters::cli_subprocess::CLISubprocessAdapter;
+//!
+//! let yaml = r#"
+//! name: example
+//! steps:
+//!   - id: greet
+//!     command: "echo hello"
+//! "#;
+//!
+//! let adapter = CLISubprocessAdapter::new();
+//! let result = recipe_runner_rs::run_recipe(yaml, adapter, None, false).unwrap();
+//! assert!(result.success);
+//! ```
+
 pub mod adapters;
 pub mod agent_resolver;
 pub mod condition;
@@ -8,6 +31,10 @@ pub mod parser;
 pub mod runner;
 
 /// Safely truncate a string to at most `max_bytes` bytes at a UTF-8 boundary.
+///
+/// Returns a slice of the original string that is at most `max_bytes` long,
+/// ending at a valid character boundary. If the string is shorter than
+/// `max_bytes`, the full string is returned unchanged.
 pub fn safe_truncate(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
@@ -20,6 +47,9 @@ pub fn safe_truncate(s: &str, max_bytes: usize) -> &str {
 }
 
 /// Safely get the tail of a string starting at most `max_bytes` from the end.
+///
+/// Returns a slice of the string comprising at most the last `max_bytes` bytes,
+/// starting at a valid character boundary.
 pub fn safe_tail(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
@@ -40,12 +70,24 @@ use runner::RecipeRunner;
 use serde_json::Value;
 use std::collections::HashMap;
 
-/// Shortcut: parse a YAML string into a Recipe.
+/// Parse a YAML string into a [`Recipe`].
+///
+/// # Errors
+///
+/// Returns [`parser::ParseError`] if the YAML is malformed, exceeds the 1 MB
+/// size limit, or contains invalid step definitions.
 pub fn parse_recipe(yaml_content: &str) -> Result<Recipe, parser::ParseError> {
     RecipeParser::new().parse(yaml_content)
 }
 
-/// Shortcut: parse and execute a recipe in one call.
+/// Parse and execute a recipe from a YAML string in one call.
+///
+/// Parses the recipe, resolves any `extends` inheritance, and executes it
+/// using the provided adapter. Optional `user_context` values override recipe defaults.
+///
+/// # Errors
+///
+/// Returns [`parser::ParseError`] if parsing or extends resolution fails.
 pub fn run_recipe<A: Adapter>(
     yaml_content: &str,
     adapter: A,
@@ -58,7 +100,15 @@ pub fn run_recipe<A: Adapter>(
     Ok(runner.execute(&recipe, user_context))
 }
 
-/// Find a recipe by name, parse it, and execute it.
+/// Find a recipe by name across standard search directories, parse it, and execute it.
+///
+/// Searches `~/.amplihack/recipes/`, `./recipes/`, and `./` for a recipe file
+/// matching `name` (with `.yaml` or `.yml` extension).
+///
+/// # Errors
+///
+/// Returns an error if the recipe is not found, cannot be parsed, or extends
+/// resolution fails.
 pub fn run_recipe_by_name<A: Adapter>(
     name: &str,
     adapter: A,
@@ -73,7 +123,14 @@ pub fn run_recipe_by_name<A: Adapter>(
     Ok(runner.execute(&recipe, user_context))
 }
 
-/// Validate a recipe and return warnings.
+/// Validate a recipe and return any warnings.
+///
+/// Parses the YAML and checks for structural issues such as unrecognized fields,
+/// duplicate step IDs, or unreferenced output variables.
+///
+/// # Errors
+///
+/// Returns [`parser::ParseError`] if the YAML cannot be parsed at all.
 pub fn validate_recipe(yaml_content: &str) -> Result<Vec<String>, parser::ParseError> {
     let parser = RecipeParser::new();
     let recipe = parser.parse(yaml_content)?;

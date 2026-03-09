@@ -1141,3 +1141,154 @@ steps:
         "post_step hook should have created marker file"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Outside-In Tests — Structured Exit Codes
+// ---------------------------------------------------------------------------
+
+/// User passes a nonexistent recipe path — exits with code 3 (not found).
+#[test]
+fn test_exit_code_not_found_file() {
+    ensure_built();
+    let output = Command::new(binary_path())
+        .arg("/tmp/nonexistent-recipe-12345.yaml")
+        .output()
+        .expect("failed to execute");
+    assert_eq!(
+        output.status.code().unwrap(),
+        3,
+        "nonexistent file should exit with code 3 (not found)"
+    );
+}
+
+/// User passes a nonexistent recipe name — exits with code 3 (not found).
+#[test]
+fn test_exit_code_not_found_name() {
+    ensure_built();
+    let output = Command::new(binary_path())
+        .arg("totally-fake-recipe-name-xyz")
+        .output()
+        .expect("failed to execute");
+    assert_eq!(
+        output.status.code().unwrap(),
+        3,
+        "nonexistent recipe name should exit with code 3 (not found)"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not found"),
+        "stderr should mention 'not found'"
+    );
+}
+
+/// User omits recipe path entirely — exits with code 4 (bad args).
+#[test]
+fn test_exit_code_bad_args_no_recipe() {
+    ensure_built();
+    let output = Command::new(binary_path())
+        .output()
+        .expect("failed to execute");
+    // clap exits with code 2 for missing required args, which is fine;
+    // our code returns 4 for missing recipe (after clap allows optional recipe).
+    let code = output.status.code().unwrap();
+    assert_eq!(
+        code, 4,
+        "missing recipe path should exit with code 4 (bad args)"
+    );
+}
+
+/// User provides an invalid YAML file — exits with code 2 (parse error).
+#[test]
+fn test_exit_code_parse_error() {
+    let tmp = TempDir::new().unwrap();
+    let bad_yaml = tmp.path().join("bad.yaml");
+    std::fs::write(&bad_yaml, "this is not: [valid: yaml: {{{").unwrap();
+    ensure_built();
+    let output = Command::new(binary_path())
+        .arg(&bad_yaml)
+        .output()
+        .expect("failed to execute");
+    assert_eq!(
+        output.status.code().unwrap(),
+        2,
+        "invalid YAML should exit with code 2 (parse error)"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Error"),
+        "stderr should report error for invalid YAML"
+    );
+}
+
+/// Successful recipe exits with code 0.
+#[test]
+fn test_exit_code_success() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "ok.yaml",
+        r#"
+name: success-recipe
+steps:
+  - id: ok
+    command: "echo ok"
+"#,
+    );
+    let (code, _, _) = run_binary(&recipe, &[]);
+    assert_eq!(code, 0, "successful recipe should exit with code 0");
+}
+
+/// Failed recipe step exits with code 1.
+#[test]
+fn test_exit_code_recipe_failed() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "fail.yaml",
+        r#"
+name: fail-recipe
+steps:
+  - id: boom
+    command: "exit 1"
+"#,
+    );
+    let (code, _, _) = run_binary(&recipe, &[]);
+    assert_eq!(code, 1, "failed recipe should exit with code 1");
+}
+
+/// Audit log files are created with restricted permissions (0600 on Unix).
+#[cfg(unix)]
+#[test]
+fn test_audit_log_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    let audit_dir = tmp.path().join("secure-audit");
+    std::fs::create_dir_all(&audit_dir).unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "audit-perms.yaml",
+        r#"
+name: audit-perms
+steps:
+  - id: step1
+    command: "echo test"
+"#,
+    );
+    let (code, _, _) = run_binary(&recipe, &["--audit-dir", audit_dir.to_str().unwrap()]);
+    assert_eq!(code, 0);
+
+    let entries: Vec<_> = std::fs::read_dir(&audit_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    assert!(!entries.is_empty(), "should have audit log file");
+    let perms = entries[0].metadata().unwrap().permissions();
+    assert_eq!(
+        perms.mode() & 0o777,
+        0o600,
+        "audit log should have mode 0600, got {:o}",
+        perms.mode() & 0o777
+    );
+}

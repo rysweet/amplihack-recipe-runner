@@ -279,8 +279,10 @@ impl<A: Adapter> RecipeRunner<A> {
                     self.write_audit_entry(&audit_file, &result);
 
                     if !failed && let Some(ref output_key) = gs.output {
-                        let value = serde_json::from_str(&result.output)
-                            .unwrap_or(Value::String(result.output.clone()));
+                        let value = match serde_json::from_str(&result.output) {
+                            Ok(v) => v,
+                            Err(_) => Value::String(result.output.clone()),
+                        };
                         ctx.set(output_key, value);
                     }
 
@@ -425,7 +427,14 @@ impl<A: Adapter> RecipeRunner<A> {
             .as_secs();
         let path = dir.join(format!("{}-{}.jsonl", recipe_name, ts));
         match std::fs::File::create(&path) {
-            Ok(f) => Some(f),
+            Ok(f) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+                }
+                Some(f)
+            }
             Err(e) => {
                 warn!("Failed to create audit log file: {}", e);
                 None
@@ -586,8 +595,10 @@ impl<A: Adapter> RecipeRunner<A> {
         if step_status != StepStatus::Failed
             && let Some(ref output_key) = step.output
         {
-            let value =
-                serde_json::from_str(&final_output).unwrap_or(Value::String(final_output.clone()));
+            let value = match serde_json::from_str(&final_output) {
+                Ok(v) => v,
+                Err(_) => Value::String(final_output.clone()),
+            };
             ctx.set(output_key, value);
         }
 
