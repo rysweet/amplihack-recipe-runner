@@ -160,7 +160,9 @@ impl CLISubprocessAdapter {
 
         let status = child.wait()?;
         stop.store(true, Ordering::SeqCst);
-        let _ = heartbeat.join();
+        if let Err(e) = heartbeat.join() {
+            log::warn!("Heartbeat thread panicked: {:?}", e);
+        }
 
         let stdout =
             std::fs::read_to_string(&output_file).context("Failed to read agent output file")?;
