@@ -639,10 +639,57 @@ fn test_run_recipe_by_name_nonexistent_errors() {
 
 // -- RR-M6: Hook execution verification --
 
+/// Adapter that actually runs bash commands but doesn't require the `claude`
+/// binary, so hook tests work in CI where only bash is available.
+struct RealBashAdapter;
+
+impl Adapter for RealBashAdapter {
+    fn execute_agent_step(
+        &self,
+        _prompt: &str,
+        _agent_name: Option<&str>,
+        _system_prompt: Option<&str>,
+        _mode: Option<&str>,
+        _working_dir: &str,
+        _timeout: Option<u64>,
+        _model: Option<&str>,
+    ) -> Result<String, anyhow::Error> {
+        Ok("mock agent response".to_string())
+    }
+
+    fn execute_bash_step(
+        &self,
+        command: &str,
+        working_dir: &str,
+        _timeout: Option<u64>,
+    ) -> Result<String, anyhow::Error> {
+        let output = std::process::Command::new("/bin/bash")
+            .args(["-c", command])
+            .current_dir(working_dir)
+            .output()
+            .map_err(|e| anyhow::anyhow!("Failed to run bash: {}: {}", command, e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "Command failed (exit {}): {}",
+                output.status.code().unwrap_or(-1),
+                stderr.trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn name(&self) -> &str {
+        "real-bash"
+    }
+}
+
 #[test]
 fn test_hook_pre_step_actually_executes() {
-    use recipe_runner_rs::adapters::cli_subprocess::CLISubprocessAdapter;
-
     let tmp = tempfile::tempdir().unwrap();
     let marker = tmp.path().join("hook_ran.txt");
 
@@ -658,7 +705,7 @@ steps:
         marker.display()
     );
 
-    let adapter = CLISubprocessAdapter::new();
+    let adapter = RealBashAdapter;
     let parser = RecipeParser::new();
     let recipe = parser.parse(&yaml).unwrap();
     let runner = RecipeRunner::new(adapter).with_working_dir(tmp.path().to_str().unwrap());
@@ -674,8 +721,6 @@ steps:
 
 #[test]
 fn test_hook_post_step_actually_executes() {
-    use recipe_runner_rs::adapters::cli_subprocess::CLISubprocessAdapter;
-
     let tmp = tempfile::tempdir().unwrap();
     let marker = tmp.path().join("post_hook_ran.txt");
 
@@ -691,7 +736,7 @@ steps:
         marker.display()
     );
 
-    let adapter = CLISubprocessAdapter::new();
+    let adapter = RealBashAdapter;
     let parser = RecipeParser::new();
     let recipe = parser.parse(&yaml).unwrap();
     let runner = RecipeRunner::new(adapter).with_working_dir(tmp.path().to_str().unwrap());
