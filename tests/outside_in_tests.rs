@@ -700,3 +700,436 @@ steps:
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Outside-In Tests — Quality Audit Cycles 3 & 4 coverage
+// ---------------------------------------------------------------------------
+
+/// User runs a recipe with a bash step whose error message includes full context.
+/// (err-9: error chain context preserved in map_err)
+#[test]
+fn test_error_chain_context_in_step_failure() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "fail.yaml",
+        r#"
+name: error-chain-test
+steps:
+  - id: will-fail
+    command: "exit 42"
+"#,
+    );
+    let (code, json, _stderr) = run_json(&recipe, &[]);
+    assert_eq!(code, 1);
+    let step = find_step(&json, "will-fail").expect("step not found");
+    assert_eq!(step["status"].as_str().unwrap(), "failed");
+    let error = step["error"].as_str().unwrap();
+    assert!(
+        error.contains("bash step failed"),
+        "error should include 'bash step failed' prefix for chain context, got: {error}"
+    );
+}
+
+/// User runs --explain to see recipe structure without executing.
+#[test]
+fn test_explain_mode_shows_recipe_structure() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "explainable.yaml",
+        r#"
+name: explainable-recipe
+version: "2.0"
+description: "A recipe to explain"
+steps:
+  - id: step-alpha
+    command: "echo alpha"
+  - id: step-beta
+    prompt: "do something"
+    agent: "test-agent"
+"#,
+    );
+    let (code, stdout, _stderr) = run_binary(&recipe, &["--explain"]);
+    assert_eq!(code, 0, "explain should exit 0");
+    assert!(
+        stdout.contains("explainable-recipe"),
+        "explain output should contain recipe name"
+    );
+    assert!(
+        stdout.contains("step-alpha"),
+        "explain output should list step IDs"
+    );
+    assert!(
+        stdout.contains("step-beta"),
+        "explain output should list all step IDs"
+    );
+}
+
+/// User passes --version and gets a version string.
+#[test]
+fn test_version_flag() {
+    ensure_built();
+    let output = Command::new(binary_path())
+        .arg("--version")
+        .output()
+        .expect("failed to run --version");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("recipe-runner"),
+        "version output should contain binary name, got: {stdout}"
+    );
+}
+
+/// User filters steps by --include-tags.
+#[test]
+fn test_include_tags_filters_steps() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "tagged.yaml",
+        r#"
+name: tagged-recipe
+steps:
+  - id: fast-step
+    command: "echo fast"
+    when_tags: ["fast"]
+  - id: slow-step
+    command: "echo slow"
+    when_tags: ["slow"]
+  - id: untagged
+    command: "echo always"
+"#,
+    );
+    let (code, json, _stderr) = run_json(&recipe, &["--include-tags", "fast"]);
+    assert_eq!(code, 0);
+    let fast = find_step(&json, "fast-step").expect("fast-step not found");
+    assert_eq!(fast["status"].as_str().unwrap(), "completed");
+    let slow = find_step(&json, "slow-step").expect("slow-step not found");
+    assert_eq!(
+        slow["status"].as_str().unwrap(),
+        "skipped",
+        "slow-step should be skipped when only 'fast' tag is included"
+    );
+}
+
+/// User filters steps by --exclude-tags.
+#[test]
+fn test_exclude_tags_skips_steps() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "excluded.yaml",
+        r#"
+name: excluded-recipe
+steps:
+  - id: keep-me
+    command: "echo kept"
+    when_tags: ["keep"]
+  - id: drop-me
+    command: "echo dropped"
+    when_tags: ["drop"]
+"#,
+    );
+    let (code, json, _stderr) = run_json(&recipe, &["--exclude-tags", "drop"]);
+    assert_eq!(code, 0);
+    let kept = find_step(&json, "keep-me").expect("keep-me not found");
+    assert_eq!(kept["status"].as_str().unwrap(), "completed");
+    let dropped = find_step(&json, "drop-me").expect("drop-me not found");
+    assert_eq!(dropped["status"].as_str().unwrap(), "skipped");
+}
+
+/// User passes --audit-dir and gets JSONL audit log written.
+#[test]
+fn test_audit_dir_creates_log_file() {
+    let tmp = TempDir::new().unwrap();
+    let audit_dir = tmp.path().join("audit");
+    std::fs::create_dir_all(&audit_dir).unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "auditable.yaml",
+        r#"
+name: auditable-recipe
+steps:
+  - id: logged-step
+    command: "echo audited"
+"#,
+    );
+    let (code, _stdout, _stderr) = run_binary(
+        &recipe,
+        &["--audit-dir", audit_dir.to_str().unwrap()],
+    );
+    assert_eq!(code, 0);
+    // Audit dir should contain a .jsonl file
+    let entries: Vec<_> = std::fs::read_dir(&audit_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .is_some_and(|ext| ext == "jsonl")
+        })
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "audit dir should contain at least one .jsonl file"
+    );
+    // Verify JSONL content is valid
+    let content = std::fs::read_to_string(entries[0].path()).unwrap();
+    for line in content.lines() {
+        let parsed: Result<Value, _> = serde_json::from_str(line);
+        assert!(parsed.is_ok(), "each JSONL line should be valid JSON: {line}");
+    }
+}
+
+/// User sets context variable via --set and uses it in a condition.
+#[test]
+fn test_context_override_with_condition() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "conditional.yaml",
+        r#"
+name: context-condition
+context:
+  mode: "default"
+steps:
+  - id: guarded
+    command: "echo custom mode"
+    condition: "mode == 'custom'"
+  - id: default-step
+    command: "echo default mode"
+    condition: "mode == 'default'"
+"#,
+    );
+    // Without override — default-step runs, guarded skips
+    let (code, json, _) = run_json(&recipe, &[]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        find_step(&json, "guarded").unwrap()["status"].as_str().unwrap(),
+        "skipped"
+    );
+    assert_eq!(
+        find_step(&json, "default-step").unwrap()["status"].as_str().unwrap(),
+        "completed"
+    );
+
+    // With override — guarded runs, default-step skips
+    let (code, json, _) = run_json(&recipe, &["--set", "mode=custom"]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        find_step(&json, "guarded").unwrap()["status"].as_str().unwrap(),
+        "completed"
+    );
+    assert_eq!(
+        find_step(&json, "default-step").unwrap()["status"].as_str().unwrap(),
+        "skipped"
+    );
+}
+
+/// User uses condition with len() function and string methods in a recipe.
+#[test]
+fn test_condition_with_builtin_functions() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "functions.yaml",
+        r#"
+name: function-conditions
+context:
+  items: ["a", "b", "c"]
+  greeting: "  Hello World  "
+steps:
+  - id: len-check
+    command: "echo len-ok"
+    condition: "len(items) == 3"
+  - id: strip-check
+    command: "echo strip-ok"
+    condition: "greeting.strip() == 'Hello World'"
+  - id: lower-check
+    command: "echo lower-ok"
+    condition: "greeting.strip().lower() == 'hello world'"
+"#,
+    );
+    let (code, json, _stderr) = run_json(&recipe, &[]);
+    assert_eq!(code, 0);
+    for step_id in &["len-check", "strip-check", "lower-check"] {
+        let step = find_step(&json, step_id).unwrap_or_else(|| panic!("{step_id} not found"));
+        assert_eq!(
+            step["status"].as_str().unwrap(),
+            "completed",
+            "step {step_id} should be completed (condition should be true)"
+        );
+    }
+}
+
+/// User runs a recipe where a condition evaluates to empty/falsy — step is skipped.
+#[test]
+fn test_falsy_condition_skips_step() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "falsy.yaml",
+        r#"
+name: falsy-conditions
+context:
+  empty_str: ""
+  zero: 0
+  missing_var_doesnt_exist: null
+steps:
+  - id: empty-string-guard
+    command: "echo should-not-run"
+    condition: "empty_str"
+  - id: zero-guard
+    command: "echo should-not-run"
+    condition: "zero"
+  - id: null-guard
+    command: "echo should-not-run"
+    condition: "missing_var_doesnt_exist"
+  - id: always-runs
+    command: "echo ok"
+"#,
+    );
+    let (code, json, _stderr) = run_json(&recipe, &[]);
+    assert_eq!(code, 0);
+    for step_id in &["empty-string-guard", "zero-guard", "null-guard"] {
+        let step = find_step(&json, step_id).unwrap_or_else(|| panic!("{step_id} not found"));
+        assert_eq!(
+            step["status"].as_str().unwrap(),
+            "skipped",
+            "step {step_id} should be skipped (falsy condition)"
+        );
+    }
+    let always = find_step(&json, "always-runs").expect("always-runs not found");
+    assert_eq!(always["status"].as_str().unwrap(), "completed");
+}
+
+/// User sets RECIPE_RUNNER_CACHE_TTL env var and the binary uses it without error.
+#[test]
+fn test_cache_ttl_env_var_accepted() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "cache-test.yaml",
+        r#"
+name: cache-test
+steps:
+  - id: simple
+    command: "echo cached"
+"#,
+    );
+    ensure_built();
+    let output = Command::new(binary_path())
+        .arg(&recipe)
+        .args(["--output-format", "json"])
+        .env("RECIPE_RUNNER_CACHE_TTL", "5")
+        .output()
+        .expect("failed to execute");
+    assert!(output.status.success(), "binary should accept RECIPE_RUNNER_CACHE_TTL env var");
+}
+
+/// User lists recipes via the `list` subcommand.
+#[test]
+fn test_list_subcommand() {
+    let tmp = TempDir::new().unwrap();
+    write_recipe(
+        tmp.path(),
+        "alpha.yaml",
+        r#"
+name: alpha-recipe
+steps:
+  - id: s1
+    command: "echo a"
+"#,
+    );
+    write_recipe(
+        tmp.path(),
+        "beta.yaml",
+        r#"
+name: beta-recipe
+steps:
+  - id: s1
+    command: "echo b"
+"#,
+    );
+    ensure_built();
+    let output = Command::new(binary_path())
+        .args(["list", "-R", tmp.path().to_str().unwrap()])
+        .output()
+        .expect("failed to run list");
+    assert!(output.status.success(), "list subcommand should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("alpha-recipe"),
+        "list should show alpha-recipe, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("beta-recipe"),
+        "list should show beta-recipe, got: {stdout}"
+    );
+}
+
+/// User runs a recipe with output chaining — step B uses step A's output.
+#[test]
+fn test_output_chaining_between_steps() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "chain.yaml",
+        r#"
+name: output-chain
+steps:
+  - id: producer
+    command: "echo hello-from-producer"
+    output: produced_value
+  - id: consumer
+    command: "echo got-{{produced_value}}"
+    output: consumed_value
+"#,
+    );
+    let (code, json, _stderr) = run_json(&recipe, &[]);
+    assert_eq!(code, 0);
+    let consumer = find_step(&json, "consumer").expect("consumer not found");
+    assert_eq!(consumer["status"].as_str().unwrap(), "completed");
+    let output = consumer["output"].as_str().unwrap();
+    assert!(
+        output.contains("hello-from-producer"),
+        "consumer should receive producer's output via template, got: {output}"
+    );
+}
+
+/// User runs a recipe with hooks — pre_step and post_step execute around each step.
+#[test]
+fn test_hooks_pre_and_post_step() {
+    let tmp = TempDir::new().unwrap();
+    let pre_marker = tmp.path().join("pre-marker");
+    let post_marker = tmp.path().join("post-marker");
+    let recipe = write_recipe(
+        tmp.path(),
+        "hooked.yaml",
+        &format!(
+            r#"
+name: hooked-recipe
+hooks:
+  pre_step: "touch {pre}"
+  post_step: "touch {post}"
+steps:
+  - id: hook-target
+    command: "echo hooked"
+"#,
+            pre = pre_marker.display(),
+            post = post_marker.display(),
+        ),
+    );
+    let (code, _stdout, _stderr) = run_binary(&recipe, &[]);
+    assert_eq!(code, 0);
+    assert!(
+        pre_marker.exists(),
+        "pre_step hook should have created marker file"
+    );
+    assert!(
+        post_marker.exists(),
+        "post_step hook should have created marker file"
+    );
+}
