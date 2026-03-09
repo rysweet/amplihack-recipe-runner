@@ -44,6 +44,8 @@ const KNOWN_STEP_FIELDS: &[&str] = &[
     "continue_on_error",
     "parallel_group",
     "when_tags",
+    "recovery_on_failure",
+    "model",
 ];
 
 #[derive(Debug, thiserror::Error)]
