@@ -282,7 +282,10 @@ impl Adapter for CLISubprocessAdapter {
     }
 
     fn is_available(&self) -> bool {
-        which::which(&self.cli).is_ok()
+        // Always available for bash steps. Agent steps will fail at execution
+        // time if the CLI binary (e.g. `claude`) is not installed, providing
+        // a clear error message for the specific step that needs it.
+        true
     }
 
     fn name(&self) -> &str {
