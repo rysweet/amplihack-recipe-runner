@@ -189,9 +189,20 @@ impl<A: Adapter> RecipeRunner<A> {
             };
         }
 
+        self.run_steps(&recipe, user_context)
+    }
+
+    /// Core step execution loop shared by `execute()` and `execute_with_depth()`.
+    ///
+    /// Handles serial and parallel step execution, hooks, tag filtering,
+    /// audit logging, and listener notifications.
+    fn run_steps(
+        &self,
+        recipe: &Recipe,
+        user_context: Option<HashMap<String, Value>>,
+    ) -> RecipeResult {
         let start = Instant::now();
 
-        // Build initial context from recipe defaults + user overrides
         let mut initial: HashMap<String, Value> = recipe.context.clone();
         if let Some(uc) = user_context {
             initial.extend(uc);
@@ -201,13 +212,11 @@ impl<A: Adapter> RecipeRunner<A> {
         let mut step_results = Vec::new();
         let mut success = true;
 
-        // Initialize audit log
         let audit_file = self.open_audit_log(&recipe.name);
 
         let mut step_idx = 0;
         while step_idx < recipe.steps.len() {
             if recipe.steps[step_idx].parallel_group.is_some() {
-                // Collect consecutive steps sharing the same parallel_group
                 let group_name = recipe.steps[step_idx]
                     .parallel_group
                     .as_ref()
@@ -221,7 +230,6 @@ impl<A: Adapter> RecipeRunner<A> {
                 }
                 let group_steps: Vec<&Step> = recipe.steps[group_start..step_idx].iter().collect();
 
-                // Check total step limit before the group
                 if self.total_steps.get() >= self.max_total_steps.get() {
                     error!(
                         "Total step limit ({}) reached, stopping execution",
@@ -245,17 +253,14 @@ impl<A: Adapter> RecipeRunner<A> {
                     break;
                 }
 
-                // Notify listeners and run pre_step hooks for all steps in the group
                 for gs in &group_steps {
                     self.listener.on_step_start(&gs.id, gs.effective_type());
                     self.run_hook(&recipe.hooks.pre_step, "pre_step", &gs.id, &ctx);
                 }
 
-                // Execute group (bash steps in parallel, others sequential)
                 let group_results =
-                    self.execute_parallel_group(&group_steps, &recipe, &ctx, &*self.listener);
+                    self.execute_parallel_group(&group_steps, recipe, &ctx, &*self.listener);
 
-                // Merge results into context in step order for determinism
                 let mut group_failed = false;
                 for (gs, result) in group_steps.iter().zip(group_results.into_iter()) {
                     self.total_steps.set(self.total_steps.get() + 1);
@@ -270,7 +275,6 @@ impl<A: Adapter> RecipeRunner<A> {
                     self.listener.on_step_complete(&result);
                     self.write_audit_entry(&audit_file, &result);
 
-                    // Store output in context in step order
                     if !failed && let Some(ref output_key) = gs.output {
                         let value = serde_json::from_str(&result.output)
                             .unwrap_or(Value::String(result.output.clone()));
@@ -298,7 +302,6 @@ impl<A: Adapter> RecipeRunner<A> {
             } else {
                 let step = &recipe.steps[step_idx];
 
-                // Check total step limit
                 if self.total_steps.get() >= self.max_total_steps.get() {
                     error!(
                         "Total step limit ({}) reached, stopping execution",
@@ -318,7 +321,6 @@ impl<A: Adapter> RecipeRunner<A> {
                     break;
                 }
 
-                // Tag filtering
                 if self.should_skip_by_tags(step) {
                     info!("Skipping step '{}': excluded by tag filter", step.id);
                     step_results.push(StepResult {
@@ -333,8 +335,6 @@ impl<A: Adapter> RecipeRunner<A> {
                 }
 
                 self.listener.on_step_start(&step.id, step.effective_type());
-
-                // Run pre_step hook
                 self.run_hook(&recipe.hooks.pre_step, "pre_step", &step.id, &ctx);
 
                 let result = self.execute_step(step, &mut ctx);
@@ -342,7 +342,6 @@ impl<A: Adapter> RecipeRunner<A> {
 
                 let failed = result.status == StepStatus::Failed;
 
-                // Run post_step or on_error hook
                 if failed {
                     self.run_hook(&recipe.hooks.on_error, "on_error", &step.id, &ctx);
                 } else {
@@ -790,187 +789,14 @@ impl<A: Adapter> RecipeRunner<A> {
 
     /// Execute a recipe at the current recursion depth.
     ///
-    /// Uses the same per-step logic as `execute()` — parallel groups, hooks,
-    /// tag filtering, audit logging, and listener notifications are all honored.
+    /// Delegates to the shared `run_steps()` implementation. Unlike `execute()`,
+    /// this skips extends resolution and recursion limit setup (already done by caller).
     fn execute_with_depth(
         &self,
         recipe: &Recipe,
         user_context: Option<HashMap<String, Value>>,
     ) -> RecipeResult {
-        let start = std::time::Instant::now();
-        let mut initial: HashMap<String, Value> = recipe.context.clone();
-        if let Some(uc) = user_context {
-            initial.extend(uc);
-        }
-        let mut ctx = RecipeContext::new(initial);
-
-        let mut step_results = Vec::new();
-        let mut success = true;
-
-        let audit_file = self.open_audit_log(&recipe.name);
-
-        let mut step_idx = 0;
-        while step_idx < recipe.steps.len() {
-            if recipe.steps[step_idx].parallel_group.is_some() {
-                let group_name = recipe.steps[step_idx]
-                    .parallel_group
-                    .as_ref()
-                    .unwrap()
-                    .clone();
-                let group_start = step_idx;
-                while step_idx < recipe.steps.len()
-                    && recipe.steps[step_idx].parallel_group.as_deref() == Some(&group_name)
-                {
-                    step_idx += 1;
-                }
-                let group_steps: Vec<&Step> = recipe.steps[group_start..step_idx].iter().collect();
-
-                if self.total_steps.get() >= self.max_total_steps.get() {
-                    error!(
-                        "Total step limit ({}) reached, stopping execution",
-                        self.max_total_steps.get()
-                    );
-                    let failed_id = group_steps
-                        .first()
-                        .map(|s| s.id.clone())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    step_results.push(StepResult {
-                        step_id: failed_id,
-                        status: StepStatus::Failed,
-                        output: String::new(),
-                        error: format!(
-                            "Total step limit ({}) exceeded",
-                            self.max_total_steps.get()
-                        ),
-                        duration: None,
-                    });
-                    success = false;
-                    break;
-                }
-
-                for gs in &group_steps {
-                    self.listener.on_step_start(&gs.id, gs.effective_type());
-                    self.run_hook(&recipe.hooks.pre_step, "pre_step", &gs.id, &ctx);
-                }
-
-                let group_results =
-                    self.execute_parallel_group(&group_steps, recipe, &ctx, &*self.listener);
-
-                let mut group_failed = false;
-                for (gs, result) in group_steps.iter().zip(group_results.into_iter()) {
-                    self.total_steps.set(self.total_steps.get() + 1);
-                    let failed = result.status == StepStatus::Failed;
-
-                    if failed {
-                        self.run_hook(&recipe.hooks.on_error, "on_error", &gs.id, &ctx);
-                    } else {
-                        self.run_hook(&recipe.hooks.post_step, "post_step", &gs.id, &ctx);
-                    }
-
-                    self.listener.on_step_complete(&result);
-                    self.write_audit_entry(&audit_file, &result);
-
-                    if !failed && let Some(ref output_key) = gs.output {
-                        let value = serde_json::from_str(&result.output)
-                            .unwrap_or(Value::String(result.output.clone()));
-                        ctx.set(output_key, value);
-                    }
-
-                    if failed && !gs.continue_on_error {
-                        group_failed = true;
-                    }
-
-                    if failed && gs.continue_on_error {
-                        warn!(
-                            "Step '{}' failed but continue_on_error is set, continuing",
-                            gs.id
-                        );
-                    }
-
-                    step_results.push(result);
-                }
-
-                if group_failed {
-                    success = false;
-                    break;
-                }
-            } else {
-                let step = &recipe.steps[step_idx];
-
-                if self.total_steps.get() >= self.max_total_steps.get() {
-                    error!(
-                        "Total step limit ({}) reached, stopping execution",
-                        self.max_total_steps.get()
-                    );
-                    step_results.push(StepResult {
-                        step_id: step.id.clone(),
-                        status: StepStatus::Failed,
-                        output: String::new(),
-                        error: format!(
-                            "Total step limit ({}) exceeded",
-                            self.max_total_steps.get()
-                        ),
-                        duration: None,
-                    });
-                    success = false;
-                    break;
-                }
-
-                if self.should_skip_by_tags(step) {
-                    info!("Skipping step '{}': excluded by tag filter", step.id);
-                    step_results.push(StepResult {
-                        step_id: step.id.clone(),
-                        status: StepStatus::Skipped,
-                        output: String::new(),
-                        error: String::new(),
-                        duration: None,
-                    });
-                    step_idx += 1;
-                    continue;
-                }
-
-                self.listener.on_step_start(&step.id, step.effective_type());
-                self.run_hook(&recipe.hooks.pre_step, "pre_step", &step.id, &ctx);
-
-                let result = self.execute_step(step, &mut ctx);
-                self.total_steps.set(self.total_steps.get() + 1);
-
-                let failed = result.status == StepStatus::Failed;
-
-                if failed {
-                    self.run_hook(&recipe.hooks.on_error, "on_error", &step.id, &ctx);
-                } else {
-                    self.run_hook(&recipe.hooks.post_step, "post_step", &step.id, &ctx);
-                }
-
-                self.listener.on_step_complete(&result);
-                self.write_audit_entry(&audit_file, &result);
-
-                if failed && !step.continue_on_error {
-                    step_results.push(result);
-                    success = false;
-                    break;
-                }
-
-                if failed && step.continue_on_error {
-                    warn!(
-                        "Step '{}' failed but continue_on_error is set, continuing",
-                        step.id
-                    );
-                }
-
-                step_results.push(result);
-                step_idx += 1;
-            }
-        }
-
-        RecipeResult {
-            recipe_name: recipe.name.clone(),
-            success,
-            step_results,
-            context: ctx.to_map(),
-            duration: Some(start.elapsed()),
-        }
+        self.run_steps(recipe, user_context)
     }
 
     fn find_recipe_path(&self, name: &str) -> Option<String> {

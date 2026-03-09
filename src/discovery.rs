@@ -416,10 +416,25 @@ pub fn sync_upstream(
         .map(|s| s.to_string())
         .collect();
 
+    let diff_summary = if has_changes {
+        let truncated = crate::safe_truncate(&diff_stdout, 500);
+        if truncated.len() < diff_stdout.len() {
+            format!(
+                "{}... (truncated from {} bytes)",
+                truncated,
+                diff_stdout.len()
+            )
+        } else {
+            truncated.to_string()
+        }
+    } else {
+        "No changes".to_string()
+    };
+
     Ok(serde_json::json!({
         "has_changes": has_changes,
         "files_changed": files_changed,
-        "diff_summary": if has_changes { crate::safe_truncate(&diff_stdout, 500) } else { "No changes" },
+        "diff_summary": diff_summary,
         "upstream_ref": upstream_ref,
     }))
 }
