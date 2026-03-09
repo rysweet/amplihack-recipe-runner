@@ -59,6 +59,8 @@ pub struct Step {
     pub parse_json_required: bool,
     pub mode: Option<String>,
     pub working_dir: Option<String>,
+    /// Timeout in seconds. Only applies to bash steps — agent steps have no
+    /// timeout and run until completion (they can take hours).
     pub timeout: Option<u64>,
     pub auto_stage: Option<bool>,
     pub recipe: Option<String>,
