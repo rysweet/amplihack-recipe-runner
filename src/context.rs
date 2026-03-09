@@ -98,21 +98,34 @@ impl RecipeContext {
 
     /// Convert a template variable name to an env var key.
     fn env_key(var_name: &str) -> String {
-        format!("RECIPE_VAR_{}", var_name.replace('.', "__").replace('-', "_"))
+        format!(
+            "RECIPE_VAR_{}",
+            var_name.replace('.', "__").replace('-', "_")
+        )
     }
 
     /// Recursively flatten nested JSON objects into env vars with `__` separators.
-    fn flatten_nested(prefix: &str, map: &serde_json::Map<String, Value>, env: &mut HashMap<String, String>) {
+    fn flatten_nested(
+        prefix: &str,
+        map: &serde_json::Map<String, Value>,
+        env: &mut HashMap<String, String>,
+    ) {
         for (k, v) in map {
             let key = format!("{}__{}", prefix, k.replace('.', "__").replace('-', "_"));
             match v {
-                Value::String(s) => { env.insert(key, s.clone()); }
-                Value::Null => { env.insert(key, String::new()); }
+                Value::String(s) => {
+                    env.insert(key, s.clone());
+                }
+                Value::Null => {
+                    env.insert(key, String::new());
+                }
                 Value::Object(nested) => {
                     env.insert(key.clone(), v.to_string());
                     Self::flatten_nested(&key, nested, env);
                 }
-                other => { env.insert(key, other.to_string()); }
+                other => {
+                    env.insert(key, other.to_string());
+                }
             }
         }
     }

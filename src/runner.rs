@@ -405,9 +405,9 @@ impl<A: Adapter> RecipeRunner<A> {
             let rendered = ctx.render_shell(cmd);
             let env_vars = ctx.shell_env_vars();
             info!("Running {} hook for step '{}'", hook_name, step_id);
-            if let Err(e) = self
-                .adapter
-                .execute_bash_step(&rendered, &self.working_dir, Some(30), &env_vars)
+            if let Err(e) =
+                self.adapter
+                    .execute_bash_step(&rendered, &self.working_dir, Some(30), &env_vars)
             {
                 warn!("{} hook failed for step '{}': {}", hook_name, step_id, e);
             }

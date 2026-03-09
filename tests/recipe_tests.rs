@@ -2121,7 +2121,10 @@ fn test_shell_render_prevents_injection() {
     // Value should be an env var reference, NOT inlined in shell source
     assert_eq!(rendered, "echo \"$RECIPE_VAR_input\"");
     // The dangerous value lives in the env var, not the command
-    assert!(!rendered.contains("rm -rf"), "dangerous value must not be in shell source");
+    assert!(
+        !rendered.contains("rm -rf"),
+        "dangerous value must not be in shell source"
+    );
     let env = ctx.shell_env_vars();
     assert_eq!(env.get("RECIPE_VAR_input").unwrap(), "$(rm -rf /)");
 }
