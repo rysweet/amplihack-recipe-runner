@@ -430,49 +430,63 @@ impl<'a> ExprParser<'a> {
                 }
             };
 
-            // If next token is '(' and it's a safe method, treat as method call
-            if self.peek() == Some(&Token::LParen)
-                && SAFE_METHOD_NAMES.contains(&method_name.as_str())
-            {
-                self.advance(); // consume '('
-
-                let mut args = Vec::new();
-                if self.peek() != Some(&Token::RParen) {
-                    args.push(self.parse_or_value()?);
-                    while self.peek() == Some(&Token::Comma) {
-                        self.advance();
-                        args.push(self.parse_or_value()?);
-                    }
-                }
-
-                if self.peek() != Some(&Token::RParen) {
-                    return Err(ConditionError::Parse("expected ')'".to_string()));
-                }
-                self.advance();
-
-                value = apply_method(&value, &method_name, &args)?;
-            } else if self.peek() == Some(&Token::LParen) {
-                // '(' present but not a safe method — reject
-                return Err(ConditionError::Unsafe(format!(
-                    "method '.{}()' is not allowed. Safe methods: {:?}",
-                    method_name, SAFE_METHOD_NAMES
-                )));
-            } else {
-                // No '(' — treat as dot-notation property access
-                if method_name.contains("__") {
-                    return Err(ConditionError::Unsafe(format!(
-                        "dunder property '{}' is not allowed",
-                        method_name
-                    )));
-                }
-                value = match value.get(&method_name) {
-                    Some(v) => v.clone(),
-                    None => Value::Null,
-                };
-            }
+            value = self.parse_dot_access(value, &method_name)?;
         }
 
         Ok(value)
+    }
+
+    /// Handle dot-access: safe method call, unsafe method rejection, or property access.
+    fn parse_dot_access(
+        &mut self,
+        value: Value,
+        method_name: &str,
+    ) -> Result<Value, ConditionError> {
+        if self.peek() == Some(&Token::LParen) && SAFE_METHOD_NAMES.contains(&method_name) {
+            self.parse_method_call(value, method_name)
+        } else if self.peek() == Some(&Token::LParen) {
+            Err(ConditionError::Unsafe(format!(
+                "method '.{}()' is not allowed. Safe methods: {:?}",
+                method_name, SAFE_METHOD_NAMES
+            )))
+        } else {
+            // Dot-notation property access
+            if method_name.contains("__") {
+                return Err(ConditionError::Unsafe(format!(
+                    "dunder property '{}' is not allowed",
+                    method_name
+                )));
+            }
+            Ok(match value.get(method_name) {
+                Some(v) => v.clone(),
+                None => Value::Null,
+            })
+        }
+    }
+
+    /// Parse a safe method call: value.method(args...)
+    fn parse_method_call(
+        &mut self,
+        value: Value,
+        method_name: &str,
+    ) -> Result<Value, ConditionError> {
+        self.advance(); // consume '('
+
+        let mut args = Vec::new();
+        if self.peek() != Some(&Token::RParen) {
+            args.push(self.parse_or_value()?);
+            while self.peek() == Some(&Token::Comma) {
+                self.advance();
+                args.push(self.parse_or_value()?);
+            }
+        }
+
+        if self.peek() != Some(&Token::RParen) {
+            return Err(ConditionError::Parse("expected ')'".to_string()));
+        }
+        self.advance();
+
+        apply_method(&value, method_name, &args)
     }
 
     /// Parse an expression that returns a Value (for function/method args)
@@ -1054,5 +1068,167 @@ mod tests {
         assert!(c.evaluate("a and b").unwrap());
         let c2 = ctx(vec![("a", json!("")), ("b", json!("yes"))]);
         assert!(c2.evaluate("a or b").unwrap());
+    }
+
+    // ── Edge cases (test-5) ──────────────────────────────
+
+    #[test]
+    fn test_empty_condition() {
+        let c = ctx(vec![]);
+        assert!(c.evaluate("").is_err());
+    }
+
+    #[test]
+    fn test_whitespace_only_condition() {
+        let c = ctx(vec![]);
+        assert!(c.evaluate("   ").is_err());
+    }
+
+    #[test]
+    fn test_empty_context_variable_access() {
+        let c = ctx(vec![]);
+        // Accessing a nonexistent variable evaluates to Null (falsy)
+        assert!(!c.evaluate("novar").unwrap());
+    }
+
+    #[test]
+    fn test_null_value_comparison() {
+        let c = ctx(vec![("v", json!(null))]);
+        assert!(!c.evaluate("v").unwrap());
+        // Null is not equal to empty string — it's a distinct type
+        assert!(!c.evaluate("v == 'hello'").unwrap());
+    }
+
+    #[test]
+    fn test_empty_string_is_falsy() {
+        let c = ctx(vec![("s", json!(""))]);
+        assert!(!c.evaluate("s").unwrap());
+    }
+
+    #[test]
+    fn test_render_empty_template() {
+        let c = ctx(vec![]);
+        assert_eq!(c.render(""), "");
+    }
+
+    #[test]
+    fn test_render_no_placeholders() {
+        let c = ctx(vec![]);
+        assert_eq!(c.render("plain text"), "plain text");
+    }
+
+    #[test]
+    fn test_render_missing_variable() {
+        let c = ctx(vec![]);
+        // Missing variable renders as empty string
+        assert_eq!(c.render("before {{missing}} after"), "before  after");
+    }
+
+    #[test]
+    fn test_render_shell_empty() {
+        let c = ctx(vec![]);
+        assert_eq!(c.render_shell(""), "");
+    }
+
+    #[test]
+    fn test_len_empty_string() {
+        let c = ctx(vec![("s", json!(""))]);
+        assert!(c.evaluate("len(s) == 0").unwrap());
+    }
+
+    #[test]
+    fn test_len_empty_array() {
+        let c = ctx(vec![("a", json!([]))]);
+        assert!(c.evaluate("len(a) == 0").unwrap());
+    }
+
+    #[test]
+    fn test_method_on_empty_string() {
+        let c = ctx(vec![("s", json!(""))]);
+        assert!(c.evaluate("s.strip() == ''").unwrap());
+        assert!(c.evaluate("s.upper() == ''").unwrap());
+        assert!(c.evaluate("s.lower() == ''").unwrap());
+    }
+
+    // ── Boundary values (test-6) ──────────────────────────
+
+    #[test]
+    fn test_deeply_nested_parens() {
+        let c = ctx(vec![("x", json!(true))]);
+        // 30 levels of nesting — should pass (max is 32)
+        let inner = "x";
+        let mut expr = inner.to_string();
+        for _ in 0..30 {
+            expr = format!("({})", expr);
+        }
+        assert!(c.evaluate(&expr).unwrap());
+    }
+
+    #[test]
+    fn test_max_nesting_exceeded() {
+        let c = ctx(vec![("x", json!(true))]);
+        // 33 levels — should fail
+        let inner = "x";
+        let mut expr = inner.to_string();
+        for _ in 0..33 {
+            expr = format!("({})", expr);
+        }
+        assert!(c.evaluate(&expr).is_err());
+    }
+
+    #[test]
+    fn test_very_long_string_literal() {
+        let c = ctx(vec![]);
+        // Condition evaluator has an 8192-byte limit; stay within it
+        let long = "a".repeat(3000);
+        let expr = format!("'{}' == '{}'", long, long);
+        assert!(c.evaluate(&expr).unwrap());
+    }
+
+    #[test]
+    fn test_many_or_clauses() {
+        let c = ctx(vec![("x", json!("last"))]);
+        // Chain 50 OR clauses, only the last is true
+        let mut parts: Vec<String> = (0..49).map(|i| format!("x == 'v{}'", i)).collect();
+        parts.push("x == 'last'".to_string());
+        let expr = parts.join(" or ");
+        assert!(c.evaluate(&expr).unwrap());
+    }
+
+    #[test]
+    fn test_many_and_clauses() {
+        let vars: Vec<(&str, Value)> = (0..20)
+            .map(|i| {
+                let name = Box::leak(format!("v{}", i).into_boxed_str()) as &str;
+                (name, json!(true))
+            })
+            .collect();
+        let c = ctx(vars);
+        let expr = (0..20)
+            .map(|i| format!("v{}", i))
+            .collect::<Vec<_>>()
+            .join(" and ");
+        assert!(c.evaluate(&expr).unwrap());
+    }
+
+    #[test]
+    fn test_numeric_boundary_zero() {
+        let c = ctx(vec![("n", json!(0))]);
+        assert!(!c.evaluate("n").unwrap());
+        assert!(c.evaluate("n == 0").unwrap());
+    }
+
+    #[test]
+    fn test_numeric_boundary_negative() {
+        let c = ctx(vec![("n", json!(-1))]);
+        assert!(c.evaluate("n < 0").unwrap());
+        assert!(c.evaluate("n == -1").unwrap());
+    }
+
+    #[test]
+    fn test_numeric_boundary_large() {
+        let c = ctx(vec![("n", json!(999_999_999))]);
+        assert!(c.evaluate("n > 0").unwrap());
+        assert!(c.evaluate("n == 999999999").unwrap());
     }
 }

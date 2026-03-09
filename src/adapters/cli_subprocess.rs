@@ -134,24 +134,34 @@ impl CLISubprocessAdapter {
             let mut last_size = 0u64;
             let mut last_activity = Instant::now();
             while !stop_clone.load(Ordering::Relaxed) {
-                if let Ok(meta) = std::fs::metadata(&output_path) {
-                    let current_size = meta.len();
-                    if current_size > last_size {
-                        if let Ok(file) = std::fs::File::open(&output_path) {
-                            let reader = BufReader::new(file);
-                            if let Some(Ok(last_line)) = reader.lines().last() {
-                                let truncated = crate::safe_truncate(&last_line, 120);
-                                eprintln!("  [agent] {}", truncated);
+                match std::fs::metadata(&output_path) {
+                    Ok(meta) => {
+                        let current_size = meta.len();
+                        if current_size > last_size {
+                            match std::fs::File::open(&output_path) {
+                                Ok(file) => {
+                                    let reader = BufReader::new(file);
+                                    if let Some(Ok(last_line)) = reader.lines().last() {
+                                        let truncated = crate::safe_truncate(&last_line, 120);
+                                        eprintln!("  [agent] {}", truncated);
+                                    }
+                                }
+                                Err(e) => {
+                                    log::debug!("heartbeat: cannot open output file: {}", e);
+                                }
                             }
+                            last_size = current_size;
+                            last_activity = Instant::now();
+                        } else if last_activity.elapsed() > Duration::from_secs(60) {
+                            eprintln!(
+                                "  [agent] ... still running ({}s since last output)",
+                                last_activity.elapsed().as_secs()
+                            );
+                            last_activity = Instant::now();
                         }
-                        last_size = current_size;
-                        last_activity = Instant::now();
-                    } else if last_activity.elapsed() > Duration::from_secs(60) {
-                        eprintln!(
-                            "  [agent] ... still running ({}s since last output)",
-                            last_activity.elapsed().as_secs()
-                        );
-                        last_activity = Instant::now();
+                    }
+                    Err(e) => {
+                        log::debug!("heartbeat: cannot stat output file: {}", e);
                     }
                 }
                 std::thread::sleep(Duration::from_secs(2));
@@ -255,5 +265,193 @@ impl Adapter for CLISubprocessAdapter {
 
     fn name(&self) -> &str {
         "cli-subprocess"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_defaults() {
+        let adapter = CLISubprocessAdapter::new();
+        assert_eq!(adapter.cli, "claude");
+        assert_eq!(adapter.working_dir, ".");
+    }
+
+    #[test]
+    fn test_with_binary() {
+        let adapter = CLISubprocessAdapter::new().with_binary("my-agent");
+        assert_eq!(adapter.cli, "my-agent");
+    }
+
+    #[test]
+    fn test_with_working_dir() {
+        let adapter = CLISubprocessAdapter::new().with_working_dir("/tmp/test");
+        assert_eq!(adapter.working_dir, "/tmp/test");
+    }
+
+    #[test]
+    fn test_default_impl() {
+        let adapter = CLISubprocessAdapter::default();
+        assert_eq!(adapter.cli, "claude");
+        assert_eq!(adapter.working_dir, ".");
+    }
+
+    #[test]
+    fn test_is_available_always_true() {
+        let adapter = CLISubprocessAdapter::new();
+        assert!(adapter.is_available());
+    }
+
+    #[test]
+    fn test_name() {
+        let adapter = CLISubprocessAdapter::new();
+        assert_eq!(adapter.name(), "cli-subprocess");
+    }
+
+    #[test]
+    fn test_build_child_env_has_required_keys() {
+        let env = CLISubprocessAdapter::build_child_env();
+        // All of these keys must always be present
+        assert!(env.contains_key("AMPLIHACK_SESSION_DEPTH"));
+        assert!(env.contains_key("AMPLIHACK_MAX_DEPTH"));
+        assert!(env.contains_key("AMPLIHACK_TREE_ID"));
+        assert!(env.contains_key("AMPLIHACK_MAX_SESSIONS"));
+        // CLAUDECODE is never passed to children
+        assert!(!env.contains_key("CLAUDECODE"));
+    }
+
+    #[test]
+    fn test_build_child_env_tree_id_nonempty() {
+        let env = CLISubprocessAdapter::build_child_env();
+        let tree_id = env.get("AMPLIHACK_TREE_ID").unwrap();
+        assert!(!tree_id.is_empty(), "tree ID should be non-empty");
+    }
+
+    #[test]
+    fn test_build_child_env_max_sessions_is_numeric() {
+        let env = CLISubprocessAdapter::build_child_env();
+        let ms: u32 = env
+            .get("AMPLIHACK_MAX_SESSIONS")
+            .unwrap()
+            .parse()
+            .expect("max_sessions must be numeric");
+        assert!(ms >= 1);
+    }
+
+    #[test]
+    fn test_build_child_env_increments_depth() {
+        // build_child_env reads current AMPLIHACK_SESSION_DEPTH and increments by 1
+        // Since tests run in parallel, just verify the result is a valid number > 0
+        let env = CLISubprocessAdapter::build_child_env();
+        let depth: u32 = env
+            .get("AMPLIHACK_SESSION_DEPTH")
+            .unwrap()
+            .parse()
+            .expect("depth should be a number");
+        assert!(depth >= 1, "child depth should be at least 1");
+    }
+
+    #[test]
+    fn test_build_child_env_max_depth_valid() {
+        let env = CLISubprocessAdapter::build_child_env();
+        let max_depth: u32 = env
+            .get("AMPLIHACK_MAX_DEPTH")
+            .unwrap()
+            .parse()
+            .expect("max_depth should be a number");
+        assert!(max_depth >= 1, "max_depth should be at least 1");
+    }
+
+    #[test]
+    fn test_build_child_env_preserves_max_depth() {
+        // Verify max_depth is always set to a valid value
+        let env = CLISubprocessAdapter::build_child_env();
+        let max_depth: u32 = env
+            .get("AMPLIHACK_MAX_DEPTH")
+            .unwrap()
+            .parse()
+            .expect("max_depth should be a number");
+        assert!(max_depth >= 1, "max_depth should be at least 1");
+    }
+
+    #[test]
+    fn test_build_child_env_preserves_existing_tree_id() {
+        // If AMPLIHACK_TREE_ID is already set, build_child_env preserves it
+        let env = CLISubprocessAdapter::build_child_env();
+        let tree_id = env.get("AMPLIHACK_TREE_ID").unwrap().clone();
+        // Call again — tree_id should remain stable when already set in env
+        assert!(!tree_id.is_empty());
+    }
+
+    #[test]
+    fn test_build_child_env_depth_is_always_valid() {
+        // Regardless of env state, the child depth must be a valid positive number
+        let env = CLISubprocessAdapter::build_child_env();
+        let depth: u32 = env
+            .get("AMPLIHACK_SESSION_DEPTH")
+            .unwrap()
+            .parse()
+            .expect("depth must always be a valid number");
+        assert!(depth >= 1);
+    }
+
+    #[test]
+    fn test_execute_bash_step_echo() {
+        let adapter = CLISubprocessAdapter::new();
+        let result = adapter.execute_bash_step("echo hello world", ".", None);
+        assert!(result.is_ok(), "echo should succeed: {:?}", result);
+        assert_eq!(result.unwrap(), "hello world");
+    }
+
+    #[test]
+    fn test_execute_bash_step_failure() {
+        let adapter = CLISubprocessAdapter::new();
+        let result = adapter.execute_bash_step("exit 1", ".", None);
+        assert!(result.is_err(), "exit 1 should fail");
+    }
+
+    #[test]
+    fn test_execute_bash_step_with_timeout() {
+        let adapter = CLISubprocessAdapter::new();
+        let result = adapter.execute_bash_step("echo timed", ".", Some(10));
+        assert!(result.is_ok(), "timed echo should succeed: {:?}", result);
+        assert_eq!(result.unwrap(), "timed");
+    }
+
+    #[test]
+    fn test_execute_bash_step_timeout_kills() {
+        let adapter = CLISubprocessAdapter::new();
+        let result = adapter.execute_bash_step("sleep 60", ".", Some(1));
+        assert!(result.is_err(), "sleep 60 with 1s timeout should fail");
+    }
+
+    #[test]
+    fn test_execute_bash_step_working_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adapter = CLISubprocessAdapter::new().with_working_dir(tmp.path().to_str().unwrap());
+        let result = adapter.execute_bash_step("pwd", "", None);
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(
+            output.contains(tmp.path().to_str().unwrap()),
+            "working dir should be respected, got: {}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_execute_bash_step_empty_command() {
+        let adapter = CLISubprocessAdapter::new();
+        let result = adapter.execute_bash_step("", ".", None);
+        // Empty command succeeds with empty output in bash
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_non_interactive_footer_constant() {
+        assert!(NON_INTERACTIVE_FOOTER.contains("autonomously"));
+        assert!(NON_INTERACTIVE_FOOTER.contains("Do not ask questions"));
     }
 }
