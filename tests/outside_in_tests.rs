@@ -1292,3 +1292,474 @@ steps:
         perms.mode() & 0o777
     );
 }
+
+// ---------------------------------------------------------------------------
+// Module split validation: src/runner/listeners.rs
+// Tests that --progress flag emits listener output to stderr
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_progress_flag_shows_step_start_on_stderr() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "progress.yaml",
+        r#"
+name: progress-test
+steps:
+  - id: hello
+    command: echo hi
+"#,
+    );
+    let (code, _stdout, stderr) = run_binary(&recipe, &["--progress"]);
+    assert_eq!(code, 0);
+    assert!(
+        stderr.contains("▶ hello"),
+        "stderr should contain step start marker '▶ hello', got: {stderr}"
+    );
+}
+
+#[test]
+fn test_progress_flag_shows_completion_icon() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "progress-done.yaml",
+        r#"
+name: progress-done-test
+steps:
+  - id: greet
+    command: echo done
+"#,
+    );
+    let (code, _stdout, stderr) = run_binary(&recipe, &["--progress"]);
+    assert_eq!(code, 0);
+    assert!(
+        stderr.contains("✓ greet"),
+        "stderr should contain success icon '✓ greet', got: {stderr}"
+    );
+}
+
+#[test]
+fn test_progress_flag_shows_failure_icon() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "progress-fail.yaml",
+        r#"
+name: progress-fail-test
+steps:
+  - id: bad-step
+    command: exit 1
+"#,
+    );
+    let (code, _stdout, stderr) = run_binary(&recipe, &["--progress"]);
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("✗ bad-step"),
+        "stderr should contain failure icon '✗ bad-step', got: {stderr}"
+    );
+}
+
+#[test]
+fn test_progress_flag_shows_skipped_icon() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "progress-skip.yaml",
+        r#"
+name: progress-skip-test
+steps:
+  - id: skipped-step
+    command: echo nope
+    condition: "false"
+"#,
+    );
+    let (code, _stdout, stderr) = run_binary(&recipe, &["--progress"]);
+    assert_eq!(code, 0);
+    assert!(
+        stderr.contains("⊘ skipped-step"),
+        "stderr should contain skipped icon '⊘ skipped-step', got: {stderr}"
+    );
+}
+
+#[test]
+fn test_progress_output_goes_to_stderr_not_stdout() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "progress-channel.yaml",
+        r#"
+name: progress-channel-test
+steps:
+  - id: channel-step
+    command: echo payload
+"#,
+    );
+    let (code, stdout, stderr) = run_binary(&recipe, &["--progress"]);
+    assert_eq!(code, 0);
+    assert!(
+        !stdout.contains("▶"),
+        "progress markers should NOT appear in stdout"
+    );
+    assert!(
+        stderr.contains("▶"),
+        "progress markers should appear in stderr"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Module split validation: src/runner/json_parser.rs
+// Tests JSON extraction strategies via CLI (fenced blocks, balanced brackets)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_parse_json_from_fenced_block_via_cli() {
+    let tmp = TempDir::new().unwrap();
+    // Use python3 to produce backtick fences (shell eats raw backticks)
+    let recipe = write_recipe(
+        tmp.path(),
+        "fence-parse.yaml",
+        r#"
+name: fence-parse-test
+steps:
+  - id: fenced
+    command: 'python3 -c "print(\"Here:\\n\\x60\\x60\\x60json\\n{\\\"fenced\\\": true}\\n\\x60\\x60\\x60\\nDone.\")"'
+    parse_json: true
+"#,
+    );
+    let (code, json, _stderr) = run_json(&recipe, &[]);
+    assert_eq!(code, 0);
+    let step = find_step(&json, "fenced").expect("should find step 'fenced'");
+    assert_eq!(
+        step["status"].as_str(),
+        Some("completed"),
+        "fenced JSON parse should produce completed status"
+    );
+    // Parsed JSON replaces the output field
+    let output = step["output"].as_str().unwrap_or("");
+    let parsed: Value = serde_json::from_str(output)
+        .unwrap_or_else(|_| panic!("output should be valid JSON, got: {output}"));
+    assert_eq!(parsed["fenced"], true, "should extract fenced JSON");
+}
+
+#[test]
+fn test_parse_json_from_balanced_bracket_via_cli() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "balanced-parse.yaml",
+        r#"
+name: balanced-parse-test
+steps:
+  - id: balanced
+    command: "echo 'some prose {\"balanced\": true} more text'"
+    parse_json: true
+"#,
+    );
+    let (code, json, _stderr) = run_json(&recipe, &[]);
+    assert_eq!(code, 0);
+    let step = find_step(&json, "balanced").expect("should find step 'balanced'");
+    assert_eq!(step["status"].as_str(), Some("completed"));
+    let output = step["output"].as_str().unwrap_or("");
+    let parsed: Value = serde_json::from_str(output)
+        .unwrap_or_else(|_| panic!("output should be valid JSON, got: {output}"));
+    assert_eq!(
+        parsed["balanced"], true,
+        "balanced bracket should extract JSON"
+    );
+}
+
+#[test]
+fn test_parse_json_unlabeled_fence_via_cli() {
+    let tmp = TempDir::new().unwrap();
+    // Unlabeled fence: ``` without json label
+    let recipe = write_recipe(
+        tmp.path(),
+        "unlabeled-fence.yaml",
+        r#"
+name: unlabeled-fence-test
+steps:
+  - id: unlabeled
+    command: 'python3 -c "print(\"\\x60\\x60\\x60\\n{\\\"unlabeled\\\": true}\\n\\x60\\x60\\x60\")"'
+    parse_json: true
+"#,
+    );
+    let (code, json, _stderr) = run_json(&recipe, &[]);
+    assert_eq!(code, 0);
+    let step = find_step(&json, "unlabeled").expect("should find step 'unlabeled'");
+    assert_eq!(step["status"].as_str(), Some("completed"));
+    let output = step["output"].as_str().unwrap_or("");
+    let parsed: Value = serde_json::from_str(output)
+        .unwrap_or_else(|_| panic!("output should be valid JSON, got: {output}"));
+    assert_eq!(parsed["unlabeled"], true, "unlabeled fence should parse");
+}
+
+// ---------------------------------------------------------------------------
+// Module split validation: src/runner/audit.rs
+// Tests audit log entry structure, content, and multi-step behavior
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_audit_log_filename_format() {
+    let tmp = TempDir::new().unwrap();
+    let audit_dir = tmp.path().join("audit-fname");
+    let recipe = write_recipe(
+        tmp.path(),
+        "audit-fname.yaml",
+        r#"
+name: fname-recipe
+steps:
+  - id: step1
+    command: echo ok
+"#,
+    );
+    let (code, _stdout, _stderr) =
+        run_binary(&recipe, &["--audit-dir", audit_dir.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    let entries: Vec<_> = std::fs::read_dir(&audit_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(entries.len(), 1, "should have exactly one audit log file");
+    let fname = entries[0].file_name().to_string_lossy().to_string();
+    assert!(
+        fname.starts_with("fname-recipe-"),
+        "filename should start with recipe name, got: {fname}"
+    );
+    assert!(
+        fname.ends_with(".jsonl"),
+        "filename should end with .jsonl, got: {fname}"
+    );
+    // Middle part should be a Unix timestamp (digits only)
+    let ts_part = fname
+        .strip_prefix("fname-recipe-")
+        .unwrap()
+        .strip_suffix(".jsonl")
+        .unwrap();
+    assert!(
+        ts_part.chars().all(|c| c.is_ascii_digit()),
+        "timestamp portion should be all digits, got: {ts_part}"
+    );
+}
+
+#[test]
+fn test_audit_log_entry_has_all_fields() {
+    let tmp = TempDir::new().unwrap();
+    let audit_dir = tmp.path().join("audit-fields");
+    let recipe = write_recipe(
+        tmp.path(),
+        "audit-fields.yaml",
+        r#"
+name: fields-test
+steps:
+  - id: fieldstep
+    command: echo hello
+"#,
+    );
+    let (code, _stdout, _stderr) =
+        run_binary(&recipe, &["--audit-dir", audit_dir.to_str().unwrap()]);
+    assert_eq!(code, 0);
+
+    let log_file = std::fs::read_dir(&audit_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .next()
+        .expect("audit log should exist");
+    let content = std::fs::read_to_string(log_file.path()).unwrap();
+    let entry: Value = serde_json::from_str(content.trim()).expect("should be valid JSON");
+
+    assert!(entry.get("step_id").is_some(), "entry should have step_id");
+    assert!(entry.get("status").is_some(), "entry should have status");
+    assert!(
+        entry.get("duration_ms").is_some(),
+        "entry should have duration_ms"
+    );
+    assert!(
+        entry.get("output_len").is_some(),
+        "entry should have output_len"
+    );
+    // error field should exist (even if null)
+    assert!(
+        entry.get("error").is_some(),
+        "entry should have error field"
+    );
+}
+
+#[test]
+fn test_audit_log_step_id_matches() {
+    let tmp = TempDir::new().unwrap();
+    let audit_dir = tmp.path().join("audit-stepid");
+    let recipe = write_recipe(
+        tmp.path(),
+        "audit-stepid.yaml",
+        r#"
+name: stepid-test
+steps:
+  - id: mystep
+    command: echo ok
+"#,
+    );
+    let (code, _stdout, _stderr) =
+        run_binary(&recipe, &["--audit-dir", audit_dir.to_str().unwrap()]);
+    assert_eq!(code, 0);
+
+    let log_file = std::fs::read_dir(&audit_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .next()
+        .unwrap();
+    let content = std::fs::read_to_string(log_file.path()).unwrap();
+    let entry: Value = serde_json::from_str(content.trim()).unwrap();
+    assert_eq!(
+        entry["step_id"].as_str(),
+        Some("mystep"),
+        "audit entry step_id should match executed step"
+    );
+}
+
+#[test]
+fn test_audit_log_error_null_on_success() {
+    let tmp = TempDir::new().unwrap();
+    let audit_dir = tmp.path().join("audit-ok");
+    let recipe = write_recipe(
+        tmp.path(),
+        "audit-ok.yaml",
+        r#"
+name: audit-ok-test
+steps:
+  - id: okstep
+    command: echo success
+"#,
+    );
+    let (code, _stdout, _stderr) =
+        run_binary(&recipe, &["--audit-dir", audit_dir.to_str().unwrap()]);
+    assert_eq!(code, 0);
+
+    let log_file = std::fs::read_dir(&audit_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .next()
+        .unwrap();
+    let content = std::fs::read_to_string(log_file.path()).unwrap();
+    let entry: Value = serde_json::from_str(content.trim()).unwrap();
+    assert!(
+        entry["error"].is_null(),
+        "error should be null on success, got: {}",
+        entry["error"]
+    );
+}
+
+#[test]
+fn test_audit_log_error_populated_on_failure() {
+    let tmp = TempDir::new().unwrap();
+    let audit_dir = tmp.path().join("audit-err");
+    let recipe = write_recipe(
+        tmp.path(),
+        "audit-err.yaml",
+        r#"
+name: audit-err-test
+steps:
+  - id: failstep
+    command: exit 1
+    continue_on_error: true
+"#,
+    );
+    let (code, _stdout, _stderr) =
+        run_binary(&recipe, &["--audit-dir", audit_dir.to_str().unwrap()]);
+    assert_eq!(code, 0); // continue_on_error means recipe succeeds
+
+    let log_file = std::fs::read_dir(&audit_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .next()
+        .unwrap();
+    let content = std::fs::read_to_string(log_file.path()).unwrap();
+    let entry: Value = serde_json::from_str(content.trim()).unwrap();
+    assert!(
+        !entry["error"].is_null(),
+        "error should be populated on failure"
+    );
+}
+
+#[test]
+fn test_audit_log_multiple_steps_multiple_lines() {
+    let tmp = TempDir::new().unwrap();
+    let audit_dir = tmp.path().join("audit-multi");
+    let recipe = write_recipe(
+        tmp.path(),
+        "audit-multi.yaml",
+        r#"
+name: audit-multi-test
+steps:
+  - id: first
+    command: echo one
+  - id: second
+    command: echo two
+  - id: third
+    command: echo three
+"#,
+    );
+    let (code, _stdout, _stderr) =
+        run_binary(&recipe, &["--audit-dir", audit_dir.to_str().unwrap()]);
+    assert_eq!(code, 0);
+
+    let log_file = std::fs::read_dir(&audit_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .next()
+        .unwrap();
+    let content = std::fs::read_to_string(log_file.path()).unwrap();
+    let lines: Vec<&str> = content.trim().lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "3 steps should produce 3 JSONL lines, got {}",
+        lines.len()
+    );
+
+    // Verify each line is valid JSON with the correct step_id
+    let expected_ids = ["first", "second", "third"];
+    for (i, line) in lines.iter().enumerate() {
+        let entry: Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("line {} should be valid JSON: {}", i, e));
+        assert_eq!(
+            entry["step_id"].as_str(),
+            Some(expected_ids[i]),
+            "line {} step_id mismatch",
+            i
+        );
+    }
+}
+
+#[test]
+fn test_audit_log_duration_ms_is_populated() {
+    let tmp = TempDir::new().unwrap();
+    let audit_dir = tmp.path().join("audit-dur");
+    let recipe = write_recipe(
+        tmp.path(),
+        "audit-dur.yaml",
+        r#"
+name: audit-dur-test
+steps:
+  - id: timed
+    command: echo fast
+"#,
+    );
+    let (code, _stdout, _stderr) =
+        run_binary(&recipe, &["--audit-dir", audit_dir.to_str().unwrap()]);
+    assert_eq!(code, 0);
+
+    let log_file = std::fs::read_dir(&audit_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .next()
+        .unwrap();
+    let content = std::fs::read_to_string(log_file.path()).unwrap();
+    let entry: Value = serde_json::from_str(content.trim()).unwrap();
+    assert!(
+        entry["duration_ms"].is_number(),
+        "duration_ms should be a number, got: {}",
+        entry["duration_ms"]
+    );
+}
