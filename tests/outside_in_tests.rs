@@ -856,20 +856,14 @@ steps:
     command: "echo audited"
 "#,
     );
-    let (code, _stdout, _stderr) = run_binary(
-        &recipe,
-        &["--audit-dir", audit_dir.to_str().unwrap()],
-    );
+    let (code, _stdout, _stderr) =
+        run_binary(&recipe, &["--audit-dir", audit_dir.to_str().unwrap()]);
     assert_eq!(code, 0);
     // Audit dir should contain a .jsonl file
     let entries: Vec<_> = std::fs::read_dir(&audit_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "jsonl")
-        })
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
         .collect();
     assert!(
         !entries.is_empty(),
@@ -879,7 +873,10 @@ steps:
     let content = std::fs::read_to_string(entries[0].path()).unwrap();
     for line in content.lines() {
         let parsed: Result<Value, _> = serde_json::from_str(line);
-        assert!(parsed.is_ok(), "each JSONL line should be valid JSON: {line}");
+        assert!(
+            parsed.is_ok(),
+            "each JSONL line should be valid JSON: {line}"
+        );
     }
 }
 
@@ -907,11 +904,15 @@ steps:
     let (code, json, _) = run_json(&recipe, &[]);
     assert_eq!(code, 0);
     assert_eq!(
-        find_step(&json, "guarded").unwrap()["status"].as_str().unwrap(),
+        find_step(&json, "guarded").unwrap()["status"]
+            .as_str()
+            .unwrap(),
         "skipped"
     );
     assert_eq!(
-        find_step(&json, "default-step").unwrap()["status"].as_str().unwrap(),
+        find_step(&json, "default-step").unwrap()["status"]
+            .as_str()
+            .unwrap(),
         "completed"
     );
 
@@ -919,11 +920,15 @@ steps:
     let (code, json, _) = run_json(&recipe, &["--set", "mode=custom"]);
     assert_eq!(code, 0);
     assert_eq!(
-        find_step(&json, "guarded").unwrap()["status"].as_str().unwrap(),
+        find_step(&json, "guarded").unwrap()["status"]
+            .as_str()
+            .unwrap(),
         "completed"
     );
     assert_eq!(
-        find_step(&json, "default-step").unwrap()["status"].as_str().unwrap(),
+        find_step(&json, "default-step").unwrap()["status"]
+            .as_str()
+            .unwrap(),
         "skipped"
     );
 }
@@ -1026,7 +1031,10 @@ steps:
         .env("RECIPE_RUNNER_CACHE_TTL", "5")
         .output()
         .expect("failed to execute");
-    assert!(output.status.success(), "binary should accept RECIPE_RUNNER_CACHE_TTL env var");
+    assert!(
+        output.status.success(),
+        "binary should accept RECIPE_RUNNER_CACHE_TTL env var"
+    );
 }
 
 /// User lists recipes via the `list` subcommand.
