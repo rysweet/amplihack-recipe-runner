@@ -162,7 +162,8 @@ impl CLISubprocessAdapter {
         stop.store(true, Ordering::SeqCst);
         let _ = heartbeat.join();
 
-        let stdout = std::fs::read_to_string(&output_file).unwrap_or_default();
+        let stdout =
+            std::fs::read_to_string(&output_file).context("Failed to read agent output file")?;
 
         // temp_dir is dropped here, cleaning up automatically
 

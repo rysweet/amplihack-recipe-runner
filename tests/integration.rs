@@ -749,6 +749,42 @@ steps:
     );
 }
 
+#[test]
+fn test_hook_on_error_actually_executes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let marker = tmp.path().join("on_error_ran.txt");
+
+    let yaml = format!(
+        r#"
+name: "on-error-hook-test"
+hooks:
+  on_error: "touch {}"
+steps:
+  - id: "failing-step"
+    command: "exit 1"
+    continue_on_error: true
+"#,
+        marker.display()
+    );
+
+    let adapter = RealBashAdapter;
+    let parser = RecipeParser::new();
+    let recipe = parser.parse(&yaml).unwrap();
+    let runner = RecipeRunner::new(adapter).with_working_dir(tmp.path().to_str().unwrap());
+    let result = runner.execute(&recipe, None);
+
+    assert!(
+        result.success,
+        "Recipe should succeed (continue_on_error): {:?}",
+        result
+    );
+    assert!(
+        marker.exists(),
+        "on_error hook should have created marker file at {}",
+        marker.display()
+    );
+}
+
 // -- Test: model parameter passthrough --
 
 #[test]

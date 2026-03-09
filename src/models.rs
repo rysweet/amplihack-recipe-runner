@@ -247,3 +247,265 @@ pub struct StepExecutionError {
     pub step_id: String,
     pub message: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_effective_type_explicit_bash() {
+        let step = Step {
+            id: "s1".into(),
+            step_type: Some(StepType::Bash),
+            command: None,
+            agent: Some("my-agent".into()),
+            prompt: None,
+            output: None,
+            condition: None,
+            parse_json: false,
+            parse_json_required: false,
+            mode: None,
+            working_dir: None,
+            timeout: None,
+            auto_stage: None,
+            recipe: None,
+            sub_context: None,
+            continue_on_error: false,
+            parallel_group: None,
+            when_tags: vec![],
+            recovery_on_failure: false,
+            model: None,
+        };
+        // Explicit type overrides all field-based inference
+        assert_eq!(step.effective_type(), StepType::Bash);
+    }
+
+    #[test]
+    fn test_effective_type_infers_recipe() {
+        let step = Step {
+            id: "s1".into(),
+            step_type: None,
+            command: None,
+            agent: None,
+            prompt: None,
+            output: None,
+            condition: None,
+            parse_json: false,
+            parse_json_required: false,
+            mode: None,
+            working_dir: None,
+            timeout: None,
+            auto_stage: None,
+            recipe: Some("sub-recipe".into()),
+            sub_context: None,
+            continue_on_error: false,
+            parallel_group: None,
+            when_tags: vec![],
+            recovery_on_failure: false,
+            model: None,
+        };
+        assert_eq!(step.effective_type(), StepType::Recipe);
+    }
+
+    #[test]
+    fn test_effective_type_infers_agent_from_agent_field() {
+        let step = Step {
+            id: "s1".into(),
+            step_type: None,
+            command: None,
+            agent: Some("my-agent".into()),
+            prompt: None,
+            output: None,
+            condition: None,
+            parse_json: false,
+            parse_json_required: false,
+            mode: None,
+            working_dir: None,
+            timeout: None,
+            auto_stage: None,
+            recipe: None,
+            sub_context: None,
+            continue_on_error: false,
+            parallel_group: None,
+            when_tags: vec![],
+            recovery_on_failure: false,
+            model: None,
+        };
+        assert_eq!(step.effective_type(), StepType::Agent);
+    }
+
+    #[test]
+    fn test_effective_type_infers_agent_from_prompt_only() {
+        let step = Step {
+            id: "s1".into(),
+            step_type: None,
+            command: None,
+            agent: None,
+            prompt: Some("do something".into()),
+            output: None,
+            condition: None,
+            parse_json: false,
+            parse_json_required: false,
+            mode: None,
+            working_dir: None,
+            timeout: None,
+            auto_stage: None,
+            recipe: None,
+            sub_context: None,
+            continue_on_error: false,
+            parallel_group: None,
+            when_tags: vec![],
+            recovery_on_failure: false,
+            model: None,
+        };
+        assert_eq!(step.effective_type(), StepType::Agent);
+    }
+
+    #[test]
+    fn test_effective_type_infers_bash_with_command_and_prompt() {
+        let step = Step {
+            id: "s1".into(),
+            step_type: None,
+            command: Some("echo hello".into()),
+            agent: None,
+            prompt: Some("prompt too".into()),
+            output: None,
+            condition: None,
+            parse_json: false,
+            parse_json_required: false,
+            mode: None,
+            working_dir: None,
+            timeout: None,
+            auto_stage: None,
+            recipe: None,
+            sub_context: None,
+            continue_on_error: false,
+            parallel_group: None,
+            when_tags: vec![],
+            recovery_on_failure: false,
+            model: None,
+        };
+        // command + prompt → Bash (prompt alone would be Agent, but command presence wins)
+        assert_eq!(step.effective_type(), StepType::Bash);
+    }
+
+    #[test]
+    fn test_effective_type_defaults_to_bash() {
+        let step = Step {
+            id: "s1".into(),
+            step_type: None,
+            command: None,
+            agent: None,
+            prompt: None,
+            output: None,
+            condition: None,
+            parse_json: false,
+            parse_json_required: false,
+            mode: None,
+            working_dir: None,
+            timeout: None,
+            auto_stage: None,
+            recipe: None,
+            sub_context: None,
+            continue_on_error: false,
+            parallel_group: None,
+            when_tags: vec![],
+            recovery_on_failure: false,
+            model: None,
+        };
+        assert_eq!(step.effective_type(), StepType::Bash);
+    }
+
+    #[test]
+    fn test_recursion_config_defaults() {
+        let config = RecursionConfig::default();
+        assert_eq!(config.max_depth, 6);
+        assert_eq!(config.max_total_steps, 200);
+    }
+
+    #[test]
+    fn test_step_status_display() {
+        assert_eq!(format!("{}", StepStatus::Pending), "pending");
+        assert_eq!(format!("{}", StepStatus::Running), "running");
+        assert_eq!(format!("{}", StepStatus::Completed), "completed");
+        assert_eq!(format!("{}", StepStatus::Skipped), "skipped");
+        assert_eq!(format!("{}", StepStatus::Failed), "failed");
+        assert_eq!(format!("{}", StepStatus::Degraded), "degraded");
+    }
+
+    #[test]
+    fn test_step_result_display() {
+        let result = StepResult {
+            step_id: "test-step".into(),
+            status: StepStatus::Completed,
+            output: "some output".into(),
+            error: String::new(),
+            duration: Some(Duration::from_secs_f64(1.5)),
+        };
+        let display = format!("{}", result);
+        assert!(display.contains("completed"));
+        assert!(display.contains("test-step"));
+        assert!(display.contains("1.5s"));
+        assert!(!display.contains("error"));
+    }
+
+    #[test]
+    fn test_step_result_display_with_error() {
+        let result = StepResult {
+            step_id: "fail-step".into(),
+            status: StepStatus::Failed,
+            output: String::new(),
+            error: "something broke".into(),
+            duration: None,
+        };
+        let display = format!("{}", result);
+        assert!(display.contains("failed"));
+        assert!(display.contains("something broke"));
+    }
+
+    #[test]
+    fn test_recipe_result_display() {
+        let result = RecipeResult {
+            recipe_name: "test-recipe".into(),
+            success: true,
+            step_results: vec![],
+            context: HashMap::new(),
+            duration: Some(Duration::from_secs(2)),
+        };
+        let display = format!("{}", result);
+        assert!(display.contains("test-recipe"));
+        assert!(display.contains("SUCCESS"));
+    }
+
+    #[test]
+    fn test_recipe_result_display_failure() {
+        let result = RecipeResult {
+            recipe_name: "bad-recipe".into(),
+            success: false,
+            step_results: vec![StepResult {
+                step_id: "s1".into(),
+                status: StepStatus::Failed,
+                output: String::new(),
+                error: "boom".into(),
+                duration: None,
+            }],
+            context: HashMap::new(),
+            duration: None,
+        };
+        let display = format!("{}", result);
+        assert!(display.contains("bad-recipe"));
+        assert!(display.contains("FAILED"));
+        assert!(display.contains("boom"));
+    }
+
+    #[test]
+    fn test_step_execution_error_display() {
+        let err = StepExecutionError {
+            step_id: "broken".into(),
+            message: "timed out".into(),
+        };
+        let display = format!("{}", err);
+        assert!(display.contains("broken"));
+        assert!(display.contains("timed out"));
+    }
+}

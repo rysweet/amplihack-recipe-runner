@@ -27,6 +27,9 @@ use crate::models::DEFAULT_MAX_DEPTH;
 static JSON_FENCE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)```(?:json)?\s*\n?(.*?)\n?\s*```").unwrap());
 
+/// Maximum number of threads to spawn per parallel group.
+const MAX_PARALLEL_STEPS: usize = 50;
+
 /// Callback trait for step execution progress events.
 pub trait ExecutionListener {
     fn on_step_start(&self, step_id: &str, step_type: StepType) {
@@ -224,8 +227,12 @@ impl<A: Adapter> RecipeRunner<A> {
                         "Total step limit ({}) reached, stopping execution",
                         self.max_total_steps.get()
                     );
+                    let failed_id = group_steps
+                        .first()
+                        .map(|s| s.id.clone())
+                        .unwrap_or_else(|| "unknown".to_string());
                     step_results.push(StepResult {
-                        step_id: group_steps[0].id.clone(),
+                        step_id: failed_id,
                         status: StepStatus::Failed,
                         output: String::new(),
                         error: format!(
@@ -433,7 +440,9 @@ impl<A: Adapter> RecipeRunner<A> {
                 "error": if result.error.is_empty() { None } else { Some(&result.error) },
                 "output_len": result.output.len(),
             });
-            let _ = writeln!(f, "{}", entry);
+            if let Err(e) = writeln!(f, "{}", entry) {
+                warn!("Failed to write audit log entry: {}", e);
+            }
         }
     }
 
@@ -821,8 +830,12 @@ impl<A: Adapter> RecipeRunner<A> {
                         "Total step limit ({}) reached, stopping execution",
                         self.max_total_steps.get()
                     );
+                    let failed_id = group_steps
+                        .first()
+                        .map(|s| s.id.clone())
+                        .unwrap_or_else(|| "unknown".to_string());
                     step_results.push(StepResult {
-                        step_id: group_steps[0].id.clone(),
+                        step_id: failed_id,
                         status: StepStatus::Failed,
                         output: String::new(),
                         error: format!(
@@ -1038,6 +1051,13 @@ impl<A: Adapter> RecipeRunner<A> {
         ctx: &RecipeContext,
         _listener: &dyn ExecutionListener,
     ) -> Vec<StepResult> {
+        if steps.len() > MAX_PARALLEL_STEPS {
+            warn!(
+                "Parallel group has {} steps (limit {}); excess steps will run sequentially",
+                steps.len(),
+                MAX_PARALLEL_STEPS
+            );
+        }
         let adapter = &self.adapter;
         let default_wd = self.working_dir.as_str();
         let dry_run = self.dry_run;
@@ -1058,7 +1078,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     continue;
                 }
 
-                if step.effective_type() == StepType::Bash {
+                if step.effective_type() == StepType::Bash && handles.len() < MAX_PARALLEL_STEPS {
                     let ctx_clone = ctx.clone();
                     let handle = s.spawn(move || {
                         Self::execute_bash_step_parallel(
@@ -1067,7 +1087,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     });
                     handles.push((idx, handle));
                 } else {
-                    // Non-bash steps fall back to sequential on the main thread
+                    // Non-bash steps or excess parallel steps fall back to sequential
                     let mut ctx_clone = ctx.clone();
                     let result = self.execute_step(step, &mut ctx_clone);
                     results[idx] = Some(result);
