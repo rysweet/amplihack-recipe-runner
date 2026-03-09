@@ -566,9 +566,8 @@ steps:
         let result = parser.parse("name: test\nsteps: []\n");
         // Empty steps list is technically valid YAML but useless — should either
         // parse to Recipe with 0 steps or error
-        match result {
-            Ok(r) => assert!(r.steps.is_empty()),
-            Err(_) => {} // also acceptable
+        if let Ok(r) = result {
+            assert!(r.steps.is_empty());
         }
     }
 
