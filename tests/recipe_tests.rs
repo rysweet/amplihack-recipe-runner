@@ -101,15 +101,20 @@ impl Adapter for RecordingAdapter {
         command: &str,
         _working_dir: &str,
         _timeout: Option<u64>,
+        extra_env: &std::collections::HashMap<String, String>,
     ) -> Result<String, anyhow::Error> {
         self.bash_calls.fetch_add(1, Ordering::SeqCst);
+        // Check patterns against both command text and env var values
+        // (env vars contain the actual values since render_shell uses env var refs)
+        let env_values: String = extra_env.values().cloned().collect::<Vec<_>>().join(" ");
+        let search_text = format!("{} {}", command, env_values);
         for pat in &self.fail_patterns {
-            if command.contains(pat.as_str()) {
+            if search_text.contains(pat.as_str()) {
                 anyhow::bail!("Simulated bash failure on '{}'", pat);
             }
         }
         for (pat, resp) in &self.responses {
-            if command.contains(pat.as_str()) {
+            if search_text.contains(pat.as_str()) {
                 return Ok(resp.clone());
             }
         }
@@ -499,10 +504,10 @@ steps:
 "#,
         adapter,
     );
-    // The rendered command should contain "hello world"
+    // render_shell replaces {{name}} with env var reference
     assert!(
-        r.step_results[0].output.contains("hello world"),
-        "got: {}",
+        r.step_results[0].output.contains("$RECIPE_VAR_name"),
+        "should contain env var ref, got: {}",
         r.step_results[0].output
     );
 }
@@ -1073,6 +1078,7 @@ fn test_unavailable_adapter_fails_gracefully() {
             _: &str,
             _: &str,
             _: Option<u64>,
+            _: &std::collections::HashMap<String, String>,
         ) -> Result<String, anyhow::Error> {
             Ok("".into())
         }
@@ -1486,7 +1492,7 @@ fn test_agent_resolver_rejects_four_parts() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn test_shell_injection_via_template_is_escaped() {
+fn test_shell_injection_via_template_uses_env_vars() {
     let adapter = RecordingAdapter::new();
     let r = parse_and_run(
         r#"
@@ -1499,11 +1505,17 @@ steps:
 "#,
         adapter,
     );
-    // render_shell wraps values in single quotes for safety
+    // render_shell replaces with env var references — values never appear in shell source
     let cmd = &r.step_results[0].output;
     assert!(
-        cmd.contains("'hello; rm -rf /'") || cmd.contains("'hello;"),
-        "shell injection should be escaped with quotes, got: {}",
+        cmd.contains("$RECIPE_VAR_user_input"),
+        "should use env var reference, got: {}",
+        cmd
+    );
+    // The dangerous value should NOT appear in the rendered command
+    assert!(
+        !cmd.contains("rm -rf"),
+        "dangerous value should not be inlined in shell, got: {}",
         cmd
     );
 }
@@ -2106,12 +2118,15 @@ fn test_shell_render_prevents_injection() {
     data.insert("input".to_string(), json!("$(rm -rf /)"));
     let ctx = RecipeContext::new(data);
     let rendered = ctx.render_shell("echo {{input}}");
-    // Should be escaped — wrapped in single quotes
+    // Value should be an env var reference, NOT inlined in shell source
+    assert_eq!(rendered, "echo \"$RECIPE_VAR_input\"");
+    // The dangerous value lives in the env var, not the command
     assert!(
-        rendered.contains("'") || rendered.contains("\\$"),
-        "dangerous input should be quoted/escaped, got: {}",
-        rendered
+        !rendered.contains("rm -rf"),
+        "dangerous value must not be in shell source"
     );
+    let env = ctx.shell_env_vars();
+    assert_eq!(env.get("RECIPE_VAR_input").unwrap(), "$(rm -rf /)");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2179,6 +2194,7 @@ impl Adapter for RecoverySuccessAdapter {
         command: &str,
         _: &str,
         _: Option<u64>,
+        _extra_env: &std::collections::HashMap<String, String>,
     ) -> Result<String, anyhow::Error> {
         if command.contains("break_now") {
             anyhow::bail!("step failed");
@@ -2213,6 +2229,7 @@ impl Adapter for RecoveryFailAdapter {
         command: &str,
         _: &str,
         _: Option<u64>,
+        _extra_env: &std::collections::HashMap<String, String>,
     ) -> Result<String, anyhow::Error> {
         if command.contains("break_now") {
             anyhow::bail!("step failed");

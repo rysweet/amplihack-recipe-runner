@@ -25,11 +25,14 @@ pub trait Adapter: Sync {
     /// Execute a bash step and return the output.
     ///
     /// The optional `timeout` (in seconds) kills the process after the given duration.
+    /// `extra_env` contains `RECIPE_VAR_*` environment variables — context values
+    /// injected via the process environment instead of shell text substitution.
     fn execute_bash_step(
         &self,
         command: &str,
         working_dir: &str,
         timeout: Option<u64>,
+        extra_env: &std::collections::HashMap<String, String>,
     ) -> Result<String, anyhow::Error>;
 
     /// Check if the adapter is available.

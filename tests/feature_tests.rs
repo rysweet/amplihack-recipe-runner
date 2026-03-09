@@ -31,6 +31,7 @@ impl Adapter for MockAdapter {
         command: &str,
         _: &str,
         _: Option<u64>,
+        _extra_env: &std::collections::HashMap<String, String>,
     ) -> Result<String, anyhow::Error> {
         if command.contains("FAIL") {
             anyhow::bail!("Simulated failure");
@@ -192,6 +193,7 @@ fn test_parse_json_success_returns_parsed_output() {
             command: &str,
             _: &str,
             _: Option<u64>,
+            _extra_env: &std::collections::HashMap<String, String>,
         ) -> Result<String, anyhow::Error> {
             Ok(format!("[bash] {}", command))
         }

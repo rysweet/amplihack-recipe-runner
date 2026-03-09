@@ -59,6 +59,7 @@ impl Adapter for MockAdapter {
         command: &str,
         _working_dir: &str,
         _timeout: Option<u64>,
+        _extra_env: &std::collections::HashMap<String, String>,
     ) -> Result<String, anyhow::Error> {
         for (pattern, response) in &self.responses {
             if command.contains(pattern) {
@@ -511,6 +512,7 @@ steps:
             cmd: &str,
             _w: &str,
             _t: Option<u64>,
+            _extra_env: &std::collections::HashMap<String, String>,
         ) -> Result<String, anyhow::Error> {
             if cmd.contains("fail") {
                 anyhow::bail!("command failed")
@@ -661,10 +663,12 @@ impl Adapter for RealBashAdapter {
         command: &str,
         working_dir: &str,
         _timeout: Option<u64>,
+        extra_env: &std::collections::HashMap<String, String>,
     ) -> Result<String, anyhow::Error> {
         let output = std::process::Command::new("/bin/bash")
             .args(["-c", command])
             .current_dir(working_dir)
+            .envs(extra_env)
             .output()
             .map_err(|e| anyhow::anyhow!("Failed to run bash: {}: {}", command, e))?;
         if !output.status.success() {
@@ -818,6 +822,7 @@ fn test_model_parameter_passed_to_adapter() {
             _command: &str,
             _working_dir: &str,
             _timeout: Option<u64>,
+            _extra_env: &std::collections::HashMap<String, String>,
         ) -> Result<String, anyhow::Error> {
             Ok("ok".to_string())
         }

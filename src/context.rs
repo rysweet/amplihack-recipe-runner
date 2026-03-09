@@ -56,23 +56,78 @@ impl RecipeContext {
             .into_owned()
     }
 
-    /// Replace `{{var}}` placeholders with shell-escaped context values.
+    /// Replace `{{var}}` placeholders with env var references for bash steps.
+    ///
+    /// Instead of inlining values into shell source (which breaks on single
+    /// quotes, parentheses, and other shell metacharacters), this method:
+    /// 1. Replaces `{{var}}` with `"$RECIPE_VAR_var"` (double-quoted env ref)
+    /// 2. Returns the env vars to inject into the subprocess
+    ///
+    /// The env var approach is immune to shell injection because values never
+    /// appear in the shell source — they're passed via the process environment.
     pub fn render_shell(&self, template: &str) -> String {
         TEMPLATE_RE
             .replace_all(template, |caps: &regex::Captures| {
                 let var_name = &caps[1];
-                let raw = match self.get(var_name) {
-                    None => {
-                        log::warn!("Template variable '{}' not found in context — replaced with empty string", var_name);
-                        String::new()
-                    }
-                    Some(Value::String(s)) => s.clone(),
-                    Some(Value::Null) => String::new(),
-                    Some(v) => v.to_string(),
-                };
-                shell_escape::escape(raw.into()).into_owned()
+                let env_key = Self::env_key(var_name);
+                format!("\"${}\"", env_key)
             })
             .into_owned()
+    }
+
+    /// Return environment variables for all context values.
+    /// Keys are prefixed with `RECIPE_VAR_` and dots replaced with `__`.
+    pub fn shell_env_vars(&self) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+        for (key, value) in &self.data {
+            let env_key = Self::env_key(key);
+            let env_val = match value {
+                Value::String(s) => s.clone(),
+                Value::Null => String::new(),
+                v => v.to_string(),
+            };
+            env.insert(env_key, env_val);
+
+            // Also export nested keys for dot-notation access
+            if let Value::Object(map) = value {
+                Self::flatten_nested(&format!("RECIPE_VAR_{}", key), map, &mut env);
+            }
+        }
+        env
+    }
+
+    /// Convert a template variable name to an env var key.
+    fn env_key(var_name: &str) -> String {
+        format!(
+            "RECIPE_VAR_{}",
+            var_name.replace('.', "__").replace('-', "_")
+        )
+    }
+
+    /// Recursively flatten nested JSON objects into env vars with `__` separators.
+    fn flatten_nested(
+        prefix: &str,
+        map: &serde_json::Map<String, Value>,
+        env: &mut HashMap<String, String>,
+    ) {
+        for (k, v) in map {
+            let key = format!("{}__{}", prefix, k.replace('.', "__").replace('-', "_"));
+            match v {
+                Value::String(s) => {
+                    env.insert(key, s.clone());
+                }
+                Value::Null => {
+                    env.insert(key, String::new());
+                }
+                Value::Object(nested) => {
+                    env.insert(key.clone(), v.to_string());
+                    Self::flatten_nested(&key, nested, env);
+                }
+                other => {
+                    env.insert(key, other.to_string());
+                }
+            }
+        }
     }
 
     /// Safely evaluate a boolean condition against the current context.
@@ -121,12 +176,26 @@ mod tests {
     }
 
     #[test]
-    fn test_render_shell_escapes() {
+    fn test_render_shell_uses_env_var_refs() {
         let c = ctx(vec![("cmd", json!("hello; rm -rf /"))]);
         let rendered = c.render_shell("echo {{cmd}}");
-        // shell_escape wraps the value in quotes, preventing injection
-        assert!(rendered.contains('\'') || rendered.contains('"'));
-        assert!(rendered.starts_with("echo "));
+        // render_shell now replaces with env var reference instead of inlining
+        assert_eq!(rendered, "echo \"$RECIPE_VAR_cmd\"");
+    }
+
+    #[test]
+    fn test_shell_env_vars() {
+        let c = ctx(vec![("cmd", json!("hello; rm -rf /"))]);
+        let env = c.shell_env_vars();
+        assert_eq!(env.get("RECIPE_VAR_cmd").unwrap(), "hello; rm -rf /");
+    }
+
+    #[test]
+    fn test_shell_env_vars_nested() {
+        let c = ctx(vec![("obj", json!({"status": "ok", "count": 5}))]);
+        let env = c.shell_env_vars();
+        assert_eq!(env.get("RECIPE_VAR_obj__status").unwrap(), "ok");
+        assert_eq!(env.get("RECIPE_VAR_obj__count").unwrap(), "5");
     }
 
     #[test]

@@ -39,11 +39,13 @@ impl Adapter for MockAdapter {
         command: &str,
         _working_dir: &str,
         _timeout: Option<u64>,
+        extra_env: &std::collections::HashMap<String, String>,
     ) -> Result<String, anyhow::Error> {
         if command.trim().starts_with("echo ") || command.trim().starts_with("printf ") {
             let output = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(command)
+                .envs(extra_env)
                 .output()?;
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         } else {
@@ -80,6 +82,7 @@ impl Adapter for FailOnExitAdapter {
         command: &str,
         _: &str,
         _: Option<u64>,
+        extra_env: &std::collections::HashMap<String, String>,
     ) -> Result<String, anyhow::Error> {
         if command.contains("exit 1") {
             anyhow::bail!("command failed with exit code 1")
@@ -88,6 +91,7 @@ impl Adapter for FailOnExitAdapter {
             let output = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(command)
+                .envs(extra_env)
                 .output()?;
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         } else {
