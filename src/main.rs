@@ -11,6 +11,20 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Exit codes for structured error reporting.
+mod exit_codes {
+    /// Recipe executed successfully.
+    pub const SUCCESS: i32 = 0;
+    /// One or more recipe steps failed during execution.
+    pub const RECIPE_FAILED: i32 = 1;
+    /// Recipe YAML could not be parsed or is invalid.
+    pub const PARSE_ERROR: i32 = 2;
+    /// Recipe file or name could not be found.
+    pub const NOT_FOUND: i32 = 3;
+    /// Invalid CLI arguments or context overrides.
+    pub const BAD_ARGS: i32 = 4;
+}
+
 #[derive(Parser)]
 #[command(
     name = "recipe-runner",
@@ -120,9 +134,12 @@ fn parse_context_pair(pair: &str) -> Option<(String, Value)> {
     Some((key.to_string(), parse_context_value(val)))
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
     env_logger::init();
+    std::process::exit(run());
+}
 
+fn run() -> i32 {
     let cli = Cli::parse();
 
     // Handle subcommands
@@ -149,15 +166,19 @@ fn main() -> anyhow::Result<()> {
             }
             println!("\n{} recipe(s) found.", recipes.len());
         }
-        return Ok(());
+        return exit_codes::SUCCESS;
     }
 
     // Require recipe path for all other operations
-    let recipe_path = cli.recipe.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Recipe path is required. Use `recipe-runner <path>` or `recipe-runner list`."
-        )
-    })?;
+    let recipe_path = match cli.recipe {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "Error: Recipe path is required. Use `recipe-runner <path>` or `recipe-runner list`."
+            );
+            return exit_codes::BAD_ARGS;
+        }
+    };
 
     // Parse context overrides with type detection
     let mut user_context: HashMap<String, Value> = HashMap::new();
@@ -174,7 +195,13 @@ fn main() -> anyhow::Result<()> {
     let resolved_path;
     let recipe = if recipe_path.is_file() {
         resolved_path = recipe_path;
-        parser.parse_file(&resolved_path)?
+        match parser.parse_file(&resolved_path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Error: Failed to parse recipe: {}", e);
+                return exit_codes::PARSE_ERROR;
+            }
+        }
     } else {
         let name = recipe_path.to_string_lossy();
         let extra_dirs: Vec<PathBuf> = cli.recipe_dirs.iter().map(PathBuf::from).collect();
@@ -183,13 +210,23 @@ fn main() -> anyhow::Result<()> {
         } else {
             Some(extra_dirs.as_slice())
         };
-        resolved_path = discovery::find_recipe(&name, search).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Recipe '{}' not found. Use `recipe-runner list` to see available recipes.",
-                name
-            )
-        })?;
-        parser.parse_file(&resolved_path)?
+        resolved_path = match discovery::find_recipe(&name, search) {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "Error: Recipe '{}' not found. Use `recipe-runner list` to see available recipes.",
+                    name
+                );
+                return exit_codes::NOT_FOUND;
+            }
+        };
+        match parser.parse_file(&resolved_path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Error: Failed to parse recipe: {}", e);
+                return exit_codes::PARSE_ERROR;
+            }
+        }
     };
 
     // --explain: show recipe structure
@@ -242,13 +279,19 @@ fn main() -> anyhow::Result<()> {
                 coe
             );
         }
-        return Ok(());
+        return exit_codes::SUCCESS;
     }
 
     // --validate-only: parse + validate
     if cli.validate_only {
-        let warnings =
-            parser.validate_with_yaml(&recipe, Some(&std::fs::read_to_string(&resolved_path)?));
+        let yaml_content = match std::fs::read_to_string(&resolved_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error: Failed to read recipe file: {}", e);
+                return exit_codes::PARSE_ERROR;
+            }
+        };
+        let warnings = parser.validate_with_yaml(&recipe, Some(&yaml_content));
         if warnings.is_empty() {
             println!(
                 "✓ Recipe '{}' is valid ({} steps)",
@@ -265,7 +308,7 @@ fn main() -> anyhow::Result<()> {
                 println!("  - {}", w);
             }
         }
-        return Ok(());
+        return exit_codes::SUCCESS;
     }
 
     if cli.output_format != "json" {
@@ -300,15 +343,18 @@ fn main() -> anyhow::Result<()> {
 
     // Output
     if cli.output_format == "json" {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        match serde_json::to_string_pretty(&result) {
+            Ok(json) => println!("{}", json),
+            Err(e) => eprintln!("Error: Failed to serialize result: {}", e),
+        }
     } else {
         println!("\n{}", result);
     }
 
     if result.success {
-        std::process::exit(0);
+        exit_codes::SUCCESS
     } else {
-        std::process::exit(1);
+        exit_codes::RECIPE_FAILED
     }
 }
 
