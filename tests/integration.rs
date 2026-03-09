@@ -40,7 +40,6 @@ impl Adapter for MockAdapter {
         _system_prompt: Option<&str>,
         _mode: Option<&str>,
         _working_dir: &str,
-        _timeout: Option<u64>,
         _model: Option<&str>,
     ) -> Result<String, anyhow::Error> {
         // Find matching response
@@ -503,7 +502,6 @@ steps:
             _s: Option<&str>,
             _m: Option<&str>,
             _w: &str,
-            _t: Option<u64>,
             _model: Option<&str>,
         ) -> Result<String, anyhow::Error> {
             Ok("ok".to_string())
@@ -726,7 +724,6 @@ fn test_model_parameter_passed_to_adapter() {
             _system_prompt: Option<&str>,
             _mode: Option<&str>,
             _working_dir: &str,
-            _timeout: Option<u64>,
             model: Option<&str>,
         ) -> Result<String, anyhow::Error> {
             self.captured_models

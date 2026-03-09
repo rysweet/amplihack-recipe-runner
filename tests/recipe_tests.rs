@@ -80,7 +80,6 @@ impl Adapter for RecordingAdapter {
         _system_prompt: Option<&str>,
         _mode: Option<&str>,
         _working_dir: &str,
-        _timeout: Option<u64>,
         _model: Option<&str>,
     ) -> Result<String, anyhow::Error> {
         self.agent_calls.fetch_add(1, Ordering::SeqCst);
@@ -1065,7 +1064,6 @@ fn test_unavailable_adapter_fails_gracefully() {
             _: Option<&str>,
             _: Option<&str>,
             _: &str,
-            _: Option<u64>,
             _: Option<&str>,
         ) -> Result<String, anyhow::Error> {
             Ok("".into())
@@ -2172,7 +2170,6 @@ impl Adapter for RecoverySuccessAdapter {
         _: Option<&str>,
         _: Option<&str>,
         _: &str,
-        _: Option<u64>,
         _: Option<&str>,
     ) -> Result<String, anyhow::Error> {
         Ok("I fixed the issue. STATUS: COMPLETE".to_string())
@@ -2207,7 +2204,6 @@ impl Adapter for RecoveryFailAdapter {
         _: Option<&str>,
         _: Option<&str>,
         _: &str,
-        _: Option<u64>,
         _: Option<&str>,
     ) -> Result<String, anyhow::Error> {
         Ok("I cannot fix this, the data is corrupt".to_string())

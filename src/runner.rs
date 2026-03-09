@@ -628,7 +628,6 @@ impl<A: Adapter> RecipeRunner<A> {
                         agent_system_prompt.as_deref(),
                         step.mode.as_deref(),
                         working_dir,
-                        step.timeout,
                         step.model.as_deref(),
                     )
                     .map_err(|e| StepExecutionError {
@@ -740,7 +739,6 @@ impl<A: Adapter> RecipeRunner<A> {
                     None,
                     None,
                     working_dir,
-                    step.timeout,
                     None,
                 ) {
                     Ok(output)
@@ -1005,7 +1003,6 @@ impl<A: Adapter> RecipeRunner<A> {
             None,
             None,
             working_dir,
-            step.timeout,
             None,
         ) {
             Ok(output) => Some(output),
@@ -1295,7 +1292,6 @@ mod tests {
             _system_prompt: Option<&str>,
             _mode: Option<&str>,
             _working_dir: &str,
-            _timeout: Option<u64>,
             _model: Option<&str>,
         ) -> Result<String, anyhow::Error> {
             Ok(format!(
