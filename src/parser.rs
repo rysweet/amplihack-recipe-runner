@@ -243,10 +243,25 @@ impl Default for RecipeParser {
 ///
 /// Only single-level inheritance is supported (parent's `extends` is ignored).
 pub fn resolve_extends(recipe: &mut Recipe, search_dirs: &[PathBuf]) -> Result<(), ParseError> {
+    resolve_extends_with_visited(recipe, search_dirs, &mut HashSet::new())
+}
+
+fn resolve_extends_with_visited(
+    recipe: &mut Recipe,
+    search_dirs: &[PathBuf],
+    visited: &mut HashSet<String>,
+) -> Result<(), ParseError> {
     let parent_name = match recipe.extends.take() {
         Some(name) => name,
         None => return Ok(()),
     };
+
+    if !visited.insert(parent_name.clone()) {
+        return Err(ParseError::Extends(format!(
+            "Circular extends detected: '{}' was already visited in the extends chain",
+            parent_name
+        )));
+    }
 
     let parent_path = discovery::find_recipe(&parent_name, Some(search_dirs)).ok_or_else(|| {
         ParseError::Extends(format!(
@@ -256,7 +271,12 @@ pub fn resolve_extends(recipe: &mut Recipe, search_dirs: &[PathBuf]) -> Result<(
     })?;
 
     let parser = RecipeParser::new();
-    let parent = parser.parse_file(&parent_path)?;
+    let mut parent = parser.parse_file(&parent_path)?;
+
+    // Recursively resolve parent's extends before merging
+    if parent.extends.is_some() {
+        resolve_extends_with_visited(&mut parent, search_dirs, visited)?;
+    }
 
     // Merge context: start with parent, child overrides
     let mut merged_context = parent.context;

@@ -375,8 +375,10 @@ pub fn sync_upstream(
         info!("Added remote '{}' -> {}", remote, repo);
     }
 
-    // Fetch
-    let fetch_output = Command::new("git").args(["fetch", &remote, br]).output()?;
+    // Fetch (with 30s timeout to prevent hangs on network issues)
+    let fetch_output = Command::new("timeout")
+        .args(["30", "git", "fetch", &remote, br])
+        .output()?;
     if !fetch_output.status.success() {
         return Err(anyhow::anyhow!(
             "git fetch failed: {}",

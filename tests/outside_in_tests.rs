@@ -392,8 +392,197 @@ steps:
 }
 
 // ---------------------------------------------------------------------------
-// Additional outside-in tests
+// Quality audit fixes: circular extends, on_error hooks, parallel groups
 // ---------------------------------------------------------------------------
+
+#[test]
+fn test_circular_extends_detected_and_rejected() {
+    let dir = TempDir::new().unwrap();
+    write_recipe(
+        dir.path(),
+        "recipe-a.yaml",
+        r#"
+name: recipe-a
+extends: recipe-b
+steps:
+  - id: a-step
+    command: "echo a"
+"#,
+    );
+    write_recipe(
+        dir.path(),
+        "recipe-b.yaml",
+        r#"
+name: recipe-b
+extends: recipe-a
+steps:
+  - id: b-step
+    command: "echo b"
+"#,
+    );
+
+    let recipe_a = dir.path().join("recipe-a.yaml");
+    let (code, _stdout, stderr) = run_binary(&recipe_a, &["-R", dir.path().to_str().unwrap()]);
+
+    assert_eq!(code, 1, "circular extends should fail the recipe");
+    assert!(
+        stderr.contains("Circular")
+            || stderr.contains("circular")
+            || stderr.contains("already visited"),
+        "error should mention circular extends detection, got stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_on_error_hook_executes_on_step_failure() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("on_error_marker.txt");
+
+    let recipe = write_recipe(
+        dir.path(),
+        "recipe.yaml",
+        &format!(
+            r#"
+name: on-error-hook-e2e
+hooks:
+  on_error: "touch {}"
+steps:
+  - id: failing-step
+    command: "exit 1"
+    continue_on_error: true
+  - id: after-failure
+    command: "echo done"
+"#,
+            marker.display()
+        ),
+    );
+
+    let (code, json, stderr) = run_json(&recipe, &[]);
+
+    assert_eq!(
+        code, 0,
+        "recipe should succeed (continue_on_error). stderr: {stderr}"
+    );
+
+    // The on_error hook should have created the marker file
+    assert!(
+        marker.exists(),
+        "on_error hook should have created marker file at {}",
+        marker.display()
+    );
+
+    // The step after the failure should have completed
+    let after = find_step(&json, "after-failure").expect("after-failure step should exist");
+    assert_eq!(after["status"].as_str().unwrap(), "completed");
+}
+
+#[test]
+fn test_parallel_group_execution_via_binary() {
+    let dir = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        dir.path(),
+        "recipe.yaml",
+        r#"
+name: parallel-e2e
+steps:
+  - id: par-a
+    command: "echo a"
+    parallel_group: grp1
+  - id: par-b
+    command: "echo b"
+    parallel_group: grp1
+  - id: par-c
+    command: "echo c"
+    parallel_group: grp1
+  - id: after-parallel
+    command: "echo 'after parallel'"
+"#,
+    );
+
+    let (code, json, stderr) = run_json(&recipe, &[]);
+
+    assert_eq!(
+        code, 0,
+        "parallel group recipe should succeed. stderr: {stderr}"
+    );
+
+    // All parallel steps should have completed
+    for id in &["par-a", "par-b", "par-c", "after-parallel"] {
+        let step = find_step(&json, id).unwrap_or_else(|| panic!("step {id} should exist"));
+        assert_eq!(
+            step["status"].as_str().unwrap(),
+            "completed",
+            "step {id} should be completed"
+        );
+    }
+}
+
+#[test]
+fn test_binary_runs_without_which_crate() {
+    // Validates that removing the `which` crate didn't break the binary.
+    // The binary should start, parse a recipe, and execute bash steps.
+    let dir = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        dir.path(),
+        "recipe.yaml",
+        r#"
+name: post-cleanup-smoke
+steps:
+  - id: smoke
+    command: "echo 'binary works without which crate'"
+    output: result
+"#,
+    );
+
+    let (code, json, stderr) = run_json(&recipe, &[]);
+
+    assert_eq!(
+        code, 0,
+        "binary should work after removing which crate. stderr: {stderr}"
+    );
+    let step = find_step(&json, "smoke").expect("smoke step should exist");
+    assert_eq!(step["status"].as_str().unwrap(), "completed");
+
+    let ctx = &json["context"];
+    let result = ctx["result"].as_str().unwrap_or("");
+    assert!(
+        result.contains("binary works without which crate"),
+        "output should contain expected text, got: {result}"
+    );
+}
+
+#[test]
+fn test_validate_only_detects_no_regressions() {
+    // Run validate-only on ALL example recipes to catch field parsing regressions
+    let examples_dir = project_root().join("examples");
+    if !examples_dir.exists() {
+        return; // Skip if examples directory doesn't exist
+    }
+
+    ensure_built();
+    for entry in std::fs::read_dir(&examples_dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "yaml") {
+            let output = Command::new(binary_path())
+                .arg(&path)
+                .arg("--validate-only")
+                .args(["-R", examples_dir.to_str().unwrap()])
+                .output()
+                .expect("failed to execute binary");
+
+            let code = output.status.code().unwrap_or(-1);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                code,
+                0,
+                "validate-only failed for {}: stderr: {}",
+                path.display(),
+                stderr
+            );
+        }
+    }
+}
 
 #[test]
 fn test_recipe_name_resolution() {
