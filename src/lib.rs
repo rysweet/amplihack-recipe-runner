@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod agent_resolver;
+pub mod condition;
 pub mod context;
 pub mod discovery;
 pub mod models;
