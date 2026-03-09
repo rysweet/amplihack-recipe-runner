@@ -1464,7 +1464,10 @@ steps:
     let output = step["output"].as_str().unwrap_or("");
     let parsed: Value = serde_json::from_str(output)
         .unwrap_or_else(|_| panic!("output should be valid JSON, got: {output}"));
-    assert_eq!(parsed["balanced"], true, "balanced bracket should extract JSON");
+    assert_eq!(
+        parsed["balanced"], true,
+        "balanced bracket should extract JSON"
+    );
 }
 
 #[test]
@@ -1511,10 +1514,8 @@ steps:
     command: echo ok
 "#,
     );
-    let (code, _stdout, _stderr) = run_binary(
-        &recipe,
-        &["--audit-dir", audit_dir.to_str().unwrap()],
-    );
+    let (code, _stdout, _stderr) =
+        run_binary(&recipe, &["--audit-dir", audit_dir.to_str().unwrap()]);
     assert_eq!(code, 0);
     let entries: Vec<_> = std::fs::read_dir(&audit_dir)
         .unwrap()
@@ -1556,10 +1557,8 @@ steps:
     command: echo hello
 "#,
     );
-    let (code, _stdout, _stderr) = run_binary(
-        &recipe,
-        &["--audit-dir", audit_dir.to_str().unwrap()],
-    );
+    let (code, _stdout, _stderr) =
+        run_binary(&recipe, &["--audit-dir", audit_dir.to_str().unwrap()]);
     assert_eq!(code, 0);
 
     let log_file = std::fs::read_dir(&audit_dir)
@@ -1601,10 +1600,8 @@ steps:
     command: echo ok
 "#,
     );
-    let (code, _stdout, _stderr) = run_binary(
-        &recipe,
-        &["--audit-dir", audit_dir.to_str().unwrap()],
-    );
+    let (code, _stdout, _stderr) =
+        run_binary(&recipe, &["--audit-dir", audit_dir.to_str().unwrap()]);
     assert_eq!(code, 0);
 
     let log_file = std::fs::read_dir(&audit_dir)
@@ -1635,10 +1632,8 @@ steps:
     command: echo success
 "#,
     );
-    let (code, _stdout, _stderr) = run_binary(
-        &recipe,
-        &["--audit-dir", audit_dir.to_str().unwrap()],
-    );
+    let (code, _stdout, _stderr) =
+        run_binary(&recipe, &["--audit-dir", audit_dir.to_str().unwrap()]);
     assert_eq!(code, 0);
 
     let log_file = std::fs::read_dir(&audit_dir)
@@ -1670,10 +1665,8 @@ steps:
     continue_on_error: true
 "#,
     );
-    let (code, _stdout, _stderr) = run_binary(
-        &recipe,
-        &["--audit-dir", audit_dir.to_str().unwrap()],
-    );
+    let (code, _stdout, _stderr) =
+        run_binary(&recipe, &["--audit-dir", audit_dir.to_str().unwrap()]);
     assert_eq!(code, 0); // continue_on_error means recipe succeeds
 
     let log_file = std::fs::read_dir(&audit_dir)
@@ -1707,10 +1700,8 @@ steps:
     command: echo three
 "#,
     );
-    let (code, _stdout, _stderr) = run_binary(
-        &recipe,
-        &["--audit-dir", audit_dir.to_str().unwrap()],
-    );
+    let (code, _stdout, _stderr) =
+        run_binary(&recipe, &["--audit-dir", audit_dir.to_str().unwrap()]);
     assert_eq!(code, 0);
 
     let log_file = std::fs::read_dir(&audit_dir)
@@ -1755,10 +1746,8 @@ steps:
     command: echo fast
 "#,
     );
-    let (code, _stdout, _stderr) = run_binary(
-        &recipe,
-        &["--audit-dir", audit_dir.to_str().unwrap()],
-    );
+    let (code, _stdout, _stderr) =
+        run_binary(&recipe, &["--audit-dir", audit_dir.to_str().unwrap()]);
     assert_eq!(code, 0);
 
     let log_file = std::fs::read_dir(&audit_dir)
