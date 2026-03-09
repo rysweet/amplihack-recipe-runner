@@ -3,6 +3,10 @@
 /// Runs a parsed Recipe step-by-step through an adapter, managing context
 /// accumulation, conditional execution, template rendering, and fail-fast behavior.
 ///
+pub mod audit;
+pub mod json_parser;
+pub mod listeners;
+
 use crate::adapters::Adapter;
 use crate::agent_resolver::{AgentResolveError, AgentResolver};
 use crate::context::RecipeContext;
@@ -12,65 +16,23 @@ use crate::models::{
 };
 use crate::parser::{RecipeParser, resolve_extends};
 use log::{error, info, warn};
-use regex::Regex;
 use serde_json::Value;
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::LazyLock;
 use std::time::Instant;
 
 use crate::models::DEFAULT_MAX_DEPTH;
 
-static JSON_FENCE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?s)```(?:json)?\s*\n?(.*?)\n?\s*```").unwrap());
+use json_parser::parse_json_output;
+pub use listeners::{ExecutionListener, NullListener, StderrListener};
 
 /// Maximum number of threads to spawn per parallel group.
 const MAX_PARALLEL_STEPS: usize = 50;
 
 /// Maximum size of step output stored in memory (10 MB).
 const MAX_STEP_OUTPUT_BYTES: usize = 10_000_000;
-
-/// Callback trait for step execution progress events.
-pub trait ExecutionListener {
-    fn on_step_start(&self, step_id: &str, step_type: StepType) {
-        let _ = (step_id, step_type);
-    }
-    fn on_step_complete(&self, result: &StepResult) {
-        let _ = result;
-    }
-    fn on_output(&self, step_id: &str, line: &str) {
-        let _ = (step_id, line);
-    }
-}
-
-/// No-op listener.
-pub struct NullListener;
-impl ExecutionListener for NullListener {}
-
-/// Stderr progress listener (for --progress flag).
-pub struct StderrListener;
-impl ExecutionListener for StderrListener {
-    fn on_step_start(&self, step_id: &str, step_type: StepType) {
-        eprintln!("▶ {} ({:?})", step_id, step_type);
-    }
-    fn on_step_complete(&self, result: &StepResult) {
-        let icon = match result.status {
-            StepStatus::Completed => "✓",
-            StepStatus::Skipped => "⊘",
-            StepStatus::Failed => "✗",
-            StepStatus::Degraded => "⚠",
-            _ => "?",
-        };
-        let dur = result
-            .duration
-            .map(|d| format!(" ({:.1}s)", d.as_secs_f64()))
-            .unwrap_or_default();
-        eprintln!("  {} {}{}", icon, result.step_id, dur);
-    }
-}
 
 /// Executes recipes by delegating steps to an adapter.
 pub struct RecipeRunner<A: Adapter> {
@@ -418,44 +380,11 @@ impl<A: Adapter> RecipeRunner<A> {
 
     fn open_audit_log(&self, recipe_name: &str) -> Option<std::fs::File> {
         let dir = self.audit_dir.as_ref()?;
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            warn!("Failed to create audit log directory: {}", e);
-            return None;
-        }
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let path = dir.join(format!("{}-{}.jsonl", recipe_name, ts));
-        match std::fs::File::create(&path) {
-            Ok(f) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
-                }
-                Some(f)
-            }
-            Err(e) => {
-                warn!("Failed to create audit log file: {}", e);
-                None
-            }
-        }
+        audit::open_audit_log(dir, recipe_name)
     }
 
     fn write_audit_entry(&self, file: &Option<std::fs::File>, result: &StepResult) {
-        if let Some(mut f) = file.as_ref().and_then(|f| f.try_clone().ok()) {
-            let entry = serde_json::json!({
-                "step_id": result.step_id,
-                "status": format!("{}", result.status),
-                "duration_ms": result.duration.map(|d| d.as_millis()),
-                "error": if result.error.is_empty() { None } else { Some(&result.error) },
-                "output_len": result.output.len(),
-            });
-            if let Err(e) = writeln!(f, "{}", entry) {
-                warn!("Failed to write audit log entry: {}", e);
-            }
-        }
+        audit::write_audit_entry(file, result);
     }
 
     fn execute_step(&self, step: &Step, ctx: &mut RecipeContext) -> StepResult {
@@ -1089,69 +1018,6 @@ fn git_stage_all(working_dir: &str) -> Option<String> {
     }
 }
 
-/// Try to parse JSON from LLM output using multiple strategies.
-fn parse_json_output(output: &str, step_id: &str) -> Option<Value> {
-    let text = output.trim();
-
-    // Strategy 1: Direct parse
-    if let Ok(v) = serde_json::from_str::<Value>(text) {
-        return Some(v);
-    }
-
-    // Strategy 2: Extract from markdown fences
-    if let Some(caps) = JSON_FENCE_RE.captures(text)
-        && let Some(m) = caps.get(1)
-        && let Ok(v) = serde_json::from_str::<Value>(m.as_str().trim())
-    {
-        return Some(v);
-    }
-
-    // Strategy 3: Find first balanced JSON block
-    for (open_ch, close_ch) in [('{', '}'), ('[', ']')] {
-        if let Some(start) = text.find(open_ch) {
-            let mut depth = 0i32;
-            let mut in_string = false;
-            let mut escape = false;
-
-            for (i, ch) in text[start..].char_indices() {
-                if escape {
-                    escape = false;
-                    continue;
-                }
-                if ch == '\\' {
-                    escape = true;
-                    continue;
-                }
-                if ch == '"' {
-                    in_string = !in_string;
-                    continue;
-                }
-                if in_string {
-                    continue;
-                }
-                if ch == open_ch {
-                    depth += 1;
-                } else if ch == close_ch {
-                    depth -= 1;
-                    if depth == 0 {
-                        let candidate = &text[start..start + i + 1];
-                        if let Ok(v) = serde_json::from_str::<Value>(candidate) {
-                            return Some(v);
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    warn!(
-        "All JSON extraction strategies failed for step '{}'",
-        step_id
-    );
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1248,27 +1114,6 @@ steps:
         let result = runner.execute(&recipe, None);
         assert!(result.success);
         assert_eq!(result.step_results[0].output, "[dry run]");
-    }
-
-    #[test]
-    fn test_parse_json_direct() {
-        let json_str = r#"{"key": "value"}"#;
-        let result = parse_json_output(json_str, "test");
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn test_parse_json_from_fence() {
-        let text = "Here is the result:\n```json\n{\"key\": \"value\"}\n```\nDone.";
-        let result = parse_json_output(text, "test");
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn test_parse_json_from_balanced() {
-        let text = "Some text before {\"key\": \"value\"} and after";
-        let result = parse_json_output(text, "test");
-        assert!(result.is_some());
     }
 
     /// C2-RD-10: timeout:0 edge case — verify step still executes and completes
