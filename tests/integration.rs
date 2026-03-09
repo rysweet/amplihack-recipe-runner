@@ -651,7 +651,6 @@ impl Adapter for RealBashAdapter {
         _system_prompt: Option<&str>,
         _mode: Option<&str>,
         _working_dir: &str,
-        _timeout: Option<u64>,
         _model: Option<&str>,
     ) -> Result<String, anyhow::Error> {
         Ok("mock agent response".to_string())
