@@ -216,6 +216,7 @@ impl Adapter for CLISubprocessAdapter {
         command: &str,
         working_dir: &str,
         timeout: Option<u64>,
+        extra_env: &std::collections::HashMap<String, String>,
     ) -> Result<String, anyhow::Error> {
         let child_env = Self::build_child_env();
         let effective_dir = if working_dir.is_empty() || working_dir == "." {
@@ -230,6 +231,7 @@ impl Adapter for CLISubprocessAdapter {
                 .current_dir(effective_dir)
                 .env_remove("CLAUDECODE")
                 .envs(&child_env)
+                .envs(extra_env)
                 .output()
                 .with_context(|| "Failed to execute bash step with timeout")?
         } else {
@@ -238,6 +240,7 @@ impl Adapter for CLISubprocessAdapter {
                 .current_dir(effective_dir)
                 .env_remove("CLAUDECODE")
                 .envs(&child_env)
+                .envs(extra_env)
                 .output()
                 .with_context(|| "Failed to execute bash step")?
         };
@@ -400,7 +403,8 @@ mod tests {
     #[test]
     fn test_execute_bash_step_echo() {
         let adapter = CLISubprocessAdapter::new();
-        let result = adapter.execute_bash_step("echo hello world", ".", None);
+        let empty_env = std::collections::HashMap::new();
+        let result = adapter.execute_bash_step("echo hello world", ".", None, &empty_env);
         assert!(result.is_ok(), "echo should succeed: {:?}", result);
         assert_eq!(result.unwrap(), "hello world");
     }
@@ -408,14 +412,16 @@ mod tests {
     #[test]
     fn test_execute_bash_step_failure() {
         let adapter = CLISubprocessAdapter::new();
-        let result = adapter.execute_bash_step("exit 1", ".", None);
+        let empty_env = std::collections::HashMap::new();
+        let result = adapter.execute_bash_step("exit 1", ".", None, &empty_env);
         assert!(result.is_err(), "exit 1 should fail");
     }
 
     #[test]
     fn test_execute_bash_step_with_timeout() {
         let adapter = CLISubprocessAdapter::new();
-        let result = adapter.execute_bash_step("echo timed", ".", Some(10));
+        let empty_env = std::collections::HashMap::new();
+        let result = adapter.execute_bash_step("echo timed", ".", Some(10), &empty_env);
         assert!(result.is_ok(), "timed echo should succeed: {:?}", result);
         assert_eq!(result.unwrap(), "timed");
     }
@@ -423,7 +429,8 @@ mod tests {
     #[test]
     fn test_execute_bash_step_timeout_kills() {
         let adapter = CLISubprocessAdapter::new();
-        let result = adapter.execute_bash_step("sleep 60", ".", Some(1));
+        let empty_env = std::collections::HashMap::new();
+        let result = adapter.execute_bash_step("sleep 60", ".", Some(1), &empty_env);
         assert!(result.is_err(), "sleep 60 with 1s timeout should fail");
     }
 
@@ -431,7 +438,8 @@ mod tests {
     fn test_execute_bash_step_working_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let adapter = CLISubprocessAdapter::new().with_working_dir(tmp.path().to_str().unwrap());
-        let result = adapter.execute_bash_step("pwd", "", None);
+        let empty_env = std::collections::HashMap::new();
+        let result = adapter.execute_bash_step("pwd", "", None, &empty_env);
         assert!(result.is_ok());
         let output = result.unwrap();
         assert!(
@@ -444,7 +452,8 @@ mod tests {
     #[test]
     fn test_execute_bash_step_empty_command() {
         let adapter = CLISubprocessAdapter::new();
-        let result = adapter.execute_bash_step("", ".", None);
+        let empty_env = std::collections::HashMap::new();
+        let result = adapter.execute_bash_step("", ".", None, &empty_env);
         // Empty command succeeds with empty output in bash
         assert!(result.is_ok());
     }

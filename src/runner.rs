@@ -403,10 +403,11 @@ impl<A: Adapter> RecipeRunner<A> {
     fn run_hook(&self, hook: &Option<String>, hook_name: &str, step_id: &str, ctx: &RecipeContext) {
         if let Some(cmd) = hook {
             let rendered = ctx.render_shell(cmd);
+            let env_vars = ctx.shell_env_vars();
             info!("Running {} hook for step '{}'", hook_name, step_id);
             if let Err(e) = self
                 .adapter
-                .execute_bash_step(&rendered, &self.working_dir, Some(30))
+                .execute_bash_step(&rendered, &self.working_dir, Some(30), &env_vars)
             {
                 warn!("{} hook failed for step '{}': {}", hook_name, step_id, e);
             }
@@ -617,8 +618,9 @@ impl<A: Adapter> RecipeRunner<A> {
             StepType::Recipe => self.execute_sub_recipe(step, ctx),
             StepType::Bash => {
                 let rendered = ctx.render_shell(step.command.as_deref().unwrap_or(""));
+                let env_vars = ctx.shell_env_vars();
                 self.adapter
-                    .execute_bash_step(&rendered, working_dir, step.timeout)
+                    .execute_bash_step(&rendered, working_dir, step.timeout, &env_vars)
                     .map_err(|e| StepExecutionError {
                         step_id: step.id.clone(),
                         message: format!("bash step failed: {:#}", e),
@@ -999,9 +1001,10 @@ impl<A: Adapter> RecipeRunner<A> {
         }
 
         let rendered = ctx.render_shell(step.command.as_deref().unwrap_or(""));
+        let env_vars = ctx.shell_env_vars();
         let working_dir = step.working_dir.as_deref().unwrap_or(default_working_dir);
 
-        match adapter.execute_bash_step(&rendered, working_dir, step.timeout) {
+        match adapter.execute_bash_step(&rendered, working_dir, step.timeout, &env_vars) {
             Ok(output) => {
                 // Apply parse_json if requested
                 let (final_output, status) = if step.parse_json && !output.is_empty() {
@@ -1166,6 +1169,7 @@ mod tests {
             command: &str,
             _working_dir: &str,
             _timeout: Option<u64>,
+            _extra_env: &std::collections::HashMap<String, String>,
         ) -> Result<String, anyhow::Error> {
             Ok(format!("Bash output for: {}", command))
         }
