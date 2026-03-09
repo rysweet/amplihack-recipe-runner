@@ -621,7 +621,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     .execute_bash_step(&rendered, working_dir, step.timeout)
                     .map_err(|e| StepExecutionError {
                         step_id: step.id.clone(),
-                        message: e.to_string(),
+                        message: format!("bash step failed: {:#}", e),
                     })
             }
             StepType::Agent => {
@@ -655,7 +655,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     )
                     .map_err(|e| StepExecutionError {
                         step_id: step.id.clone(),
-                        message: e.to_string(),
+                        message: format!("agent step failed: {:#}", e),
                     })
             }
         }

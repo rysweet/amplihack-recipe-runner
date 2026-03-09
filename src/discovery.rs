@@ -12,6 +12,21 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Collect directory entries, logging any I/O errors instead of silently dropping them.
+fn collect_dir_entries(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| match entry {
+            Ok(e) => Some(e.path()),
+            Err(e) => {
+                debug!("skipping unreadable entry in {}: {}", dir.display(), e);
+                None
+            }
+        })
+        .collect()
+}
+
 fn default_search_dirs() -> Vec<PathBuf> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let mut dirs = Vec::new();
@@ -69,11 +84,8 @@ pub fn discover_recipes(search_dirs: Option<&[PathBuf]>) -> HashMap<String, Reci
         debug!("  Scanning: {}", search_dir.display());
         let mut dir_count = 0;
 
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(search_dir)
+        let mut entries: Vec<PathBuf> = collect_dir_entries(search_dir)
             .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|ext| ext == "yaml"))
             .collect();
         entries.sort();
@@ -232,11 +244,9 @@ pub fn verify_global_installation() -> serde_json::Value {
         let exists = dir.is_dir();
         dirs_exist.push(exists);
         if exists {
-            let count = std::fs::read_dir(dir)
-                .into_iter()
-                .flatten()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "yaml"))
+            let count = collect_dir_entries(dir)
+                .iter()
+                .filter(|p| p.extension().is_some_and(|ext| ext == "yaml"))
                 .count();
             recipe_counts.push(count);
             if count > 0 {
@@ -269,11 +279,8 @@ pub fn check_upstream_changes(local_dir: Option<&Path>) -> Vec<HashMap<String, S
     let mut changes = Vec::new();
 
     // Check existing files
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(&recipe_dir)
+    let mut entries: Vec<PathBuf> = collect_dir_entries(&recipe_dir)
         .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|ext| ext == "yaml"))
         .collect();
     entries.sort();
@@ -330,9 +337,8 @@ pub fn update_manifest(local_dir: Option<&Path>) -> Result<PathBuf, std::io::Err
         })?;
 
     let mut manifest = HashMap::new();
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(&recipe_dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
+    let mut entries: Vec<PathBuf> = collect_dir_entries(&recipe_dir)
+        .into_iter()
         .filter(|p| p.extension().is_some_and(|ext| ext == "yaml"))
         .collect();
     entries.sort();

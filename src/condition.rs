@@ -355,49 +355,63 @@ impl<'a> ExprParser<'a> {
                 }
             };
 
-            // If next token is '(' and it's a safe method, treat as method call
-            if self.peek() == Some(&Token::LParen)
-                && SAFE_METHOD_NAMES.contains(&method_name.as_str())
-            {
-                self.advance(); // consume '('
-
-                let mut args = Vec::new();
-                if self.peek() != Some(&Token::RParen) {
-                    args.push(self.parse_or_value()?);
-                    while self.peek() == Some(&Token::Comma) {
-                        self.advance();
-                        args.push(self.parse_or_value()?);
-                    }
-                }
-
-                if self.peek() != Some(&Token::RParen) {
-                    return Err(ConditionError::Parse("expected ')'".to_string()));
-                }
-                self.advance();
-
-                value = apply_method(&value, &method_name, &args)?;
-            } else if self.peek() == Some(&Token::LParen) {
-                // '(' present but not a safe method — reject
-                return Err(ConditionError::Unsafe(format!(
-                    "method '.{}()' is not allowed. Safe methods: {:?}",
-                    method_name, SAFE_METHOD_NAMES
-                )));
-            } else {
-                // No '(' — treat as dot-notation property access
-                if method_name.contains("__") {
-                    return Err(ConditionError::Unsafe(format!(
-                        "dunder property '{}' is not allowed",
-                        method_name
-                    )));
-                }
-                value = match value.get(&method_name) {
-                    Some(v) => v.clone(),
-                    None => Value::Null,
-                };
-            }
+            value = self.parse_dot_access(value, &method_name)?;
         }
 
         Ok(value)
+    }
+
+    /// Handle dot-access: safe method call, unsafe method rejection, or property access.
+    fn parse_dot_access(
+        &mut self,
+        value: Value,
+        method_name: &str,
+    ) -> Result<Value, ConditionError> {
+        if self.peek() == Some(&Token::LParen) && SAFE_METHOD_NAMES.contains(&method_name) {
+            self.parse_method_call(value, method_name)
+        } else if self.peek() == Some(&Token::LParen) {
+            Err(ConditionError::Unsafe(format!(
+                "method '.{}()' is not allowed. Safe methods: {:?}",
+                method_name, SAFE_METHOD_NAMES
+            )))
+        } else {
+            // Dot-notation property access
+            if method_name.contains("__") {
+                return Err(ConditionError::Unsafe(format!(
+                    "dunder property '{}' is not allowed",
+                    method_name
+                )));
+            }
+            Ok(match value.get(method_name) {
+                Some(v) => v.clone(),
+                None => Value::Null,
+            })
+        }
+    }
+
+    /// Parse a safe method call: value.method(args...)
+    fn parse_method_call(
+        &mut self,
+        value: Value,
+        method_name: &str,
+    ) -> Result<Value, ConditionError> {
+        self.advance(); // consume '('
+
+        let mut args = Vec::new();
+        if self.peek() != Some(&Token::RParen) {
+            args.push(self.parse_or_value()?);
+            while self.peek() == Some(&Token::Comma) {
+                self.advance();
+                args.push(self.parse_or_value()?);
+            }
+        }
+
+        if self.peek() != Some(&Token::RParen) {
+            return Err(ConditionError::Parse("expected ')'".to_string()));
+        }
+        self.advance();
+
+        apply_method(&value, method_name, &args)
     }
 
     /// Parse an expression that returns a Value (for function/method args)

@@ -304,4 +304,159 @@ mod tests {
         let c2 = ctx(vec![("a", json!("")), ("b", json!("yes"))]);
         assert!(c2.evaluate("a or b").unwrap());
     }
+
+    // ── Edge cases (test-5) ──────────────────────────────
+
+    #[test]
+    fn test_empty_condition() {
+        let c = ctx(vec![]);
+        assert!(c.evaluate("").is_err());
+    }
+
+    #[test]
+    fn test_whitespace_only_condition() {
+        let c = ctx(vec![]);
+        assert!(c.evaluate("   ").is_err());
+    }
+
+    #[test]
+    fn test_empty_context_variable_access() {
+        let c = ctx(vec![]);
+        assert!(!c.evaluate("novar").unwrap());
+    }
+
+    #[test]
+    fn test_null_value_comparison() {
+        let c = ctx(vec![("v", json!(null))]);
+        assert!(!c.evaluate("v").unwrap());
+        assert!(!c.evaluate("v == 'hello'").unwrap());
+    }
+
+    #[test]
+    fn test_empty_string_is_falsy() {
+        let c = ctx(vec![("s", json!(""))]);
+        assert!(!c.evaluate("s").unwrap());
+    }
+
+    #[test]
+    fn test_render_empty_template() {
+        let c = ctx(vec![]);
+        assert_eq!(c.render(""), "");
+    }
+
+    #[test]
+    fn test_render_no_placeholders() {
+        let c = ctx(vec![]);
+        assert_eq!(c.render("plain text"), "plain text");
+    }
+
+    #[test]
+    fn test_render_missing_variable() {
+        let c = ctx(vec![]);
+        assert_eq!(c.render("before {{missing}} after"), "before  after");
+    }
+
+    #[test]
+    fn test_render_shell_empty() {
+        let c = ctx(vec![]);
+        assert_eq!(c.render_shell(""), "");
+    }
+
+    #[test]
+    fn test_len_empty_string() {
+        let c = ctx(vec![("s", json!(""))]);
+        assert!(c.evaluate("len(s) == 0").unwrap());
+    }
+
+    #[test]
+    fn test_len_empty_array() {
+        let c = ctx(vec![("a", json!([]))]);
+        assert!(c.evaluate("len(a) == 0").unwrap());
+    }
+
+    #[test]
+    fn test_method_on_empty_string() {
+        let c = ctx(vec![("s", json!(""))]);
+        assert!(c.evaluate("s.strip() == ''").unwrap());
+        assert!(c.evaluate("s.upper() == ''").unwrap());
+        assert!(c.evaluate("s.lower() == ''").unwrap());
+    }
+
+    // ── Boundary values (test-6) ──────────────────────────
+
+    #[test]
+    fn test_deeply_nested_parens() {
+        let c = ctx(vec![("x", json!(true))]);
+        let inner = "x";
+        let mut expr = inner.to_string();
+        for _ in 0..30 {
+            expr = format!("({})", expr);
+        }
+        assert!(c.evaluate(&expr).unwrap());
+    }
+
+    #[test]
+    fn test_max_nesting_exceeded() {
+        let c = ctx(vec![("x", json!(true))]);
+        let inner = "x";
+        let mut expr = inner.to_string();
+        for _ in 0..33 {
+            expr = format!("({})", expr);
+        }
+        assert!(c.evaluate(&expr).is_err());
+    }
+
+    #[test]
+    fn test_very_long_string_literal() {
+        let c = ctx(vec![]);
+        let long = "a".repeat(3000);
+        let expr = format!("'{}' == '{}'", long, long);
+        assert!(c.evaluate(&expr).unwrap());
+    }
+
+    #[test]
+    fn test_many_or_clauses() {
+        let c = ctx(vec![("x", json!("last"))]);
+        let mut parts: Vec<String> = (0..49).map(|i| format!("x == 'v{}'", i)).collect();
+        parts.push("x == 'last'".to_string());
+        let expr = parts.join(" or ");
+        assert!(c.evaluate(&expr).unwrap());
+    }
+
+    #[test]
+    fn test_many_and_clauses() {
+        let vars: Vec<(&str, Value)> = (0..20)
+            .map(|i| {
+                let name = Box::leak(format!("v{}", i).into_boxed_str()) as &str;
+                (name, json!(true))
+            })
+            .collect();
+        let c = ctx(vars);
+        let expr = (0..20)
+            .map(|i| format!("v{}", i))
+            .collect::<Vec<_>>()
+            .join(" and ");
+        assert!(c.evaluate(&expr).unwrap());
+    }
+
+    #[test]
+    fn test_numeric_boundary_zero() {
+        let c = ctx(vec![("n", json!(0))]);
+        assert!(!c.evaluate("n").unwrap());
+        assert!(c.evaluate("n == 0").unwrap());
+    }
+
+    #[test]
+    fn test_numeric_boundary_negative() {
+        let c = ctx(vec![("n", json!(-1))]);
+        assert!(c.evaluate("n < 0").unwrap());
+        assert!(c.evaluate("n == -1").unwrap());
+    }
+
+    #[test]
+    fn test_numeric_boundary_large() {
+        let c = ctx(vec![("n", json!(999_999_999))]);
+        assert!(c.evaluate("n > 0").unwrap());
+        assert!(c.evaluate("n == 999999999").unwrap());
+    }
 }

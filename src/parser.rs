@@ -536,4 +536,119 @@ steps:
         let err = resolve_extends(&mut recipe, &[]).unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
+
+    // ── Edge cases (test-5) ──────────────────────────────
+
+    #[test]
+    fn test_parse_empty_yaml() {
+        let parser = RecipeParser::new();
+        let result = parser.parse("");
+        assert!(result.is_err(), "empty YAML should fail");
+    }
+
+    #[test]
+    fn test_parse_whitespace_only_yaml() {
+        let parser = RecipeParser::new();
+        let result = parser.parse("   \n\n  ");
+        assert!(result.is_err(), "whitespace-only YAML should fail");
+    }
+
+    #[test]
+    fn test_parse_no_steps() {
+        let parser = RecipeParser::new();
+        let result = parser.parse("name: test\n");
+        assert!(result.is_err(), "recipe with no steps should fail");
+    }
+
+    #[test]
+    fn test_parse_empty_steps_list() {
+        let parser = RecipeParser::new();
+        let result = parser.parse("name: test\nsteps: []\n");
+        // Empty steps list is technically valid YAML but useless — should either
+        // parse to Recipe with 0 steps or error
+        if let Ok(r) = result {
+            assert!(r.steps.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_parse_step_with_empty_id() {
+        let yaml = r#"
+name: test
+steps:
+  - id: ""
+    command: "echo hello"
+"#;
+        let parser = RecipeParser::new();
+        let result = parser.parse(yaml);
+        // Parser rejects empty step IDs — this is correct validation
+        assert!(result.is_err(), "empty step ID should be rejected");
+    }
+
+    #[test]
+    fn test_parse_step_with_empty_command() {
+        let yaml = r#"
+name: test
+steps:
+  - id: "step1"
+    command: ""
+"#;
+        let parser = RecipeParser::new();
+        let result = parser.parse(yaml);
+        assert!(result.is_ok());
+        let recipe = result.unwrap();
+        assert_eq!(recipe.steps[0].command.as_deref(), Some(""));
+    }
+
+    // ── Boundary values (test-6) ──────────────────────────
+
+    #[test]
+    fn test_parse_yaml_exactly_at_size_limit() {
+        let parser = RecipeParser::new();
+        // Create YAML that's exactly at MAX_YAML_SIZE_BYTES
+        let base = "name: test\nsteps:\n  - id: step1\n    command: echo ";
+        let padding_needed = MAX_YAML_SIZE_BYTES - base.len();
+        let yaml = format!("{}{}", base, "x".repeat(padding_needed));
+        assert_eq!(yaml.len(), MAX_YAML_SIZE_BYTES);
+        // Should parse successfully (at limit, not over)
+        let result = parser.parse(&yaml);
+        assert!(
+            result.is_ok(),
+            "YAML at exactly the size limit should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_parse_yaml_one_byte_over_limit() {
+        let parser = RecipeParser::new();
+        let base = "name: test\nsteps:\n  - id: step1\n    command: echo ";
+        let padding_needed = MAX_YAML_SIZE_BYTES - base.len() + 1;
+        let yaml = format!("{}{}", base, "x".repeat(padding_needed));
+        assert_eq!(yaml.len(), MAX_YAML_SIZE_BYTES + 1);
+        let result = parser.parse(&yaml);
+        assert!(
+            result.is_err(),
+            "YAML over the size limit should be rejected"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("too large"),
+            "error should mention size: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_parse_name_with_special_characters() {
+        let yaml = r#"
+name: "test-recipe_v2.1 (beta)"
+steps:
+  - id: "step-1"
+    command: "echo hello"
+"#;
+        let parser = RecipeParser::new();
+        let result = parser.parse(yaml);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().name, "test-recipe_v2.1 (beta)");
+    }
 }
