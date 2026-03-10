@@ -35,10 +35,10 @@ fn default_search_dirs() -> Vec<PathBuf> {
     // recipe directory.  This is set by the Python wrapper
     // (run_recipe_via_rust) and also usable by standalone callers to bridge
     // the Python/Rust discovery gap (issue #3002).
-    if let Ok(pkg_dir) = std::env::var("AMPLIHACK_PACKAGE_RECIPE_DIR") {
-        if !pkg_dir.is_empty() {
-            dirs.push(PathBuf::from(pkg_dir));
-        }
+    if let Ok(pkg_dir) = std::env::var("AMPLIHACK_PACKAGE_RECIPE_DIR")
+        && !pkg_dir.is_empty()
+    {
+        dirs.push(PathBuf::from(pkg_dir));
     }
 
     if let Ok(extra) = std::env::var("RECIPE_RUNNER_RECIPE_DIRS") {
