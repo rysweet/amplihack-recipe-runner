@@ -143,12 +143,20 @@ jobs:
 
       - name: Check coverage threshold
         run: |
-          # Extract coverage percentage
-          coverage=$(grep -oP '\d+\.\d+%' coverage.txt | tail -1 | tr -d '%')
-          echo "Coverage: ${coverage}%"
-          # Fail if below 60% (generous threshold to start)
-          if [ "$(echo "$coverage < 60" | bc)" -eq 1 ]; then
-            echo "ERROR: Coverage ${coverage}% is below 60% threshold"
-            exit 1
-          fi
-          echo "Coverage ${coverage}% meets threshold ✓"
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          text = Path("coverage.txt").read_text()
+          match = re.search(r"(\d+\.\d+)% coverage,", text)
+          if not match:
+              raise SystemExit("ERROR: Could not parse overall coverage from coverage.txt")
+
+          coverage = float(match.group(1))
+          print(f"Coverage: {coverage:.2f}%")
+
+          if coverage < 60.0:
+              raise SystemExit(f"ERROR: Coverage {coverage:.2f}% is below 60% threshold")
+
+          print(f"Coverage {coverage:.2f}% meets threshold ✓")
+          PY

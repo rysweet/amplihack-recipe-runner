@@ -30,6 +30,17 @@ fn collect_dir_entries(dir: &Path) -> Vec<PathBuf> {
 fn default_search_dirs() -> Vec<PathBuf> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let mut dirs = Vec::new();
+
+    // AMPLIHACK_PACKAGE_RECIPE_DIR: the installed Python package's bundled
+    // recipe directory.  This is set by the Python wrapper
+    // (run_recipe_via_rust) and also usable by standalone callers to bridge
+    // the Python/Rust discovery gap (issue #3002).
+    if let Ok(pkg_dir) = std::env::var("AMPLIHACK_PACKAGE_RECIPE_DIR")
+        && !pkg_dir.is_empty()
+    {
+        dirs.push(PathBuf::from(pkg_dir));
+    }
+
     if let Ok(extra) = std::env::var("RECIPE_RUNNER_RECIPE_DIRS") {
         for p in extra.split(':') {
             if !p.is_empty() {
@@ -715,6 +726,86 @@ steps:
             result.contains_key("dir2-recipe"),
             "new dir results must appear"
         );
+    }
+
+    #[test]
+    fn test_package_recipe_dir_env_var() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("env-recipe.yaml"),
+            "name: env-recipe\nsteps:\n  - id: s1\n    command: echo",
+        )
+        .unwrap();
+
+        // Set the env var and verify discovery finds the recipe
+        // SAFETY: test runs are single-threaded for env var tests
+        unsafe {
+            std::env::set_var("AMPLIHACK_PACKAGE_RECIPE_DIR", tmp.path().as_os_str());
+        }
+        let dirs = default_search_dirs();
+        assert!(
+            dirs.contains(&tmp.path().to_path_buf()),
+            "default_search_dirs should include AMPLIHACK_PACKAGE_RECIPE_DIR"
+        );
+        // Search only our tmp dir to isolate the test
+        let recipes = discover_recipes(Some(&[tmp.path().to_path_buf()]));
+        assert!(
+            recipes.contains_key("env-recipe"),
+            "recipe from AMPLIHACK_PACKAGE_RECIPE_DIR should be discoverable"
+        );
+        // SAFETY: test cleanup
+        unsafe {
+            std::env::remove_var("AMPLIHACK_PACKAGE_RECIPE_DIR");
+        }
+    }
+
+    #[test]
+    fn test_empty_package_recipe_dir_env_var_is_ignored() {
+        // SAFETY: test runs are single-threaded for env var tests
+        unsafe {
+            std::env::set_var("AMPLIHACK_PACKAGE_RECIPE_DIR", "");
+        }
+        let dirs = default_search_dirs();
+        assert!(
+            !dirs.iter().any(|d| d.as_os_str().is_empty()),
+            "empty AMPLIHACK_PACKAGE_RECIPE_DIR must not add an empty search dir"
+        );
+        // SAFETY: test cleanup
+        unsafe {
+            std::env::remove_var("AMPLIHACK_PACKAGE_RECIPE_DIR");
+        }
+    }
+
+    #[test]
+    fn test_package_recipe_dir_precedes_extra_recipe_dirs() {
+        let pkg = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+
+        // SAFETY: test runs are single-threaded for env var tests
+        unsafe {
+            std::env::set_var("AMPLIHACK_PACKAGE_RECIPE_DIR", pkg.path().as_os_str());
+            std::env::set_var(
+                "RECIPE_RUNNER_RECIPE_DIRS",
+                extra.path().display().to_string(),
+            );
+        }
+
+        let dirs = default_search_dirs();
+        assert_eq!(
+            dirs.first(),
+            Some(&pkg.path().to_path_buf()),
+            "package recipe dir should be searched before extra dirs"
+        );
+        assert!(
+            dirs.contains(&extra.path().to_path_buf()),
+            "extra recipe dirs should still be included"
+        );
+
+        // SAFETY: test cleanup
+        unsafe {
+            std::env::remove_var("AMPLIHACK_PACKAGE_RECIPE_DIR");
+            std::env::remove_var("RECIPE_RUNNER_RECIPE_DIRS");
+        }
     }
 
     #[test]
