@@ -269,6 +269,57 @@ steps:
 }
 
 #[test]
+fn test_sub_recipe_failure_surfaces_child_step_details() {
+    let dir = TempDir::new().unwrap();
+
+    write_recipe(
+        dir.path(),
+        "sub-recipe-fail.yaml",
+        r#"
+name: sub-recipe-fail
+steps:
+  - id: will-fail
+    command: "echo child-detail >&2; exit 1"
+"#,
+    );
+
+    let recipe = write_recipe(
+        dir.path(),
+        "parent-no-recovery.yaml",
+        r#"
+name: parent-no-recovery
+steps:
+  - id: run-sub
+    type: recipe
+    recipe: sub-recipe-fail
+"#,
+    );
+
+    let (code, json, _stderr) = run_json(&recipe, &["-R", dir.path().to_str().unwrap()]);
+
+    assert_eq!(code, 1, "parent recipe should fail when sub-recipe fails");
+
+    let sub = find_step(&json, "run-sub").expect("run-sub step should exist");
+    let error = sub["error"].as_str().unwrap();
+    assert!(
+        error.contains("Sub-recipe 'sub-recipe-fail' failed"),
+        "error should mention the failed sub-recipe, got: {error}"
+    );
+    assert!(
+        error.contains("will-fail"),
+        "error should include the failed child step id, got: {error}"
+    );
+    assert!(
+        error.contains("[error]"),
+        "error should identify the source of the child failure detail, got: {error}"
+    );
+    assert!(
+        error.contains("child-detail"),
+        "error should include the child step failure detail, got: {error}"
+    );
+}
+
+#[test]
 fn test_recovery_on_failure_field_accepted_in_yaml() {
     let dir = TempDir::new().unwrap();
 

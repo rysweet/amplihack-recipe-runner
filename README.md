@@ -100,6 +100,20 @@ cargo test
 
 Comprehensive test suite covering unit, integration, recipe, feature, and example tests.
 
+## Local Quality Gates
+
+Install the repo hooks with:
+
+```bash
+pre-commit install
+pre-commit install --hook-type pre-push
+```
+
+The pre-commit config mirrors the main CI checks:
+
+- commit-time: file hygiene, `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`
+- push-time: `cargo test --all-targets`
+
 ## Creating a Recipe
 
 ```yaml

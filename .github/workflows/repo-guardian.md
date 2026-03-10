@@ -3,13 +3,12 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
-engine: copilot
-
 permissions:
   contents: read
   issues: read
   pull-requests: read
 
+engine: claude
 safe-outputs:
   add-comment:
     max: 1
