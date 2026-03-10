@@ -674,28 +674,15 @@ impl<A: Adapter> RecipeRunner<A> {
         self.depth.set(current_depth);
 
         if !sub_result.success {
+            let failure_summary = self.describe_sub_recipe_failure(&sub_result);
             if step.recovery_on_failure {
                 let working_dir = step.working_dir.as_deref().unwrap_or(&self.working_dir);
-                let failed: Vec<_> = sub_result
-                    .step_results
-                    .iter()
-                    .filter(|r| r.status == StepStatus::Failed)
-                    .map(|r| format!("{}: {}", r.step_id, r.error))
-                    .collect();
-                let completed: Vec<_> = sub_result
-                    .step_results
-                    .iter()
-                    .filter(|r| r.status == StepStatus::Completed)
-                    .map(|r| r.step_id.clone())
-                    .collect();
-
                 let recovery_prompt = format!(
-                    "Sub-recipe '{}' failed.\nFailed steps:\n{}\nCompleted steps: {:?}\n\n\
+                    "Sub-recipe '{}' failed.\n{}\n\n\
                      Attempt to complete the remaining work. If you succeed, end with 'STATUS: COMPLETE'. \
                      If recovery is impossible, explain why.",
                     recipe_name,
-                    failed.join("\n"),
-                    completed
+                    failure_summary
                 );
 
                 match self.adapter.execute_agent_step(
@@ -717,8 +704,8 @@ impl<A: Adapter> RecipeRunner<A> {
                         return Err(StepExecutionError {
                             step_id: step.id.clone(),
                             message: format!(
-                                "Sub-recipe '{}' failed and agentic recovery was unsuccessful",
-                                recipe_name
+                                "Sub-recipe '{}' failed and agentic recovery was unsuccessful.\n{}",
+                                recipe_name, failure_summary
                             ),
                         });
                     }
@@ -727,7 +714,7 @@ impl<A: Adapter> RecipeRunner<A> {
 
             return Err(StepExecutionError {
                 step_id: step.id.clone(),
-                message: format!("Sub-recipe '{}' failed", recipe_name),
+                message: format!("Sub-recipe '{}' failed.\n{}", recipe_name, failure_summary),
             });
         }
 
@@ -742,6 +729,43 @@ impl<A: Adapter> RecipeRunner<A> {
             current_depth + 1
         );
         Ok(format!("{}", sub_result))
+    }
+
+    fn describe_sub_recipe_failure(&self, sub_result: &RecipeResult) -> String {
+        let failed: Vec<String> = sub_result
+            .step_results
+            .iter()
+            .filter(|r| r.status == StepStatus::Failed)
+            .map(|r| {
+                let detail = if !r.error.trim().is_empty() {
+                    r.error.trim().to_string()
+                } else if !r.output.trim().is_empty() {
+                    crate::safe_tail(r.output.trim(), 200).to_string()
+                } else {
+                    "no additional detail".to_string()
+                };
+                format!("- {}: {}", r.step_id, detail)
+            })
+            .collect();
+        let completed: Vec<String> = sub_result
+            .step_results
+            .iter()
+            .filter(|r| r.status == StepStatus::Completed)
+            .map(|r| r.step_id.clone())
+            .collect();
+
+        let mut sections: Vec<String> = Vec::new();
+        if !failed.is_empty() {
+            sections.push(format!("Failed steps:\n{}", failed.join("\n")));
+        }
+        if !completed.is_empty() {
+            sections.push(format!("Completed steps: {}", completed.join(", ")));
+        }
+        if sections.is_empty() {
+            "No child step details captured.".to_string()
+        } else {
+            sections.join("\n")
+        }
     }
 
     /// Execute a recipe at the current recursion depth.
