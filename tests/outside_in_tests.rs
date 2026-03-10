@@ -310,6 +310,10 @@ steps:
         "error should include the failed child step id, got: {error}"
     );
     assert!(
+        error.contains("[error]"),
+        "error should identify the source of the child failure detail, got: {error}"
+    );
+    assert!(
         error.contains("child-detail"),
         "error should include the child step failure detail, got: {error}"
     );

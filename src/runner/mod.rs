@@ -681,8 +681,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     "Sub-recipe '{}' failed.\n{}\n\n\
                      Attempt to complete the remaining work. If you succeed, end with 'STATUS: COMPLETE'. \
                      If recovery is impossible, explain why.",
-                    recipe_name,
-                    failure_summary
+                    recipe_name, failure_summary
                 );
 
                 match self.adapter.execute_agent_step(
@@ -737,14 +736,17 @@ impl<A: Adapter> RecipeRunner<A> {
             .iter()
             .filter(|r| r.status == StepStatus::Failed)
             .map(|r| {
-                let detail = if !r.error.trim().is_empty() {
-                    r.error.trim().to_string()
+                let (detail_source, detail) = if !r.error.trim().is_empty() {
+                    ("error", r.error.trim().to_string())
                 } else if !r.output.trim().is_empty() {
-                    crate::safe_tail(r.output.trim(), 200).to_string()
+                    (
+                        "output tail",
+                        crate::safe_tail(r.output.trim(), 200).to_string(),
+                    )
                 } else {
-                    "no additional detail".to_string()
+                    ("no detail", "no additional detail".to_string())
                 };
-                format!("- {}: {}", r.step_id, detail)
+                format!("- {} [{}]: {}", r.step_id, detail_source, detail)
             })
             .collect();
         let completed: Vec<String> = sub_result
