@@ -1763,3 +1763,224 @@ steps:
         entry["duration_ms"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Model and mode field tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_model_field_in_dry_run_output() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "model-field.yaml",
+        r#"
+name: model-test
+steps:
+  - id: with-model
+    agent: test-agent
+    prompt: "hello"
+    model: haiku
+"#,
+    );
+    let (code, json, _stderr) = run_json(&recipe, &["--dry-run"]);
+    assert_eq!(code, 0);
+    let step = find_step(&json, "with-model").expect("should find step");
+    // In dry-run, agent steps are skipped but the recipe parses successfully
+    assert!(
+        step["status"].as_str() == Some("skipped") || step["status"].as_str() == Some("degraded"),
+        "dry-run agent step should be skipped or degraded, got: {}",
+        step["status"]
+    );
+}
+
+#[test]
+fn test_mode_field_accepted_in_recipe() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "mode-field.yaml",
+        r#"
+name: mode-test
+steps:
+  - id: with-mode
+    agent: test-agent
+    prompt: "hello"
+    mode: background
+"#,
+    );
+    // Should parse without error even with mode field
+    let (code, _stdout, _stderr) = run_binary(&recipe, &["--validate-only"]);
+    assert_eq!(code, 0, "recipe with mode field should validate");
+}
+
+#[test]
+fn test_model_and_mode_combined() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "model-mode.yaml",
+        r#"
+name: model-mode-test
+steps:
+  - id: combined
+    agent: test-agent
+    prompt: "hello"
+    model: sonnet
+    mode: background
+"#,
+    );
+    let (code, _stdout, _stderr) = run_binary(&recipe, &["--validate-only"]);
+    assert_eq!(code, 0, "recipe with both model and mode should validate");
+}
+
+// ---------------------------------------------------------------------------
+// Parallel execution edge cases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_parallel_group_with_failing_step() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "parallel-fail.yaml",
+        r#"
+name: parallel-fail-test
+steps:
+  - id: para-ok
+    command: echo ok
+    parallel_group: g1
+  - id: para-fail
+    command: exit 1
+    parallel_group: g1
+    continue_on_error: true
+  - id: para-ok2
+    command: echo ok2
+    parallel_group: g1
+"#,
+    );
+    let (code, json, _stderr) = run_json(&recipe, &[]);
+    assert_eq!(code, 0, "recipe should succeed with continue_on_error");
+    let ok_step = find_step(&json, "para-ok").expect("para-ok should exist");
+    assert_eq!(ok_step["status"].as_str(), Some("completed"));
+    let fail_step = find_step(&json, "para-fail").expect("para-fail should exist");
+    assert!(
+        fail_step["status"].as_str() == Some("degraded")
+            || fail_step["status"].as_str() == Some("failed"),
+        "failed parallel step should be degraded or failed"
+    );
+    let ok2_step = find_step(&json, "para-ok2").expect("para-ok2 should exist");
+    assert_eq!(ok2_step["status"].as_str(), Some("completed"));
+}
+
+#[test]
+fn test_parallel_group_all_succeed() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "parallel-ok.yaml",
+        r#"
+name: parallel-ok-test
+steps:
+  - id: p1
+    command: echo one
+    parallel_group: grp
+  - id: p2
+    command: echo two
+    parallel_group: grp
+  - id: p3
+    command: echo three
+    parallel_group: grp
+"#,
+    );
+    let (code, json, _stderr) = run_json(&recipe, &[]);
+    assert_eq!(code, 0);
+    // All 3 steps should complete
+    for id in &["p1", "p2", "p3"] {
+        let step = find_step(&json, id).unwrap_or_else(|| panic!("{id} should exist"));
+        assert_eq!(
+            step["status"].as_str(),
+            Some("completed"),
+            "{id} should complete"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// recovery_on_failure (sub-recipe feature)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_recovery_on_failure_field_parsed_in_recipe() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "recovery.yaml",
+        r#"
+name: recovery-test
+steps:
+  - id: call-sub
+    recipe: nonexistent-recipe
+    recovery_on_failure: true
+"#,
+    );
+    // Should parse successfully even though sub-recipe doesn't exist
+    let (code, _stdout, _stderr) = run_binary(&recipe, &["--validate-only"]);
+    assert_eq!(code, 0, "recipe with recovery_on_failure should validate");
+}
+
+// ---------------------------------------------------------------------------
+// parse_json_required (strict JSON parsing)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_parse_json_required_fails_on_non_json() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "strict-json.yaml",
+        r#"
+name: strict-json-test
+steps:
+  - id: strict
+    command: echo "this is not json"
+    parse_json: true
+    parse_json_required: true
+"#,
+    );
+    let (code, json, _stderr) = run_json(&recipe, &[]);
+    assert_ne!(
+        code, 0,
+        "parse_json_required should fail recipe on non-JSON"
+    );
+    let step = find_step(&json, "strict").expect("strict step should exist");
+    assert_eq!(
+        step["status"].as_str(),
+        Some("failed"),
+        "step should be failed when parse_json_required and output is not JSON"
+    );
+}
+
+#[test]
+fn test_parse_json_required_succeeds_on_valid_json() {
+    let tmp = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        tmp.path(),
+        "strict-json-ok.yaml",
+        r#"
+name: strict-json-ok-test
+steps:
+  - id: strict-ok
+    command: 'echo ''{"valid": true}'''
+    parse_json: true
+    parse_json_required: true
+"#,
+    );
+    let (code, json, _stderr) = run_json(&recipe, &[]);
+    assert_eq!(
+        code, 0,
+        "parse_json_required with valid JSON should succeed"
+    );
+    let step = find_step(&json, "strict-ok").expect("step should exist");
+    assert_eq!(step["status"].as_str(), Some("completed"));
+}

@@ -391,21 +391,40 @@ steps:
     working_dir: "{{repo_path}}"
 
   # =========================================================================
-  # Phase 8 — runner.rs (Execution Engine)
+  # Phase 8 — runner/ module (Execution Engine, split into submodules)
   # =========================================================================
   - id: "create-runner"
     agent: "amplihack:core:builder"
     working_dir: "{{repo_path}}"
     prompt: |
-      Create src/runner.rs — the core execution engine (~1150 lines).
+      Create src/runner/ as a module directory with these files:
+      - src/runner/mod.rs — coordinator (~1140 lines)
+      - src/runner/listeners.rs — execution listeners (~55 lines)
+      - src/runner/json_parser.rs — JSON extraction (~150 lines)
+      - src/runner/audit.rs — audit logging (~55 lines)
 
-      ## ExecutionListener trait
+      ## src/runner/listeners.rs — ExecutionListener trait
       - on_step_start(step_id, step_type) — default no-op
       - on_step_complete(result) — default no-op
       - on_output(step_id, line) — default no-op
-      Implementations: NullListener (no-op), StderrListener (prints to stderr)
+      Implementations: NullListener (no-op), StderrListener (prints ▶ on start, ✓/✗/⊘/⚠ on complete)
 
-      ## RecipeRunner<A: Adapter> struct
+      ## src/runner/json_parser.rs — JSON extraction
+      Static JSON_FENCE_RE regex for ```json fences.
+      parse_json_output(output, step_id) -> Option<Value>
+      3 strategies: 1) direct parse, 2) markdown fence regex, 3) balanced braces
+      Include unit tests inline.
+
+      ## src/runner/audit.rs — JSONL audit logging
+      open_audit_log(audit_dir, recipe_name) -> Option<File>
+        Creates {recipe_name}-{unix_timestamp}.jsonl with mode 0600
+      write_audit_entry(file, result)
+        Writes JSON: step_id, status, duration_ms, error, output_len
+
+      ## src/runner/mod.rs — RecipeRunner<A: Adapter> coordinator
+      Re-exports: pub use listeners::{ExecutionListener, NullListener, StderrListener}
+      Internal use: use json_parser::parse_json_output
+
       Fields: adapter, agent_resolver (AgentResolver), working_dir,
       dry_run, auto_stage (default true), depth (Cell<u32>),
       total_steps (Cell<u32>), max_depth (Cell<u32>),
@@ -426,11 +445,11 @@ steps:
       2. Apply recursion limits from recipe.recursion
       3. Check depth <= max_depth, else error
       4. Merge recipe.context + user_context into RecipeContext
-      5. Create audit log file if audit_dir set
+      5. Create audit log file if audit_dir set (delegate to audit::open_audit_log)
       6. Group consecutive steps with same parallel_group
       7. For sequential steps: execute_single_step()
       8. For parallel groups: execute_parallel_group() using std::thread::scope
-      9. After each step: write audit entry, update context, check continue_on_error
+      9. After each step: write audit entry (delegate to audit::write_audit_entry), update context, check continue_on_error
       10. Return RecipeResult with timing
 
       ## execute_single_step (private)
@@ -439,28 +458,26 @@ steps:
       3. Evaluate condition (skip if false, fail if evaluation errors)
       4. Dry run: return mock output (mock JSON for parse_json steps)
       5. Dispatch by type: bash→adapter.execute_bash_step,
-         agent→adapter.execute_agent_step, recipe→execute_sub_recipe
-      6. If parse_json: try extract_json (3 strategies), retry once if failed
-      7. Store output in context
-      8. Git auto-stage after agent steps (git add -A)
-      9. Run post_step hook (or on_error hook on failure)
-      10. Return StepResult with timing
+         agent→adapter.execute_agent_step (with mode and model params),
+         recipe→execute_sub_recipe
+      6. If parse_json: try json_parser::parse_json_output, retry once if failed
+      7. If parse_json_required and extraction fails: mark step as Failed and stop recipe
+      8. Store output in context
+      9. Git auto-stage after agent steps (git add -A)
+      10. Run post_step hook (or on_error hook on failure)
+      11. Return StepResult with timing
 
       ## execute_sub_recipe (private)
       Check depth < max_depth. Find recipe by name. Parse it.
-      Create child RecipeRunner with depth+1. Execute. If failed, error.
-
-      ## extract_json (private static)
-      3 strategies: 1) direct parse, 2) markdown fence regex, 3) balanced braces
+      Create child RecipeRunner with depth+1. Execute.
+      If failed and recovery_on_failure is true: send failure details to agent for recovery.
+      If agent responds with "STATUS: COMPLETE" or "recovered": mark as recovered.
 
       ## execute_parallel_group (private)
       Use std::thread::scope. Only bash steps run in parallel threads.
       Non-bash steps fall back to sequential on main thread.
       Results collected in step order (not completion order) for determinism.
-
-      ## Audit log
-      JSONL format. Each entry: step_id, status, duration_ms, error, output_len.
-      One file per recipe run in audit_dir.
+      Thread panics caught and converted to Failed StepResult.
     output: "runner_done"
 
   - id: "verify-runner"

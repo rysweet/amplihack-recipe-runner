@@ -94,6 +94,12 @@ jobs:
               missing=1
             fi
           done
+          # Submodules extracted from runner.rs
+          for mod in listeners json_parser audit; do
+            if ! grep -q "$mod" recipes/build-recipe-runner.yaml; then
+              echo "WARNING: recipes/build-recipe-runner.yaml missing reference to submodule $mod"
+            fi
+          done
           if [ "$missing" -eq 1 ]; then
             echo "Self-building recipe is out of sync with source modules"
             exit 1
@@ -110,3 +116,39 @@ jobs:
         run: cargo install cargo-audit --quiet
       - name: Run security audit
         run: cargo audit
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
+
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin --quiet
+
+      - name: Run coverage
+        run: cargo tarpaulin --all-targets --out stdout --skip-clean 2>&1 | tee coverage.txt
+
+      - name: Check coverage threshold
+        run: |
+          # Extract coverage percentage
+          coverage=$(grep -oP '\d+\.\d+%' coverage.txt | tail -1 | tr -d '%')
+          echo "Coverage: ${coverage}%"
+          # Fail if below 60% (generous threshold to start)
+          if [ "$(echo "$coverage < 60" | bc)" -eq 1 ]; then
+            echo "ERROR: Coverage ${coverage}% is below 60% threshold"
+            exit 1
+          fi
+          echo "Coverage ${coverage}% meets threshold ✓"

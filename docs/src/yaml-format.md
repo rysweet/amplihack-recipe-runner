@@ -51,13 +51,15 @@ Hook commands receive context variables via template substitution.
 | `prompt`            | string          | no       | —       | Prompt template (agent steps)                            |
 | `output`            | string          | no       | —       | Variable name to store step output in context            |
 | `condition`         | string          | no       | —       | Expression that must be truthy to execute                |
-| `parse_json`        | bool            | no       | `false` | Extract JSON from step output                            |
+| `parse_json`          | bool            | no       | `false` | Extract JSON from step output                            |
+| `parse_json_required` | bool            | no       | `false` | Fail the step if JSON extraction fails (see below)       |
 | `mode`              | string          | no       | —       | Execution mode                                           |
 | `working_dir`       | string          | no       | —       | Override working directory for this step                 |
 | `timeout`           | int             | no       | —       | Step timeout in seconds                                  |
 | `auto_stage`        | bool            | no       | `true`  | Git auto-stage after agent steps                         |
 | `model`             | string          | no       | —       | Model override for agent steps (e.g., "haiku", "sonnet") |
 | `recipe`            | string          | no       | —       | Sub-recipe name (recipe steps)                           |
+| `recovery_on_failure` | bool            | no       | `false` | Attempt agentic recovery if sub-recipe fails (see below) |
 | `context`           | map             | no       | —       | Context overrides passed to sub-recipe                   |
 | `continue_on_error` | bool            | no       | `false` | Continue execution if this step fails                    |
 | `when_tags`         | list of strings | no       | `[]`    | Step only runs when these tags match active tag filters  |
@@ -186,6 +188,62 @@ If all strategies fail a warning is logged and the raw output is stored.
 
 - id: use-config
   command: echo "Region is {{api_config.region}}"
+```
+
+### Strict Mode (`parse_json_required`)
+
+By default, JSON extraction failure degrades the step (status becomes `degraded`)
+but the recipe continues. Set `parse_json_required: true` to make extraction
+failure a hard error that stops the recipe.
+
+```yaml
+- id: must-be-json
+  command: curl -s https://api.example.com/data
+  parse_json: true
+  parse_json_required: true  # fails the recipe if output isn't valid JSON
+  output: api_data
+```
+
+| `parse_json_required` | On extraction failure        |
+|-----------------------|------------------------------|
+| `false` (default)     | Step marked `degraded`, raw output stored, recipe continues |
+| `true`                | Step marked `failed`, recipe stops immediately |
+
+---
+
+## Sub-Recipe Recovery (`recovery_on_failure`)
+
+When a sub-recipe step fails, set `recovery_on_failure: true` to trigger an
+agentic recovery attempt. The runner sends the failure details to an agent,
+which attempts to complete the remaining work.
+
+```yaml
+- id: deploy
+  recipe: deploy-to-staging
+  recovery_on_failure: true  # agent attempts recovery if deploy fails
+```
+
+If the agent's recovery output contains "STATUS: COMPLETE" or "recovered",
+the step is marked as recovered and the recipe continues. Otherwise, the
+original failure propagates.
+
+---
+
+## Model Override (`model`)
+
+Agent steps can override the default model using the `model` field. The value
+is passed to the adapter, which maps it to a specific model identifier.
+
+```yaml
+- id: quick-check
+  agent: reviewer
+  prompt: "Quick lint check on {{file_path}}"
+  model: haiku  # fast, cheap model for simple tasks
+
+- id: deep-review
+  agent: reviewer
+  prompt: "Thorough security review of {{file_path}}"
+  model: sonnet  # more capable model for complex analysis
 ```
 
 ---
