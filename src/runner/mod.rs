@@ -561,6 +561,7 @@ impl<A: Adapter> RecipeRunner<A> {
                 let env_vars = ctx.shell_env_vars();
                 self.adapter
                     .execute_bash_step(&rendered, working_dir, step.timeout, &env_vars)
+                    .map(|output| output.trim_end().to_string())
                     .map_err(|e| StepExecutionError {
                         step_id: step.id.clone(),
                         message: format!("bash step failed: {:#}", e),
@@ -971,7 +972,10 @@ impl<A: Adapter> RecipeRunner<A> {
         let working_dir = step.working_dir.as_deref().unwrap_or(default_working_dir);
 
         match adapter.execute_bash_step(&rendered, working_dir, step.timeout, &env_vars) {
-            Ok(output) => {
+            Ok(raw_output) => {
+                // Strip trailing whitespace/newlines from bash output so that
+                // condition comparisons like `count != '1'` work correctly.
+                let output = raw_output.trim_end().to_string();
                 // Apply parse_json if requested
                 let (final_output, status) = if step.parse_json && !output.is_empty() {
                     match parse_json_output(&output, &step.id) {
@@ -1140,6 +1144,79 @@ steps:
         let result = runner.execute(&recipe, None);
         assert!(result.success);
         assert_eq!(result.step_results[0].output, "[dry run]");
+    }
+
+    /// A mock adapter that returns output with trailing newlines, simulating
+    /// real shell behavior where commands like `echo 1` produce "1\n".
+    struct TrailingNewlineAdapter;
+
+    impl Adapter for TrailingNewlineAdapter {
+        fn execute_agent_step(
+            &self,
+            _prompt: &str,
+            _agent_name: Option<&str>,
+            _system_prompt: Option<&str>,
+            _mode: Option<&str>,
+            _working_dir: &str,
+            _model: Option<&str>,
+        ) -> Result<String, anyhow::Error> {
+            Ok("agent output\n".to_string())
+        }
+
+        fn execute_bash_step(
+            &self,
+            _command: &str,
+            _working_dir: &str,
+            _timeout: Option<u64>,
+            _extra_env: &std::collections::HashMap<String, String>,
+        ) -> Result<String, anyhow::Error> {
+            // Simulate `echo 1` which produces "1\n"
+            Ok("1\n".to_string())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &str {
+            "trailing-newline-mock"
+        }
+    }
+
+    /// Bash step output should have trailing whitespace stripped so that
+    /// condition comparisons like `count != '1'` work correctly.
+    /// Regression test for amplihack#3058.
+    #[test]
+    fn test_bash_output_trailing_whitespace_stripped() {
+        let yaml = r#"
+name: "test-trim"
+steps:
+  - id: "count"
+    command: "echo 1"
+    output: "workstream_count"
+  - id: "check"
+    command: "echo matched"
+    condition: "workstream_count == '1'"
+    output: "check_result"
+"#;
+        let parser = RecipeParser::new();
+        let recipe = parser.parse(yaml).unwrap();
+        let runner = RecipeRunner::new(TrailingNewlineAdapter);
+        let result = runner.execute(&recipe, None);
+        assert!(result.success);
+        // The count step should store trimmed "1" — serde_json parses it as Number(1)
+        let count_val = result.context.get("workstream_count").unwrap();
+        assert!(
+            count_val.is_number() || count_val == &Value::String("1".to_string()),
+            "bash output should be trimmed (no trailing newline); got {:?}",
+            count_val
+        );
+        // The condition step should NOT be skipped — values_equal coerces
+        // Number(1) == String("1") via cross-type comparison.
+        assert_eq!(
+            result.step_results[1].status,
+            StepStatus::Completed,
+            "condition `workstream_count == '1'` should match after trimming"
+        );
     }
 
     /// C2-RD-10: timeout:0 edge case — verify step still executes and completes
