@@ -12,6 +12,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+mod update;
+
 /// Exit codes for structured error reporting.
 mod exit_codes {
     /// Recipe executed successfully.
@@ -98,6 +100,8 @@ enum Commands {
         #[arg(short = 'R', long = "recipe-dir")]
         recipe_dirs: Vec<String>,
     },
+    /// Update recipe-runner-rs to the latest version
+    Update,
 }
 
 /// Parse a context value string, auto-detecting type.
@@ -143,10 +147,23 @@ fn main() {
 }
 
 fn run() -> i32 {
+    // Non-blocking startup update check (respects 24h cooldown)
+    update::maybe_print_update_notice_from_args(
+        &std::env::args_os().collect::<Vec<_>>(),
+    );
+
     let cli = Cli::parse();
     debug!("run: starting recipe runner");
 
     // Handle subcommands
+    if let Some(Commands::Update) = &cli.command {
+        if let Err(e) = update::run_update() {
+            eprintln!("Update failed: {e}");
+            return exit_codes::RECIPE_FAILED;
+        }
+        return exit_codes::SUCCESS;
+    }
+
     if let Some(Commands::List { recipe_dirs }) = &cli.command {
         let dirs: Vec<PathBuf> = recipe_dirs.iter().map(PathBuf::from).collect();
         let search = if dirs.is_empty() {
