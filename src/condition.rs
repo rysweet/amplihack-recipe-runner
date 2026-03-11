@@ -4,6 +4,7 @@
 /// library for evaluating boolean expressions over recipe context variables.
 use serde_json::Value;
 use std::collections::HashMap;
+use log::debug;
 
 /// Maximum length of a condition expression (bytes).
 pub(crate) const MAX_CONDITION_LEN: usize = 8192;
@@ -15,6 +16,7 @@ pub(crate) fn evaluate_condition(
     condition: &str,
     data: &HashMap<String, Value>,
 ) -> Result<bool, ConditionError> {
+    debug!("evaluate_condition: condition={:?}", crate::safe_truncate(condition, 200));
     if condition.len() > MAX_CONDITION_LEN {
         return Err(ConditionError::Parse(format!(
             "condition expression too long ({} bytes, max {})",
@@ -60,6 +62,7 @@ enum Token {
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, ConditionError> {
+    debug!("tokenize: input length={}", input.len());
     let mut tokens = Vec::new();
     let chars: Vec<char> = input.chars().collect();
     let mut i = 0;
@@ -238,6 +241,7 @@ impl<'a> ExprParser<'a> {
     // or_expr: and_expr ('or' and_expr)*
     // Short-circuits: if left is truthy, skip evaluating right.
     fn parse_or(&mut self) -> Result<bool, ConditionError> {
+        log::trace!("ExprParser::parse_or: pos={}", self.pos);
         let mut result = self.parse_and()?;
         while self.peek() == Some(&Token::Or) {
             self.advance();
@@ -255,6 +259,7 @@ impl<'a> ExprParser<'a> {
     // and_expr: not_expr ('and' not_expr)*
     // Short-circuits: if left is falsy, skip evaluating right.
     fn parse_and(&mut self) -> Result<bool, ConditionError> {
+        log::trace!("ExprParser::parse_and: pos={}", self.pos);
         let mut result = self.parse_not()?;
         while self.peek() == Some(&Token::And) {
             self.advance();
@@ -537,6 +542,7 @@ const SAFE_METHOD_NAMES: &[&str] = &[
 
 /// Apply a safe built-in function.
 fn apply_function(name: &str, args: &[Value]) -> Result<Value, ConditionError> {
+    debug!("apply_function: name={:?}, args_count={}", name, args.len());
     match name {
         "int" => {
             let arg = args.first().unwrap_or(&Value::Null);
@@ -641,6 +647,7 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, ConditionError> {
 
 /// Apply a safe method call on a value.
 fn apply_method(value: &Value, method: &str, args: &[Value]) -> Result<Value, ConditionError> {
+    debug!("apply_method: method={:?}, args_count={}", method, args.len());
     let s = match value {
         Value::String(s) => s.as_str(),
         _ => {
@@ -728,6 +735,7 @@ fn apply_method(value: &Value, method: &str, args: &[Value]) -> Result<Value, Co
 }
 
 fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    log::trace!("compare_values: comparing values");
     match (a, b) {
         (Value::Number(na), Value::Number(nb)) => na.as_f64()?.partial_cmp(&nb.as_f64()?),
         (Value::String(sa), Value::String(sb)) => Some(sa.cmp(sb)),
@@ -743,6 +751,7 @@ fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
 }
 
 fn values_equal(a: &Value, b: &Value) -> bool {
+    log::trace!("values_equal: checking equality");
     // Coerce: compare string representations for mixed types
     match (a, b) {
         (Value::String(sa), Value::String(sb)) => sa == sb,
@@ -768,6 +777,7 @@ fn value_in(needle: &Value, haystack: &Value) -> bool {
 }
 
 fn is_truthy(val: &Value) -> bool {
+    log::trace!("is_truthy: checking truthiness of {:?}", val);
     match val {
         Value::Null => false,
         Value::Bool(b) => *b,
