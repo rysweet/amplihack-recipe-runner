@@ -2,7 +2,7 @@
 //!
 //! These tests exercise the COMPILED BINARY via `std::process::Command`,
 //! exactly as a user would invoke it from the command line.
-//! They validate fixes for issues #2954, #2953, and #2792.
+//! They validate fixes for issues #2954 and #2792.
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -216,7 +216,7 @@ steps:
 }
 
 // ---------------------------------------------------------------------------
-// Issue #2953: recovery_on_failure for sub-recipes
+// Sub-recipe failure propagation
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -266,53 +266,6 @@ steps:
             );
         }
     }
-}
-
-#[test]
-fn test_recovery_on_failure_field_accepted_in_yaml() {
-    let dir = TempDir::new().unwrap();
-
-    write_recipe(
-        dir.path(),
-        "sub-recipe-fail.yaml",
-        r#"
-name: sub-recipe-fail
-steps:
-  - id: will-fail
-    command: "exit 1"
-"#,
-    );
-
-    let recipe = write_recipe(
-        dir.path(),
-        "parent-with-recovery.yaml",
-        r#"
-name: parent-with-recovery
-steps:
-  - id: run-sub
-    type: recipe
-    recipe: sub-recipe-fail
-    recovery_on_failure: true
-  - id: after-sub
-    command: "echo 'after recovery'"
-"#,
-    );
-
-    // Validate-only should succeed — the YAML field is recognized.
-    let (code, _stdout, stderr) = run_binary(
-        &recipe,
-        &["--validate-only", "-R", dir.path().to_str().unwrap()],
-    );
-
-    assert_eq!(
-        code, 0,
-        "validate-only should pass when recovery_on_failure is used.\nstderr: {stderr}"
-    );
-    // No "unknown field" errors
-    assert!(
-        !stderr.contains("unknown field"),
-        "should not warn about unknown field recovery_on_failure"
-    );
 }
 
 // ---------------------------------------------------------------------------

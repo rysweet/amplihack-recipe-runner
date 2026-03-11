@@ -74,10 +74,6 @@ pub struct Step {
     /// Tags for conditional step filtering via --include-tags / --exclude-tags.
     #[serde(default)]
     pub when_tags: Vec<String>,
-    /// If true, attempt agentic recovery when a sub-recipe fails before
-    /// reporting the step as failed.
-    #[serde(default)]
-    pub recovery_on_failure: bool,
     /// Model override for agent steps (e.g., "haiku", "sonnet").
     pub model: Option<String>,
 }
@@ -273,7 +269,6 @@ mod tests {
             continue_on_error: false,
             parallel_group: None,
             when_tags: vec![],
-            recovery_on_failure: false,
             model: None,
         };
         // Explicit type overrides all field-based inference
@@ -301,7 +296,6 @@ mod tests {
             continue_on_error: false,
             parallel_group: None,
             when_tags: vec![],
-            recovery_on_failure: false,
             model: None,
         };
         assert_eq!(step.effective_type(), StepType::Recipe);
@@ -328,7 +322,6 @@ mod tests {
             continue_on_error: false,
             parallel_group: None,
             when_tags: vec![],
-            recovery_on_failure: false,
             model: None,
         };
         assert_eq!(step.effective_type(), StepType::Agent);
@@ -355,7 +348,6 @@ mod tests {
             continue_on_error: false,
             parallel_group: None,
             when_tags: vec![],
-            recovery_on_failure: false,
             model: None,
         };
         assert_eq!(step.effective_type(), StepType::Agent);
@@ -382,7 +374,6 @@ mod tests {
             continue_on_error: false,
             parallel_group: None,
             when_tags: vec![],
-            recovery_on_failure: false,
             model: None,
         };
         // command + prompt → Bash (prompt alone would be Agent, but command presence wins)
@@ -410,7 +401,6 @@ mod tests {
             continue_on_error: false,
             parallel_group: None,
             when_tags: vec![],
-            recovery_on_failure: false,
             model: None,
         };
         assert_eq!(step.effective_type(), StepType::Bash);

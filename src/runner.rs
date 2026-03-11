@@ -734,57 +734,6 @@ impl<A: Adapter> RecipeRunner<A> {
         self.depth.set(current_depth);
 
         if !sub_result.success {
-            if step.recovery_on_failure {
-                let working_dir = step.working_dir.as_deref().unwrap_or(&self.working_dir);
-                let failed: Vec<_> = sub_result
-                    .step_results
-                    .iter()
-                    .filter(|r| r.status == StepStatus::Failed)
-                    .map(|r| format!("{}: {}", r.step_id, r.error))
-                    .collect();
-                let completed: Vec<_> = sub_result
-                    .step_results
-                    .iter()
-                    .filter(|r| r.status == StepStatus::Completed)
-                    .map(|r| r.step_id.clone())
-                    .collect();
-
-                let recovery_prompt = format!(
-                    "Sub-recipe '{}' failed.\nFailed steps:\n{}\nCompleted steps: {:?}\n\n\
-                     Attempt to complete the remaining work. If you succeed, end with 'STATUS: COMPLETE'. \
-                     If recovery is impossible, explain why.",
-                    recipe_name,
-                    failed.join("\n"),
-                    completed
-                );
-
-                match self.adapter.execute_agent_step(
-                    &recovery_prompt,
-                    None,
-                    None,
-                    None,
-                    working_dir,
-                    None,
-                ) {
-                    Ok(output)
-                        if output.to_lowercase().contains("status: complete")
-                            || output.to_lowercase().contains("recovered") =>
-                    {
-                        info!("Sub-recipe '{}' recovered via agent", recipe_name);
-                        return Ok(output);
-                    }
-                    _ => {
-                        return Err(StepExecutionError {
-                            step_id: step.id.clone(),
-                            message: format!(
-                                "Sub-recipe '{}' failed and agentic recovery was unsuccessful",
-                                recipe_name
-                            ),
-                        });
-                    }
-                }
-            }
-
             return Err(StepExecutionError {
                 step_id: step.id.clone(),
                 message: format!("Sub-recipe '{}' failed", recipe_name),
