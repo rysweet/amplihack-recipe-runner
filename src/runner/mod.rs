@@ -1212,8 +1212,11 @@ steps:
         );
         // The condition step should NOT be skipped — values_equal coerces
         // Number(1) == String("1") via cross-type comparison.
-        assert_eq!(result.step_results[1].status, StepStatus::Completed,
-            "condition `workstream_count == '1'` should match after trimming");
+        assert_eq!(
+            result.step_results[1].status,
+            StepStatus::Completed,
+            "condition `workstream_count == '1'` should match after trimming"
+        );
     }
 
     /// C2-RD-10: timeout:0 edge case — verify step still executes and completes
