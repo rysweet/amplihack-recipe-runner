@@ -1,10 +1,10 @@
+use log::debug;
 /// Safe condition evaluator for recipe step conditions.
 ///
 /// Provides a tokenizer, recursive-descent parser, and built-in function/method
 /// library for evaluating boolean expressions over recipe context variables.
 use serde_json::Value;
 use std::collections::HashMap;
-use log::debug;
 
 /// Maximum length of a condition expression (bytes).
 pub(crate) const MAX_CONDITION_LEN: usize = 8192;
@@ -16,7 +16,10 @@ pub(crate) fn evaluate_condition(
     condition: &str,
     data: &HashMap<String, Value>,
 ) -> Result<bool, ConditionError> {
-    debug!("evaluate_condition: condition={:?}", crate::safe_truncate(condition, 200));
+    debug!(
+        "evaluate_condition: condition={:?}",
+        crate::safe_truncate(condition, 200)
+    );
     if condition.len() > MAX_CONDITION_LEN {
         return Err(ConditionError::Parse(format!(
             "condition expression too long ({} bytes, max {})",
@@ -647,7 +650,11 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, ConditionError> {
 
 /// Apply a safe method call on a value.
 fn apply_method(value: &Value, method: &str, args: &[Value]) -> Result<Value, ConditionError> {
-    debug!("apply_method: method={:?}, args_count={}", method, args.len());
+    debug!(
+        "apply_method: method={:?}, args_count={}",
+        method,
+        args.len()
+    );
     let s = match value {
         Value::String(s) => s.as_str(),
         _ => {

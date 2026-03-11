@@ -3,6 +3,7 @@
 /// CLI interface for parsing and executing YAML-defined recipes.
 ///
 use clap::{Parser, Subcommand};
+use log::{debug, info};
 use recipe_runner_rs::adapters::cli_subprocess::CLISubprocessAdapter;
 use recipe_runner_rs::discovery;
 use recipe_runner_rs::parser::RecipeParser;
@@ -10,7 +11,6 @@ use recipe_runner_rs::runner::{RecipeRunner, StderrListener};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use log::{debug, info};
 
 /// Exit codes for structured error reporting.
 mod exit_codes {
@@ -344,7 +344,11 @@ fn run() -> i32 {
     } else {
         Some(user_context)
     };
-    info!("run: executing recipe '{}' with {} steps", recipe.name, recipe.steps.len());
+    info!(
+        "run: executing recipe '{}' with {} steps",
+        recipe.name,
+        recipe.steps.len()
+    );
     let result = runner.execute(&recipe, ctx);
 
     // Output

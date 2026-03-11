@@ -1,3 +1,4 @@
+use log::{debug, info, warn};
 /// Agent resolver for mapping agent references to system prompt content.
 ///
 /// Resolves references like `amplihack:builder` or `amplihack:core:architect`
@@ -6,7 +7,6 @@
 use regex::Regex;
 use std::path::PathBuf;
 use std::sync::LazyLock;
-use log::{debug, info, warn};
 
 static SAFE_NAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_-]+$").unwrap());
 
@@ -45,7 +45,10 @@ pub struct AgentResolver {
 
 impl AgentResolver {
     pub fn new(search_paths: Option<Vec<PathBuf>>) -> Self {
-        debug!("AgentResolver::new: initializing with {} search path(s)", search_paths.as_ref().map(|p| p.len()).unwrap_or(0));
+        debug!(
+            "AgentResolver::new: initializing with {} search path(s)",
+            search_paths.as_ref().map(|p| p.len()).unwrap_or(0)
+        );
         Self {
             search_paths: search_paths.unwrap_or_else(default_search_paths),
         }
@@ -55,7 +58,10 @@ impl AgentResolver {
     ///
     /// Accepts `namespace:name` or `namespace:category:name` format.
     pub fn resolve(&self, agent_ref: &str) -> Result<String, AgentResolveError> {
-        debug!("AgentResolver::resolve: resolving agent_ref={:?}", agent_ref);
+        debug!(
+            "AgentResolver::resolve: resolving agent_ref={:?}",
+            agent_ref
+        );
         if !agent_ref.contains(':') {
             return Err(AgentResolveError::InvalidReference(format!(
                 "Agent reference must be in 'namespace:name' format, got: '{}'",
@@ -128,7 +134,10 @@ impl AgentResolver {
                     {
                         match std::fs::read_to_string(&full) {
                             Ok(content) => {
-                                info!("AgentResolver::resolve: found agent '{}' at {:?}", agent_ref, full);
+                                info!(
+                                    "AgentResolver::resolve: found agent '{}' at {:?}",
+                                    agent_ref, full
+                                );
                                 return Ok(content);
                             }
                             Err(_) => continue,
@@ -138,7 +147,11 @@ impl AgentResolver {
             }
         }
 
-        warn!("AgentResolver::resolve: agent '{}' not found (searched {} paths)", agent_ref, searched.len());
+        warn!(
+            "AgentResolver::resolve: agent '{}' not found (searched {} paths)",
+            agent_ref,
+            searched.len()
+        );
         Err(AgentResolveError::NotFound {
             agent_ref: agent_ref.to_string(),
             searched: format!(

@@ -89,7 +89,12 @@ impl CLISubprocessAdapter {
         system_prompt: Option<&str>,
         model: Option<&str>,
     ) -> Result<String, anyhow::Error> {
-        log::debug!("execute_agent_step_impl: prompt_len={}, has_system_prompt={}, model={:?}", prompt.len(), system_prompt.is_some(), model);
+        log::debug!(
+            "execute_agent_step_impl: prompt_len={}, has_system_prompt={}, model={:?}",
+            prompt.len(),
+            system_prompt.is_some(),
+            model
+        );
         // Use a temp directory to avoid file races with the parent session (#2758)
         let temp_dir = tempfile::tempdir()
             .with_context(|| "Failed to create temp directory for agent step")?;
@@ -213,7 +218,11 @@ impl Adapter for CLISubprocessAdapter {
         _working_dir: &str,
         model: Option<&str>,
     ) -> Result<String, anyhow::Error> {
-        log::debug!("CLISubprocessAdapter::execute_agent_step: prompt_len={}, model={:?}", prompt.len(), model);
+        log::debug!(
+            "CLISubprocessAdapter::execute_agent_step: prompt_len={}, model={:?}",
+            prompt.len(),
+            model
+        );
         self.execute_agent_step_impl(prompt, system_prompt, model)
     }
 
@@ -224,7 +233,12 @@ impl Adapter for CLISubprocessAdapter {
         timeout: Option<u64>,
         extra_env: &std::collections::HashMap<String, String>,
     ) -> Result<String, anyhow::Error> {
-        log::debug!("CLISubprocessAdapter::execute_bash_step: command_len={}, working_dir={:?}, timeout={:?}", command.len(), working_dir, timeout);
+        log::debug!(
+            "CLISubprocessAdapter::execute_bash_step: command_len={}, working_dir={:?}, timeout={:?}",
+            command.len(),
+            working_dir,
+            timeout
+        );
         let child_env = Self::build_child_env();
         let effective_dir = if working_dir.is_empty() || working_dir == "." {
             &self.working_dir

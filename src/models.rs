@@ -1,3 +1,4 @@
+use log::trace;
 /// Data models for the Recipe Runner.
 ///
 /// Defines the core data structures: steps, recipes, results, and error types.
@@ -6,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
-use log::trace;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -87,7 +87,10 @@ pub struct Step {
 impl Step {
     /// Infer the effective step type from explicit field or presence of other fields.
     pub fn effective_type(&self) -> StepType {
-        trace!("Step::effective_type: inferring type for step '{}'", self.id);
+        trace!(
+            "Step::effective_type: inferring type for step '{}'",
+            self.id
+        );
         if let Some(t) = self.step_type {
             return t;
         }
@@ -115,7 +118,10 @@ pub struct RecursionConfig {
 
 impl Default for RecursionConfig {
     fn default() -> Self {
-        trace!("RecursionConfig::default: using defaults max_depth={}, max_total_steps=200", DEFAULT_MAX_DEPTH);
+        trace!(
+            "RecursionConfig::default: using defaults max_depth={}, max_total_steps=200",
+            DEFAULT_MAX_DEPTH
+        );
         Self {
             max_depth: default_max_depth(),
             max_total_steps: default_max_total_steps(),
@@ -203,7 +209,10 @@ pub struct StepResult {
 
 impl fmt::Display for StepResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        trace!("StepResult::fmt: formatting step_id={:?}, status={:?}", self.step_id, self.status);
+        trace!(
+            "StepResult::fmt: formatting step_id={:?}, status={:?}",
+            self.step_id, self.status
+        );
         write!(f, "[{:>9}] {}", self.status, self.step_id)?;
         if let Some(d) = self.duration {
             write!(f, " ({:.1}s)", d.as_secs_f64())?;
@@ -233,7 +242,10 @@ pub struct RecipeResult {
 
 impl fmt::Display for RecipeResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        trace!("RecipeResult::fmt: formatting recipe='{}', success={}", self.recipe_name, self.success);
+        trace!(
+            "RecipeResult::fmt: formatting recipe='{}', success={}",
+            self.recipe_name, self.success
+        );
         let status = if self.success { "SUCCESS" } else { "FAILED" };
         write!(f, "Recipe '{}': {}", self.recipe_name, status)?;
         if let Some(d) = self.duration {

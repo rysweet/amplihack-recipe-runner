@@ -19,7 +19,10 @@ pub struct RecipeContext {
 
 impl RecipeContext {
     pub fn new(initial: HashMap<String, Value>) -> Self {
-        log::debug!("RecipeContext::new: initializing with {} keys", initial.len());
+        log::debug!(
+            "RecipeContext::new: initializing with {} keys",
+            initial.len()
+        );
         Self { data: initial }
     }
 
@@ -70,7 +73,10 @@ impl RecipeContext {
     /// The env var approach is immune to shell injection because values never
     /// appear in the shell source — they're passed via the process environment.
     pub fn render_shell(&self, template: &str) -> String {
-        log::debug!("RecipeContext::render_shell: template length={}", template.len());
+        log::debug!(
+            "RecipeContext::render_shell: template length={}",
+            template.len()
+        );
         TEMPLATE_RE
             .replace_all(template, |caps: &regex::Captures| {
                 let var_name = &caps[1];
@@ -83,7 +89,10 @@ impl RecipeContext {
     /// Return environment variables for all context values.
     /// Keys are prefixed with `RECIPE_VAR_` and dots replaced with `__`.
     pub fn shell_env_vars(&self) -> HashMap<String, String> {
-        log::debug!("RecipeContext::shell_env_vars: exporting {} context keys", self.data.len());
+        log::debug!(
+            "RecipeContext::shell_env_vars: exporting {} context keys",
+            self.data.len()
+        );
         let mut env = HashMap::new();
         for (key, value) in &self.data {
             let env_key = Self::env_key(key);
@@ -117,7 +126,11 @@ impl RecipeContext {
         map: &serde_json::Map<String, Value>,
         env: &mut HashMap<String, String>,
     ) {
-        log::trace!("RecipeContext::flatten_nested: prefix={:?}, keys={}", prefix, map.len());
+        log::trace!(
+            "RecipeContext::flatten_nested: prefix={:?}, keys={}",
+            prefix,
+            map.len()
+        );
         for (k, v) in map {
             let key = format!("{}__{}", prefix, k.replace('.', "__").replace('-', "_"));
             match v {
@@ -142,7 +155,10 @@ impl RecipeContext {
     ///
     /// Delegates to `condition::evaluate_condition()`.
     pub fn evaluate(&self, condition: &str) -> Result<bool, ConditionError> {
-        log::debug!("RecipeContext::evaluate: condition={:?}", crate::safe_truncate(condition, 200));
+        log::debug!(
+            "RecipeContext::evaluate: condition={:?}",
+            crate::safe_truncate(condition, 200)
+        );
         evaluate_condition(condition, &self.data)
     }
 

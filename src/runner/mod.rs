@@ -117,7 +117,11 @@ impl<A: Adapter> RecipeRunner<A> {
     }
 
     pub fn with_tags(mut self, include: Vec<String>, exclude: Vec<String>) -> Self {
-        log::debug!("RecipeRunner::with_tags: include={:?}, exclude={:?}", include, exclude);
+        log::debug!(
+            "RecipeRunner::with_tags: include={:?}, exclude={:?}",
+            include,
+            exclude
+        );
         self.active_tags = include;
         self.exclude_tags = exclude;
         self
@@ -135,7 +139,10 @@ impl<A: Adapter> RecipeRunner<A> {
         recipe: &Recipe,
         user_context: Option<HashMap<String, Value>>,
     ) -> RecipeResult {
-        info!("RecipeRunner::execute: recipe='{}', dry_run={}", recipe.name, self.dry_run);
+        info!(
+            "RecipeRunner::execute: recipe='{}', dry_run={}",
+            recipe.name, self.dry_run
+        );
         // Resolve extends (single-level inheritance) if set
         let mut recipe = recipe.clone();
         if recipe.extends.is_some()
@@ -177,7 +184,11 @@ impl<A: Adapter> RecipeRunner<A> {
         recipe: &Recipe,
         user_context: Option<HashMap<String, Value>>,
     ) -> RecipeResult {
-        info!("run_steps: recipe='{}', steps={}", recipe.name, recipe.steps.len());
+        info!(
+            "run_steps: recipe='{}', steps={}",
+            recipe.name,
+            recipe.steps.len()
+        );
         let start = Instant::now();
 
         let mut initial: HashMap<String, Value> = recipe.context.clone();
@@ -358,7 +369,11 @@ impl<A: Adapter> RecipeRunner<A> {
     }
 
     fn should_skip_by_tags(&self, step: &Step) -> bool {
-        log::debug!("should_skip_by_tags: step='{}', when_tags={:?}", step.id, step.when_tags);
+        log::debug!(
+            "should_skip_by_tags: step='{}', when_tags={:?}",
+            step.id,
+            step.when_tags
+        );
         if step.when_tags.is_empty() {
             return false;
         }
@@ -398,7 +413,11 @@ impl<A: Adapter> RecipeRunner<A> {
     }
 
     fn write_audit_entry(&self, file: &Option<std::fs::File>, result: &StepResult) {
-        log::debug!("write_audit_entry: step_id={:?}, status={:?}", result.step_id, result.status);
+        log::debug!(
+            "write_audit_entry: step_id={:?}, status={:?}",
+            result.step_id,
+            result.status
+        );
         audit::write_audit_entry(file, result);
     }
 
@@ -566,7 +585,11 @@ impl<A: Adapter> RecipeRunner<A> {
         step: &Step,
         ctx: &mut RecipeContext,
     ) -> Result<String, StepExecutionError> {
-        log::debug!("dispatch_step: step='{}', type={:?}", step.id, step.effective_type());
+        log::debug!(
+            "dispatch_step: step='{}', type={:?}",
+            step.id,
+            step.effective_type()
+        );
         let working_dir = step.working_dir.as_deref().unwrap_or(&self.working_dir);
         let st = step.effective_type();
 
@@ -624,7 +647,12 @@ impl<A: Adapter> RecipeRunner<A> {
         step: &Step,
         ctx: &mut RecipeContext,
     ) -> Result<String, StepExecutionError> {
-        log::debug!("execute_sub_recipe: step='{}', recipe={:?}, depth={}", step.id, step.recipe, self.depth.get());
+        log::debug!(
+            "execute_sub_recipe: step='{}', recipe={:?}, depth={}",
+            step.id,
+            step.recipe,
+            self.depth.get()
+        );
         let current_depth = self.depth.get();
         if current_depth >= self.max_depth.get() {
             return Err(StepExecutionError {
@@ -748,7 +776,10 @@ impl<A: Adapter> RecipeRunner<A> {
     }
 
     fn describe_sub_recipe_failure(&self, sub_result: &RecipeResult) -> String {
-        log::debug!("describe_sub_recipe_failure: recipe='{}'", sub_result.recipe_name);
+        log::debug!(
+            "describe_sub_recipe_failure: recipe='{}'",
+            sub_result.recipe_name
+        );
         let failed: Vec<String> = sub_result
             .step_results
             .iter()
@@ -797,7 +828,11 @@ impl<A: Adapter> RecipeRunner<A> {
         recipe: &Recipe,
         user_context: Option<HashMap<String, Value>>,
     ) -> RecipeResult {
-        log::debug!("execute_with_depth: recipe='{}', depth={}", recipe.name, self.depth.get());
+        log::debug!(
+            "execute_with_depth: recipe='{}', depth={}",
+            recipe.name,
+            self.depth.get()
+        );
         self.run_steps(recipe, user_context)
     }
 
@@ -857,7 +892,11 @@ impl<A: Adapter> RecipeRunner<A> {
     }
 
     fn maybe_auto_stage(&self, step: &Step) {
-        log::debug!("maybe_auto_stage: step='{}', auto_stage={:?}", step.id, step.auto_stage);
+        log::debug!(
+            "maybe_auto_stage: step='{}', auto_stage={:?}",
+            step.id,
+            step.auto_stage
+        );
         let should_stage = step.auto_stage.unwrap_or(self.auto_stage);
         if !should_stage {
             return;
@@ -953,7 +992,11 @@ impl<A: Adapter> RecipeRunner<A> {
         default_working_dir: &str,
         dry_run: bool,
     ) -> StepResult {
-        log::debug!("execute_bash_step_parallel: step='{}', dry_run={}", step.id, dry_run);
+        log::debug!(
+            "execute_bash_step_parallel: step='{}', dry_run={}",
+            step.id,
+            dry_run
+        );
         let step_start = Instant::now();
 
         if dry_run {

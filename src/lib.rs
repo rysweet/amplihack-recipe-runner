@@ -66,12 +66,12 @@ pub fn safe_tail(s: &str, max_bytes: usize) -> &str {
 // Public API convenience functions
 
 use adapters::Adapter;
+use log::{debug, info};
 use models::{Recipe, RecipeResult};
 use parser::{RecipeParser, resolve_extends};
 use runner::RecipeRunner;
 use serde_json::Value;
 use std::collections::HashMap;
-use log::{debug, info};
 
 /// Parse a YAML string into a [`Recipe`].
 ///
@@ -138,7 +138,10 @@ pub fn run_recipe_by_name<A: Adapter>(
 ///
 /// Returns [`parser::ParseError`] if the YAML cannot be parsed at all.
 pub fn validate_recipe(yaml_content: &str) -> Result<Vec<String>, parser::ParseError> {
-    debug!("validate_recipe: yaml_content length={}", yaml_content.len());
+    debug!(
+        "validate_recipe: yaml_content length={}",
+        yaml_content.len()
+    );
     let parser = RecipeParser::new();
     let recipe = parser.parse(yaml_content)?;
     Ok(parser.validate_with_yaml(&recipe, Some(yaml_content)))

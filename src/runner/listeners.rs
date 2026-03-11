@@ -35,11 +35,19 @@ impl ExecutionListener for NullListener {}
 pub struct StderrListener;
 impl ExecutionListener for StderrListener {
     fn on_step_start(&self, step_id: &str, step_type: StepType) {
-        log::debug!("StderrListener::on_step_start: step_id={:?}, type={:?}", step_id, step_type);
+        log::debug!(
+            "StderrListener::on_step_start: step_id={:?}, type={:?}",
+            step_id,
+            step_type
+        );
         eprintln!("▶ {} ({:?})", step_id, step_type);
     }
     fn on_step_complete(&self, result: &StepResult) {
-        log::debug!("StderrListener::on_step_complete: step_id={:?}, status={:?}", result.step_id, result.status);
+        log::debug!(
+            "StderrListener::on_step_complete: step_id={:?}, status={:?}",
+            result.step_id,
+            result.status
+        );
         let icon = match result.status {
             StepStatus::Completed => "✓",
             StepStatus::Skipped => "⊘",
