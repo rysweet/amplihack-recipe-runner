@@ -749,6 +749,12 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Number(na), Value::Number(nb)) => na.as_f64() == nb.as_f64(),
         (Value::Bool(ba), Value::Bool(bb)) => ba == bb,
         (Value::Null, Value::Null) => true,
+        // Cross-type number/string: coerce via compare_values so that
+        // Number(1) == String("1") is true (bash outputs are often numeric
+        // strings stored as JSON numbers after trim + parse).
+        (Value::String(_), Value::Number(_)) | (Value::Number(_), Value::String(_)) => {
+            compare_values(a, b) == Some(std::cmp::Ordering::Equal)
+        }
         _ => *a == *b,
     }
 }
