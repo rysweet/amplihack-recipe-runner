@@ -36,6 +36,7 @@ pub mod runner;
 /// ending at a valid character boundary. If the string is shorter than
 /// `max_bytes`, the full string is returned unchanged.
 pub fn safe_truncate(s: &str, max_bytes: usize) -> &str {
+    log::trace!("safe_truncate: len={}, max_bytes={}", s.len(), max_bytes);
     if s.len() <= max_bytes {
         return s;
     }
@@ -51,6 +52,7 @@ pub fn safe_truncate(s: &str, max_bytes: usize) -> &str {
 /// Returns a slice of the string comprising at most the last `max_bytes` bytes,
 /// starting at a valid character boundary.
 pub fn safe_tail(s: &str, max_bytes: usize) -> &str {
+    log::trace!("safe_tail: len={}, max_bytes={}", s.len(), max_bytes);
     if s.len() <= max_bytes {
         return s;
     }
@@ -64,6 +66,7 @@ pub fn safe_tail(s: &str, max_bytes: usize) -> &str {
 // Public API convenience functions
 
 use adapters::Adapter;
+use log::{debug, info};
 use models::{Recipe, RecipeResult};
 use parser::{RecipeParser, resolve_extends};
 use runner::RecipeRunner;
@@ -77,6 +80,7 @@ use std::collections::HashMap;
 /// Returns [`parser::ParseError`] if the YAML is malformed, exceeds the 1 MB
 /// size limit, or contains invalid step definitions.
 pub fn parse_recipe(yaml_content: &str) -> Result<Recipe, parser::ParseError> {
+    debug!("parse_recipe: yaml_content length={}", yaml_content.len());
     RecipeParser::new().parse(yaml_content)
 }
 
@@ -94,6 +98,7 @@ pub fn run_recipe<A: Adapter>(
     user_context: Option<HashMap<String, Value>>,
     dry_run: bool,
 ) -> Result<RecipeResult, parser::ParseError> {
+    info!("run_recipe: dry_run={}", dry_run);
     let mut recipe = parse_recipe(yaml_content)?;
     resolve_extends(&mut recipe, &[])?;
     let runner = RecipeRunner::new(adapter).with_dry_run(dry_run);
@@ -115,6 +120,7 @@ pub fn run_recipe_by_name<A: Adapter>(
     user_context: Option<HashMap<String, Value>>,
     dry_run: bool,
 ) -> Result<RecipeResult, Box<dyn std::error::Error>> {
+    info!("run_recipe_by_name: name={:?}, dry_run={}", name, dry_run);
     let path = discovery::find_recipe(name, None)
         .ok_or_else(|| format!("Recipe '{}' not found in any search directory", name))?;
     let mut recipe = RecipeParser::new().parse_file(&path)?;
@@ -132,6 +138,10 @@ pub fn run_recipe_by_name<A: Adapter>(
 ///
 /// Returns [`parser::ParseError`] if the YAML cannot be parsed at all.
 pub fn validate_recipe(yaml_content: &str) -> Result<Vec<String>, parser::ParseError> {
+    debug!(
+        "validate_recipe: yaml_content length={}",
+        yaml_content.len()
+    );
     let parser = RecipeParser::new();
     let recipe = parser.parse(yaml_content)?;
     Ok(parser.validate_with_yaml(&recipe, Some(yaml_content)))

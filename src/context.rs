@@ -19,11 +19,16 @@ pub struct RecipeContext {
 
 impl RecipeContext {
     pub fn new(initial: HashMap<String, Value>) -> Self {
+        log::debug!(
+            "RecipeContext::new: initializing with {} keys",
+            initial.len()
+        );
         Self { data: initial }
     }
 
     /// Retrieve a value by key, supporting dot notation for nested access.
     pub fn get(&self, key: &str) -> Option<&Value> {
+        log::trace!("RecipeContext::get: key={:?}", key);
         let parts: Vec<&str> = key.split('.').collect();
         let mut current = self.data.get(parts[0])?;
         for part in &parts[1..] {
@@ -34,12 +39,14 @@ impl RecipeContext {
 
     /// Store a value at the top level of the context.
     pub fn set(&mut self, key: &str, value: Value) {
+        log::debug!("RecipeContext::set: key={:?}", key);
         self.data.insert(key.to_string(), value);
     }
 
     /// Replace `{{var}}` placeholders with context values.
     /// Dict/array values are serialized to JSON. Missing variables become empty string.
     pub fn render(&self, template: &str) -> String {
+        log::debug!("RecipeContext::render: template length={}", template.len());
         TEMPLATE_RE
             .replace_all(template, |caps: &regex::Captures| {
                 let var_name = &caps[1];
@@ -66,6 +73,10 @@ impl RecipeContext {
     /// The env var approach is immune to shell injection because values never
     /// appear in the shell source — they're passed via the process environment.
     pub fn render_shell(&self, template: &str) -> String {
+        log::debug!(
+            "RecipeContext::render_shell: template length={}",
+            template.len()
+        );
         TEMPLATE_RE
             .replace_all(template, |caps: &regex::Captures| {
                 let var_name = &caps[1];
@@ -78,6 +89,10 @@ impl RecipeContext {
     /// Return environment variables for all context values.
     /// Keys are prefixed with `RECIPE_VAR_` and dots replaced with `__`.
     pub fn shell_env_vars(&self) -> HashMap<String, String> {
+        log::debug!(
+            "RecipeContext::shell_env_vars: exporting {} context keys",
+            self.data.len()
+        );
         let mut env = HashMap::new();
         for (key, value) in &self.data {
             let env_key = Self::env_key(key);
@@ -98,6 +113,7 @@ impl RecipeContext {
 
     /// Convert a template variable name to an env var key.
     fn env_key(var_name: &str) -> String {
+        log::trace!("RecipeContext::env_key: var_name={:?}", var_name);
         format!(
             "RECIPE_VAR_{}",
             var_name.replace('.', "__").replace('-', "_")
@@ -110,6 +126,11 @@ impl RecipeContext {
         map: &serde_json::Map<String, Value>,
         env: &mut HashMap<String, String>,
     ) {
+        log::trace!(
+            "RecipeContext::flatten_nested: prefix={:?}, keys={}",
+            prefix,
+            map.len()
+        );
         for (k, v) in map {
             let key = format!("{}__{}", prefix, k.replace('.', "__").replace('-', "_"));
             match v {
@@ -134,11 +155,16 @@ impl RecipeContext {
     ///
     /// Delegates to `condition::evaluate_condition()`.
     pub fn evaluate(&self, condition: &str) -> Result<bool, ConditionError> {
+        log::debug!(
+            "RecipeContext::evaluate: condition={:?}",
+            crate::safe_truncate(condition, 200)
+        );
         evaluate_condition(condition, &self.data)
     }
 
     /// Return a clone of the context data.
     pub fn to_map(&self) -> HashMap<String, Value> {
+        log::trace!("RecipeContext::to_map: cloning {} keys", self.data.len());
         self.data.clone()
     }
 }

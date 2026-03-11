@@ -24,6 +24,7 @@ pub struct CLISubprocessAdapter {
 
 impl CLISubprocessAdapter {
     pub fn new() -> Self {
+        log::debug!("CLISubprocessAdapter::new: creating adapter with defaults");
         Self {
             cli: "claude".to_string(),
             working_dir: ".".to_string(),
@@ -31,11 +32,13 @@ impl CLISubprocessAdapter {
     }
 
     pub fn with_binary(mut self, binary: &str) -> Self {
+        log::debug!("CLISubprocessAdapter::with_binary: binary={:?}", binary);
         self.cli = binary.to_string();
         self
     }
 
     pub fn with_working_dir(mut self, dir: &str) -> Self {
+        log::debug!("CLISubprocessAdapter::with_working_dir: dir={:?}", dir);
         self.working_dir = dir.to_string();
         self
     }
@@ -46,6 +49,7 @@ impl CLISubprocessAdapter {
     /// - Propagates session tree env vars, incrementing depth by 1.
     /// - Generates a tree ID if none exists.
     fn build_child_env() -> HashMap<String, String> {
+        log::debug!("CLISubprocessAdapter::build_child_env: building child environment");
         let mut child_env: HashMap<String, String> =
             env::vars().filter(|(k, _)| k != "CLAUDECODE").collect();
 
@@ -85,6 +89,12 @@ impl CLISubprocessAdapter {
         system_prompt: Option<&str>,
         model: Option<&str>,
     ) -> Result<String, anyhow::Error> {
+        log::debug!(
+            "execute_agent_step_impl: prompt_len={}, has_system_prompt={}, model={:?}",
+            prompt.len(),
+            system_prompt.is_some(),
+            model
+        );
         // Use a temp directory to avoid file races with the parent session (#2758)
         let temp_dir = tempfile::tempdir()
             .with_context(|| "Failed to create temp directory for agent step")?;
@@ -208,6 +218,11 @@ impl Adapter for CLISubprocessAdapter {
         _working_dir: &str,
         model: Option<&str>,
     ) -> Result<String, anyhow::Error> {
+        log::debug!(
+            "CLISubprocessAdapter::execute_agent_step: prompt_len={}, model={:?}",
+            prompt.len(),
+            model
+        );
         self.execute_agent_step_impl(prompt, system_prompt, model)
     }
 
@@ -218,6 +233,12 @@ impl Adapter for CLISubprocessAdapter {
         timeout: Option<u64>,
         extra_env: &std::collections::HashMap<String, String>,
     ) -> Result<String, anyhow::Error> {
+        log::debug!(
+            "CLISubprocessAdapter::execute_bash_step: command_len={}, working_dir={:?}, timeout={:?}",
+            command.len(),
+            working_dir,
+            timeout
+        );
         let child_env = Self::build_child_env();
         let effective_dir = if working_dir.is_empty() || working_dir == "." {
             &self.working_dir
@@ -263,10 +284,12 @@ impl Adapter for CLISubprocessAdapter {
         // Always available for bash steps. Agent steps will fail at execution
         // time if the CLI binary (e.g. `claude`) is not installed, providing
         // a clear error message for the specific step that needs it.
+        log::debug!("CLISubprocessAdapter::is_available: always true");
         true
     }
 
     fn name(&self) -> &str {
+        log::trace!("CLISubprocessAdapter::name: returning 'cli-subprocess'");
         "cli-subprocess"
     }
 }

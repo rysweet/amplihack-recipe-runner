@@ -3,6 +3,7 @@
 /// CLI interface for parsing and executing YAML-defined recipes.
 ///
 use clap::{Parser, Subcommand};
+use log::{debug, info};
 use recipe_runner_rs::adapters::cli_subprocess::CLISubprocessAdapter;
 use recipe_runner_rs::discovery;
 use recipe_runner_rs::parser::RecipeParser;
@@ -101,6 +102,7 @@ enum Commands {
 
 /// Parse a context value string, auto-detecting type.
 fn parse_context_value(raw: &str) -> Value {
+    debug!("parse_context_value: raw={:?}", raw);
     // Try JSON first (handles objects, arrays, booleans, numbers)
     if let Ok(v) = serde_json::from_str::<Value>(raw)
         && !v.is_string()
@@ -130,6 +132,7 @@ fn parse_context_value(raw: &str) -> Value {
 ///
 /// Returns `None` if there is no `=` (malformed pair).
 fn parse_context_pair(pair: &str) -> Option<(String, Value)> {
+    debug!("parse_context_pair: pair={:?}", pair);
     let (key, val) = pair.split_once('=')?;
     Some((key.to_string(), parse_context_value(val)))
 }
@@ -141,6 +144,7 @@ fn main() {
 
 fn run() -> i32 {
     let cli = Cli::parse();
+    debug!("run: starting recipe runner");
 
     // Handle subcommands
     if let Some(Commands::List { recipe_dirs }) = &cli.command {
@@ -191,6 +195,7 @@ fn run() -> i32 {
     }
 
     // Parse recipe — try as file path first, then as recipe name
+    info!("run: parsing recipe from {:?}", recipe_path);
     let parser = RecipeParser::new();
     let resolved_path;
     let recipe = if recipe_path.is_file() {
@@ -339,6 +344,11 @@ fn run() -> i32 {
     } else {
         Some(user_context)
     };
+    info!(
+        "run: executing recipe '{}' with {} steps",
+        recipe.name,
+        recipe.steps.len()
+    );
     let result = runner.execute(&recipe, ctx);
 
     // Output

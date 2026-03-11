@@ -54,6 +54,7 @@ pub struct RecipeRunner<A: Adapter> {
 
 impl<A: Adapter> RecipeRunner<A> {
     pub fn new(adapter: A) -> Self {
+        info!("RecipeRunner::new: creating runner with default settings");
         Self {
             adapter,
             agent_resolver: AgentResolver::default(),
@@ -73,48 +74,61 @@ impl<A: Adapter> RecipeRunner<A> {
     }
 
     pub fn with_working_dir(mut self, dir: &str) -> Self {
+        log::debug!("RecipeRunner::with_working_dir: dir={:?}", dir);
         self.working_dir = dir.to_string();
         self
     }
 
     pub fn with_dry_run(mut self, dry_run: bool) -> Self {
+        log::debug!("RecipeRunner::with_dry_run: dry_run={}", dry_run);
         self.dry_run = dry_run;
         self
     }
 
     pub fn with_auto_stage(mut self, auto_stage: bool) -> Self {
+        log::debug!("RecipeRunner::with_auto_stage: auto_stage={}", auto_stage);
         self.auto_stage = auto_stage;
         self
     }
 
     pub fn with_agent_resolver(mut self, resolver: AgentResolver) -> Self {
+        log::debug!("RecipeRunner::with_agent_resolver: setting custom agent resolver");
         self.agent_resolver = resolver;
         self
     }
 
     pub fn with_recipe_search_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        log::debug!("RecipeRunner::with_recipe_search_dirs: {} dirs", dirs.len());
         self.recipe_search_dirs = dirs;
         self
     }
 
     #[cfg(test)]
     pub fn with_depth(self, depth: u32) -> Self {
+        log::debug!("RecipeRunner::with_depth: depth={}", depth);
         self.depth.set(depth);
         self
     }
 
     pub fn with_audit_dir(mut self, dir: PathBuf) -> Self {
+        log::debug!("RecipeRunner::with_audit_dir: dir={:?}", dir);
         self.audit_dir = Some(dir);
         self
     }
 
     pub fn with_tags(mut self, include: Vec<String>, exclude: Vec<String>) -> Self {
+        log::debug!(
+            "RecipeRunner::with_tags: include={:?}, exclude={:?}",
+            include,
+            exclude
+        );
         self.active_tags = include;
         self.exclude_tags = exclude;
         self
     }
 
     pub fn with_listener(mut self, listener: Box<dyn ExecutionListener>) -> Self {
+        log::debug!("RecipeRunner::with_listener: setting custom execution listener");
         self.listener = listener;
         self
     }
@@ -125,6 +139,10 @@ impl<A: Adapter> RecipeRunner<A> {
         recipe: &Recipe,
         user_context: Option<HashMap<String, Value>>,
     ) -> RecipeResult {
+        info!(
+            "RecipeRunner::execute: recipe='{}', dry_run={}",
+            recipe.name, self.dry_run
+        );
         // Resolve extends (single-level inheritance) if set
         let mut recipe = recipe.clone();
         if recipe.extends.is_some()
@@ -166,6 +184,11 @@ impl<A: Adapter> RecipeRunner<A> {
         recipe: &Recipe,
         user_context: Option<HashMap<String, Value>>,
     ) -> RecipeResult {
+        info!(
+            "run_steps: recipe='{}', steps={}",
+            recipe.name,
+            recipe.steps.len()
+        );
         let start = Instant::now();
 
         let mut initial: HashMap<String, Value> = recipe.context.clone();
@@ -346,6 +369,11 @@ impl<A: Adapter> RecipeRunner<A> {
     }
 
     fn should_skip_by_tags(&self, step: &Step) -> bool {
+        log::debug!(
+            "should_skip_by_tags: step='{}', when_tags={:?}",
+            step.id,
+            step.when_tags
+        );
         if step.when_tags.is_empty() {
             return false;
         }
@@ -379,11 +407,17 @@ impl<A: Adapter> RecipeRunner<A> {
     }
 
     fn open_audit_log(&self, recipe_name: &str) -> Option<std::fs::File> {
+        log::debug!("open_audit_log: recipe_name={:?}", recipe_name);
         let dir = self.audit_dir.as_ref()?;
         audit::open_audit_log(dir, recipe_name)
     }
 
     fn write_audit_entry(&self, file: &Option<std::fs::File>, result: &StepResult) {
+        log::debug!(
+            "write_audit_entry: step_id={:?}, status={:?}",
+            result.step_id,
+            result.status
+        );
         audit::write_audit_entry(file, result);
     }
 
@@ -551,6 +585,11 @@ impl<A: Adapter> RecipeRunner<A> {
         step: &Step,
         ctx: &mut RecipeContext,
     ) -> Result<String, StepExecutionError> {
+        log::debug!(
+            "dispatch_step: step='{}', type={:?}",
+            step.id,
+            step.effective_type()
+        );
         let working_dir = step.working_dir.as_deref().unwrap_or(&self.working_dir);
         let st = step.effective_type();
 
@@ -609,6 +648,12 @@ impl<A: Adapter> RecipeRunner<A> {
         step: &Step,
         ctx: &mut RecipeContext,
     ) -> Result<String, StepExecutionError> {
+        log::debug!(
+            "execute_sub_recipe: step='{}', recipe={:?}, depth={}",
+            step.id,
+            step.recipe,
+            self.depth.get()
+        );
         let current_depth = self.depth.get();
         if current_depth >= self.max_depth.get() {
             return Err(StepExecutionError {
@@ -732,6 +777,10 @@ impl<A: Adapter> RecipeRunner<A> {
     }
 
     fn describe_sub_recipe_failure(&self, sub_result: &RecipeResult) -> String {
+        log::debug!(
+            "describe_sub_recipe_failure: recipe='{}'",
+            sub_result.recipe_name
+        );
         let failed: Vec<String> = sub_result
             .step_results
             .iter()
@@ -780,10 +829,16 @@ impl<A: Adapter> RecipeRunner<A> {
         recipe: &Recipe,
         user_context: Option<HashMap<String, Value>>,
     ) -> RecipeResult {
+        log::debug!(
+            "execute_with_depth: recipe='{}', depth={}",
+            recipe.name,
+            self.depth.get()
+        );
         self.run_steps(recipe, user_context)
     }
 
     fn find_recipe_path(&self, name: &str) -> Option<String> {
+        log::debug!("find_recipe_path: name={:?}", name);
         // First try discovery module
         if !self.recipe_search_dirs.is_empty()
             && let Some(path) = discovery::find_recipe(name, Some(&self.recipe_search_dirs))
@@ -807,6 +862,7 @@ impl<A: Adapter> RecipeRunner<A> {
 
     /// Retry an agent step with an explicit JSON-only instruction.
     fn retry_for_json(&self, step: &Step, ctx: &mut RecipeContext) -> Option<String> {
+        log::debug!("retry_for_json: step='{}'", step.id);
         if step.effective_type() != StepType::Agent {
             return None; // Can't retry bash steps with different prompts
         }
@@ -837,6 +893,11 @@ impl<A: Adapter> RecipeRunner<A> {
     }
 
     fn maybe_auto_stage(&self, step: &Step) {
+        log::debug!(
+            "maybe_auto_stage: step='{}', auto_stage={:?}",
+            step.id,
+            step.auto_stage
+        );
         let should_stage = step.auto_stage.unwrap_or(self.auto_stage);
         if !should_stage {
             return;
@@ -861,6 +922,7 @@ impl<A: Adapter> RecipeRunner<A> {
         ctx: &RecipeContext,
         _listener: &dyn ExecutionListener,
     ) -> Vec<StepResult> {
+        log::debug!("execute_parallel_group: {} steps", steps.len());
         if steps.len() > MAX_PARALLEL_STEPS {
             warn!(
                 "Parallel group has {} steps (limit {}); excess steps will run sequentially",
@@ -931,6 +993,11 @@ impl<A: Adapter> RecipeRunner<A> {
         default_working_dir: &str,
         dry_run: bool,
     ) -> StepResult {
+        log::debug!(
+            "execute_bash_step_parallel: step='{}', dry_run={}",
+            step.id,
+            dry_run
+        );
         let step_start = Instant::now();
 
         if dry_run {
@@ -1024,6 +1091,7 @@ impl<A: Adapter> RecipeRunner<A> {
 }
 
 fn git_stage_all(working_dir: &str) -> Option<String> {
+    log::debug!("git_stage_all: working_dir={:?}", working_dir);
     let result = Command::new("git")
         .args(["add", "-A"])
         .current_dir(working_dir)

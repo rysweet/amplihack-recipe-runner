@@ -4,6 +4,7 @@
 /// and step-type inference.
 use crate::discovery;
 use crate::models::{Recipe, StepType};
+use log::{debug, info};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -73,11 +74,13 @@ pub struct RecipeParser;
 
 impl RecipeParser {
     pub fn new() -> Self {
+        debug!("RecipeParser::new: creating parser instance");
         Self
     }
 
     /// Parse a recipe YAML file from disk.
     pub fn parse_file(&self, path: &Path) -> Result<Recipe, ParseError> {
+        info!("RecipeParser::parse_file: parsing {:?}", path);
         if !path.is_file() {
             return Err(ParseError::FileNotFound(path.display().to_string()));
         }
@@ -97,6 +100,10 @@ impl RecipeParser {
 
     /// Parse a YAML string into a Recipe.
     pub fn parse(&self, yaml_content: &str) -> Result<Recipe, ParseError> {
+        debug!(
+            "RecipeParser::parse: parsing {} bytes of YAML",
+            yaml_content.len()
+        );
         if yaml_content.len() > MAX_YAML_SIZE_BYTES {
             return Err(ParseError::FileTooLarge {
                 size: yaml_content.len(),
@@ -139,11 +146,20 @@ impl RecipeParser {
 
     /// Validate a parsed recipe and return a list of warning strings.
     pub fn validate(&self, recipe: &Recipe) -> Vec<String> {
+        debug!(
+            "RecipeParser::validate: validating recipe '{}'",
+            recipe.name
+        );
         self.validate_with_yaml(recipe, None)
     }
 
     /// Validate a parsed recipe with optional raw YAML for field checking.
     pub fn validate_with_yaml(&self, recipe: &Recipe, raw_yaml: Option<&str>) -> Vec<String> {
+        debug!(
+            "RecipeParser::validate_with_yaml: validating recipe '{}' ({} steps)",
+            recipe.name,
+            recipe.steps.len()
+        );
         let mut warnings = Vec::new();
 
         for step in &recipe.steps {
@@ -243,6 +259,10 @@ impl Default for RecipeParser {
 ///
 /// Only single-level inheritance is supported (parent's `extends` is ignored).
 pub fn resolve_extends(recipe: &mut Recipe, search_dirs: &[PathBuf]) -> Result<(), ParseError> {
+    info!(
+        "resolve_extends: resolving extends for recipe '{}'",
+        recipe.name
+    );
     resolve_extends_with_visited(recipe, search_dirs, &mut HashSet::new())
 }
 
@@ -251,6 +271,10 @@ fn resolve_extends_with_visited(
     search_dirs: &[PathBuf],
     visited: &mut HashSet<String>,
 ) -> Result<(), ParseError> {
+    debug!(
+        "resolve_extends_with_visited: processing recipe '{}', visited={:?}",
+        recipe.name, visited
+    );
     let parent_name = match recipe.extends.take() {
         Some(name) => name,
         None => return Ok(()),
@@ -314,6 +338,10 @@ fn resolve_extends_with_visited(
         recipe.hooks.on_error = parent.hooks.on_error;
     }
 
+    debug!(
+        "resolve_extends_with_visited: extends for '{}' resolved successfully",
+        recipe.name
+    );
     Ok(())
 }
 

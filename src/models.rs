@@ -1,3 +1,4 @@
+use log::trace;
 /// Data models for the Recipe Runner.
 ///
 /// Defines the core data structures: steps, recipes, results, and error types.
@@ -28,6 +29,7 @@ pub enum StepStatus {
 
 impl fmt::Display for StepStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        trace!("StepStatus::fmt: formatting {:?}", self);
         let s = match self {
             StepStatus::Pending => "pending",
             StepStatus::Running => "running",
@@ -85,6 +87,10 @@ pub struct Step {
 impl Step {
     /// Infer the effective step type from explicit field or presence of other fields.
     pub fn effective_type(&self) -> StepType {
+        trace!(
+            "Step::effective_type: inferring type for step '{}'",
+            self.id
+        );
         if let Some(t) = self.step_type {
             return t;
         }
@@ -112,6 +118,10 @@ pub struct RecursionConfig {
 
 impl Default for RecursionConfig {
     fn default() -> Self {
+        trace!(
+            "RecursionConfig::default: using defaults max_depth={}, max_total_steps=200",
+            DEFAULT_MAX_DEPTH
+        );
         Self {
             max_depth: default_max_depth(),
             max_total_steps: default_max_total_steps(),
@@ -175,6 +185,7 @@ fn serialize_duration_secs<S>(duration: &Option<Duration>, serializer: S) -> Res
 where
     S: serde::Serializer,
 {
+    trace!("serialize_duration_secs: duration={:?}", duration);
     match duration {
         Some(d) => serializer.serialize_f64(d.as_secs_f64()),
         None => serializer.serialize_none(),
@@ -198,6 +209,10 @@ pub struct StepResult {
 
 impl fmt::Display for StepResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        trace!(
+            "StepResult::fmt: formatting step_id={:?}, status={:?}",
+            self.step_id, self.status
+        );
         write!(f, "[{:>9}] {}", self.status, self.step_id)?;
         if let Some(d) = self.duration {
             write!(f, " ({:.1}s)", d.as_secs_f64())?;
@@ -227,6 +242,10 @@ pub struct RecipeResult {
 
 impl fmt::Display for RecipeResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        trace!(
+            "RecipeResult::fmt: formatting recipe='{}', success={}",
+            self.recipe_name, self.success
+        );
         let status = if self.success { "SUCCESS" } else { "FAILED" };
         write!(f, "Recipe '{}': {}", self.recipe_name, status)?;
         if let Some(d) = self.duration {

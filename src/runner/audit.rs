@@ -14,6 +14,11 @@ use std::path::Path;
 /// Returns `None` if no audit directory is configured or if the file cannot
 /// be created. On Unix, the file is created with mode `0600` (owner-only).
 pub fn open_audit_log(audit_dir: &Path, recipe_name: &str) -> Option<std::fs::File> {
+    log::debug!(
+        "open_audit_log: audit_dir={:?}, recipe_name={:?}",
+        audit_dir,
+        recipe_name
+    );
     if let Err(e) = std::fs::create_dir_all(audit_dir) {
         warn!("Failed to create audit log directory: {}", e);
         return None;
@@ -41,6 +46,11 @@ pub fn open_audit_log(audit_dir: &Path, recipe_name: &str) -> Option<std::fs::Fi
 
 /// Write a step result as a single JSONL line to the audit log.
 pub fn write_audit_entry(file: &Option<std::fs::File>, result: &StepResult) {
+    log::debug!(
+        "write_audit_entry: step_id={:?}, status={:?}",
+        result.step_id,
+        result.status
+    );
     if let Some(mut f) = file.as_ref().and_then(|f| f.try_clone().ok()) {
         let entry = serde_json::json!({
             "step_id": result.step_id,
