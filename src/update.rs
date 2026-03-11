@@ -111,10 +111,7 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
         .build()
         .get(url)
         .set("Accept", "application/vnd.github+json")
-        .set(
-            "User-Agent",
-            &format!("recipe-runner-rs/{CURRENT_VERSION}"),
-        )
+        .set("User-Agent", &format!("recipe-runner-rs/{CURRENT_VERSION}"))
         .call()
     {
         Ok(response) => response,
@@ -183,11 +180,8 @@ fn supported_release_target() -> Option<&'static str> {
 }
 
 fn required_release_target() -> Result<&'static str> {
-    supported_release_target().ok_or_else(|| {
-        anyhow!(
-            "self-update is only supported on linux/macos (x86_64 and aarch64)"
-        )
-    })
+    supported_release_target()
+        .ok_or_else(|| anyhow!("self-update is only supported on linux/macos (x86_64 and aarch64)"))
 }
 
 fn expected_archive_name() -> Result<String> {
@@ -274,9 +268,7 @@ fn download_and_replace(release: &UpdateRelease) -> Result<()> {
         if !expected_hex.is_empty() {
             let actual_hex = hex::encode(Sha256::digest(&archive_bytes));
             if actual_hex != expected_hex {
-                bail!(
-                    "SHA256 mismatch: expected {expected_hex}, got {actual_hex}"
-                );
+                bail!("SHA256 mismatch: expected {expected_hex}, got {actual_hex}");
             }
             println!("SHA256 verified.");
         }
@@ -321,9 +313,7 @@ fn find_binary(root: &Path, binary_name: &str) -> Result<PathBuf> {
         let entries = fs::read_dir(root).ok()?;
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file()
-                && path.file_name() == Some(std::ffi::OsStr::new(binary_name))
-            {
+            if path.is_file() && path.file_name() == Some(std::ffi::OsStr::new(binary_name)) {
                 return Some(path);
             }
             if path.is_dir()
@@ -423,7 +413,8 @@ mod tests {
         let path = cache_path_from_home(temp.path());
         assert_eq!(
             path,
-            temp.path().join(".config/recipe-runner-rs/last_update_check")
+            temp.path()
+                .join(".config/recipe-runner-rs/last_update_check")
         );
     }
 

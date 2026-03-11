@@ -148,9 +148,7 @@ fn main() {
 
 fn run() -> i32 {
     // Non-blocking startup update check (respects 24h cooldown)
-    update::maybe_print_update_notice_from_args(
-        &std::env::args_os().collect::<Vec<_>>(),
-    );
+    update::maybe_print_update_notice_from_args(&std::env::args_os().collect::<Vec<_>>());
 
     let cli = Cli::parse();
     debug!("run: starting recipe runner");
