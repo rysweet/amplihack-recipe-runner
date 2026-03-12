@@ -900,12 +900,11 @@ mod tests {
 
         // The execute-single-round-1 condition
         let cond = "('Development' in task_type or 'Investigation' in task_type) and ((workstream_count == '1' or workstream_count == '') or force_single_workstream == 'true')";
-        assert_eq!(evaluate_condition(cond, &data).unwrap(), true);
+        assert!(evaluate_condition(cond, &data).unwrap());
     }
 
     #[test]
     fn test_force_single_workstream_blocks_parallel() {
-        // The create-workstreams-config condition should be false when force_single_workstream is true
         let data = ctx(&[
             ("task_type", json!("Development")),
             ("workstream_count", json!(2)),
@@ -914,12 +913,11 @@ mod tests {
         ]);
 
         let cond = "('Development' in task_type or 'Investigation' in task_type) and workstream_count != '1' and workstream_count != '' and 'ALLOWED' in recursion_guard and force_single_workstream != 'true'";
-        assert_eq!(evaluate_condition(cond, &data).unwrap(), false);
+        assert!(!evaluate_condition(cond, &data).unwrap());
     }
 
     #[test]
     fn test_force_single_workstream_false_allows_parallel() {
-        // When force_single_workstream is "false" (string from YAML default), parallel should work
         let data = ctx(&[
             ("task_type", json!("Development")),
             ("workstream_count", json!(2)),
@@ -928,7 +926,7 @@ mod tests {
         ]);
 
         let cond = "('Development' in task_type or 'Investigation' in task_type) and workstream_count != '1' and workstream_count != '' and 'ALLOWED' in recursion_guard and force_single_workstream != 'true'";
-        assert_eq!(evaluate_condition(cond, &data).unwrap(), true);
+        assert!(evaluate_condition(cond, &data).unwrap());
     }
 
     // -- Basic condition tests --
