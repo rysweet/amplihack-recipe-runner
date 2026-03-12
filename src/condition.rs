@@ -746,12 +746,33 @@ fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Value::Number(na), Value::Number(nb)) => na.as_f64()?.partial_cmp(&nb.as_f64()?),
         (Value::String(sa), Value::String(sb)) => Some(sa.cmp(sb)),
+        (Value::Bool(ba), Value::Bool(bb)) => Some(ba.cmp(bb)),
         // Cross-type: try numeric coercion
         (Value::String(s), Value::Number(n)) => {
             s.trim().parse::<f64>().ok()?.partial_cmp(&n.as_f64()?)
         }
         (Value::Number(n), Value::String(s)) => {
             n.as_f64()?.partial_cmp(&s.trim().parse::<f64>().ok()?)
+        }
+        // Cross-type Bool/String: coerce bool to string then compare.
+        // Matches the coercion in values_equal (see issue #3069).
+        // false < true, "false" < "true" (lexicographic), so this is consistent.
+        (Value::Bool(b_val), Value::String(s)) => {
+            let b_str = if *b_val { "true" } else { "false" };
+            Some(b_str.cmp(s.as_str()))
+        }
+        (Value::String(s), Value::Bool(b_val)) => {
+            let b_str = if *b_val { "true" } else { "false" };
+            Some(s.as_str().cmp(b_str))
+        }
+        // Cross-type Bool/Number: false=0, true=1
+        (Value::Bool(b_val), Value::Number(n)) => {
+            let b_num = if *b_val { 1.0 } else { 0.0 };
+            b_num.partial_cmp(&n.as_f64()?)
+        }
+        (Value::Number(n), Value::Bool(b_val)) => {
+            let b_num = if *b_val { 1.0 } else { 0.0 };
+            n.as_f64()?.partial_cmp(&b_num)
         }
         _ => None,
     }
@@ -938,5 +959,32 @@ mod tests {
         assert!(evaluate_condition("a == 'x' and b == 'y'", &data).unwrap());
         assert!(evaluate_condition("a == 'x' or b == 'z'", &data).unwrap());
         assert!(!evaluate_condition("a == 'z' and b == 'y'", &data).unwrap());
+    }
+
+    #[test]
+    fn test_compare_values_bool_string_ordering() {
+        let data = ctx(&[("flag", json!(true)), ("off", json!(false))]);
+        assert!(evaluate_condition("flag >= 'true'", &data).unwrap());
+        assert!(evaluate_condition("off <= 'false'", &data).unwrap());
+        assert!(evaluate_condition("flag > 'false'", &data).unwrap());
+        assert!(evaluate_condition("off < 'true'", &data).unwrap());
+    }
+
+    #[test]
+    fn test_compare_values_bool_number_ordering() {
+        let data = ctx(&[("flag", json!(true)), ("off", json!(false))]);
+        assert!(evaluate_condition("flag >= 1", &data).unwrap());
+        assert!(evaluate_condition("off <= 0", &data).unwrap());
+        assert!(evaluate_condition("flag > 0", &data).unwrap());
+        assert!(!evaluate_condition("off > 0", &data).unwrap());
+    }
+
+    #[test]
+    fn test_compare_values_bool_bool_ordering() {
+        let data = ctx(&[("a", json!(true)), ("b", json!(false))]);
+        assert!(evaluate_condition("a > b", &data).unwrap());
+        assert!(evaluate_condition("b < a", &data).unwrap());
+        assert!(evaluate_condition("a >= a", &data).unwrap());
+        assert!(evaluate_condition("b <= b", &data).unwrap());
     }
 }
