@@ -820,7 +820,10 @@ mod tests {
     use serde_json::json;
 
     fn ctx(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
     }
 
     // -- Bool/String cross-type equality (issue #3069) --
@@ -870,7 +873,7 @@ mod tests {
         let data = ctx(&[
             ("task_type", json!("Development")),
             ("workstream_count", json!(2)),
-            ("force_single_workstream", json!(true)),  // CLI sets this as Bool
+            ("force_single_workstream", json!(true)), // CLI sets this as Bool
             ("recursion_guard", json!("")),
         ]);
 
