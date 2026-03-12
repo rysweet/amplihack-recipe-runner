@@ -771,6 +771,19 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::String(_), Value::Number(_)) | (Value::Number(_), Value::String(_)) => {
             compare_values(a, b) == Some(std::cmp::Ordering::Equal)
         }
+        // Cross-type bool/string: coerce so that Bool(true) == String("true")
+        // and Bool(false) == String("false"). CLI --set parses "true"/"false"
+        // as Value::Bool, but recipe YAML contexts and conditions use quoted
+        // string literals like 'true'. Without this coercion, conditions like
+        // `force_single_workstream == 'true'` fail when the context variable
+        // was set via --set (which stores it as Bool). See issue #3069.
+        (Value::Bool(b_val), Value::String(s)) | (Value::String(s), Value::Bool(b_val)) => {
+            match s.as_str() {
+                "true" | "True" => *b_val,
+                "false" | "False" => !*b_val,
+                _ => false,
+            }
+        }
         _ => *a == *b,
     }
 }
@@ -798,5 +811,132 @@ fn is_truthy(val: &Value) -> bool {
         Value::String(s) => !s.is_empty(),
         Value::Array(a) => !a.is_empty(),
         Value::Object(o) => !o.is_empty(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ctx(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    // -- Bool/String cross-type equality (issue #3069) --
+
+    #[test]
+    fn test_bool_true_equals_string_true() {
+        assert!(values_equal(&json!(true), &json!("true")));
+        assert!(values_equal(&json!("true"), &json!(true)));
+    }
+
+    #[test]
+    fn test_bool_false_equals_string_false() {
+        assert!(values_equal(&json!(false), &json!("false")));
+        assert!(values_equal(&json!("false"), &json!(false)));
+    }
+
+    #[test]
+    fn test_bool_true_not_equals_string_false() {
+        assert!(!values_equal(&json!(true), &json!("false")));
+        assert!(!values_equal(&json!("false"), &json!(true)));
+    }
+
+    #[test]
+    fn test_bool_false_not_equals_string_true() {
+        assert!(!values_equal(&json!(false), &json!("true")));
+        assert!(!values_equal(&json!("true"), &json!(false)));
+    }
+
+    #[test]
+    fn test_bool_not_equals_arbitrary_string() {
+        assert!(!values_equal(&json!(true), &json!("yes")));
+        assert!(!values_equal(&json!(false), &json!("no")));
+    }
+
+    #[test]
+    fn test_bool_true_equals_string_true_capitalized() {
+        assert!(values_equal(&json!(true), &json!("True")));
+        assert!(values_equal(&json!("True"), &json!(true)));
+    }
+
+    // -- Condition evaluation with Bool/String coercion (issue #3069) --
+
+    #[test]
+    fn test_force_single_workstream_condition() {
+        // Reproduces issue #3069: force_single_workstream set via --set as Bool(true)
+        // but condition compares against string literal 'true'.
+        let data = ctx(&[
+            ("task_type", json!("Development")),
+            ("workstream_count", json!(2)),
+            ("force_single_workstream", json!(true)), // CLI sets this as Bool
+            ("recursion_guard", json!("")),
+        ]);
+
+        // The execute-single-round-1 condition
+        let cond = "('Development' in task_type or 'Investigation' in task_type) and ((workstream_count == '1' or workstream_count == '') or force_single_workstream == 'true')";
+        assert_eq!(evaluate_condition(cond, &data).unwrap(), true);
+    }
+
+    #[test]
+    fn test_force_single_workstream_blocks_parallel() {
+        // The create-workstreams-config condition should be false when force_single_workstream is true
+        let data = ctx(&[
+            ("task_type", json!("Development")),
+            ("workstream_count", json!(2)),
+            ("force_single_workstream", json!(true)),
+            ("recursion_guard", json!("ALLOWED")),
+        ]);
+
+        let cond = "('Development' in task_type or 'Investigation' in task_type) and workstream_count != '1' and workstream_count != '' and 'ALLOWED' in recursion_guard and force_single_workstream != 'true'";
+        assert_eq!(evaluate_condition(cond, &data).unwrap(), false);
+    }
+
+    #[test]
+    fn test_force_single_workstream_false_allows_parallel() {
+        // When force_single_workstream is "false" (string from YAML default), parallel should work
+        let data = ctx(&[
+            ("task_type", json!("Development")),
+            ("workstream_count", json!(2)),
+            ("force_single_workstream", json!("false")),
+            ("recursion_guard", json!("ALLOWED")),
+        ]);
+
+        let cond = "('Development' in task_type or 'Investigation' in task_type) and workstream_count != '1' and workstream_count != '' and 'ALLOWED' in recursion_guard and force_single_workstream != 'true'";
+        assert_eq!(evaluate_condition(cond, &data).unwrap(), true);
+    }
+
+    // -- Basic condition tests --
+
+    #[test]
+    fn test_string_equality() {
+        let data = ctx(&[("status", json!("ok"))]);
+        assert!(evaluate_condition("status == 'ok'", &data).unwrap());
+        assert!(!evaluate_condition("status == 'fail'", &data).unwrap());
+    }
+
+    #[test]
+    fn test_number_string_cross_type() {
+        let data = ctx(&[("count", json!(1))]);
+        assert!(evaluate_condition("count == '1'", &data).unwrap());
+    }
+
+    #[test]
+    fn test_in_operator() {
+        let data = ctx(&[("task_type", json!("Development"))]);
+        assert!(evaluate_condition("'Development' in task_type", &data).unwrap());
+        assert!(!evaluate_condition("'Q&A' in task_type", &data).unwrap());
+    }
+
+    #[test]
+    fn test_boolean_and_or() {
+        let data = ctx(&[("a", json!("x")), ("b", json!("y"))]);
+        assert!(evaluate_condition("a == 'x' and b == 'y'", &data).unwrap());
+        assert!(evaluate_condition("a == 'x' or b == 'z'", &data).unwrap());
+        assert!(!evaluate_condition("a == 'z' and b == 'y'", &data).unwrap());
     }
 }
