@@ -1,4 +1,5 @@
-/// CLI subprocess adapter — executes agent steps by spawning `claude -p` subprocesses
+/// CLI subprocess adapter — executes agent steps by spawning agent CLI subprocesses
+/// (configurable via `--agent-binary` or `AMPLIHACK_AGENT_BINARY` env var, defaults to `claude`)
 /// and bash steps via `/bin/bash -c`.
 ///
 /// Agent steps use a temporary working directory to prevent file write races
@@ -10,8 +11,8 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const NON_INTERACTIVE_FOOTER: &str = "\n\nIMPORTANT: Proceed autonomously. Do not ask questions. \
@@ -24,9 +25,14 @@ pub struct CLISubprocessAdapter {
 
 impl CLISubprocessAdapter {
     pub fn new() -> Self {
-        log::debug!("CLISubprocessAdapter::new: creating adapter with defaults");
+        // Use AMPLIHACK_AGENT_BINARY env var if set, otherwise default to "claude"
+        let cli = env::var("AMPLIHACK_AGENT_BINARY").unwrap_or_else(|_| "claude".to_string());
+        log::debug!(
+            "CLISubprocessAdapter::new: creating adapter with cli={:?}",
+            cli
+        );
         Self {
-            cli: "claude".to_string(),
+            cli,
             working_dir: ".".to_string(),
         }
     }
@@ -297,12 +303,40 @@ impl Adapter for CLISubprocessAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Mutex to serialize tests that mutate AMPLIHACK_AGENT_BINARY env var.
+    // Rust runs tests in parallel by default; without this, env var mutations race.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn test_new_defaults() {
+    fn test_new_defaults_without_env() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved = env::var("AMPLIHACK_AGENT_BINARY").ok();
+        env::remove_var("AMPLIHACK_AGENT_BINARY");
+
         let adapter = CLISubprocessAdapter::new();
         assert_eq!(adapter.cli, "claude");
         assert_eq!(adapter.working_dir, ".");
+
+        if let Some(val) = saved {
+            env::set_var("AMPLIHACK_AGENT_BINARY", val);
+        }
+    }
+
+    #[test]
+    fn test_new_reads_env_var() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved = env::var("AMPLIHACK_AGENT_BINARY").ok();
+        env::set_var("AMPLIHACK_AGENT_BINARY", "copilot");
+
+        let adapter = CLISubprocessAdapter::new();
+        assert_eq!(adapter.cli, "copilot");
+
+        env::remove_var("AMPLIHACK_AGENT_BINARY");
+        if let Some(val) = saved {
+            env::set_var("AMPLIHACK_AGENT_BINARY", val);
+        }
     }
 
     #[test]
@@ -319,9 +353,17 @@ mod tests {
 
     #[test]
     fn test_default_impl() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved = env::var("AMPLIHACK_AGENT_BINARY").ok();
+        env::remove_var("AMPLIHACK_AGENT_BINARY");
+
         let adapter = CLISubprocessAdapter::default();
         assert_eq!(adapter.cli, "claude");
         assert_eq!(adapter.working_dir, ".");
+
+        if let Some(val) = saved {
+            env::set_var("AMPLIHACK_AGENT_BINARY", val);
+        }
     }
 
     #[test]
