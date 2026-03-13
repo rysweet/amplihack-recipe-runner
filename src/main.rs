@@ -90,6 +90,11 @@ struct Cli {
     /// Directory for JSONL audit logs
     #[arg(long)]
     audit_dir: Option<PathBuf>,
+
+    /// Agent binary to use for agent steps (e.g., claude, copilot, codex).
+    /// Falls back to AMPLIHACK_AGENT_BINARY env var, then "claude".
+    #[arg(long)]
+    agent_binary: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -337,7 +342,10 @@ fn run() -> i32 {
     }
 
     // Build runner
-    let adapter = CLISubprocessAdapter::new();
+    let mut adapter = CLISubprocessAdapter::new();
+    if let Some(ref binary) = cli.agent_binary {
+        adapter = adapter.with_binary(binary);
+    }
     let mut runner = RecipeRunner::new(adapter)
         .with_working_dir(&cli.working_dir)
         .with_dry_run(cli.dry_run)
