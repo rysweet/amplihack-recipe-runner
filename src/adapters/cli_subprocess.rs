@@ -306,37 +306,49 @@ mod tests {
     use std::sync::Mutex;
 
     // Mutex to serialize tests that mutate AMPLIHACK_AGENT_BINARY env var.
-    // Rust runs tests in parallel by default; without this, env var mutations race.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// RAII guard that restores an env var on drop (even during panic unwinding).
+    struct EnvGuard {
+        key: &'static str,
+        saved: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn new(key: &'static str) -> Self {
+            let saved = env::var(key).ok();
+            Self { key, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            env::remove_var(self.key);
+            if let Some(val) = self.saved.take() {
+                env::set_var(self.key, val);
+            }
+        }
+    }
 
     #[test]
     fn test_new_defaults_without_env() {
         let _lock = ENV_MUTEX.lock().unwrap();
-        let saved = env::var("AMPLIHACK_AGENT_BINARY").ok();
+        let _guard = EnvGuard::new("AMPLIHACK_AGENT_BINARY");
         env::remove_var("AMPLIHACK_AGENT_BINARY");
 
         let adapter = CLISubprocessAdapter::new();
         assert_eq!(adapter.cli, "claude");
         assert_eq!(adapter.working_dir, ".");
-
-        if let Some(val) = saved {
-            env::set_var("AMPLIHACK_AGENT_BINARY", val);
-        }
     }
 
     #[test]
     fn test_new_reads_env_var() {
         let _lock = ENV_MUTEX.lock().unwrap();
-        let saved = env::var("AMPLIHACK_AGENT_BINARY").ok();
+        let _guard = EnvGuard::new("AMPLIHACK_AGENT_BINARY");
         env::set_var("AMPLIHACK_AGENT_BINARY", "copilot");
 
         let adapter = CLISubprocessAdapter::new();
         assert_eq!(adapter.cli, "copilot");
-
-        env::remove_var("AMPLIHACK_AGENT_BINARY");
-        if let Some(val) = saved {
-            env::set_var("AMPLIHACK_AGENT_BINARY", val);
-        }
     }
 
     #[test]
@@ -354,16 +366,12 @@ mod tests {
     #[test]
     fn test_default_impl() {
         let _lock = ENV_MUTEX.lock().unwrap();
-        let saved = env::var("AMPLIHACK_AGENT_BINARY").ok();
+        let _guard = EnvGuard::new("AMPLIHACK_AGENT_BINARY");
         env::remove_var("AMPLIHACK_AGENT_BINARY");
 
         let adapter = CLISubprocessAdapter::default();
         assert_eq!(adapter.cli, "claude");
         assert_eq!(adapter.working_dir, ".");
-
-        if let Some(val) = saved {
-            env::set_var("AMPLIHACK_AGENT_BINARY", val);
-        }
     }
 
     #[test]
