@@ -11,6 +11,14 @@ use std::sync::LazyLock;
 static TEMPLATE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\{\{([a-zA-Z0-9_.\-]+)\}\}").unwrap());
 
+/// Matches heredoc start markers: <<WORD, <<-WORD, <<'WORD', <<"WORD"
+/// Cannot use backreferences in Rust regex, so we match each quote style
+/// as separate alternatives.
+/// Group 1 = single-quoted delimiter, Group 2 = double-quoted, Group 3 = unquoted
+static HEREDOC_START_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<<-?\s*(?:'([A-Za-z_]\w*)'|"([A-Za-z_]\w*)"|([A-Za-z_]\w*))"#).unwrap()
+});
+
 /// Mutable context that accumulates step outputs and renders templates.
 #[derive(Debug, Clone)]
 pub struct RecipeContext {
@@ -66,9 +74,17 @@ impl RecipeContext {
     /// Replace `{{var}}` placeholders with env var references for bash steps.
     ///
     /// Instead of inlining values into shell source (which breaks on single
-    /// quotes, parentheses, and other shell metacharacters), this method:
-    /// 1. Replaces `{{var}}` with `"$RECIPE_VAR_var"` (double-quoted env ref)
-    /// 2. Returns the env vars to inject into the subprocess
+    /// quotes, parentheses, and other shell metacharacters), this method
+    /// replaces `{{var}}` with `$RECIPE_VAR_var` environment variable refs.
+    ///
+    /// **Context-aware quoting:**
+    /// - Outside heredocs: `{{var}}` → `"$RECIPE_VAR_var"` (double-quoted to
+    ///   prevent word splitting)
+    /// - Inside unquoted heredoc bodies (`<<WORD`): `{{var}}` → `$RECIPE_VAR_var`
+    ///   (unquoted, because heredocs don't word-split and double quotes would
+    ///   become literal characters in the output)
+    /// - Inside quoted heredoc bodies (`<<'WORD'`): `{{var}}` → inline value
+    ///   (bash won't expand `$VAR` in quoted heredocs, so we must inline)
     ///
     /// The env var approach is immune to shell injection because values never
     /// appear in the shell source — they're passed via the process environment.
@@ -77,11 +93,108 @@ impl RecipeContext {
             "RecipeContext::render_shell: template length={}",
             template.len()
         );
+
+        let lines: Vec<&str> = template.split('\n').collect();
+        let mut result: Vec<String> = Vec::with_capacity(lines.len());
+
+        // Stack of (delimiter, is_quoted) for nested heredocs
+        let mut heredoc_stack: Vec<(String, bool)> = Vec::new();
+
+        for line in lines {
+            if heredoc_stack.is_empty() {
+                // Outside any heredoc — scan for heredoc start markers
+                for cap in HEREDOC_START_RE.captures_iter(line) {
+                    // Group 1 = single-quoted, Group 2 = double-quoted, Group 3 = unquoted
+                    let (delimiter, is_quoted) = if let Some(m) = cap.get(1) {
+                        (m.as_str().to_string(), true)
+                    } else if let Some(m) = cap.get(2) {
+                        (m.as_str().to_string(), true)
+                    } else if let Some(m) = cap.get(3) {
+                        (m.as_str().to_string(), false)
+                    } else {
+                        continue;
+                    };
+                    log::trace!(
+                        "render_shell: found heredoc start: delimiter={:?}, quoted={}",
+                        delimiter,
+                        is_quoted
+                    );
+                    heredoc_stack.push((delimiter, is_quoted));
+                }
+                // The start line itself is a regular command — use quoted refs
+                result.push(Self::replace_vars_quoted(line));
+            } else {
+                // Inside a heredoc body — check if this line ends it
+                let trimmed = line.trim();
+                let (ref delim, is_quoted) = heredoc_stack[heredoc_stack.len() - 1];
+
+                if trimmed == delim {
+                    // End of heredoc — this line is the delimiter, don't substitute
+                    heredoc_stack.pop();
+                    result.push(line.to_string());
+                } else if is_quoted {
+                    // Quoted heredoc (<<'WORD') — bash won't expand $VAR,
+                    // so inline the actual values
+                    result.push(Self::replace_vars_inline(line, &self.data));
+                } else {
+                    // Unquoted heredoc (<<WORD) — bash WILL expand $VAR,
+                    // so use unquoted env var refs (no spurious literal quotes)
+                    result.push(Self::replace_vars_unquoted(line));
+                }
+            }
+        }
+
+        result.join("\n")
+    }
+
+    /// Replace `{{var}}` with `"$RECIPE_VAR_var"` (quoted env ref).
+    /// Used outside heredocs where word-splitting protection is needed.
+    fn replace_vars_quoted(line: &str) -> String {
         TEMPLATE_RE
-            .replace_all(template, |caps: &regex::Captures| {
+            .replace_all(line, |caps: &regex::Captures| {
                 let var_name = &caps[1];
                 let env_key = Self::env_key(var_name);
                 format!("\"${}\"", env_key)
+            })
+            .into_owned()
+    }
+
+    /// Replace `{{var}}` with `$RECIPE_VAR_var` (unquoted env ref).
+    /// Used inside unquoted heredoc bodies where quotes become literal.
+    fn replace_vars_unquoted(line: &str) -> String {
+        TEMPLATE_RE
+            .replace_all(line, |caps: &regex::Captures| {
+                let var_name = &caps[1];
+                let env_key = Self::env_key(var_name);
+                format!("${}", env_key)
+            })
+            .into_owned()
+    }
+
+    /// Replace `{{var}}` with the actual context value (inline).
+    /// Used inside quoted heredoc bodies where bash won't expand env vars.
+    fn replace_vars_inline(line: &str, data: &HashMap<String, Value>) -> String {
+        TEMPLATE_RE
+            .replace_all(line, |caps: &regex::Captures| {
+                let var_name = &caps[1];
+                // Walk dot-notation path
+                let parts: Vec<&str> = var_name.split('.').collect();
+                let mut current = data.get(parts[0]);
+                for part in &parts[1..] {
+                    current = current.and_then(|v| v.get(part));
+                }
+                match current {
+                    None => {
+                        log::warn!(
+                            "Template variable '{}' not found in context (quoted heredoc) — replaced with empty string",
+                            var_name
+                        );
+                        String::new()
+                    }
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Null) => String::new(),
+                    Some(v) => v.to_string(),
+                }
             })
             .into_owned()
     }
@@ -553,5 +666,169 @@ mod tests {
         let c = ctx(vec![("n", json!(999_999_999))]);
         assert!(c.evaluate("n > 0").unwrap());
         assert!(c.evaluate("n == 999999999").unwrap());
+    }
+
+    // ── Heredoc-aware render_shell tests ──────────────────
+
+    #[test]
+    fn test_render_shell_heredoc_unquoted_no_quotes_in_body() {
+        let c = ctx(vec![("user", json!("alice"))]);
+        let template = "cat <<EOF\nUser: {{user}}\nEOF";
+        let rendered = c.render_shell(template);
+        // Inside unquoted heredoc, vars should NOT be wrapped in double quotes
+        assert_eq!(rendered, "cat <<EOF\nUser: $RECIPE_VAR_user\nEOF");
+    }
+
+    #[test]
+    fn test_render_shell_heredoc_start_line_stays_quoted() {
+        let c = ctx(vec![("name", json!("test"))]);
+        let template = "TASK=$(cat <<EOF\n{{name}}\nEOF\n)";
+        let rendered = c.render_shell(template);
+        // The start line "TASK=$(cat <<EOF" has no vars, nothing to test there.
+        // The body line should be unquoted.
+        assert!(rendered.contains("$RECIPE_VAR_name"));
+        assert!(!rendered.contains("\"$RECIPE_VAR_name\""));
+    }
+
+    #[test]
+    fn test_render_shell_heredoc_multiple_vars() {
+        let c = ctx(vec![
+            ("title", json!("Fix bug")),
+            ("body", json!("Details here")),
+        ]);
+        let template = "cat <<EOF\nTitle: {{title}}\nBody: {{body}}\nEOF";
+        let rendered = c.render_shell(template);
+        assert_eq!(
+            rendered,
+            "cat <<EOF\nTitle: $RECIPE_VAR_title\nBody: $RECIPE_VAR_body\nEOF"
+        );
+    }
+
+    #[test]
+    fn test_render_shell_heredoc_with_tab_strip() {
+        let c = ctx(vec![("data", json!("value"))]);
+        let template = "cat <<-ENDMARKER\n\t{{data}}\n\tENDMARKER";
+        let rendered = c.render_shell(template);
+        // <<- allows tab-indented delimiter
+        assert!(rendered.contains("$RECIPE_VAR_data"));
+        assert!(!rendered.contains("\"$RECIPE_VAR_data\""));
+    }
+
+    #[test]
+    fn test_render_shell_quoted_heredoc_inlines_value() {
+        let c = ctx(vec![("script", json!("echo hello"))]);
+        let template = "cat <<'PYEOF'\n{{script}}\nPYEOF";
+        let rendered = c.render_shell(template);
+        // Quoted heredoc: bash won't expand $VAR, so inline the actual value
+        assert_eq!(rendered, "cat <<'PYEOF'\necho hello\nPYEOF");
+    }
+
+    #[test]
+    fn test_render_shell_double_quoted_heredoc_inlines_value() {
+        let c = ctx(vec![("code", json!("print('hi')"))]);
+        let template = "cat <<\"PYEOF\"\n{{code}}\nPYEOF";
+        let rendered = c.render_shell(template);
+        assert_eq!(rendered, "cat <<\"PYEOF\"\nprint('hi')\nPYEOF");
+    }
+
+    #[test]
+    fn test_render_shell_mixed_heredoc_and_regular() {
+        let c = ctx(vec![
+            ("file", json!("/tmp/out")),
+            ("content", json!("hello world")),
+        ]);
+        // Line 1: regular command (quoted)
+        // Lines 2-4: heredoc body (unquoted)
+        // Line 5: after heredoc (quoted again)
+        let template = "cat <<EOF > {{file}}\n{{content}}\nEOF\necho {{file}}";
+        let rendered = c.render_shell(template);
+        let lines: Vec<&str> = rendered.split('\n').collect();
+        // Start line: {{file}} is outside heredoc body → quoted
+        assert_eq!(lines[0], "cat <<EOF > \"$RECIPE_VAR_file\"");
+        // Body: {{content}} is inside heredoc → unquoted
+        assert_eq!(lines[1], "$RECIPE_VAR_content");
+        // Delimiter line
+        assert_eq!(lines[2], "EOF");
+        // After heredoc: back to quoted
+        assert_eq!(lines[3], "echo \"$RECIPE_VAR_file\"");
+    }
+
+    #[test]
+    fn test_render_shell_no_heredoc_preserves_quoted_behavior() {
+        let c = ctx(vec![("cmd", json!("hello; rm -rf /"))]);
+        let rendered = c.render_shell("echo {{cmd}} && ls {{cmd}}");
+        assert_eq!(
+            rendered,
+            "echo \"$RECIPE_VAR_cmd\" && ls \"$RECIPE_VAR_cmd\""
+        );
+    }
+
+    #[test]
+    fn test_render_shell_realistic_recipe_pattern() {
+        // This is the actual pattern from default-workflow.yaml
+        let c = ctx(vec![("task_description", json!("Fix the login bug"))]);
+        let template = "TASK_DESC=$(cat <<EOFTASKDESC\n{{task_description}}\nEOFTASKDESC\n)";
+        let rendered = c.render_shell(template);
+        let lines: Vec<&str> = rendered.split('\n').collect();
+        assert_eq!(lines[0], "TASK_DESC=$(cat <<EOFTASKDESC");
+        assert_eq!(lines[1], "$RECIPE_VAR_task_description"); // NO quotes!
+        assert_eq!(lines[2], "EOFTASKDESC");
+        assert_eq!(lines[3], ")");
+    }
+
+    #[test]
+    fn test_render_shell_heredoc_with_dot_notation_var() {
+        let c = ctx(vec![("obj", json!({"status": "ok"}))]);
+        let template = "cat <<EOF\nStatus: {{obj.status}}\nEOF";
+        let rendered = c.render_shell(template);
+        assert_eq!(rendered, "cat <<EOF\nStatus: $RECIPE_VAR_obj__status\nEOF");
+    }
+
+    #[test]
+    fn test_render_shell_heredoc_missing_var_in_body() {
+        let c = ctx(vec![]);
+        let template = "cat <<EOF\n{{missing}}\nEOF";
+        let rendered = c.render_shell(template);
+        // Missing var in unquoted heredoc still becomes env ref (will be empty at runtime)
+        assert_eq!(rendered, "cat <<EOF\n$RECIPE_VAR_missing\nEOF");
+    }
+
+    #[test]
+    fn test_render_shell_quoted_heredoc_missing_var() {
+        let c = ctx(vec![]);
+        let template = "cat <<'EOF'\n{{missing}}\nEOF";
+        let rendered = c.render_shell(template);
+        // Missing var in quoted heredoc: inline as empty string
+        assert_eq!(rendered, "cat <<'EOF'\n\nEOF");
+    }
+
+    #[test]
+    fn test_render_shell_heredoc_preserves_non_template_content() {
+        let c = ctx(vec![("x", json!("val"))]);
+        let template = "cat <<EOF\nplain text\n$EXISTING_VAR\n{{x}}\nmore text\nEOF";
+        let rendered = c.render_shell(template);
+        assert!(rendered.contains("plain text"));
+        assert!(rendered.contains("$EXISTING_VAR"));
+        assert!(rendered.contains("$RECIPE_VAR_x"));
+        assert!(rendered.contains("more text"));
+    }
+
+    #[test]
+    fn test_render_shell_empty_heredoc_body() {
+        let c = ctx(vec![]);
+        let template = "cat <<EOF\nEOF";
+        let rendered = c.render_shell(template);
+        assert_eq!(rendered, "cat <<EOF\nEOF");
+    }
+
+    #[test]
+    fn test_render_shell_var_on_heredoc_start_line_is_quoted() {
+        // Vars on the same line as <<EOF are NOT in the heredoc body
+        let c = ctx(vec![("prefix", json!("data"))]);
+        let template = "echo {{prefix}} | cat <<EOF\nstuff\nEOF";
+        let rendered = c.render_shell(template);
+        let lines: Vec<&str> = rendered.split('\n').collect();
+        // The start line should use quoted behavior
+        assert!(lines[0].contains("\"$RECIPE_VAR_prefix\""));
     }
 }

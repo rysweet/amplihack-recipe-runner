@@ -122,7 +122,10 @@ impl AgentResolver {
         for base in &self.search_paths {
             let resolved_base = match base.canonicalize() {
                 Ok(p) => p,
-                Err(_) => continue,
+                Err(e) => {
+                    log::debug!("AgentResolver: skipping search path {:?}: {}", base, e);
+                    continue;
+                }
             };
             for candidate in &candidates {
                 let full = base.join(candidate);
@@ -140,7 +143,10 @@ impl AgentResolver {
                                 );
                                 return Ok(content);
                             }
-                            Err(_) => continue,
+                            Err(e) => {
+                                log::debug!("AgentResolver: failed to read {:?}: {}", full, e);
+                                continue;
+                            }
                         }
                     }
                 }

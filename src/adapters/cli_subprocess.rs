@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const NON_INTERACTIVE_FOOTER: &str = "\n\nIMPORTANT: Proceed autonomously. Do not ask questions. \
@@ -323,9 +323,15 @@ mod tests {
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            env::remove_var(self.key);
+            // SAFETY: test runs hold ENV_MUTEX to serialize env var access
+            unsafe {
+                env::remove_var(self.key);
+            }
             if let Some(val) = self.saved.take() {
-                env::set_var(self.key, val);
+                // SAFETY: test runs hold ENV_MUTEX to serialize env var access
+                unsafe {
+                    env::set_var(self.key, val);
+                }
             }
         }
     }
@@ -334,7 +340,10 @@ mod tests {
     fn test_new_defaults_without_env() {
         let _lock = ENV_MUTEX.lock().unwrap();
         let _guard = EnvGuard::new("AMPLIHACK_AGENT_BINARY");
-        env::remove_var("AMPLIHACK_AGENT_BINARY");
+        // SAFETY: test runs hold ENV_MUTEX to serialize env var access
+        unsafe {
+            env::remove_var("AMPLIHACK_AGENT_BINARY");
+        }
 
         let adapter = CLISubprocessAdapter::new();
         assert_eq!(adapter.cli, "claude");
@@ -345,7 +354,10 @@ mod tests {
     fn test_new_reads_env_var() {
         let _lock = ENV_MUTEX.lock().unwrap();
         let _guard = EnvGuard::new("AMPLIHACK_AGENT_BINARY");
-        env::set_var("AMPLIHACK_AGENT_BINARY", "copilot");
+        // SAFETY: test runs hold ENV_MUTEX to serialize env var access
+        unsafe {
+            env::set_var("AMPLIHACK_AGENT_BINARY", "copilot");
+        }
 
         let adapter = CLISubprocessAdapter::new();
         assert_eq!(adapter.cli, "copilot");
@@ -367,7 +379,10 @@ mod tests {
     fn test_default_impl() {
         let _lock = ENV_MUTEX.lock().unwrap();
         let _guard = EnvGuard::new("AMPLIHACK_AGENT_BINARY");
-        env::remove_var("AMPLIHACK_AGENT_BINARY");
+        // SAFETY: test runs hold ENV_MUTEX to serialize env var access
+        unsafe {
+            env::remove_var("AMPLIHACK_AGENT_BINARY");
+        }
 
         let adapter = CLISubprocessAdapter::default();
         assert_eq!(adapter.cli, "claude");

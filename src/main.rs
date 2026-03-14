@@ -295,7 +295,12 @@ fn run() -> i32 {
             };
             println!(
                 "  {:>3}. [{:<6}] {}{}{}{}{}",
-                recipe.steps.iter().position(|s| s.id == step.id).unwrap() + 1,
+                recipe
+                    .steps
+                    .iter()
+                    .position(|s| s.id == step.id)
+                    .map(|p| p + 1)
+                    .unwrap_or(0),
                 ty.to_lowercase(),
                 step.id,
                 cond,

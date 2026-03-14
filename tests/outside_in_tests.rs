@@ -2035,3 +2035,114 @@ steps:
     let step = find_step(&json, "strict-ok").expect("step should exist");
     assert_eq!(step["status"].as_str(), Some("completed"));
 }
+
+// ---------------------------------------------------------------------------
+// Heredoc quoting fix: render_shell() should not wrap vars in double quotes
+// inside heredoc bodies (the quotes become literal characters)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_heredoc_var_expansion_no_spurious_quotes() {
+    // Verify that variables inside unquoted heredocs produce values WITHOUT
+    // surrounding double quotes. This is the core fix for the render_shell bug.
+    let dir = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        dir.path(),
+        "heredoc-fix.yaml",
+        r#"
+name: heredoc-fix-test
+steps:
+  - id: capture-via-heredoc
+    command: |
+      CAPTURED=$(cat <<EOFTEST
+      {{task_description}}
+      EOFTEST
+      )
+      echo "$CAPTURED"
+    output: heredoc_result
+"#,
+    );
+    let (code, json, stderr) = run_json(&recipe, &["--set", "task_description=Fix the login bug"]);
+    assert_eq!(code, 0, "heredoc recipe should succeed. stderr: {}", stderr);
+    let step = find_step(&json, "capture-via-heredoc").expect("step should exist");
+    let output = step["output"].as_str().unwrap_or("");
+    // The output should NOT contain spurious double quotes around the value
+    assert!(
+        !output.contains('"'),
+        "heredoc output should not contain literal double quotes, got: {:?}",
+        output
+    );
+    assert!(
+        output.contains("Fix the login bug"),
+        "heredoc output should contain the actual value, got: {:?}",
+        output
+    );
+}
+
+#[test]
+fn test_regular_command_var_still_protected() {
+    // Verify that variables in regular (non-heredoc) commands still get
+    // double-quote protection to prevent word splitting.
+    let dir = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        dir.path(),
+        "regular-cmd.yaml",
+        r#"
+name: regular-cmd-test
+steps:
+  - id: echo-var
+    command: echo {{message}}
+    output: echo_result
+"#,
+    );
+    let (code, json, stderr) = run_json(&recipe, &["--set", "message=hello world with spaces"]);
+    assert_eq!(code, 0, "echo recipe should succeed. stderr: {}", stderr);
+    let step = find_step(&json, "echo-var").expect("step should exist");
+    let output = step["output"].as_str().unwrap_or("");
+    // Word splitting should NOT occur — the full string should be preserved
+    assert_eq!(
+        output.trim(),
+        "hello world with spaces",
+        "regular command should preserve spaces in variable value"
+    );
+}
+
+#[test]
+fn test_heredoc_with_multiple_vars_no_quotes() {
+    let dir = TempDir::new().unwrap();
+    let recipe = write_recipe(
+        dir.path(),
+        "multi-var-heredoc.yaml",
+        r#"
+name: multi-var-heredoc-test
+steps:
+  - id: multi-capture
+    command: |
+      RESULT=$(cat <<EOF
+      Title: {{title}}
+      Author: {{author}}
+      EOF
+      )
+      echo "$RESULT"
+    output: multi_result
+"#,
+    );
+    let (code, json, stderr) = run_json(
+        &recipe,
+        &["--set", "title=My Title", "--set", "author=Jane Doe"],
+    );
+    assert_eq!(
+        code, 0,
+        "multi-var heredoc should succeed. stderr: {}",
+        stderr
+    );
+    let step = find_step(&json, "multi-capture").expect("step should exist");
+    let output = step["output"].as_str().unwrap_or("");
+    assert!(
+        !output.contains('"'),
+        "multi-var heredoc output should not contain literal double quotes, got: {:?}",
+        output
+    );
+    assert!(output.contains("My Title"), "should contain title value");
+    assert!(output.contains("Jane Doe"), "should contain author value");
+}

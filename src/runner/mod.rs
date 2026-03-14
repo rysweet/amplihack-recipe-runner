@@ -969,12 +969,27 @@ impl<A: Adapter> RecipeRunner<A> {
             for (idx, handle) in handles {
                 match handle.join() {
                     Ok(result) => results[idx] = Some(result),
-                    Err(_) => {
+                    Err(panic_info) => {
+                        let panic_msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                            s.clone()
+                        } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        log::error!(
+                            "Thread panicked during parallel step '{}': {}",
+                            steps[idx].id,
+                            panic_msg
+                        );
                         results[idx] = Some(StepResult {
                             step_id: steps[idx].id.clone(),
                             status: StepStatus::Failed,
                             output: String::new(),
-                            error: "Thread panicked during parallel execution".to_string(),
+                            error: format!(
+                                "Thread panicked during parallel execution: {}",
+                                panic_msg
+                            ),
                             duration: None,
                         });
                     }
