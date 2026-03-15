@@ -77,9 +77,13 @@ impl RecipeContext {
     /// quotes, parentheses, and other shell metacharacters), this method
     /// replaces `{{var}}` with `$RECIPE_VAR_var` environment variable refs.
     ///
-    /// **Context-aware quoting:**
-    /// - Outside heredocs: `{{var}}` → `"$RECIPE_VAR_var"` (double-quoted to
-    ///   prevent word splitting)
+    /// **Context-aware quoting (fixes issue #32):**
+    /// - Outside heredocs, unquoted: `{{var}}` → `"$RECIPE_VAR_var"` (double-quoted
+    ///   to prevent word splitting)
+    /// - Outside heredocs, inside `"..."`: `{{var}}` → `$RECIPE_VAR_var` (already
+    ///   quoted by author — adding extra quotes would produce `""$RECIPE_VAR_var""`)
+    /// - Outside heredocs, inside `'...'`: `{{var}}` → inline actual value (single
+    ///   quotes block `$VAR` expansion in bash)
     /// - Inside unquoted heredoc bodies (`<<WORD`): `{{var}}` → `$RECIPE_VAR_var`
     ///   (unquoted, because heredocs don't word-split and double quotes would
     ///   become literal characters in the output)
@@ -121,8 +125,8 @@ impl RecipeContext {
                     );
                     heredoc_stack.push((delimiter, is_quoted));
                 }
-                // The start line itself is a regular command — use quoted refs
-                result.push(Self::replace_vars_quoted(line));
+                // The start line itself is a regular command — use context-aware refs
+                result.push(Self::replace_vars_quoted(line, &self.data));
             } else {
                 // Inside a heredoc body — check if this line ends it
                 let trimmed = line.trim();
@@ -147,14 +151,80 @@ impl RecipeContext {
         result.join("\n")
     }
 
-    /// Replace `{{var}}` with `"$RECIPE_VAR_var"` (quoted env ref).
-    /// Used outside heredocs where word-splitting protection is needed.
-    fn replace_vars_quoted(line: &str) -> String {
+    /// Replace `{{var}}` in a regular bash command line (outside heredocs),
+    /// detecting bash quoting context to avoid double-quoting collisions (issue #32).
+    ///
+    /// - Unquoted context: `{{var}}` → `"$RECIPE_VAR_var"` (protective quotes)
+    /// - Inside `"..."`: `{{var}}` → `$RECIPE_VAR_var` (already quoted by author)
+    /// - Inside `'...'`: `{{var}}` → inline actual value (single quotes block expansion)
+    fn replace_vars_quoted(line: &str, data: &HashMap<String, Value>) -> String {
+        // Build quoting-context map: for each byte offset, record quote state.
+        // 0 = unquoted, 1 = inside double quotes, 2 = inside single quotes.
+        let bytes = line.as_bytes();
+        let len = bytes.len();
+        let mut quote_state = vec![0u8; len + 1]; // +1 so we can index `m.start()` == len
+        let mut state: u8 = 0;
+        let mut i = 0;
+        while i < len {
+            quote_state[i] = state;
+            match (state, bytes[i]) {
+                (0, b'"') => {
+                    state = 1;
+                }
+                (0, b'\'') => {
+                    state = 2;
+                }
+                (1, b'\\') if i + 1 < len => {
+                    // Escape sequence inside double quotes: mark next byte, skip it
+                    i += 1;
+                    quote_state[i] = state;
+                }
+                (1, b'"') => {
+                    state = 0;
+                }
+                (2, b'\'') => {
+                    state = 0;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+
         TEMPLATE_RE
             .replace_all(line, |caps: &regex::Captures| {
+                let m = caps.get(0).unwrap();
                 let var_name = &caps[1];
-                let env_key = Self::env_key(var_name);
-                format!("\"${}\"", env_key)
+                match quote_state[m.start()] {
+                    2 => {
+                        // Inside single quotes: bash won't expand $VAR → inline value
+                        let parts: Vec<&str> = var_name.split('.').collect();
+                        let mut current = data.get(parts[0]);
+                        for part in &parts[1..] {
+                            current = current.and_then(|v| v.get(part));
+                        }
+                        match current {
+                            None => {
+                                log::warn!(
+                                    "Template variable '{}' not found in context \
+                                     (single-quoted command) — replaced with empty string",
+                                    var_name
+                                );
+                                String::new()
+                            }
+                            Some(Value::String(s)) => s.clone(),
+                            Some(Value::Null) => String::new(),
+                            Some(v) => v.to_string(),
+                        }
+                    }
+                    1 => {
+                        // Inside double quotes: use unquoted env ref (author's quotes protect it)
+                        format!("${}", Self::env_key(var_name))
+                    }
+                    _ => {
+                        // Unquoted: add protective double-quote wrapping
+                        format!("\"${}\"", Self::env_key(var_name))
+                    }
+                }
             })
             .into_owned()
     }
@@ -828,7 +898,74 @@ mod tests {
         let template = "echo {{prefix}} | cat <<EOF\nstuff\nEOF";
         let rendered = c.render_shell(template);
         let lines: Vec<&str> = rendered.split('\n').collect();
-        // The start line should use quoted behavior
+        // The start line should use quoted behavior (unquoted var)
         assert!(lines[0].contains("\"$RECIPE_VAR_prefix\""));
+    }
+
+    // ── Regression: issue #32 — context-aware quoting (no double-doubled quotes) ──
+
+    #[test]
+    fn test_render_shell_no_double_quoting_when_var_inside_double_quotes() {
+        // Regression test for issue #32:
+        // When recipe YAML contains: cd "{{repo_path}}"
+        // render_shell MUST NOT produce: cd ""$RECIPE_VAR_repo_path""
+        // It MUST produce:             cd "$RECIPE_VAR_repo_path"
+        let c = ctx(vec![("repo_path", json!("/home/user/my project"))]);
+        let rendered = c.render_shell("cd \"{{repo_path}}\"");
+        assert_eq!(rendered, "cd \"$RECIPE_VAR_repo_path\"");
+        // Extra check: confirm NO double-doubled quotes
+        assert!(!rendered.contains("\"\""));
+    }
+
+    #[test]
+    fn test_render_shell_unquoted_var_still_gets_protective_quotes() {
+        // Unquoted {{var}} should still get "..." for word-split protection
+        let c = ctx(vec![("name", json!("hello world"))]);
+        let rendered = c.render_shell("echo {{name}}");
+        assert_eq!(rendered, "echo \"$RECIPE_VAR_name\"");
+    }
+
+    #[test]
+    fn test_render_shell_single_quoted_command_context_inlines_value() {
+        // Inside single-quoted bash context, $VAR is not expanded by bash.
+        // render_shell should inline the actual value.
+        let c = ctx(vec![("branch", json!("feat/my-feature"))]);
+        let rendered = c.render_shell("git checkout '{{branch}}'");
+        assert_eq!(rendered, "git checkout 'feat/my-feature'");
+    }
+
+    #[test]
+    fn test_render_shell_mixed_quoted_and_unquoted_vars() {
+        // Test multiple vars in different quoting contexts on the same line
+        let c = ctx(vec![
+            ("dir", json!("/my/path")),
+            ("msg", json!("hello")),
+        ]);
+        // {{dir}} is inside double-quotes; {{msg}} is unquoted
+        let rendered = c.render_shell("cd \"{{dir}}\" && echo {{msg}}");
+        assert_eq!(
+            rendered,
+            "cd \"$RECIPE_VAR_dir\" && echo \"$RECIPE_VAR_msg\""
+        );
+    }
+
+    #[test]
+    fn test_render_shell_gh_issue_create_pattern() {
+        // Realistic pattern: gh issue create with double-quoted args
+        // This pattern caused issue #34 where "$RECIPE_VAR_task_description"
+        // appeared literally in the GitHub issue body.
+        let c = ctx(vec![
+            ("title", json!("Fix the login bug")),
+            ("body", json!("Details about the fix")),
+        ]);
+        let rendered =
+            c.render_shell("gh issue create --title \"{{title}}\" --body \"{{body}}\"");
+        // Should produce: gh issue create --title "$RECIPE_VAR_title" --body "$RECIPE_VAR_body"
+        // NOT:            gh issue create --title ""$RECIPE_VAR_title"" --body ""$RECIPE_VAR_body""
+        assert_eq!(
+            rendered,
+            "gh issue create --title \"$RECIPE_VAR_title\" --body \"$RECIPE_VAR_body\""
+        );
+        assert!(!rendered.contains("\"\""));
     }
 }
