@@ -139,11 +139,32 @@ steps:
     command: ./deploy.sh --target {{deploy.target}} --region {{deploy.region}}
 ```
 
-### Shell Escaping
+### Shell Rendering
 
-When templates are rendered for shell commands, values are shell-escaped
-automatically via `shell_escape` to prevent injection. Undefined variables
-resolve to an empty string.
+When templates are rendered for bash step commands, `{{var}}` is replaced with
+an environment variable reference (`$RECIPE_VAR_var`), not the value itself.
+Values are passed via the process environment, which makes them immune to shell
+injection. Undefined variables resolve to an empty string.
+
+The quoting you write in YAML is preserved unchanged — the renderer does not add
+its own quotes. Quote in YAML when the value might contain spaces or special
+characters:
+
+```yaml
+context:
+  repo_path: /home/dev/my project   # has a space
+
+steps:
+  - id: enter
+    command: cd "{{repo_path}}"     # quotes in YAML → cd "$RECIPE_VAR_repo_path"
+```
+
+Inside single-quoted heredocs (`<<'EOF'`), bash suppresses `$VAR` expansion, so
+the runner inlines the actual value directly instead.
+
+See [Shell Template Rendering](shell-template-rendering.md) for the full
+explanation, and [How to Quote Variables](howto/quoting-variables.md) for
+practical guidance.
 
 ---
 

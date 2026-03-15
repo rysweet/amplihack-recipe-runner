@@ -2118,8 +2118,9 @@ fn test_shell_render_prevents_injection() {
     data.insert("input".to_string(), json!("$(rm -rf /)"));
     let ctx = RecipeContext::new(data);
     let rendered = ctx.render_shell("echo {{input}}");
-    // Value should be an env var reference, NOT inlined in shell source
-    assert_eq!(rendered, "echo \"$RECIPE_VAR_input\"");
+    // Value should be an env var reference, NOT inlined in shell source.
+    // No wrapping double quotes — recipe authors control quoting (issue #32).
+    assert_eq!(rendered, "echo $RECIPE_VAR_input");
     // The dangerous value lives in the env var, not the command
     assert!(
         !rendered.contains("rm -rf"),

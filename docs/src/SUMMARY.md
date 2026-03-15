@@ -7,6 +7,10 @@
 - [YAML Recipe Format](yaml-format.md)
 - [CLI Reference](cli-reference.md)
 - [Condition Language](conditions.md)
+- [Shell Template Rendering](shell-template-rendering.md)
+
+# How-To Guides
+- [How to Quote Variables in Bash Commands](howto/quoting-variables.md)
 
 # Examples
 - [Tutorials](examples-tutorials.md)
