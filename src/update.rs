@@ -16,6 +16,12 @@ const NO_UPDATE_CHECK_ENV: &str = "RECIPE_RUNNER_NO_UPDATE_CHECK";
 const UPDATE_CACHE_RELATIVE_PATH: &str = ".config/recipe-runner-rs/last_update_check";
 const UPDATE_CHECK_COOLDOWN_SECS: u64 = 24 * 60 * 60;
 const NETWORK_TIMEOUT_SECS: u64 = 5;
+/// Maximum number of HTTP attempts before giving up.
+const MAX_RETRIES: u32 = 3;
+/// Initial exponential-backoff delay (doubles each transient failure).
+const INITIAL_BACKOFF_SECS: u64 = 1;
+/// Upper bound on any single sleep to prevent very long stalls.
+const MAX_BACKOFF_SECS: u64 = 30;
 
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
@@ -102,7 +108,77 @@ fn fetch_latest_release() -> Result<UpdateRelease> {
     parse_latest_release(response, &asset_name)
 }
 
+/// Error categories used internally to drive retry decisions.
+#[derive(Debug)]
+enum HttpError {
+    /// Transient failure (timeout, connection reset, 5xx) — worth retrying with backoff.
+    Retryable(String),
+    /// Rate-limited (HTTP 429) — retry after the indicated delay.
+    RateLimited(Duration),
+    /// Permanent failure (4xx other than 429, auth errors) — do not retry.
+    Fatal(String),
+}
+
+/// Public entry point: GET `url` with up to `MAX_RETRIES` attempts and exponential backoff.
 fn http_get(url: &str) -> Result<Vec<u8>> {
+    http_get_with_retry(url, MAX_RETRIES, http_get_once, std::thread::sleep)
+}
+
+/// Retry orchestrator.  `attempt` and `sleep` are injectable for unit-testing without
+/// real network calls or wall-clock delays.
+fn http_get_with_retry<A, S>(
+    url: &str,
+    max_attempts: u32,
+    mut attempt: A,
+    mut sleep: S,
+) -> Result<Vec<u8>>
+where
+    A: FnMut(&str) -> Result<Vec<u8>, HttpError>,
+    S: FnMut(Duration),
+{
+    let mut backoff = Duration::from_secs(INITIAL_BACKOFF_SECS);
+    for i in 0..max_attempts {
+        match attempt(url) {
+            Ok(body) => return Ok(body),
+            Err(HttpError::Fatal(msg)) => return Err(anyhow!("{msg}")),
+            Err(HttpError::RateLimited(wait)) => {
+                let capped = wait.min(Duration::from_secs(MAX_BACKOFF_SECS));
+                log::warn!(
+                    "HTTP 429 rate-limited for {url}; waiting {:.1}s (attempt {}/{})",
+                    capped.as_secs_f32(),
+                    i + 1,
+                    max_attempts
+                );
+                if i + 1 < max_attempts {
+                    sleep(capped);
+                }
+                // 429 drives its own retry cadence — reset exponential backoff.
+                backoff = Duration::from_secs(INITIAL_BACKOFF_SECS);
+            }
+            Err(HttpError::Retryable(msg)) => {
+                if i + 1 >= max_attempts {
+                    return Err(anyhow!(
+                        "HTTP request for {url} failed after {max_attempts} attempts: {msg}"
+                    ));
+                }
+                let capped = backoff.min(Duration::from_secs(MAX_BACKOFF_SECS));
+                log::warn!(
+                    "HTTP request to {url} failed (attempt {}/{}): {msg}; retrying in {:.1}s",
+                    i + 1,
+                    max_attempts,
+                    capped.as_secs_f32()
+                );
+                sleep(capped);
+                backoff *= 2;
+            }
+        }
+    }
+    // Unreachable: the loop always returns before exhausting `max_attempts`.
+    Err(anyhow!("HTTP request failed for {url}"))
+}
+
+/// Single HTTP GET attempt — no retries.
+fn http_get_once(url: &str) -> Result<Vec<u8>, HttpError> {
     let timeout = Duration::from_secs(NETWORK_TIMEOUT_SECS);
     let response = match ureq::AgentBuilder::new()
         .timeout_connect(timeout)
@@ -114,19 +190,48 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
         .set("User-Agent", &format!("recipe-runner-rs/{CURRENT_VERSION}"))
         .call()
     {
-        Ok(response) => response,
+        Ok(r) => r,
+        // Permanent: no release published yet.
         Err(ureq::Error::Status(404, _)) if url.ends_with("/releases/latest") => {
-            bail!("no stable v* release has been published for {GITHUB_REPO} yet")
+            return Err(HttpError::Fatal(format!(
+                "no stable v* release has been published for {GITHUB_REPO} yet"
+            )));
         }
-        Err(error) => return Err(anyhow!("HTTP request failed for {url}: {error}")),
+        // Rate-limited: honour Retry-After if present, else fall back to initial backoff.
+        Err(ureq::Error::Status(429, r)) => {
+            let wait = parse_retry_after(r.header("Retry-After"))
+                .unwrap_or(Duration::from_secs(INITIAL_BACKOFF_SECS));
+            return Err(HttpError::RateLimited(wait));
+        }
+        // Server errors are transient — retry.
+        Err(ureq::Error::Status(status, _)) if status >= 500 => {
+            return Err(HttpError::Retryable(format!("HTTP {status} server error")));
+        }
+        // Other 4xx are permanent client errors — do not retry.
+        Err(ureq::Error::Status(status, _)) => {
+            return Err(HttpError::Fatal(format!(
+                "HTTP {status} client error for {url}"
+            )));
+        }
+        // Transport errors (connection reset, DNS failure, timeout) are transient — retry.
+        Err(ureq::Error::Transport(t)) => {
+            return Err(HttpError::Retryable(format!("transport error: {t}")));
+        }
     };
 
     let mut body = Vec::new();
     response
         .into_reader()
         .read_to_end(&mut body)
-        .with_context(|| format!("failed to read HTTP response from {url}"))?;
+        .map_err(|e| {
+            HttpError::Retryable(format!("failed to read HTTP response from {url}: {e}"))
+        })?;
     Ok(body)
+}
+
+/// Parse the `Retry-After` header value (integer seconds only; HTTP-date form is ignored).
+fn parse_retry_after(header: Option<&str>) -> Option<Duration> {
+    header?.parse::<u64>().ok().map(Duration::from_secs)
 }
 
 fn parse_latest_release(body: Vec<u8>, asset_name: &str) -> Result<UpdateRelease> {
@@ -445,6 +550,166 @@ mod tests {
     #[test]
     fn current_platform_has_release_target() {
         assert!(supported_release_target().is_some());
+    }
+
+    // ── Retry-After parsing ────────────────────────────────────────────────
+    #[test]
+    fn parse_retry_after_integer_seconds() {
+        assert_eq!(
+            parse_retry_after(Some("60")),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_none_header() {
+        assert_eq!(parse_retry_after(None), None);
+    }
+
+    #[test]
+    fn parse_retry_after_non_numeric_is_ignored() {
+        // HTTP-date form is not implemented — returns None rather than panicking.
+        assert_eq!(parse_retry_after(Some("Mon, 01 Jan 2024 00:00:00 GMT")), None);
+    }
+
+    // ── Retry orchestrator unit tests ─────────────────────────────────────
+    // All use Duration::ZERO for the sleep argument so tests are instantaneous.
+
+    #[test]
+    fn retry_succeeds_immediately() {
+        let result = http_get_with_retry(
+            "https://example.test/",
+            3,
+            |_| Ok(b"body".to_vec()),
+            |_| {},
+        );
+        assert_eq!(result.unwrap(), b"body");
+    }
+
+    #[test]
+    fn retry_succeeds_on_second_attempt() {
+        let calls = std::cell::Cell::new(0u32);
+        let result = http_get_with_retry(
+            "https://example.test/",
+            3,
+            |_| {
+                let n = calls.get();
+                calls.set(n + 1);
+                if n == 0 {
+                    Err(HttpError::Retryable("transient".into()))
+                } else {
+                    Ok(b"ok".to_vec())
+                }
+            },
+            |_| {},
+        );
+        assert!(result.is_ok());
+        assert_eq!(calls.get(), 2, "should have taken exactly 2 attempts");
+    }
+
+    #[test]
+    fn retry_exhausted_returns_error() {
+        let result = http_get_with_retry(
+            "https://example.test/",
+            3,
+            |_| Err(HttpError::Retryable("always fails".into())),
+            |_| {},
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("3 attempts"),
+            "error should mention attempt count: {err}"
+        );
+    }
+
+    #[test]
+    fn retry_fatal_does_not_retry() {
+        let calls = std::cell::Cell::new(0u32);
+        let result = http_get_with_retry(
+            "https://example.test/",
+            3,
+            |_| {
+                calls.set(calls.get() + 1);
+                Err(HttpError::Fatal("permanent".into()))
+            },
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1, "fatal error must not trigger retries");
+    }
+
+    #[test]
+    fn retry_rate_limited_retries_and_succeeds() {
+        let calls = std::cell::Cell::new(0u32);
+        let slept = std::cell::Cell::new(0u32);
+        let result = http_get_with_retry(
+            "https://example.test/",
+            3,
+            |_| {
+                let n = calls.get();
+                calls.set(n + 1);
+                if n == 0 {
+                    Err(HttpError::RateLimited(Duration::from_secs(5)))
+                } else {
+                    Ok(b"data".to_vec())
+                }
+            },
+            |_d| {
+                slept.set(slept.get() + 1);
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(calls.get(), 2);
+        assert_eq!(slept.get(), 1, "should sleep once for the 429");
+    }
+
+    #[test]
+    fn retry_rate_limited_all_attempts_returns_error() {
+        let result = http_get_with_retry(
+            "https://example.test/",
+            2,
+            |_| Err(HttpError::RateLimited(Duration::from_secs(1))),
+            |_| {},
+        );
+        // After 2 rate-limited attempts the orchestrator exhausts the loop
+        // without a success or a Fatal, so it falls through to the trailing error.
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn retry_backoff_doubles() {
+        let sleeps: std::cell::RefCell<Vec<Duration>> = std::cell::RefCell::new(Vec::new());
+        let _ = http_get_with_retry(
+            "https://example.test/",
+            4,
+            |_| Err(HttpError::Retryable("fail".into())),
+            |d| sleeps.borrow_mut().push(d),
+        );
+        let s = sleeps.borrow();
+        // Should have 3 sleeps for 4 attempts (sleep after attempts 1-3, not after 4)
+        assert_eq!(s.len(), 3);
+        assert_eq!(s[0], Duration::from_secs(1));
+        assert_eq!(s[1], Duration::from_secs(2));
+        assert_eq!(s[2], Duration::from_secs(4));
+    }
+
+    #[test]
+    fn retry_backoff_capped_at_max() {
+        let sleeps: std::cell::RefCell<Vec<Duration>> = std::cell::RefCell::new(Vec::new());
+        // Use enough attempts to push backoff above MAX_BACKOFF_SECS (30s)
+        let _ = http_get_with_retry(
+            "https://example.test/",
+            10,
+            |_| Err(HttpError::Retryable("fail".into())),
+            |d| sleeps.borrow_mut().push(d),
+        );
+        let s = sleeps.borrow();
+        for (i, &sleep_dur) in s.iter().enumerate() {
+            assert!(
+                sleep_dur <= Duration::from_secs(MAX_BACKOFF_SECS),
+                "sleep[{i}] {sleep_dur:?} exceeded MAX_BACKOFF_SECS"
+            );
+        }
     }
 
     #[test]
