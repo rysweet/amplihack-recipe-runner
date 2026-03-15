@@ -878,8 +878,7 @@ mod tests {
         // EOFTASKDESC
         // )
         let c = ctx(vec![("task_description", json!("Fix the login bug"))]);
-        let template =
-            "TASK_DESC=$(cat <<'EOFTASKDESC'\n{{task_description}}\nEOFTASKDESC\n)";
+        let template = "TASK_DESC=$(cat <<'EOFTASKDESC'\n{{task_description}}\nEOFTASKDESC\n)";
         let rendered = c.render_shell(template);
         let lines: Vec<&str> = rendered.split('\n').collect();
         assert_eq!(lines[0], "TASK_DESC=$(cat <<'EOFTASKDESC'");
