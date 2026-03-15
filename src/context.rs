@@ -831,4 +831,77 @@ mod tests {
         // The start line should use quoted behavior
         assert!(lines[0].contains("\"$RECIPE_VAR_prefix\""));
     }
+
+    // ── Regression: issue #33 — single-quoted heredoc inlines values ────────
+
+    #[test]
+    fn test_render_shell_single_quoted_heredoc_inlines_task_description() {
+        // Regression test for issue #33:
+        // Variables inside single-quoted heredoc bodies (<<'EOF') must be
+        // inlined as their actual values because bash does not expand $VAR
+        // inside single-quoted heredocs. The fix is in the replace_vars_inline
+        // path of render_shell(); this test pins it as a contract.
+        let c = ctx(vec![("task_description", json!("Fix the login bug"))]);
+        let template = "cat <<'EOF'\n{{task_description}}\nEOF";
+        let rendered = c.render_shell(template);
+        assert_eq!(rendered, "cat <<'EOF'\nFix the login bug\nEOF");
+        // Confirm the literal $RECIPE_VAR string does NOT appear
+        assert!(!rendered.contains("$RECIPE_VAR_task_description"));
+    }
+
+    #[test]
+    fn test_render_shell_single_quoted_heredoc_does_not_produce_env_var_ref() {
+        // Companion to the above: verify $RECIPE_VAR_* never appears in a
+        // single-quoted heredoc body (bash would pass it literally, not expand it).
+        let c = ctx(vec![("msg", json!("hello world"))]);
+        let template = "cat <<'SENTINEL'\n{{msg}}\nSENTINEL";
+        let rendered = c.render_shell(template);
+        assert!(!rendered.contains("$RECIPE_VAR"));
+        assert!(rendered.contains("hello world"));
+    }
+
+    #[test]
+    fn test_render_shell_double_quoted_heredoc_also_inlines_value() {
+        // Double-quoted heredoc delimiters (<<"EOF") also suppress expansion
+        // like single-quoted ones — values must be inlined.
+        let c = ctx(vec![("code", json!("print('hi')"))]);
+        let template = "cat <<\"PYEOF\"\n{{code}}\nPYEOF";
+        let rendered = c.render_shell(template);
+        assert_eq!(rendered, "cat <<\"PYEOF\"\nprint('hi')\nPYEOF");
+    }
+
+    #[test]
+    fn test_render_shell_realistic_single_quoted_heredoc_recipe_pattern() {
+        // Simulate the real-world recipe pattern that triggered issue #33:
+        // TASK_DESC=$(cat <<'EOFTASKDESC'
+        // {{task_description}}
+        // EOFTASKDESC
+        // )
+        let c = ctx(vec![("task_description", json!("Fix the login bug"))]);
+        let template =
+            "TASK_DESC=$(cat <<'EOFTASKDESC'\n{{task_description}}\nEOFTASKDESC\n)";
+        let rendered = c.render_shell(template);
+        let lines: Vec<&str> = rendered.split('\n').collect();
+        assert_eq!(lines[0], "TASK_DESC=$(cat <<'EOFTASKDESC'");
+        // Value must be inlined — NOT left as $RECIPE_VAR_task_description
+        assert_eq!(lines[1], "Fix the login bug");
+        assert_eq!(lines[2], "EOFTASKDESC");
+        assert_eq!(lines[3], ")");
+    }
+
+    #[test]
+    fn test_render_shell_single_quoted_heredoc_multiline_value_behavior() {
+        // [SEC-4] Documents the known boundary behavior for multi-line values
+        // in single-quoted heredocs: the value is inlined verbatim, including
+        // any embedded newlines. A value containing the heredoc terminator on
+        // its own line would close the heredoc early — accepted limitation for
+        // trusted-operator tooling (see SEC-3 in replace_vars_inline).
+        let c = ctx(vec![("lines", json!("line one\nline two"))]);
+        let template = "cat <<'EOF'\n{{lines}}\nEOF";
+        let rendered = c.render_shell(template);
+        // Both lines of the value appear verbatim in the body
+        assert!(rendered.contains("line one\nline two"));
+        // The heredoc structure is preserved
+        assert!(rendered.starts_with("cat <<'EOF'\n"));
+    }
 }
