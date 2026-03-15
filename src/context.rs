@@ -88,6 +88,17 @@ impl RecipeContext {
     ///
     /// The env var approach is immune to shell injection because values never
     /// appear in the shell source — they're passed via the process environment.
+    ///
+    /// # Security model [SEC-5]
+    ///
+    /// **Trusted-input assumption:** This function assumes recipes are authored by
+    /// trusted operators. Shell injection via `{{var}}` substitution is mitigated
+    /// by the env-var isolation strategy — values travel through the process
+    /// environment, not through the shell source text, making `$(cmd)`, backtick,
+    /// and semicolon injection impossible for env-var paths.
+    ///
+    /// The inline-substitution path (used only in `<<'WORD'` heredoc bodies) is
+    /// the exception — see `[SEC-3]` in `replace_vars_inline()`.
     pub fn render_shell(&self, template: &str) -> String {
         log::debug!(
             "RecipeContext::render_shell: template length={}",
@@ -173,6 +184,16 @@ impl RecipeContext {
 
     /// Replace `{{var}}` with the actual context value (inline).
     /// Used inside quoted heredoc bodies where bash won't expand env vars.
+    ///
+    /// # Security note [SEC-3]
+    ///
+    /// This function inlines raw values directly into the heredoc body text.
+    /// Multi-line values could inject a premature heredoc terminator (e.g. a
+    /// value containing `\nEOF\n` would close the heredoc early). This is an
+    /// accepted limitation for **trusted-operator tooling** — recipe authors
+    /// control both the heredoc delimiter and the variable values. Do NOT
+    /// call this function on untrusted input or outside the `is_quoted == true`
+    /// heredoc-body branch in `render_shell()`.
     fn replace_vars_inline(line: &str, data: &HashMap<String, Value>) -> String {
         TEMPLATE_RE
             .replace_all(line, |caps: &regex::Captures| {
@@ -830,5 +851,36 @@ mod tests {
         let lines: Vec<&str> = rendered.split('\n').collect();
         // The start line should use quoted behavior
         assert!(lines[0].contains("\"$RECIPE_VAR_prefix\""));
+    }
+
+    // ── Regression: issue #33 — single-quoted heredoc inlines values ────────
+
+    #[test]
+    fn test_render_shell_single_quoted_heredoc_inlines_task_description() {
+        // Regression test for issue #33:
+        // Variables inside single-quoted heredoc bodies (<<'EOF') must be
+        // inlined as their actual values because bash does not expand $VAR
+        // inside single-quoted heredocs. This fix already exists in production
+        // code (replace_vars_inline path); this test pins it as a contract.
+        let c = ctx(vec![("task_description", json!("Fix the login bug"))]);
+        let template = "cat <<'EOF'\n{{task_description}}\nEOF";
+        let rendered = c.render_shell(template);
+        assert_eq!(rendered, "cat <<'EOF'\nFix the login bug\nEOF");
+    }
+
+    #[test]
+    fn test_render_shell_single_quoted_heredoc_multiline_value_behavior() {
+        // [SEC-4] Documents the known boundary behavior for multi-line values
+        // in single-quoted heredocs: the value is inlined verbatim, including
+        // any embedded newlines. A value containing the heredoc terminator on
+        // its own line would close the heredoc early — accepted limitation for
+        // trusted-operator tooling (see SEC-3).
+        let c = ctx(vec![("lines", json!("line one\nline two"))]);
+        let template = "cat <<'EOF'\n{{lines}}\nEOF";
+        let rendered = c.render_shell(template);
+        // Both lines of the value appear verbatim in the body
+        assert!(rendered.contains("line one\nline two"));
+        // The heredoc structure is preserved
+        assert!(rendered.starts_with("cat <<'EOF'\n"));
     }
 }
