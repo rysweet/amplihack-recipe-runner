@@ -77,12 +77,13 @@ impl RecipeContext {
     /// quotes, parentheses, and other shell metacharacters), this method
     /// replaces `{{var}}` with `$RECIPE_VAR_var` environment variable refs.
     ///
-    /// **Context-aware quoting:**
-    /// - Outside heredocs: `{{var}}` → `"$RECIPE_VAR_var"` (double-quoted to
-    ///   prevent word splitting)
+    /// **Template rendering rules (issue #32 fix):**
+    /// - Outside heredocs: `{{var}}` → `$RECIPE_VAR_var` (no extra quotes added;
+    ///   recipe authors control quoting in their YAML — adding quotes here produces
+    ///   double-doubled quotes like `""$RECIPE_VAR_repo_path""` when YAML already
+    ///   contains `cd "{{repo_path}}"`)
     /// - Inside unquoted heredoc bodies (`<<WORD`): `{{var}}` → `$RECIPE_VAR_var`
-    ///   (unquoted, because heredocs don't word-split and double quotes would
-    ///   become literal characters in the output)
+    ///   (heredocs don't word-split and double quotes would become literal output)
     /// - Inside quoted heredoc bodies (`<<'WORD'`): `{{var}}` → inline value
     ///   (bash won't expand `$VAR` in quoted heredocs, so we must inline)
     ///
@@ -147,14 +148,22 @@ impl RecipeContext {
         result.join("\n")
     }
 
-    /// Replace `{{var}}` with `"$RECIPE_VAR_var"` (quoted env ref).
-    /// Used outside heredocs where word-splitting protection is needed.
+    /// Replace `{{var}}` with `$RECIPE_VAR_var` (unquoted env ref).
+    ///
+    /// Used outside heredocs. Quotes are intentionally omitted so that when
+    /// recipe authors already quote their variables in YAML (e.g. `cd "{{repo_path}}"`),
+    /// the rendered output is `cd "$RECIPE_VAR_repo_path"` rather than the
+    /// broken double-doubled `cd ""$RECIPE_VAR_repo_path""` (issue #32).
+    ///
+    /// Shell expansion and any required quoting is the recipe author's responsibility;
+    /// the env-var isolation model (values never appear in shell source) provides
+    /// injection protection regardless of quoting.
     fn replace_vars_quoted(line: &str) -> String {
         TEMPLATE_RE
             .replace_all(line, |caps: &regex::Captures| {
                 let var_name = &caps[1];
                 let env_key = Self::env_key(var_name);
-                format!("\"${}\"", env_key)
+                format!("${}", env_key)
             })
             .into_owned()
     }
@@ -318,8 +327,8 @@ mod tests {
     fn test_render_shell_uses_env_var_refs() {
         let c = ctx(vec![("cmd", json!("hello; rm -rf /"))]);
         let rendered = c.render_shell("echo {{cmd}}");
-        // render_shell now replaces with env var reference instead of inlining
-        assert_eq!(rendered, "echo \"$RECIPE_VAR_cmd\"");
+        // render_shell replaces with unquoted env var reference (issue #32 fix)
+        assert_eq!(rendered, "echo $RECIPE_VAR_cmd");
     }
 
     #[test]
@@ -737,30 +746,37 @@ mod tests {
             ("file", json!("/tmp/out")),
             ("content", json!("hello world")),
         ]);
-        // Line 1: regular command (quoted)
+        // Line 1: regular command (unquoted env ref — issue #32 fix)
         // Lines 2-4: heredoc body (unquoted)
-        // Line 5: after heredoc (quoted again)
+        // Line 5: after heredoc (unquoted env ref)
         let template = "cat <<EOF > {{file}}\n{{content}}\nEOF\necho {{file}}";
         let rendered = c.render_shell(template);
         let lines: Vec<&str> = rendered.split('\n').collect();
-        // Start line: {{file}} is outside heredoc body → quoted
-        assert_eq!(lines[0], "cat <<EOF > \"$RECIPE_VAR_file\"");
+        // Start line: {{file}} is outside heredoc body → unquoted env ref
+        assert_eq!(lines[0], "cat <<EOF > $RECIPE_VAR_file");
         // Body: {{content}} is inside heredoc → unquoted
         assert_eq!(lines[1], "$RECIPE_VAR_content");
         // Delimiter line
         assert_eq!(lines[2], "EOF");
-        // After heredoc: back to quoted
-        assert_eq!(lines[3], "echo \"$RECIPE_VAR_file\"");
+        // After heredoc: unquoted env ref
+        assert_eq!(lines[3], "echo $RECIPE_VAR_file");
     }
 
     #[test]
-    fn test_render_shell_no_heredoc_preserves_quoted_behavior() {
+    fn test_render_shell_no_heredoc_uses_unquoted_env_refs() {
+        // Issue #32 fix: no extra quotes added — authors control quoting in their YAML
         let c = ctx(vec![("cmd", json!("hello; rm -rf /"))]);
         let rendered = c.render_shell("echo {{cmd}} && ls {{cmd}}");
-        assert_eq!(
-            rendered,
-            "echo \"$RECIPE_VAR_cmd\" && ls \"$RECIPE_VAR_cmd\""
-        );
+        assert_eq!(rendered, "echo $RECIPE_VAR_cmd && ls $RECIPE_VAR_cmd");
+    }
+
+    #[test]
+    fn test_render_shell_author_quoted_var_no_double_quotes() {
+        // Regression test for issue #32: recipe author writes cd "{{repo_path}}"
+        // and expects cd "$RECIPE_VAR_repo_path", not cd ""$RECIPE_VAR_repo_path""
+        let c = ctx(vec![("repo_path", json!("/home/user/repo"))]);
+        let rendered = c.render_shell("cd \"{{repo_path}}\"");
+        assert_eq!(rendered, "cd \"$RECIPE_VAR_repo_path\"");
     }
 
     #[test]
@@ -828,7 +844,8 @@ mod tests {
         let template = "echo {{prefix}} | cat <<EOF\nstuff\nEOF";
         let rendered = c.render_shell(template);
         let lines: Vec<&str> = rendered.split('\n').collect();
-        // The start line should use quoted behavior
-        assert!(lines[0].contains("\"$RECIPE_VAR_prefix\""));
+        // The start line should use unquoted env ref (issue #32 fix)
+        assert!(lines[0].contains("$RECIPE_VAR_prefix"));
+        assert!(!lines[0].contains("\"$RECIPE_VAR_prefix\""));
     }
 }
