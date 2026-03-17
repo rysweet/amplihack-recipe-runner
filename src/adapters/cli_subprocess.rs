@@ -1,5 +1,5 @@
-/// CLI subprocess adapter — executes agent steps by spawning agent CLI subprocesses
-/// (configurable via `--agent-binary` or `AMPLIHACK_AGENT_BINARY` env var, defaults to `claude`)
+/// CLI subprocess adapter — executes agent steps by spawning `amplihack <agent>`
+/// subprocesses (configurable via `AMPLIHACK_AGENT_BINARY` env var, defaults to `claude`)
 /// and bash steps via `/bin/bash -c`.
 ///
 /// Agent steps use a temporary working directory to prevent file write races
@@ -109,7 +109,9 @@ impl CLISubprocessAdapter {
         // Append non-interactive footer so nested sessions never hang (#2464)
         let full_prompt = format!("{}{}", prompt, NON_INTERACTIVE_FOOTER);
 
-        let child_env = Self::build_child_env();
+        let mut child_env = Self::build_child_env();
+        // Ensure nested agent steps inherit the same agent binary preference
+        child_env.insert("AMPLIHACK_AGENT_BINARY".to_string(), self.cli.clone());
 
         // Create output log file
         let output_dir = actual_cwd.join(".recipe-output");
@@ -124,8 +126,10 @@ impl CLISubprocessAdapter {
 
         let log_fh = std::fs::File::create(&output_file)?;
 
-        let mut cmd = std::process::Command::new(&self.cli);
-        cmd.args(["-p", &full_prompt]);
+        // Always launch via `amplihack <agent>` so the amplihack infrastructure
+        // (env setup, guards, hooks) is properly initialized.
+        let mut cmd = std::process::Command::new("amplihack");
+        cmd.args([&self.cli, "-p", &full_prompt]);
         if let Some(sp) = system_prompt {
             cmd.args(["--system-prompt", sp]);
         }
@@ -139,7 +143,7 @@ impl CLISubprocessAdapter {
             .stdout(log_fh)
             .stderr(std::process::Stdio::inherit())
             .spawn()
-            .with_context(|| format!("Failed to execute '{}'", self.cli))?;
+            .with_context(|| format!("Failed to execute 'amplihack {}'", self.cli))?;
 
         // Background heartbeat thread for progress reporting
         let stop = Arc::new(AtomicBool::new(false));
@@ -197,7 +201,7 @@ impl CLISubprocessAdapter {
 
         if !status.success() {
             anyhow::bail!(
-                "{} failed (exit {}): {}",
+                "amplihack {} failed (exit {}): {}",
                 self.cli,
                 status.code().unwrap_or(-1),
                 crate::safe_tail(&stdout, 500)
@@ -245,7 +249,10 @@ impl Adapter for CLISubprocessAdapter {
             working_dir,
             timeout
         );
-        let child_env = Self::build_child_env();
+        let mut child_env = Self::build_child_env();
+        // Propagate agent binary preference so scripts spawning nested agents
+        // use the same binary as the parent (mirrors execute_agent_step_impl).
+        child_env.insert("AMPLIHACK_AGENT_BINARY".to_string(), self.cli.clone());
         let effective_dir = if working_dir.is_empty() || working_dir == "." {
             &self.working_dir
         } else {
@@ -288,8 +295,8 @@ impl Adapter for CLISubprocessAdapter {
 
     fn is_available(&self) -> bool {
         // Always available for bash steps. Agent steps will fail at execution
-        // time if the CLI binary (e.g. `claude`) is not installed, providing
-        // a clear error message for the specific step that needs it.
+        // time if `amplihack` is not in PATH, providing a clear error message
+        // for the specific step that needs it.
         log::debug!("CLISubprocessAdapter::is_available: always true");
         true
     }
@@ -550,5 +557,18 @@ mod tests {
     fn test_non_interactive_footer_constant() {
         assert!(NON_INTERACTIVE_FOOTER.contains("autonomously"));
         assert!(NON_INTERACTIVE_FOOTER.contains("Do not ask questions"));
+    }
+
+    #[test]
+    fn test_with_binary_propagates_agent_binary_env() {
+        let adapter = CLISubprocessAdapter::new().with_binary("copilot");
+        // Simulate what execute_agent_step_impl does: build env then insert
+        let mut env = CLISubprocessAdapter::build_child_env();
+        env.insert("AMPLIHACK_AGENT_BINARY".to_string(), adapter.cli.clone());
+        assert_eq!(
+            env.get("AMPLIHACK_AGENT_BINARY").unwrap(),
+            "copilot",
+            "child env must propagate the overridden agent binary"
+        );
     }
 }
