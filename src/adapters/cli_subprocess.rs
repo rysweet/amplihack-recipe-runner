@@ -249,7 +249,10 @@ impl Adapter for CLISubprocessAdapter {
             working_dir,
             timeout
         );
-        let child_env = Self::build_child_env();
+        let mut child_env = Self::build_child_env();
+        // Propagate agent binary preference so scripts spawning nested agents
+        // use the same binary as the parent (mirrors execute_agent_step_impl).
+        child_env.insert("AMPLIHACK_AGENT_BINARY".to_string(), self.cli.clone());
         let effective_dir = if working_dir.is_empty() || working_dir == "." {
             &self.working_dir
         } else {
@@ -292,8 +295,8 @@ impl Adapter for CLISubprocessAdapter {
 
     fn is_available(&self) -> bool {
         // Always available for bash steps. Agent steps will fail at execution
-        // time if the CLI binary (e.g. `claude`) is not installed, providing
-        // a clear error message for the specific step that needs it.
+        // time if `amplihack` is not in PATH, providing a clear error message
+        // for the specific step that needs it.
         log::debug!("CLISubprocessAdapter::is_available: always true");
         true
     }
@@ -554,5 +557,18 @@ mod tests {
     fn test_non_interactive_footer_constant() {
         assert!(NON_INTERACTIVE_FOOTER.contains("autonomously"));
         assert!(NON_INTERACTIVE_FOOTER.contains("Do not ask questions"));
+    }
+
+    #[test]
+    fn test_with_binary_propagates_agent_binary_env() {
+        let adapter = CLISubprocessAdapter::new().with_binary("copilot");
+        // Simulate what execute_agent_step_impl does: build env then insert
+        let mut env = CLISubprocessAdapter::build_child_env();
+        env.insert("AMPLIHACK_AGENT_BINARY".to_string(), adapter.cli.clone());
+        assert_eq!(
+            env.get("AMPLIHACK_AGENT_BINARY").unwrap(),
+            "copilot",
+            "child env must propagate the overridden agent binary"
+        );
     }
 }
