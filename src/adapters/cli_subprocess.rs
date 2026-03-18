@@ -145,14 +145,22 @@ impl CLISubprocessAdapter {
             .spawn()
             .with_context(|| format!("Failed to execute 'amplihack {}'", self.cli))?;
 
-        // Background heartbeat thread for progress reporting
+        // Background heartbeat thread for progress reporting.
+        // Monitors the output log file for growth and prints status updates
+        // to stderr.  When the agent is working but producing no stdout
+        // (common with `claude -p` which writes all output at the end),
+        // the heartbeat shows elapsed time and confirms the process is alive
+        // so the user (or parent orchestrator) does not mistake silence for
+        // a hang.  See issue #3266.
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
         let output_path = output_file.clone();
+        let child_pid = child.id();
 
         let heartbeat = std::thread::spawn(move || {
             let mut last_size = 0u64;
             let mut last_activity = Instant::now();
+            let start_time = Instant::now();
             while !stop_clone.load(Ordering::Relaxed) {
                 match std::fs::metadata(&output_path) {
                     Ok(meta) => {
@@ -172,11 +180,22 @@ impl CLISubprocessAdapter {
                             }
                             last_size = current_size;
                             last_activity = Instant::now();
-                        } else if last_activity.elapsed() > Duration::from_secs(60) {
-                            eprintln!(
-                                "  [agent] ... still running ({}s since last output)",
-                                last_activity.elapsed().as_secs()
-                            );
+                        } else if last_activity.elapsed() > Duration::from_secs(30) {
+                            let total_elapsed = start_time.elapsed().as_secs();
+                            let idle_secs = last_activity.elapsed().as_secs();
+                            // Check if the child process is still alive via /proc
+                            let pid_alive = std::path::Path::new(&format!("/proc/{}", child_pid)).exists();
+                            if pid_alive {
+                                eprintln!(
+                                    "  [agent] ... working ({}s elapsed, {}s since last output, pid {} alive)",
+                                    total_elapsed, idle_secs, child_pid
+                                );
+                            } else {
+                                eprintln!(
+                                    "  [agent] ... waiting ({}s elapsed, process may be finishing)",
+                                    total_elapsed
+                                );
+                            }
                             last_activity = Instant::now();
                         }
                     }

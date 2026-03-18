@@ -32,6 +32,8 @@ impl ExecutionListener for NullListener {}
 /// Stderr progress listener (for `--progress` flag).
 ///
 /// Prints step start/complete events to stderr with status icons and timing.
+/// Agent steps can run for minutes, so start messages include the step type
+/// to help distinguish quick bash steps from long-running agent steps.
 pub struct StderrListener;
 impl ExecutionListener for StderrListener {
     fn on_step_start(&self, step_id: &str, step_type: StepType) {
@@ -40,7 +42,12 @@ impl ExecutionListener for StderrListener {
             step_id,
             step_type
         );
-        eprintln!("▶ {} ({:?})", step_id, step_type);
+        let type_hint = match step_type {
+            StepType::Agent => " [agent — may take several minutes]",
+            StepType::Bash => "",
+            StepType::Recipe => " [sub-recipe]",
+        };
+        eprintln!("▶ {}{}", step_id, type_hint);
     }
     fn on_step_complete(&self, result: &StepResult) {
         log::debug!(
