@@ -224,6 +224,61 @@ impl RecipeContext {
         env
     }
 
+    /// Maximum total size of environment variables passed to a single bash step (bytes).
+    /// Linux default ARG_MAX is ~2 MB; we stay well under to leave room for the
+    /// command itself plus inherited environment.
+    const MAX_ENV_BYTES: usize = 1_048_576; // 1 MB
+
+    /// Return environment variables needed by a rendered bash command.
+    ///
+    /// Only exports `RECIPE_VAR_*` entries that are actually referenced in the
+    /// rendered command text (i.e., the command contains `$RECIPE_VAR_<key>` or
+    /// `RECIPE_VAR_<key>`).  This prevents the accumulated context from all
+    /// prior steps from being passed to every bash subprocess, which can exceed
+    /// the OS `ARG_MAX` limit after many steps (see issue #3340).
+    ///
+    /// Falls back to truncation if the referenced vars alone exceed
+    /// `MAX_ENV_BYTES`.
+    pub fn shell_env_vars_for_command(&self, rendered_command: &str) -> HashMap<String, String> {
+        let full_env = self.shell_env_vars();
+
+        // Filter to only vars referenced in the command
+        let mut filtered: HashMap<String, String> = full_env
+            .into_iter()
+            .filter(|(key, _)| rendered_command.contains(key.as_str()))
+            .collect();
+
+        log::debug!(
+            "RecipeContext::shell_env_vars_for_command: {} referenced vars (of {} total context keys)",
+            filtered.len(),
+            self.data.len()
+        );
+
+        // Safety valve: if filtered env is still too large, truncate values
+        let total_bytes: usize = filtered
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + 2) // +2 for '=' and null terminator
+            .sum();
+
+        if total_bytes > Self::MAX_ENV_BYTES {
+            log::warn!(
+                "Filtered env vars still exceed MAX_ENV_BYTES ({} > {}), truncating large values",
+                total_bytes,
+                Self::MAX_ENV_BYTES
+            );
+            // Truncate the largest values first
+            let max_per_var = Self::MAX_ENV_BYTES / filtered.len().max(1);
+            for value in filtered.values_mut() {
+                if value.len() > max_per_var {
+                    let truncated = crate::safe_truncate(value, max_per_var);
+                    *value = format!("{}... [truncated from {} bytes]", truncated, value.len());
+                }
+            }
+        }
+
+        filtered
+    }
+
     /// Convert a template variable name to an env var key.
     fn env_key(var_name: &str) -> String {
         log::trace!("RecipeContext::env_key: var_name={:?}", var_name);
@@ -335,6 +390,59 @@ mod tests {
         let env = c.shell_env_vars();
         assert_eq!(env.get("RECIPE_VAR_obj__status").unwrap(), "ok");
         assert_eq!(env.get("RECIPE_VAR_obj__count").unwrap(), "5");
+    }
+
+    #[test]
+    fn test_shell_env_vars_for_command_filters_unreferenced() {
+        // Simulate a context with many large outputs from prior steps
+        let c = ctx(vec![
+            ("small_var", json!("hello")),
+            ("huge_output_1", json!("x".repeat(100_000))),
+            ("huge_output_2", json!("y".repeat(100_000))),
+            ("referenced_var", json!("used value")),
+        ]);
+
+        // Command only references small_var and referenced_var
+        let command = r#"echo "$RECIPE_VAR_small_var" && echo "$RECIPE_VAR_referenced_var""#;
+        let env = c.shell_env_vars_for_command(command);
+
+        // Only the referenced vars should be exported
+        assert!(env.contains_key("RECIPE_VAR_small_var"));
+        assert!(env.contains_key("RECIPE_VAR_referenced_var"));
+        assert!(!env.contains_key("RECIPE_VAR_huge_output_1"));
+        assert!(!env.contains_key("RECIPE_VAR_huge_output_2"));
+        assert_eq!(env.len(), 2);
+    }
+
+    #[test]
+    fn test_shell_env_vars_for_command_no_vars_referenced() {
+        let c = ctx(vec![
+            ("big_1", json!("x".repeat(50_000))),
+            ("big_2", json!("y".repeat(50_000))),
+        ]);
+
+        // Command references no RECIPE_VAR_* at all
+        let command = "echo hello world";
+        let env = c.shell_env_vars_for_command(command);
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn test_shell_env_vars_for_command_includes_nested() {
+        let c = ctx(vec![
+            ("obj", json!({"status": "ok", "unused": "data"})),
+            ("unrelated", json!("big value not needed")),
+        ]);
+
+        // Command references the nested key
+        let command = "echo $RECIPE_VAR_obj__status";
+        let env = c.shell_env_vars_for_command(command);
+
+        assert!(env.contains_key("RECIPE_VAR_obj__status"));
+        // The parent key "RECIPE_VAR_obj" is a substring of the referenced key,
+        // so it will also match — this is expected and harmless (small overhead).
+        // But unrelated keys should NOT be exported.
+        assert!(!env.contains_key("RECIPE_VAR_unrelated"));
     }
 
     #[test]

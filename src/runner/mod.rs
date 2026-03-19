@@ -395,7 +395,7 @@ impl<A: Adapter> RecipeRunner<A> {
     fn run_hook(&self, hook: &Option<String>, hook_name: &str, step_id: &str, ctx: &RecipeContext) {
         if let Some(cmd) = hook {
             let rendered = ctx.render_shell(cmd);
-            let env_vars = ctx.shell_env_vars();
+            let env_vars = ctx.shell_env_vars_for_command(&rendered);
             info!("Running {} hook for step '{}'", hook_name, step_id);
             if let Err(e) =
                 self.adapter
@@ -597,7 +597,7 @@ impl<A: Adapter> RecipeRunner<A> {
             StepType::Recipe => self.execute_sub_recipe(step, ctx),
             StepType::Bash => {
                 let rendered = ctx.render_shell(step.command.as_deref().unwrap_or(""));
-                let env_vars = ctx.shell_env_vars();
+                let env_vars = ctx.shell_env_vars_for_command(&rendered);
                 self.adapter
                     .execute_bash_step(&rendered, working_dir, step.timeout, &env_vars)
                     .map(|output| output.trim_end().to_string())
@@ -1050,7 +1050,7 @@ impl<A: Adapter> RecipeRunner<A> {
         }
 
         let rendered = ctx.render_shell(step.command.as_deref().unwrap_or(""));
-        let env_vars = ctx.shell_env_vars();
+        let env_vars = ctx.shell_env_vars_for_command(&rendered);
         let working_dir = step.working_dir.as_deref().unwrap_or(default_working_dir);
 
         match adapter.execute_bash_step(&rendered, working_dir, step.timeout, &env_vars) {
