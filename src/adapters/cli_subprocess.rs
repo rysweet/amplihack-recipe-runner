@@ -9,7 +9,7 @@ use crate::adapters::Adapter;
 use anyhow::Context;
 use std::collections::HashMap;
 use std::env;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +17,18 @@ use std::time::{Duration, Instant};
 
 const NON_INTERACTIVE_FOOTER: &str = "\n\nIMPORTANT: Proceed autonomously. Do not ask questions. \
      Make reasonable decisions and continue.";
+
+/// Format current UTC time as HH:MM:SS for heartbeat output.
+fn format_utc_timestamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let total_secs = now.as_secs();
+    let hours = (total_secs / 3600) % 24;
+    let minutes = (total_secs / 60) % 60;
+    let seconds = total_secs % 60;
+    format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+}
 
 pub struct CLISubprocessAdapter {
     cli: String,
@@ -92,6 +104,7 @@ impl CLISubprocessAdapter {
     fn execute_agent_step_impl(
         &self,
         prompt: &str,
+        agent_name: Option<&str>,
         system_prompt: Option<&str>,
         model: Option<&str>,
     ) -> Result<String, anyhow::Error> {
@@ -156,44 +169,59 @@ impl CLISubprocessAdapter {
         let stop_clone = stop.clone();
         let output_path = output_file.clone();
         let child_pid = child.id();
+        let heartbeat_label = agent_name
+            .unwrap_or("agent")
+            .to_string();
 
         let heartbeat = std::thread::spawn(move || {
-            let mut last_size = 0u64;
+            let mut last_pos = 0u64;
             let mut last_activity = Instant::now();
             let start_time = Instant::now();
             while !stop_clone.load(Ordering::Relaxed) {
                 match std::fs::metadata(&output_path) {
                     Ok(meta) => {
                         let current_size = meta.len();
-                        if current_size > last_size {
+                        if current_size > last_pos {
+                            // Read and display all new lines since last position
                             match std::fs::File::open(&output_path) {
-                                Ok(file) => {
-                                    let reader = BufReader::new(file);
-                                    if let Some(Ok(last_line)) = reader.lines().last() {
-                                        let truncated = crate::safe_truncate(&last_line, 120);
-                                        eprintln!("  [agent] {}", truncated);
+                                Ok(mut file) => {
+                                    if file.seek(SeekFrom::Start(last_pos)).is_ok() {
+                                        let reader = BufReader::new(file);
+                                        let ts = format_utc_timestamp();
+                                        for line in reader.lines() {
+                                            if let Ok(line) = line {
+                                                let trimmed = line.trim();
+                                                if !trimmed.is_empty() {
+                                                    eprintln!(
+                                                        "  [{}] [{}:{}] {}",
+                                                        ts, heartbeat_label, child_pid, trimmed
+                                                    );
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 Err(e) => {
                                     log::debug!("heartbeat: cannot open output file: {}", e);
                                 }
                             }
-                            last_size = current_size;
+                            last_pos = current_size;
                             last_activity = Instant::now();
                         } else if last_activity.elapsed() > Duration::from_secs(30) {
+                            let ts = format_utc_timestamp();
                             let total_elapsed = start_time.elapsed().as_secs();
                             let idle_secs = last_activity.elapsed().as_secs();
                             // Check if the child process is still alive via /proc
                             let pid_alive = std::path::Path::new(&format!("/proc/{}", child_pid)).exists();
                             if pid_alive {
                                 eprintln!(
-                                    "  [agent] ... working ({}s elapsed, {}s since last output, pid {} alive)",
-                                    total_elapsed, idle_secs, child_pid
+                                    "  [{}] [{}:{}] ... working ({}s elapsed, {}s since last output)",
+                                    ts, heartbeat_label, child_pid, total_elapsed, idle_secs
                                 );
                             } else {
                                 eprintln!(
-                                    "  [agent] ... waiting ({}s elapsed, process may be finishing)",
-                                    total_elapsed
+                                    "  [{}] [{}:{}] ... waiting ({}s elapsed, process may be finishing)",
+                                    ts, heartbeat_label, child_pid, total_elapsed
                                 );
                             }
                             last_activity = Instant::now();
@@ -241,18 +269,19 @@ impl Adapter for CLISubprocessAdapter {
     fn execute_agent_step(
         &self,
         prompt: &str,
-        _agent_name: Option<&str>,
+        agent_name: Option<&str>,
         system_prompt: Option<&str>,
         _mode: Option<&str>,
         _working_dir: &str,
         model: Option<&str>,
     ) -> Result<String, anyhow::Error> {
         log::debug!(
-            "CLISubprocessAdapter::execute_agent_step: prompt_len={}, model={:?}",
+            "CLISubprocessAdapter::execute_agent_step: prompt_len={}, agent={:?}, model={:?}",
             prompt.len(),
+            agent_name,
             model
         );
-        self.execute_agent_step_impl(prompt, system_prompt, model)
+        self.execute_agent_step_impl(prompt, agent_name, system_prompt, model)
     }
 
     fn execute_bash_step(

@@ -7,6 +7,8 @@
 - [YAML Recipe Format](yaml-format.md)
 - [CLI Reference](cli-reference.md)
 - [Condition Language](conditions.md)
+- [Progress Markers Reference](progress-markers.md)
+- [How to Monitor Long-Running Recipes](howto-progress-markers.md)
 
 # Examples
 - [Tutorials](examples-tutorials.md)
