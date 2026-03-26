@@ -268,7 +268,7 @@ A complete run of a two-step recipe with progress enabled looks like:
 | `[STEP NN/TT] id @ time`                      | Step `id` started; it is step `NN` of `TT` total    |
 | `  [HH:MM:SS] [agent:pid] <output>`           | New agent output line, timestamped in UTC            |
 | `  [HH:MM:SS] [agent:pid] ... working (…)`    | Agent is alive but silent for ≥ 30 s                 |
-| `  [HH:MM:SS] [agent:pid] ... waiting (…)`    | Process not found in `/proc`; likely finishing       |
+| `  [HH:MM:SS] [agent:pid] ... waiting (…)`    | Process liveness check returned false; likely finishing |
 | `  ✓ id (Xs)`                                 | Step `id` completed successfully in `X` seconds     |
 | `  ✗ id (Xs)`                                 | Step `id` failed after `X` seconds                  |
 | `  ⊘ id (0.0s)`                               | Step `id` was skipped (condition false or tag-filtered) |
@@ -279,10 +279,12 @@ The `[STEP]` line is always first for each step. Agent output lines and
 `[HH:MM:SS] [agent:pid]`) appear while the step runs. The completion line
 (`✓/✗/⊘/⚠`) is always the last line for each step.
 
-> **All agent output lines are streamed in full** — there is no per-line
-> truncation. The heartbeat thread reads every new line written to the agent's
-> output file since the last poll (every 2 seconds) and prints each non-empty
-> line immediately.
+> **Agent output lines are displayed up to 4096 bytes** — lines longer than
+> 4096 bytes are truncated with a `... [N bytes truncated]` suffix on stderr.
+> Full content is captured in the agent's log file and returned as step output.
+> The heartbeat thread reads every new line written to the agent's output file
+> since the last poll (every 2 seconds) and prints each non-empty line
+> immediately.
 
 > **30-second idle threshold** — the `working`/`waiting` notice appears only
 > after the agent has been silent for 30 seconds, preventing noise during

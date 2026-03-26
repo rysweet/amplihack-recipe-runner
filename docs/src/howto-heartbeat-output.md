@@ -29,17 +29,17 @@ monitoring systems.
 Before this improvement, heartbeat output looked like:
 
 ```
-  [agent] ... still running (60s since last output)
+  [agent] ... working (92s elapsed, 32s since last output, pid 48291 alive)
 ```
 
 That line told an operator the step was alive, but not:
 
 - **When** the message was emitted — no timestamp to cross-reference logs
-- **Which agent** produced it when multiple steps ran — label lacked context
-- **Which process** to inspect with `ps` or `kill` — PID was missing
-- **What the agent last said** — output was truncated to 120 characters
+- **Which agent** produced it when multiple steps ran — the label was always `agent`
+- **What the agent last said** — output was truncated to 120 characters per line,
+  and only the last line was shown rather than all new lines since the previous poll
 
-The enriched format addresses all four gaps:
+The enriched format addresses all three gaps:
 
 ```
   [14:32:15] [amplihack:architect:48291] Analysing module boundaries…
@@ -91,7 +91,10 @@ immediately.
 
 This means:
 
-- **All output is visible** — there is no truncation of output lines.
+- **Lines are displayed up to 4096 bytes** — individual lines longer than 4096
+  bytes are truncated with a `... [N bytes truncated]` notice on stderr.
+  The full content is still captured in the agent's log file and returned as
+  the step output.
 - **Lines arrive in bursts** — if an agent writes 20 lines in 2 seconds, all
   20 appear together in the next poll cycle.
 - **Empty lines are suppressed** — the heartbeat skips blank lines to keep
@@ -110,7 +113,7 @@ recipe-runner-rs default-workflow \
     1>result.json
 
 # Tail only the heartbeat status lines during the run
-tail -f run.log | grep '^\.\.\. working\|^\.\.\. waiting'
+tail -f run.log | grep '\.\.\. working\|\.\.\. waiting'
 ```
 
 ---
@@ -126,23 +129,20 @@ status notice instead of an output line:
   [14:33:47] [amplihack:architect:48291] ... working (124s elapsed, 32s since last output)
 ```
 
-The child process exists in `/proc/<pid>`. It has produced no output for 32
-seconds but the process is alive — normal for agents doing inference, large
-file reads, or waiting for an API response.
+The child process is confirmed alive via `kill -0 <pid>` on Unix (Linux and
+macOS) or a `tasklist` query on Windows. It has produced no output for 32
+seconds — normal for agents doing inference, large file reads, or waiting for
+an API response.
 
-### Process not found in /proc — waiting
+### Process not found — waiting
 
 ```
   [14:34:02] [amplihack:architect:48291] ... waiting (139s elapsed, process may be finishing)
 ```
 
-`/proc/<pid>` does not exist, which typically means the process has exited but
-the main thread has not yet reaped it. This state is transient — the
+The liveness check returned false, which typically means the process has exited
+but the main thread has not yet reaped it. This state is transient — the
 completion line (`✓` or `✗`) usually follows within seconds.
-
-> **Note**: On macOS and Windows, `/proc` does not exist. The heartbeat always
-> emits the `... waiting` form on those platforms, even when the process is
-> running. The run still completes correctly; only the status wording differs.
 
 ---
 
@@ -194,7 +194,7 @@ grep '\[amplihack:architect:[0-9]*\]' run.log
 grep '\[amplihack:architect:48291\]' run.log
 
 # Count output lines per agent
-grep -oP '\[[\w:]+:\d+\]' run.log | sort | uniq -c | sort -rn
+grep -oP '\[[\w:.\-/]+:\d+\]' run.log | sort | uniq -c | sort -rn
 ```
 
 From Python:
@@ -204,7 +204,7 @@ import re
 from pathlib import Path
 
 HEARTBEAT_RE = re.compile(
-    r"^\s{2}\[(\d{2}:\d{2}:\d{2})\] \[([\w:]+):(\d+)\] (.+)$"
+    r"^\s{2}\[(\d{2}:\d{2}:\d{2})\] \[([\w:.\-/]+):(\d+)\] (.+)$"
 )
 
 lines = Path("run.log").read_text().splitlines()
@@ -231,17 +231,18 @@ OUTPUT  14:34:22 amplihack:architect:48291 → Module spec written to /tmp/.reci
 
 ## Understand platform differences
 
-| Behaviour                     | Linux              | macOS / Windows         |
-|-------------------------------|--------------------|-------------------------|
-| `HH:MM:SS` timestamp          | ✓ UTC              | ✓ UTC                   |
-| `agent_name:pid` label        | ✓                  | ✓                       |
-| Full output streaming         | ✓                  | ✓                       |
-| Process alive check (`/proc`) | ✓ accurate         | ✗ always `... waiting`  |
-| Status wording on exit        | `working` → `waiting` at exit | always `waiting` |
+| Behaviour                       | Linux / macOS      | Windows                 |
+|---------------------------------|--------------------|-------------------------|
+| `HH:MM:SS` timestamp            | ✓ UTC              | ✓ UTC                   |
+| `agent_name:pid` label          | ✓                  | ✓                       |
+| Full output streaming           | ✓                  | ✓                       |
+| Process alive check (`kill -0`) | ✓ accurate         | ✓ accurate (`tasklist`) |
+| Status wording on exit          | `working` → `waiting` at exit | `working` → `waiting` at exit |
 
-The only functional difference across platforms is the process alive check.
-On all platforms the recipe executes correctly, all output lines stream, and
-the `HH:MM:SS` label is accurate.
+Process liveness is checked accurately on all supported platforms: `kill -0
+<pid>` on Unix (Linux and macOS) and `tasklist` on Windows. There is no
+platform where the heartbeat is forced to emit `... waiting` regardless of
+process state.
 
 > **Security note**: Agent output written to stderr may contain secrets if the
 > agent echoes environment variables or credentials. In CI pipelines where

@@ -1001,6 +1001,52 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_output_line_ansi_then_truncation() {
+        // A line with embedded ANSI codes whose stripped length still exceeds DISPLAY_LIMIT.
+        // Verifies that ANSI stripping is applied before the length cap, and truncation
+        // fires on the stripped byte count, not the raw byte count.
+        let ansi_prefix = "\x1b[31m";
+        let ansi_suffix = "\x1b[0m";
+        let content = "x".repeat(DISPLAY_LIMIT + 10);
+        let input = format!("{}{}{}", ansi_prefix, content, ansi_suffix);
+        let result = sanitize_output_line(&input);
+        // ANSI codes are stripped first, then the DISPLAY_LIMIT cap applies.
+        assert!(
+            result.contains("bytes truncated"),
+            "line exceeding DISPLAY_LIMIT after ANSI stripping must be truncated; got: {}",
+            &result[..50.min(result.len())]
+        );
+        // No ANSI codes should remain.
+        assert!(
+            !result.contains('\x1b'),
+            "ANSI codes must be stripped before truncation check"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_output_line_ansi_reduces_below_display_limit() {
+        // A line whose raw byte count exceeds DISPLAY_LIMIT but whose stripped content
+        // is within the limit. No truncation notice should appear.
+        let ansi_codes = "\x1b[31m".repeat(100); // 500 bytes of ANSI codes
+        let content = "y".repeat(DISPLAY_LIMIT - 1); // 4095 visible bytes
+        let input = format!("{}{}", ansi_codes, content);
+        assert!(
+            input.len() > DISPLAY_LIMIT,
+            "raw input must exceed DISPLAY_LIMIT for this test"
+        );
+        let result = sanitize_output_line(&input);
+        assert!(
+            !result.contains("bytes truncated"),
+            "line within DISPLAY_LIMIT after ANSI stripping must not be truncated"
+        );
+        assert_eq!(
+            result.len(),
+            DISPLAY_LIMIT - 1,
+            "result should contain only the visible content"
+        );
+    }
+
+    #[test]
     fn test_sanitize_output_line_multibyte_utf8_at_boundary() {
         // Build a string whose 4096th byte falls in the middle of a 3-byte UTF-8
         // character (U+4E2D, "中", encoded as 0xE4 0xB8 0xAD).  The truncation
