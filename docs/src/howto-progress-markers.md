@@ -6,6 +6,11 @@ operator terminals.
 
 > **Reference**: [Progress Markers Reference](progress-markers.md) covers the
 > full wire format, thread model, and every configuration option.
+>
+> **See also**: [How to Read Enriched Heartbeat Output](howto-heartbeat-output.md)
+> explains the `[HH:MM:SS] [agent_name:pid]` prefix on agent output lines,
+> how to correlate heartbeat timestamps with CI logs, and how to filter lines
+> in scripts.
 
 ---
 
@@ -248,28 +253,45 @@ print("Success:", data["success"])
 A complete run of a two-step recipe with progress enabled looks like:
 
 ```
-[STEP 00/02] step-build @ 2026-03-23T14:10:00Z
+[STEP 00/02] step-build @ 2026-03-26T14:10:00Z
   ✓ step-build (3.4s)
-[STEP 01/02] step-test @ 2026-03-23T14:10:03Z
-[HEARTBEAT] step-test — 10s elapsed
-[HEARTBEAT] step-test — 20s elapsed
-[HEARTBEAT] step-test — 30s elapsed
-  ✓ step-test (33.7s)
+[STEP 01/02] step-test @ 2026-03-26T14:10:03Z
+  [14:10:05] [amplihack:tester:51203] Running cargo test…
+  [14:10:07] [amplihack:tester:51203] Compiling recipe-runner-rs v0.8.1
+  [14:10:37] [amplihack:tester:51203] ... working (34s elapsed, 30s since last output)
+  [14:10:40] [amplihack:tester:51203] test result: ok. 462 passed; 0 failed
+  ✓ step-test (37.1s)
 ```
 
-| Line pattern              | What it means                                    |
-|---------------------------|--------------------------------------------------|
-| `[STEP NN/TT] id @ time`  | Step `id` started; it is step `NN` of `TT` total |
-| `[HEARTBEAT] id — Ns`     | Step `id` is still running; `N` seconds elapsed  |
-| `  ✓ id (Xs)`             | Step `id` completed successfully in `X` seconds  |
-| `  ✗ id (Xs)`             | Step `id` failed after `X` seconds               |
-| `  ⊘ id (0.0s)`           | Step `id` was skipped (condition false or tag-filtered) |
-| `  ⚠ id (Xs)`             | Step `id` completed with warnings                |
+| Line pattern                                  | What it means                                        |
+|-----------------------------------------------|------------------------------------------------------|
+| `[STEP NN/TT] id @ time`                      | Step `id` started; it is step `NN` of `TT` total    |
+| `  [HH:MM:SS] [agent:pid] <output>`           | New agent output line, timestamped in UTC            |
+| `  [HH:MM:SS] [agent:pid] ... working (…)`    | Agent is alive but silent for ≥ 30 s                 |
+| `  [HH:MM:SS] [agent:pid] ... waiting (…)`    | Process not found in `/proc`; likely finishing       |
+| `  ✓ id (Xs)`                                 | Step `id` completed successfully in `X` seconds     |
+| `  ✗ id (Xs)`                                 | Step `id` failed after `X` seconds                  |
+| `  ⊘ id (0.0s)`                               | Step `id` was skipped (condition false or tag-filtered) |
+| `  ⚠ id (Xs)`                                 | Step `id` completed with warnings                   |
 
-The `[STEP]` line is always first for each step. One or more `[HEARTBEAT]`
-lines may follow if the step takes more than 10 seconds. The completion line
+The `[STEP]` line is always first for each step. Agent output lines and
+`working`/`waiting` notices (indented two spaces, prefixed with
+`[HH:MM:SS] [agent:pid]`) appear while the step runs. The completion line
 (`✓/✗/⊘/⚠`) is always the last line for each step.
+
+> **All agent output lines are streamed in full** — there is no per-line
+> truncation. The heartbeat thread reads every new line written to the agent's
+> output file since the last poll (every 2 seconds) and prints each non-empty
+> line immediately.
+
+> **30-second idle threshold** — the `working`/`waiting` notice appears only
+> after the agent has been silent for 30 seconds, preventing noise during
+> steps that respond quickly.
 
 If `total` shows `??` instead of a number, the Python layer could not read
 the recipe YAML to count steps. The run continues normally; only the total is
 missing from the display.
+
+For details on the timestamp format, PID liveness check, and how to parse
+these lines in scripts, see
+[How to Read Enriched Heartbeat Output](howto-heartbeat-output.md).

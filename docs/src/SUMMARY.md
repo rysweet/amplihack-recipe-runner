@@ -9,6 +9,7 @@
 - [Condition Language](conditions.md)
 - [Progress Markers Reference](progress-markers.md)
 - [How to Monitor Long-Running Recipes](howto-progress-markers.md)
+- [How to Read Enriched Heartbeat Output](howto-heartbeat-output.md)
 
 # Examples
 - [Tutorials](examples-tutorials.md)

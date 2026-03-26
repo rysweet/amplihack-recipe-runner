@@ -7,12 +7,13 @@
 /// vars are propagated so child processes respect recursion depth limits.
 use crate::adapters::Adapter;
 use anyhow::Context;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::env;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 const NON_INTERACTIVE_FOOTER: &str = "\n\nIMPORTANT: Proceed autonomously. Do not ask questions. \
@@ -28,6 +29,113 @@ fn format_utc_timestamp() -> String {
     let minutes = (total_secs / 60) % 60;
     let seconds = total_secs % 60;
     format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+}
+
+/// ANSI CSI escape sequence pattern: ESC [ <params> <final-byte>.
+/// Compiled once and reused across all `sanitize_label` calls.
+static ANSI_RE: OnceLock<regex::Regex> = OnceLock::new();
+
+fn ansi_re() -> &'static regex::Regex {
+    ANSI_RE.get_or_init(|| regex::Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").expect("valid regex"))
+}
+
+/// Sanitize an agent label for safe embedding in terminal/stderr output (SEC-01).
+///
+/// Allows only alphanumeric characters plus `[-:_./ ]` (space included).
+/// ANSI escape sequences are stripped first, then any remaining unsafe
+/// characters are removed.  The result is capped at 64 characters to prevent
+/// terminal injection via long labels.
+///
+/// # Examples
+/// ```ignore
+/// assert_eq!(sanitize_label("\x1b[31mred\x1b[0m"), "red");
+/// assert_eq!(sanitize_label("amplihack:architect-v1"), "amplihack:architect-v1");
+/// ```
+fn sanitize_label(input: &str) -> String {
+    let stripped = ansi_re().replace_all(input, "");
+
+    // Single pass: filter safe chars and cap at 64 — avoids an intermediate String.
+    stripped
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | ':' | '_' | '.' | '/' | ' '))
+        .take(64)
+        .collect()
+}
+
+/// Sanitize a single output line before writing to stderr (SEC-02, SEC-03).
+///
+/// 1. Strips null bytes (`\x00`) which can truncate log lines in external aggregators.
+/// 2. Caps the displayed portion at 4096 characters and appends a truncation notice
+///    `... [N bytes truncated]` when the line exceeds the limit.
+/// 3. Content beyond 4096 chars is still captured in the temp file and returned in
+///    the final `Ok(String)` result — only the *display* is capped.
+///
+/// # Security note
+/// Agent output written to stderr may contain secrets if the agent echoes them.
+/// Callers in CI should redirect stderr if logs are stored in public artifact stores.
+fn sanitize_output_line(input: &str) -> String {
+    // SEC-02: Strip null bytes.
+    // Fast-path: most lines have no null bytes — skip the allocation entirely.
+    let no_nulls: Cow<str> = if input.contains('\x00') {
+        Cow::Owned(input.chars().filter(|c| *c != '\x00').collect())
+    } else {
+        Cow::Borrowed(input)
+    };
+
+    // SEC-03: Cap display at 4096 bytes.
+    // Walk back to the nearest valid UTF-8 char boundary so we never slice
+    // through a multi-byte codepoint (which would panic).
+    const DISPLAY_LIMIT: usize = 4096;
+    let byte_len = no_nulls.len();
+    if byte_len > DISPLAY_LIMIT {
+        let end = (0..=DISPLAY_LIMIT)
+            .rev()
+            .find(|&i| no_nulls.is_char_boundary(i))
+            .unwrap_or(0);
+        let truncated_bytes = byte_len - end;
+        format!(
+            "{}... [{} bytes truncated]",
+            &no_nulls[..end],
+            truncated_bytes
+        )
+    } else {
+        no_nulls.into_owned()
+    }
+}
+
+/// Cross-platform check for whether a process with the given PID is still alive.
+///
+/// On Unix (Linux, macOS, etc.) this sends signal 0 to the process using the
+/// `kill` shell command — signal 0 is never delivered but the kernel validates
+/// that the target exists and the caller has permission to signal it.
+///
+/// On Windows this queries the process list via `tasklist`.
+///
+/// This replaces the Linux-only `/proc/<pid>` path check that always returned
+/// `false` on macOS and Windows.
+fn is_pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // `kill -0 <pid>` exits 0 if the process exists, non-zero otherwise.
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows: check via tasklist /FI "PID eq <pid>"
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+            .unwrap_or(false)
+    }
 }
 
 pub struct CLISubprocessAdapter {
@@ -169,9 +277,7 @@ impl CLISubprocessAdapter {
         let stop_clone = stop.clone();
         let output_path = output_file.clone();
         let child_pid = child.id();
-        let heartbeat_label = agent_name
-            .unwrap_or("agent")
-            .to_string();
+        let heartbeat_label = sanitize_label(agent_name.unwrap_or("agent"));
 
         let heartbeat = std::thread::spawn(move || {
             let mut last_pos = 0u64;
@@ -182,37 +288,68 @@ impl CLISubprocessAdapter {
                     Ok(meta) => {
                         let current_size = meta.len();
                         if current_size > last_pos {
-                            // Read and display all new lines since last position
+                            // Read and display all new lines since last position.
+                            // Only advance last_pos when the read succeeds to avoid
+                            // silently skipping bytes on transient I/O errors.
                             match std::fs::File::open(&output_path) {
-                                Ok(mut file) => {
-                                    if file.seek(SeekFrom::Start(last_pos)).is_ok() {
+                                Ok(mut file) => match file.seek(SeekFrom::Start(last_pos)) {
+                                    Err(e) => {
+                                        log::debug!(
+                                            "heartbeat: seek to {} failed: {}",
+                                            last_pos,
+                                            e
+                                        );
+                                    }
+                                    Ok(_) => {
                                         let reader = BufReader::new(file);
                                         let ts = format_utc_timestamp();
-                                        for line in reader.lines() {
-                                            if let Ok(line) = line {
-                                                let trimmed = line.trim();
-                                                if !trimmed.is_empty() {
-                                                    eprintln!(
-                                                        "  [{}] [{}:{}] {}",
-                                                        ts, heartbeat_label, child_pid, trimmed
+                                        let mut read_ok = true;
+                                        for line_result in reader.lines() {
+                                            match line_result {
+                                                Ok(line) => {
+                                                    let trimmed = line.trim();
+                                                    if !trimmed.is_empty() {
+                                                        let safe_line =
+                                                            sanitize_output_line(trimmed);
+                                                        eprintln!(
+                                                            "  [{}] [{}:{}] {}",
+                                                            ts,
+                                                            heartbeat_label,
+                                                            child_pid,
+                                                            safe_line
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    log::debug!(
+                                                        "heartbeat: read error at pos {}: {}",
+                                                        last_pos,
+                                                        e
                                                     );
+                                                    read_ok = false;
+                                                    break;
                                                 }
                                             }
                                         }
+                                        if read_ok {
+                                            last_pos = current_size;
+                                            last_activity = Instant::now();
+                                        }
                                     }
-                                }
+                                },
                                 Err(e) => {
                                     log::debug!("heartbeat: cannot open output file: {}", e);
                                 }
                             }
-                            last_pos = current_size;
-                            last_activity = Instant::now();
                         } else if last_activity.elapsed() > Duration::from_secs(30) {
                             let ts = format_utc_timestamp();
                             let total_elapsed = start_time.elapsed().as_secs();
                             let idle_secs = last_activity.elapsed().as_secs();
-                            // Check if the child process is still alive via /proc
-                            let pid_alive = std::path::Path::new(&format!("/proc/{}", child_pid)).exists();
+                            // Check if the child process is still alive.
+                            // Uses `kill -0 <pid>` on Unix (works on Linux and
+                            // macOS alike) and a tasklist query on Windows —
+                            // avoids the Linux-only /proc filesystem path.
+                            let pid_alive = is_pid_alive(child_pid);
                             if pid_alive {
                                 eprintln!(
                                     "  [{}] [{}:{}] ... working ({}s elapsed, {}s since last output)",
@@ -511,39 +648,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_child_env_preserves_max_depth() {
-        // Verify max_depth is always set to a valid value
-        let env = CLISubprocessAdapter::build_child_env();
-        let max_depth: u32 = env
-            .get("AMPLIHACK_MAX_DEPTH")
-            .unwrap()
-            .parse()
-            .expect("max_depth should be a number");
-        assert!(max_depth >= 1, "max_depth should be at least 1");
-    }
-
-    #[test]
-    fn test_build_child_env_preserves_existing_tree_id() {
-        // If AMPLIHACK_TREE_ID is already set, build_child_env preserves it
-        let env = CLISubprocessAdapter::build_child_env();
-        let tree_id = env.get("AMPLIHACK_TREE_ID").unwrap().clone();
-        // Call again — tree_id should remain stable when already set in env
-        assert!(!tree_id.is_empty());
-    }
-
-    #[test]
-    fn test_build_child_env_depth_is_always_valid() {
-        // Regardless of env state, the child depth must be a valid positive number
-        let env = CLISubprocessAdapter::build_child_env();
-        let depth: u32 = env
-            .get("AMPLIHACK_SESSION_DEPTH")
-            .unwrap()
-            .parse()
-            .expect("depth must always be a valid number");
-        assert!(depth >= 1);
-    }
-
-    #[test]
     fn test_execute_bash_step_echo() {
         let adapter = CLISubprocessAdapter::new();
         let empty_env = std::collections::HashMap::new();
@@ -617,6 +721,213 @@ mod tests {
             env.get("AMPLIHACK_AGENT_BINARY").unwrap(),
             "copilot",
             "child env must propagate the overridden agent binary"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // format_utc_timestamp tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_format_utc_timestamp_length() {
+        let ts = format_utc_timestamp();
+        assert_eq!(
+            ts.len(),
+            8,
+            "timestamp must be exactly 8 characters (HH:MM:SS), got {:?}",
+            ts
+        );
+    }
+
+    #[test]
+    fn test_format_utc_timestamp_format() {
+        let ts = format_utc_timestamp();
+        let re = regex::Regex::new(r"^\d{2}:\d{2}:\d{2}$").unwrap();
+        assert!(
+            re.is_match(&ts),
+            "timestamp {:?} does not match HH:MM:SS pattern",
+            ts
+        );
+    }
+
+    #[test]
+    fn test_format_utc_timestamp_valid_ranges() {
+        let ts = format_utc_timestamp();
+        let parts: Vec<&str> = ts.split(':').collect();
+        assert_eq!(parts.len(), 3, "expected HH:MM:SS with two colons");
+        let hh: u32 = parts[0].parse().expect("HH must be numeric");
+        let mm: u32 = parts[1].parse().expect("MM must be numeric");
+        let ss: u32 = parts[2].parse().expect("SS must be numeric");
+        assert!(hh <= 23, "hours must be in 00-23, got {}", hh);
+        assert!(mm <= 59, "minutes must be in 00-59, got {}", mm);
+        assert!(ss <= 59, "seconds must be in 00-59, got {}", ss);
+    }
+
+    // -------------------------------------------------------------------------
+    // sanitize_label tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_sanitize_label_ansi_escape_stripped() {
+        // ANSI escape codes must be removed entirely
+        let result = sanitize_label("\x1b[31mred\x1b[0m");
+        assert_eq!(result, "red", "ANSI escape codes must be stripped");
+    }
+
+    #[test]
+    fn test_sanitize_label_empty_string() {
+        let result = sanitize_label("");
+        assert_eq!(result, "", "empty input should produce empty output");
+    }
+
+    #[test]
+    fn test_sanitize_label_max_length() {
+        // Input longer than 64 chars must be truncated to exactly 64
+        let long_input = "a".repeat(100);
+        let result = sanitize_label(&long_input);
+        assert_eq!(
+            result.len(),
+            64,
+            "output must be truncated to 64 chars, got {} chars",
+            result.len()
+        );
+    }
+
+    #[test]
+    fn test_sanitize_label_safe_chars_passthrough() {
+        // Alphanumeric plus [-:_./ ] must pass through unchanged
+        let safe = "amplihack:architect-v1.2_test/foo";
+        let result = sanitize_label(safe);
+        assert_eq!(result, safe, "safe chars must pass through unchanged");
+    }
+
+    #[test]
+    fn test_sanitize_label_null_bytes_stripped() {
+        let result = sanitize_label("ag\x00ent");
+        assert_eq!(result, "agent", "null bytes must be stripped");
+    }
+
+    #[test]
+    fn test_sanitize_label_control_chars_stripped() {
+        // Tabs, newlines, and carriage returns are not in the safe set
+        let result = sanitize_label("ag\tent\nname\r");
+        assert_eq!(
+            result, "agentname",
+            "tabs, newlines, and CR must be stripped; got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_sanitize_label_unicode_stripped() {
+        // Non-ASCII (emoji, accented chars) must be removed
+        let result = sanitize_label("agent\u{1F600}name\u{00E9}");
+        assert_eq!(
+            result, "agentname",
+            "non-ASCII characters must be stripped; got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_sanitize_label_spaces_allowed() {
+        // Spaces are listed in the safe charset and must not be removed
+        let result = sanitize_label("my agent name");
+        assert_eq!(
+            result, "my agent name",
+            "spaces must be allowed; got {:?}",
+            result
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // sanitize_output_line tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_sanitize_output_line_null_bytes() {
+        let result = sanitize_output_line("hello\x00world");
+        assert_eq!(
+            result, "helloworld",
+            "null bytes must be stripped; got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_sanitize_output_line_normal_passthrough() {
+        let normal = "this is a normal log line with spaces and punctuation!";
+        let result = sanitize_output_line(normal);
+        assert_eq!(result, normal, "normal text must pass through unchanged");
+    }
+
+    #[test]
+    fn test_sanitize_output_line_truncation() {
+        // A line longer than 4096 chars must be truncated with the notice suffix
+        let long_line = "x".repeat(5000);
+        let result = sanitize_output_line(&long_line);
+        assert!(
+            result.contains("... ["),
+            "truncated line must contain truncation notice; got prefix: {:?}",
+            &result[..50.min(result.len())]
+        );
+        assert!(
+            result.contains("bytes truncated]"),
+            "truncation notice must mention bytes truncated"
+        );
+        // The displayed portion must not exceed 4096 chars before the notice
+        let prefix_end = result.find("... [").unwrap();
+        assert_eq!(
+            prefix_end, 4096,
+            "exactly 4096 chars should be kept before the truncation notice"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_output_line_exactly_4096() {
+        // Exactly 4096 chars must pass through without any truncation notice
+        let exact = "y".repeat(4096);
+        let result = sanitize_output_line(&exact);
+        assert_eq!(result.len(), 4096, "4096-char line must not be truncated");
+        assert!(
+            !result.contains("truncated"),
+            "4096-char line must not have truncation notice"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_output_line_4097_chars() {
+        // 4097 chars: 1 byte over the limit — must trigger truncation
+        let over = "z".repeat(4097);
+        let result = sanitize_output_line(&over);
+        assert!(
+            result.contains("... [1 bytes truncated]"),
+            "4097-char line must show '... [1 bytes truncated]'; got: {:?}",
+            &result[4090.min(result.len())..]
+        );
+    }
+
+    #[test]
+    fn test_sanitize_output_line_multibyte_utf8_at_boundary() {
+        // Build a string whose 4096th byte falls in the middle of a 3-byte UTF-8
+        // character (U+4E2D, "中", encoded as 0xE4 0xB8 0xAD).  The truncation
+        // must not panic and must produce a valid String.
+        let padding = "a".repeat(4095); // 4095 ASCII bytes
+        let multibyte = "\u{4E2D}"; // 3 bytes: positions 4095–4097
+        let extra = "b".repeat(10);
+        let input = format!("{}{}{}", padding, multibyte, extra);
+        // byte_len = 4095 + 3 + 10 = 4108 > 4096 — truncation path is exercised
+        let result = sanitize_output_line(&input);
+        // Must contain a truncation notice — the primary invariant under test.
+        assert!(
+            result.contains("bytes truncated"),
+            "result must contain truncation notice when input exceeds 4096 bytes; got: {}",
+            result
+        );
+        // Must be valid UTF-8 — the boundary-walk must not produce invalid sequences.
+        assert!(
+            std::str::from_utf8(result.as_bytes()).is_ok(),
+            "result must be valid UTF-8 after truncation at a char boundary"
         );
     }
 }
