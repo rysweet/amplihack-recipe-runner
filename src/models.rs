@@ -132,6 +132,9 @@ impl Default for RecursionConfig {
 /// Default maximum recursion depth for sub-recipe execution.
 pub const DEFAULT_MAX_DEPTH: u32 = 6;
 
+/// Default maximum number of concurrent sessions allowed in a session tree.
+pub const DEFAULT_MAX_SESSIONS: u32 = 10;
+
 fn default_max_depth() -> u32 {
     DEFAULT_MAX_DEPTH
 }

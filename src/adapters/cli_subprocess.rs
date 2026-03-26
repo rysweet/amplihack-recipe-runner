@@ -19,6 +19,11 @@ use std::time::{Duration, Instant};
 const NON_INTERACTIVE_FOOTER: &str = "\n\nIMPORTANT: Proceed autonomously. Do not ask questions. \
      Make reasonable decisions and continue.";
 
+/// Maximum number of bytes displayed per output line in heartbeat output (SEC-03).
+/// Lines exceeding this limit are truncated with a `... [N bytes truncated]` suffix.
+/// Content beyond this limit is still captured in the log file and returned as output.
+pub(crate) const DISPLAY_LIMIT: usize = 4096;
+
 /// Format current UTC time as HH:MM:SS for heartbeat output.
 fn format_utc_timestamp() -> String {
     let now = std::time::SystemTime::now()
@@ -32,7 +37,7 @@ fn format_utc_timestamp() -> String {
 }
 
 /// ANSI CSI escape sequence pattern: ESC [ <params> <final-byte>.
-/// Compiled once and reused across all `sanitize_label` calls.
+/// Compiled once and reused across `sanitize_label` and `sanitize_output_line`.
 static ANSI_RE: OnceLock<regex::Regex> = OnceLock::new();
 
 fn ansi_re() -> &'static regex::Regex {
@@ -92,15 +97,15 @@ fn sanitize_output_line(input: &str) -> String {
         no_ansi
     };
 
-    // SEC-03: Cap display at 4096 bytes.
+    // SEC-03: Cap display at DISPLAY_LIMIT bytes.
     // Walk back to the nearest valid UTF-8 char boundary so we never slice
     // through a multi-byte codepoint (which would panic).
-    const DISPLAY_LIMIT: usize = 4096;
     let byte_len = no_nulls.len();
     if byte_len > DISPLAY_LIMIT {
         let end = (0..=DISPLAY_LIMIT)
             .rev()
             .find(|&i| no_nulls.is_char_boundary(i))
+            // SAFETY: index 0 is always a valid char boundary, so None is unreachable.
             .unwrap_or(0);
         let truncated_bytes = byte_len - end;
         format!(
@@ -138,12 +143,19 @@ fn is_pid_alive(pid: u32) -> bool {
     #[cfg(not(unix))]
     {
         // Windows: check via tasklist /FI "PID eq <pid>"
+        // Use word-boundary split to avoid false positives where PID "123" matches
+        // a line containing PID "1234" (bare `contains` would incorrectly return true).
         std::process::Command::new("tasklist")
             .args(["/FI", &format!("PID eq {}", pid), "/NH"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+            .map(|o| {
+                let pid_str = pid.to_string();
+                String::from_utf8_lossy(&o.stdout)
+                    .split_whitespace()
+                    .any(|field| field == pid_str.as_str())
+            })
             .unwrap_or(false)
     }
 }
@@ -209,7 +221,8 @@ impl CLISubprocessAdapter {
         );
         child_env.insert(
             "AMPLIHACK_MAX_SESSIONS".to_string(),
-            env::var("AMPLIHACK_MAX_SESSIONS").unwrap_or_else(|_| "10".to_string()),
+            env::var("AMPLIHACK_MAX_SESSIONS")
+                .unwrap_or_else(|_| crate::models::DEFAULT_MAX_SESSIONS.to_string()),
         );
 
         child_env
@@ -745,6 +758,40 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // is_pid_alive tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_is_pid_alive_current_process() {
+        // The current process is guaranteed to be alive — is_pid_alive must return true.
+        let own_pid = std::process::id();
+        assert!(
+            is_pid_alive(own_pid),
+            "current process PID {} must be reported alive",
+            own_pid
+        );
+    }
+
+    #[test]
+    fn test_is_pid_alive_reaped_process() {
+        // Spawn a child, wait for it to exit, then verify it is no longer alive.
+        let mut child = std::process::Command::new("true")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn 'true'");
+        let pid = child.id();
+        child.wait().expect("failed to wait for child");
+        // After reaping, the PID should not be alive (no zombie entry on Unix,
+        // absent from tasklist on Windows).
+        assert!(
+            !is_pid_alive(pid),
+            "reaped process PID {} must not be reported alive",
+            pid
+        );
+    }
+
+    // -------------------------------------------------------------------------
     // format_utc_timestamp tests
     // -------------------------------------------------------------------------
 
@@ -905,7 +952,7 @@ mod tests {
 
     #[test]
     fn test_sanitize_output_line_truncation() {
-        // A line longer than 4096 chars must be truncated with the notice suffix
+        // A line longer than DISPLAY_LIMIT chars must be truncated with the notice suffix
         let long_line = "x".repeat(5000);
         let result = sanitize_output_line(&long_line);
         assert!(
@@ -917,35 +964,39 @@ mod tests {
             result.contains("bytes truncated]"),
             "truncation notice must mention bytes truncated"
         );
-        // The displayed portion must not exceed 4096 chars before the notice
+        // The displayed portion must not exceed DISPLAY_LIMIT chars before the notice
         let prefix_end = result.find("... [").unwrap();
         assert_eq!(
-            prefix_end, 4096,
-            "exactly 4096 chars should be kept before the truncation notice"
+            prefix_end, DISPLAY_LIMIT,
+            "exactly DISPLAY_LIMIT chars should be kept before the truncation notice"
         );
     }
 
     #[test]
-    fn test_sanitize_output_line_exactly_4096() {
-        // Exactly 4096 chars must pass through without any truncation notice
-        let exact = "y".repeat(4096);
+    fn test_sanitize_output_line_exactly_display_limit() {
+        // Exactly DISPLAY_LIMIT chars must pass through without any truncation notice
+        let exact = "y".repeat(DISPLAY_LIMIT);
         let result = sanitize_output_line(&exact);
-        assert_eq!(result.len(), 4096, "4096-char line must not be truncated");
+        assert_eq!(
+            result.len(),
+            DISPLAY_LIMIT,
+            "DISPLAY_LIMIT-char line must not be truncated"
+        );
         assert!(
             !result.contains("truncated"),
-            "4096-char line must not have truncation notice"
+            "DISPLAY_LIMIT-char line must not have truncation notice"
         );
     }
 
     #[test]
-    fn test_sanitize_output_line_4097_chars() {
-        // 4097 chars: 1 byte over the limit — must trigger truncation
-        let over = "z".repeat(4097);
+    fn test_sanitize_output_line_one_over_display_limit() {
+        // DISPLAY_LIMIT+1 chars: 1 byte over the limit — must trigger truncation
+        let over = "z".repeat(DISPLAY_LIMIT + 1);
         let result = sanitize_output_line(&over);
         assert!(
             result.contains("... [1 bytes truncated]"),
-            "4097-char line must show '... [1 bytes truncated]'; got: {:?}",
-            &result[4090.min(result.len())..]
+            "DISPLAY_LIMIT+1-char line must show '... [1 bytes truncated]'; got: {:?}",
+            &result[(DISPLAY_LIMIT - 6).min(result.len())..]
         );
     }
 
