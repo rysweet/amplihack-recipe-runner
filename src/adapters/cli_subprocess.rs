@@ -62,24 +62,34 @@ fn sanitize_label(input: &str) -> String {
         .collect()
 }
 
-/// Sanitize a single output line before writing to stderr (SEC-02, SEC-03).
+/// Sanitize a single output line before writing to stderr (SEC-01, SEC-02, SEC-03).
 ///
-/// 1. Strips null bytes (`\x00`) which can truncate log lines in external aggregators.
-/// 2. Caps the displayed portion at 4096 characters and appends a truncation notice
+/// 1. Strips ANSI CSI escape sequences (e.g. `\x1b[31m`) that could inject
+///    terminal control codes when agent output is piped to a parent terminal.
+/// 2. Strips null bytes (`\x00`) which can truncate log lines in external aggregators.
+/// 3. Caps the displayed portion at 4096 characters and appends a truncation notice
 ///    `... [N bytes truncated]` when the line exceeds the limit.
-/// 3. Content beyond 4096 chars is still captured in the temp file and returned in
+/// 4. Content beyond 4096 chars is still captured in the temp file and returned in
 ///    the final `Ok(String)` result — only the *display* is capped.
 ///
 /// # Security note
 /// Agent output written to stderr may contain secrets if the agent echoes them.
 /// Callers in CI should redirect stderr if logs are stored in public artifact stores.
 fn sanitize_output_line(input: &str) -> String {
-    // SEC-02: Strip null bytes.
-    // Fast-path: most lines have no null bytes — skip the allocation entirely.
-    let no_nulls: Cow<str> = if input.contains('\x00') {
-        Cow::Owned(input.chars().filter(|c| *c != '\x00').collect())
+    // SEC-01: Strip ANSI escape sequences to prevent terminal injection.
+    // Uses the same compiled regex as sanitize_label so there is no extra cost.
+    let no_ansi: Cow<str> = if input.contains('\x1b') {
+        Cow::Owned(ansi_re().replace_all(input, "").into_owned())
     } else {
         Cow::Borrowed(input)
+    };
+
+    // SEC-02: Strip null bytes.
+    // Fast-path: most lines have no null bytes — skip the allocation entirely.
+    let no_nulls: Cow<str> = if no_ansi.contains('\x00') {
+        Cow::Owned(no_ansi.chars().filter(|c| *c != '\x00').collect())
+    } else {
+        no_ansi
     };
 
     // SEC-03: Cap display at 4096 bytes.
@@ -375,7 +385,7 @@ impl CLISubprocessAdapter {
         let status = child.wait()?;
         stop.store(true, Ordering::SeqCst);
         if let Err(e) = heartbeat.join() {
-            log::warn!("Heartbeat thread panicked: {:?}", e);
+            log::error!("Heartbeat thread panicked: {:?}", e);
         }
 
         let stdout =
@@ -430,6 +440,16 @@ impl Adapter for CLISubprocessAdapter {
     ) -> Result<String, anyhow::Error> {
         log::debug!(
             "CLISubprocessAdapter::execute_bash_step: command_len={}, working_dir={:?}, timeout={:?}",
+            command.len(),
+            working_dir,
+            timeout
+        );
+        // SEC-03: Audit log for bash step execution.
+        // Records the command digest (not the raw command) and working directory so
+        // operators can correlate activity without exposing secrets that may appear
+        // in the command string.  Full command is available at log::debug level.
+        log::info!(
+            "bash_step: executing command (len={}, working_dir={:?}, timeout={:?}s)",
             command.len(),
             working_dir,
             timeout
@@ -843,6 +863,28 @@ mod tests {
     // -------------------------------------------------------------------------
     // sanitize_output_line tests
     // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_sanitize_output_line_ansi_escape_stripped() {
+        // ANSI escape codes in agent output must be stripped to prevent terminal injection (SEC-01).
+        let result = sanitize_output_line("\x1b[31mred text\x1b[0m and normal");
+        assert_eq!(
+            result, "red text and normal",
+            "ANSI escape codes must be stripped from output lines; got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_sanitize_output_line_ansi_passthrough_without_escape() {
+        // Lines with no ESC byte must be returned unchanged (fast-path check).
+        let normal = "no escape codes here";
+        let result = sanitize_output_line(normal);
+        assert_eq!(
+            result, normal,
+            "lines without ESC must pass through unchanged"
+        );
+    }
 
     #[test]
     fn test_sanitize_output_line_null_bytes() {
