@@ -184,7 +184,8 @@ impl CLISubprocessAdapter {
                             let total_elapsed = start_time.elapsed().as_secs();
                             let idle_secs = last_activity.elapsed().as_secs();
                             // Check if the child process is still alive via /proc
-                            let pid_alive = std::path::Path::new(&format!("/proc/{}", child_pid)).exists();
+                            let pid_alive =
+                                std::path::Path::new(&format!("/proc/{}", child_pid)).exists();
                             if pid_alive {
                                 eprintln!(
                                     "  [agent] ... working ({}s elapsed, {}s since last output, pid {} alive)",
