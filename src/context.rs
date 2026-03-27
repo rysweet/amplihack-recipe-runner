@@ -590,6 +590,48 @@ mod tests {
         assert!(c.evaluate("s.lower() == ''").unwrap());
     }
 
+    // ── Method coercion on non-string types (fix #3589) ──
+
+    #[test]
+    fn test_method_strip_on_number() {
+        // Bash output "1" is parsed as Value::Number by serde_json::from_str
+        let c = ctx(vec![("workstream_count", json!(1))]);
+        assert!(c.evaluate("workstream_count.strip() == '1'").unwrap());
+    }
+
+    #[test]
+    fn test_method_strip_on_bool() {
+        let c = ctx(vec![("flag", json!(true))]);
+        assert!(c.evaluate("flag.strip() == 'true'").unwrap());
+    }
+
+    #[test]
+    fn test_method_strip_on_null() {
+        let c = ctx(vec![("missing", json!(null))]);
+        assert!(c.evaluate("missing.strip() == ''").unwrap());
+    }
+
+    #[test]
+    fn test_method_lower_on_number() {
+        let c = ctx(vec![("n", json!(42))]);
+        assert!(c.evaluate("n.lower() == '42'").unwrap());
+    }
+
+    #[test]
+    fn test_smart_orch_condition_with_numeric_workstream_count() {
+        // Reproduces the exact failure from #3589: workstream_count is Number(1),
+        // condition calls .strip() which previously failed with
+        // "method '.strip()' can only be called on strings"
+        let c = ctx(vec![
+            ("task_type", json!("Development")),
+            ("workstream_count", json!(1)),
+            ("force_single_workstream", json!("false")),
+        ]);
+        assert!(c
+            .evaluate("'Development' in task_type and ((workstream_count.strip() == '1' or workstream_count.strip() == '') or force_single_workstream == 'true')")
+            .unwrap());
+    }
+
     // ── Boundary values (test-6) ──────────────────────────
 
     #[test]
