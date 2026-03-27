@@ -649,18 +649,33 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, ConditionError> {
 }
 
 /// Apply a safe method call on a value.
+///
+/// Non-string values (numbers, booleans, null) are coerced to their string
+/// representation before applying the method.  Bash step output is stored via
+/// `serde_json::from_str` which parses bare `1` as `Value::Number`, so
+/// `workstream_count.strip()` would fail without this coercion (fix #3589).
 fn apply_method(value: &Value, method: &str, args: &[Value]) -> Result<Value, ConditionError> {
     debug!(
         "apply_method: method={:?}, args_count={}",
         method,
         args.len()
     );
+    let coerced: String;
     let s = match value {
         Value::String(s) => s.as_str(),
+        Value::Number(n) => {
+            coerced = n.to_string();
+            coerced.as_str()
+        }
+        Value::Bool(b) => {
+            coerced = b.to_string();
+            coerced.as_str()
+        }
+        Value::Null => "",
         _ => {
             return Err(ConditionError::Parse(format!(
-                "method '.{}()' can only be called on strings",
-                method
+                "method '.{}()' can only be called on strings, numbers, booleans, or null; got {:?}",
+                method, value
             )));
         }
     };
