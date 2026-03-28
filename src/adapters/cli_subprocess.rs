@@ -85,6 +85,67 @@ impl CLISubprocessAdapter {
         child_env
     }
 
+    /// Read the agent output file with one retry after a short delay.
+    ///
+    /// The temp directory backing the output file may be cleaned by the OS
+    /// between the child process exiting and our read (race with systemd-tmpfiles
+    /// or similar).  A single retry with a 500ms pause handles the common case
+    /// where the filesystem just needs a moment to flush.  See #3711.
+    fn read_output_with_retry(path: &std::path::Path) -> Result<String, anyhow::Error> {
+        // First attempt: quick pre-check + read
+        if path.exists() {
+            match std::fs::read_to_string(path) {
+                Ok(content) => return Ok(content),
+                Err(e) => {
+                    log::warn!(
+                        "Agent output file exists but read failed (will retry): {} — {:?}",
+                        e,
+                        path
+                    );
+                }
+            }
+        } else {
+            log::warn!(
+                "Agent output file not found on first attempt (will retry): {:?}",
+                path
+            );
+        }
+
+        // Retry once after a short delay
+        std::thread::sleep(Duration::from_millis(500));
+
+        if !path.exists() {
+            anyhow::bail!("Agent output file does not exist after retry: {:?}", path);
+        }
+
+        std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read agent output file on retry: {:?}", path))
+    }
+
+    /// Persist a copy of the agent output to the worktree's `.recipe-output/`
+    /// directory so it survives temp directory cleanup and is available for
+    /// post-run debugging.
+    fn persist_output_copy(original_path: &std::path::Path, working_dir: &str, content: &str) {
+        let dest_dir = std::path::Path::new(working_dir).join(".recipe-output");
+        if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+            log::debug!(
+                "Could not create persistent output dir {:?}: {}",
+                dest_dir,
+                e
+            );
+            return;
+        }
+        // Reuse the original filename for the persistent copy
+        if let Some(filename) = original_path.file_name() {
+            let dest_file = dest_dir.join(filename);
+            if let Err(e) = std::fs::write(&dest_file, content) {
+                log::debug!("Could not persist output copy to {:?}: {}", dest_file, e);
+            } else {
+                log::info!("Persisted agent output to {:?}", dest_file);
+            }
+        }
+    }
+
     /// Internal: spawn agent with optional system prompt.
     ///
     /// Agent steps run without a timeout — they complete when the underlying
@@ -214,8 +275,29 @@ impl CLISubprocessAdapter {
             log::warn!("Heartbeat thread panicked: {:?}", e);
         }
 
-        let stdout =
-            std::fs::read_to_string(&output_file).context("Failed to read agent output file")?;
+        // Read agent output with retry logic for transient file-not-found (#3711).
+        // The temp directory may be cleaned by the OS between process exit and
+        // our read, or the agent may crash before writing any output.
+        let stdout = match Self::read_output_with_retry(&output_file) {
+            Ok(content) => content,
+            Err(e) => {
+                log::error!(
+                    "Agent output file missing after retry: {} (expected at {:?}). \
+                     Continuing with empty output to avoid aborting the workflow.",
+                    e,
+                    output_file
+                );
+                eprintln!(
+                    "  [agent] WARNING: output file not found at {:?}, continuing with empty output",
+                    output_file
+                );
+                String::new()
+            }
+        };
+
+        // Persist a copy of the output to the worktree .recipe-output/ dir so it
+        // survives temp directory cleanup and is available for debugging.
+        Self::persist_output_copy(&output_file, &self.working_dir, &stdout);
 
         // temp_dir is dropped here, cleaning up automatically
 
@@ -590,5 +672,68 @@ mod tests {
             "copilot",
             "child env must propagate the overridden agent binary"
         );
+    }
+
+    #[test]
+    fn test_read_output_with_retry_file_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("output.log");
+        std::fs::write(&file_path, "agent output content").unwrap();
+        let result = CLISubprocessAdapter::read_output_with_retry(&file_path);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "agent output content");
+    }
+
+    #[test]
+    fn test_read_output_with_retry_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("nonexistent.log");
+        let result = CLISubprocessAdapter::read_output_with_retry(&file_path);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("does not exist after retry"),
+            "error should mention retry failure, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_read_output_with_retry_empty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("empty.log");
+        std::fs::write(&file_path, "").unwrap();
+        let result = CLISubprocessAdapter::read_output_with_retry(&file_path);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "");
+    }
+
+    #[test]
+    fn test_persist_output_copy_creates_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = tmp.path().join("agent-step-12345.log");
+        CLISubprocessAdapter::persist_output_copy(
+            &original,
+            tmp.path().to_str().unwrap(),
+            "test output",
+        );
+        let persisted = tmp
+            .path()
+            .join(".recipe-output")
+            .join("agent-step-12345.log");
+        assert!(persisted.exists(), "persisted file should exist");
+        assert_eq!(std::fs::read_to_string(&persisted).unwrap(), "test output");
+    }
+
+    #[test]
+    fn test_persist_output_copy_handles_missing_dir_gracefully() {
+        let original = std::path::Path::new("/tmp/nonexistent-dir-xyz/agent-step.log");
+        // Should not panic even if the working dir doesn't exist
+        CLISubprocessAdapter::persist_output_copy(
+            original,
+            "/tmp/nonexistent-working-dir-xyz",
+            "content",
+        );
+        // Just verify it doesn't panic — the log message is sufficient
     }
 }
