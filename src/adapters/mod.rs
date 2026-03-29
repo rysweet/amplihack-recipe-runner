@@ -9,8 +9,8 @@ pub mod cli_subprocess;
 pub trait Adapter: Sync {
     /// Execute an agent step and return the output.
     ///
-    /// Agent steps have no timeout — they run until the underlying CLI process
-    /// completes. Use the `timeout` field on bash steps for time-bounded work.
+    /// The optional `timeout` (in seconds) kills the agent process if it exceeds
+    /// the duration. Without a timeout, agent steps run until completion.
     #[allow(clippy::too_many_arguments)]
     fn execute_agent_step(
         &self,
@@ -20,6 +20,7 @@ pub trait Adapter: Sync {
         mode: Option<&str>,
         working_dir: &str,
         model: Option<&str>,
+        timeout: Option<u64>,
     ) -> Result<String, anyhow::Error>;
 
     /// Execute a bash step and return the output.

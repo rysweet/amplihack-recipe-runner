@@ -41,6 +41,7 @@ impl Adapter for MockAdapter {
         _mode: Option<&str>,
         _working_dir: &str,
         _model: Option<&str>,
+        _timeout: Option<u64>,
     ) -> Result<String, anyhow::Error> {
         // Find matching response
         for (pattern, response) in &self.responses {
@@ -504,6 +505,7 @@ steps:
             _m: Option<&str>,
             _w: &str,
             _model: Option<&str>,
+        _timeout: Option<u64>,
         ) -> Result<String, anyhow::Error> {
             Ok("ok".to_string())
         }
@@ -654,6 +656,7 @@ impl Adapter for RealBashAdapter {
         _mode: Option<&str>,
         _working_dir: &str,
         _model: Option<&str>,
+        _timeout: Option<u64>,
     ) -> Result<String, anyhow::Error> {
         Ok("mock agent response".to_string())
     }
@@ -809,6 +812,7 @@ fn test_model_parameter_passed_to_adapter() {
             _mode: Option<&str>,
             _working_dir: &str,
             model: Option<&str>,
+            _: Option<u64>,
         ) -> Result<String, anyhow::Error> {
             self.captured_models
                 .lock()
