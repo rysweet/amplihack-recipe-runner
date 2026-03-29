@@ -200,6 +200,11 @@ impl RecipeContext {
             .into_owned()
     }
 
+    /// Return a reference to the raw context data.
+    pub fn data(&self) -> &HashMap<String, Value> {
+        &self.data
+    }
+
     /// Return environment variables for all context values.
     /// Keys are prefixed with `RECIPE_VAR_` and dots replaced with `__`.
     pub fn shell_env_vars(&self) -> HashMap<String, String> {

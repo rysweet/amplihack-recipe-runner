@@ -1,6 +1,6 @@
 [package]
 name = "recipe-runner-rs"
-version = "0.2.14"
+version = "0.3.0"
 edition = "2024"
 description = "Code-enforced YAML workflow execution engine for amplihack"
 license = "MIT"

@@ -560,3 +560,40 @@ mod tests {
         assert!(display.contains("timed out"));
     }
 }
+
+/// Checkpoint saved after each step for resume-on-failure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecipeCheckpoint {
+    pub recipe_name: String,
+    pub completed_steps: Vec<String>,
+    pub context: HashMap<String, serde_json::Value>,
+    pub timestamp: String,
+}
+
+impl RecipeCheckpoint {
+    /// Write checkpoint to a file. Returns the path.
+    pub fn save(&self, recipe_name: &str) -> std::io::Result<std::path::PathBuf> {
+        let safe_name: String = recipe_name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .take(64)
+            .collect();
+        let path = std::env::temp_dir().join(format!(
+            "amplihack-checkpoint-{}-{}.json",
+            safe_name,
+            std::process::id()
+        ));
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        std::fs::write(&path, json)?;
+        log::info!("Checkpoint saved: {} ({} steps completed)", path.display(), self.completed_steps.len());
+        Ok(path)
+    }
+
+    /// Load a checkpoint from file.
+    pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
+        let json = std::fs::read_to_string(path)?;
+        serde_json::from_str(&json)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+}
