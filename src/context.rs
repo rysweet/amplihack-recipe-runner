@@ -7,6 +7,7 @@ use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::LazyLock;
+use std::io::Write;
 
 static TEMPLATE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\{\{([a-zA-Z0-9_.\-]+)\}\}").unwrap());
@@ -222,6 +223,91 @@ impl RecipeContext {
             }
         }
         env
+    }
+
+    /// Estimated total byte size of all RECIPE_VAR_* env vars.
+    pub fn env_vars_size(&self) -> usize {
+        self.shell_env_vars()
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + 1) // key=value\0
+            .sum()
+    }
+
+    /// Write full context as JSON to a temp file and return (path, minimal env).
+    ///
+    /// The returned `HashMap` contains only `AMPLIHACK_CONTEXT_FILE` pointing to
+    /// the temp file. Bash steps can read values with:
+    ///   `jq -r '.var_name' "$AMPLIHACK_CONTEXT_FILE"`
+    ///
+    /// The caller is responsible for cleaning up the temp file after step execution.
+    pub fn write_context_file(&self) -> std::io::Result<(std::path::PathBuf, HashMap<String, String>)> {
+        let json = serde_json::to_string_pretty(&self.data)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let path = std::env::temp_dir().join(format!(
+            "amplihack-context-{}.json",
+            std::process::id()
+        ));
+        let mut file = std::fs::File::create(&path)?;
+        file.write_all(json.as_bytes())?;
+        file.flush()?;
+        // Restrict permissions (owner-only read/write)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        log::info!(
+            "Context written to {} ({} bytes, {} keys)",
+            path.display(),
+            json.len(),
+            self.data.len(),
+        );
+        let mut env = HashMap::new();
+        env.insert(
+            "AMPLIHACK_CONTEXT_FILE".to_string(),
+            path.to_string_lossy().to_string(),
+        );
+        Ok((path, env))
+    }
+
+    /// Return env vars for a bash step, using file-based context when the total
+    /// env size exceeds the OS argument list limit (~2MB on Linux).
+    ///
+    /// Returns (env_vars, Option<temp_file_path>). The caller must clean up
+    /// the temp file after the step completes.
+    pub fn shell_env_for_step(&self) -> (HashMap<String, String>, Option<std::path::PathBuf>) {
+        const MAX_ENV_BYTES: usize = 1_500_000; // ~1.5MB, well under 2MB OS limit
+        let env_vars = self.shell_env_vars();
+        let total_size: usize = env_vars.iter().map(|(k, v)| k.len() + v.len() + 1).sum();
+
+        if total_size > MAX_ENV_BYTES {
+            log::warn!(
+                "Context env size ({} bytes) exceeds threshold ({} bytes) — using file-based context",
+                total_size,
+                MAX_ENV_BYTES,
+            );
+            match self.write_context_file() {
+                Ok((path, file_env)) => {
+                    // Include a small subset of critical vars directly in env
+                    // so basic scripts still work without jq
+                    let mut combined = file_env;
+                    for key in ["task_description", "repo_path", "task_type", "workstream_count"] {
+                        if let Some(val) = env_vars.get(&Self::env_key(key)) {
+                            // Only include if the value is small
+                            if val.len() < 4096 {
+                                combined.insert(Self::env_key(key), val.clone());
+                            }
+                        }
+                    }
+                    return (combined, Some(path));
+                }
+                Err(e) => {
+                    log::error!("Failed to write context file, falling back to env vars: {}", e);
+                    // Fall through to env vars — may still fail with E2BIG
+                }
+            }
+        }
+        (env_vars, None)
     }
 
     /// Convert a template variable name to an env var key.

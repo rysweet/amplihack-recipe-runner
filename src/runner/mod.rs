@@ -395,13 +395,16 @@ impl<A: Adapter> RecipeRunner<A> {
     fn run_hook(&self, hook: &Option<String>, hook_name: &str, step_id: &str, ctx: &RecipeContext) {
         if let Some(cmd) = hook {
             let rendered = ctx.render_shell(cmd);
-            let env_vars = ctx.shell_env_vars();
+            let (env_vars, context_file) = ctx.shell_env_for_step();
             info!("Running {} hook for step '{}'", hook_name, step_id);
             if let Err(e) =
                 self.adapter
                     .execute_bash_step(&rendered, &self.working_dir, Some(30), &env_vars)
             {
                 warn!("{} hook failed for step '{}': {}", hook_name, step_id, e);
+            }
+            if let Some(path) = context_file {
+                let _ = std::fs::remove_file(&path);
             }
         }
     }
@@ -597,14 +600,21 @@ impl<A: Adapter> RecipeRunner<A> {
             StepType::Recipe => self.execute_sub_recipe(step, ctx),
             StepType::Bash => {
                 let rendered = ctx.render_shell(step.command.as_deref().unwrap_or(""));
-                let env_vars = ctx.shell_env_vars();
-                self.adapter
+                let (env_vars, context_file) = ctx.shell_env_for_step();
+                let result = self.adapter
                     .execute_bash_step(&rendered, working_dir, step.timeout, &env_vars)
                     .map(|output| output.trim_end().to_string())
                     .map_err(|e| StepExecutionError {
                         step_id: step.id.clone(),
                         message: format!("bash step failed: {:#}", e),
-                    })
+                    });
+                // Clean up temp context file after step completes
+                if let Some(path) = context_file {
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        log::debug!("Failed to clean up context file {}: {}", path.display(), e);
+                    }
+                }
+                result
             }
             StepType::Agent => {
                 let rendered_prompt = ctx.render(step.prompt.as_deref().unwrap_or(""));
@@ -1050,10 +1060,10 @@ impl<A: Adapter> RecipeRunner<A> {
         }
 
         let rendered = ctx.render_shell(step.command.as_deref().unwrap_or(""));
-        let env_vars = ctx.shell_env_vars();
+        let (env_vars, context_file) = ctx.shell_env_for_step();
         let working_dir = step.working_dir.as_deref().unwrap_or(default_working_dir);
 
-        match adapter.execute_bash_step(&rendered, working_dir, step.timeout, &env_vars) {
+        let result = match adapter.execute_bash_step(&rendered, working_dir, step.timeout, &env_vars) {
             Ok(raw_output) => {
                 // Strip trailing whitespace/newlines from bash output so that
                 // condition comparisons like `count != '1'` work correctly.
@@ -1101,7 +1111,12 @@ impl<A: Adapter> RecipeRunner<A> {
                 error: e.to_string(),
                 duration: Some(step_start.elapsed()),
             },
+        };
+        // Clean up temp context file
+        if let Some(path) = context_file {
+            let _ = std::fs::remove_file(&path);
         }
+        result
     }
 }
 
