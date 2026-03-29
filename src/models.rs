@@ -42,6 +42,10 @@ impl fmt::Display for StepStatus {
     }
 }
 
+fn default_fatal() -> bool {
+    true
+}
+
 /// A single step in a recipe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
@@ -69,8 +73,13 @@ pub struct Step {
     #[serde(rename = "context")]
     pub sub_context: Option<HashMap<String, serde_json::Value>>,
     /// If true, step failure logs a warning but does not abort the recipe.
-    #[serde(default)]
+    /// `fatal: false` in YAML is an alias for this field.
+    #[serde(default, alias = "nonfatal")]
     pub continue_on_error: bool,
+    /// Convenience alias: `fatal: false` → `continue_on_error: true`.
+    /// When both are specified, `continue_on_error` takes precedence.
+    #[serde(default = "default_fatal")]
+    pub fatal: bool,
     /// Steps sharing the same parallel_group execute concurrently.
     pub parallel_group: Option<String>,
     /// Tags for conditional step filtering via --include-tags / --exclude-tags.
@@ -85,6 +94,12 @@ pub struct Step {
 }
 
 impl Step {
+    /// Whether this step should continue on failure.
+    /// `continue_on_error: true` OR `fatal: false` makes a step non-fatal.
+    pub fn is_nonfatal(&self) -> bool {
+        self.continue_on_error || !self.fatal
+    }
+
     /// Infer the effective step type from explicit field or presence of other fields.
     pub fn effective_type(&self) -> StepType {
         trace!(
@@ -290,6 +305,7 @@ mod tests {
             recipe: None,
             sub_context: None,
             continue_on_error: false,
+            fatal: true,
             parallel_group: None,
             when_tags: vec![],
             recovery_on_failure: false,
@@ -318,6 +334,7 @@ mod tests {
             recipe: Some("sub-recipe".into()),
             sub_context: None,
             continue_on_error: false,
+            fatal: true,
             parallel_group: None,
             when_tags: vec![],
             recovery_on_failure: false,
@@ -345,6 +362,7 @@ mod tests {
             recipe: None,
             sub_context: None,
             continue_on_error: false,
+            fatal: true,
             parallel_group: None,
             when_tags: vec![],
             recovery_on_failure: false,
@@ -372,6 +390,7 @@ mod tests {
             recipe: None,
             sub_context: None,
             continue_on_error: false,
+            fatal: true,
             parallel_group: None,
             when_tags: vec![],
             recovery_on_failure: false,
@@ -399,6 +418,7 @@ mod tests {
             recipe: None,
             sub_context: None,
             continue_on_error: false,
+            fatal: true,
             parallel_group: None,
             when_tags: vec![],
             recovery_on_failure: false,
@@ -427,6 +447,7 @@ mod tests {
             recipe: None,
             sub_context: None,
             continue_on_error: false,
+            fatal: true,
             parallel_group: None,
             when_tags: vec![],
             recovery_on_failure: false,

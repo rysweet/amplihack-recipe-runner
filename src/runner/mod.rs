@@ -271,11 +271,11 @@ impl<A: Adapter> RecipeRunner<A> {
                         ctx.set(output_key, value);
                     }
 
-                    if failed && !gs.continue_on_error {
+                    if failed && !gs.is_nonfatal() {
                         group_failed = true;
                     }
 
-                    if failed && gs.continue_on_error {
+                    if failed && gs.is_nonfatal() {
                         warn!(
                             "Step '{}' failed but continue_on_error is set, continuing",
                             gs.id
@@ -341,13 +341,13 @@ impl<A: Adapter> RecipeRunner<A> {
                 self.listener.on_step_complete(&result);
                 self.write_audit_entry(&audit_file, &result);
 
-                if failed && !step.continue_on_error {
+                if failed && !step.is_nonfatal() {
                     step_results.push(result);
                     success = false;
                     break;
                 }
 
-                if failed && step.continue_on_error {
+                if failed && step.is_nonfatal() {
                     warn!(
                         "Step '{}' failed but continue_on_error is set, continuing",
                         step.id
