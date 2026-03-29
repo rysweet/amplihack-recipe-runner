@@ -50,6 +50,10 @@ pub struct RecipeRunner<A: Adapter> {
     active_tags: Vec<String>,
     exclude_tags: Vec<String>,
     listener: Box<dyn ExecutionListener>,
+    /// Step IDs to skip (already completed in a prior run).
+    resume_completed: Vec<String>,
+    /// Whether to save checkpoints after each step.
+    save_checkpoints: bool,
 }
 
 impl<A: Adapter> RecipeRunner<A> {
@@ -70,6 +74,8 @@ impl<A: Adapter> RecipeRunner<A> {
             active_tags: Vec::new(),
             exclude_tags: Vec::new(),
             listener: Box::new(NullListener),
+            resume_completed: Vec::new(),
+            save_checkpoints: false,
         }
     }
 
@@ -130,6 +136,22 @@ impl<A: Adapter> RecipeRunner<A> {
     pub fn with_listener(mut self, listener: Box<dyn ExecutionListener>) -> Self {
         log::debug!("RecipeRunner::with_listener: setting custom execution listener");
         self.listener = listener;
+        self
+    }
+
+    /// Resume from a checkpoint — skip steps that were already completed.
+    pub fn with_resume_from(mut self, checkpoint: &crate::models::RecipeCheckpoint) -> Self {
+        log::info!(
+            "Resuming from checkpoint: {} completed steps",
+            checkpoint.completed_steps.len()
+        );
+        self.resume_completed = checkpoint.completed_steps.clone();
+        self
+    }
+
+    /// Enable checkpoint saving after each step.
+    pub fn with_checkpoints(mut self, enabled: bool) -> Self {
+        self.save_checkpoints = enabled;
         self
     }
 
@@ -359,6 +381,20 @@ impl<A: Adapter> RecipeRunner<A> {
                     continue;
                 }
 
+                // Resume support: skip steps already completed in a prior run
+                if self.resume_completed.contains(&step.id) {
+                    info!("Skipping step '{}': already completed (resume)", step.id);
+                    step_results.push(StepResult {
+                        step_id: step.id.clone(),
+                        status: StepStatus::Skipped,
+                        output: String::new(),
+                        error: "skipped (resume from checkpoint)".to_string(),
+                        duration: None,
+                    });
+                    step_idx += 1;
+                    continue;
+                }
+
                 self.listener.on_step_start(&step.id, step.effective_type());
                 self.run_hook(&recipe.hooks.pre_step, "pre_step", &step.id, &ctx);
 
@@ -375,6 +411,25 @@ impl<A: Adapter> RecipeRunner<A> {
 
                 self.listener.on_step_complete(&result);
                 self.write_audit_entry(&audit_file, &result);
+
+                // Save checkpoint after each step for resume-on-failure
+                if self.save_checkpoints && !failed {
+                    let completed: Vec<String> = step_results
+                        .iter()
+                        .filter(|r| r.status == StepStatus::Completed)
+                        .map(|r| r.step_id.clone())
+                        .chain(std::iter::once(step.id.clone()))
+                        .collect();
+                    let checkpoint = crate::models::RecipeCheckpoint {
+                        recipe_name: recipe.name.clone(),
+                        completed_steps: completed,
+                        context: ctx.data().clone(),
+                        timestamp: chrono_now(),
+                    };
+                    if let Err(e) = checkpoint.save(&recipe.name) {
+                        warn!("Failed to save checkpoint: {}", e);
+                    }
+                }
 
                 if failed && !step.is_nonfatal() {
                     step_results.push(result);
@@ -1449,4 +1504,15 @@ steps:
         // Verify the output was stored in context
         assert!(result.context.contains_key("result"));
     }
+}
+
+fn chrono_now() -> String {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = duration.as_secs();
+    let hours = (secs / 3600) % 24;
+    let mins = (secs / 60) % 60;
+    let s = secs % 60;
+    format!("{:02}:{:02}:{:02}Z", hours, mins, s)
 }
