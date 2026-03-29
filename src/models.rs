@@ -181,6 +181,17 @@ pub struct Recipe {
     pub tags: Vec<String>,
     #[serde(default)]
     pub context: HashMap<String, serde_json::Value>,
+    /// Optional validation rules for context variables.
+    /// Keys match context var names. Values specify the validation type.
+    /// Supported types: "nonempty", "git_repo", "path", "optional" (default).
+    /// Example:
+    /// ```yaml
+    /// context_validation:
+    ///   task_description: "nonempty"
+    ///   repo_path: "git_repo"
+    /// ```
+    #[serde(default)]
+    pub context_validation: HashMap<String, String>,
     /// Per-recipe recursion limits (max_depth, max_total_steps).
     #[serde(default)]
     pub recursion: RecursionConfig,

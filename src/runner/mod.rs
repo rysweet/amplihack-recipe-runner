@@ -172,6 +172,41 @@ impl<A: Adapter> RecipeRunner<A> {
             };
         }
 
+        // Pre-flight context validation (#3741)
+        if !recipe.context_validation.is_empty() {
+            let merged_ctx = {
+                let mut ctx = recipe.context.clone();
+                if let Some(ref uc) = user_context {
+                    for (k, v) in uc {
+                        ctx.insert(k.clone(), v.clone());
+                    }
+                }
+                ctx
+            };
+            let errors = validate_context(&recipe.context_validation, &merged_ctx);
+            if !errors.is_empty() {
+                let msg = format!(
+                    "=== PRE-FLIGHT VALIDATION FAILED for '{}' ===\n{}\n\nFix the above, then retry.",
+                    recipe.name,
+                    errors.join("\n")
+                );
+                error!("{}", msg);
+                return RecipeResult {
+                    recipe_name: recipe.name.clone(),
+                    success: false,
+                    step_results: vec![StepResult {
+                        step_id: "preflight-validation".to_string(),
+                        status: StepStatus::Failed,
+                        output: String::new(),
+                        error: msg,
+                        duration: None,
+                    }],
+                    context: HashMap::new(),
+                    duration: None,
+                };
+            }
+        }
+
         self.run_steps(&recipe, user_context)
     }
 
@@ -1118,6 +1153,75 @@ impl<A: Adapter> RecipeRunner<A> {
         }
         result
     }
+}
+
+/// Validate context variables against the recipe's context_validation rules.
+/// Returns a list of error messages (empty = all valid).
+fn validate_context(
+    rules: &HashMap<String, String>,
+    ctx: &HashMap<String, Value>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (var_name, rule) in rules {
+        let value = ctx.get(var_name);
+        match rule.as_str() {
+            "nonempty" => {
+                let is_empty = match value {
+                    None => true,
+                    Some(Value::Null) => true,
+                    Some(Value::String(s)) => s.trim().is_empty(),
+                    _ => false,
+                };
+                if is_empty {
+                    errors.push(format!("  ✗ '{}' is required but empty or missing", var_name));
+                }
+            }
+            "git_repo" => {
+                let path = match value {
+                    Some(Value::String(s)) if !s.is_empty() => s.clone(),
+                    _ => {
+                        errors.push(format!("  ✗ '{}' is required (must be a git repo path)", var_name));
+                        continue;
+                    }
+                };
+                let resolved = if path == "." {
+                    std::env::current_dir()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| ".".to_string())
+                } else {
+                    path.clone()
+                };
+                if !std::path::Path::new(&resolved).is_dir() {
+                    errors.push(format!("  ✗ '{}' path '{}' does not exist", var_name, path));
+                } else if !std::path::Path::new(&resolved).join(".git").exists()
+                    && Command::new("git")
+                        .args(["-C", &resolved, "rev-parse", "--git-dir"])
+                        .output()
+                        .map(|o| !o.status.success())
+                        .unwrap_or(true)
+                {
+                    errors.push(format!("  ✗ '{}' path '{}' is not a git repository", var_name, path));
+                }
+            }
+            "path" => {
+                match value {
+                    Some(Value::String(s)) if !s.is_empty() => {
+                        if !std::path::Path::new(s.as_str()).exists() {
+                            errors.push(format!("  ✗ '{}' path '{}' does not exist", var_name, s));
+                        }
+                    }
+                    _ => {
+                        errors.push(format!("  ✗ '{}' is required (must be a valid path)", var_name));
+                    }
+                }
+            }
+            "optional" | "" => {} // no validation
+            other => {
+                log::warn!("Unknown context_validation type '{}' for '{}'", other, var_name);
+            }
+        }
+    }
+    errors
 }
 
 fn git_stage_all(working_dir: &str) -> Option<String> {
