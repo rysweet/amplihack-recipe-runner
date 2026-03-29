@@ -7,7 +7,7 @@ use log::{debug, info};
 use recipe_runner_rs::adapters::cli_subprocess::CLISubprocessAdapter;
 use recipe_runner_rs::discovery;
 use recipe_runner_rs::parser::RecipeParser;
-use recipe_runner_rs::runner::{RecipeRunner, StderrListener};
+use recipe_runner_rs::runner::{RecipeRunner, FileLogListener, StderrListener};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -363,7 +363,16 @@ fn run() -> i32 {
     }
 
     if cli.progress {
-        runner = runner.with_listener(Box::new(StderrListener));
+        // Use FileLogListener (writes structured JSON log + stderr) when available,
+        // fall back to StderrListener if log file creation fails.
+        match FileLogListener::new(&recipe.name) {
+            Some((listener, _path)) => {
+                runner = runner.with_listener(Box::new(listener));
+            }
+            None => {
+                runner = runner.with_listener(Box::new(StderrListener));
+            }
+        }
     }
 
     // Execute
