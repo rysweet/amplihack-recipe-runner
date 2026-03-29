@@ -214,8 +214,41 @@ impl CLISubprocessAdapter {
             log::warn!("Heartbeat thread panicked: {:?}", e);
         }
 
-        let stdout =
-            std::fs::read_to_string(&output_file).context("Failed to read agent output file")?;
+        // Read agent output with retry and graceful fallback (#3740).
+        // The output file can be missing if: the temp dir was cleaned by the OS,
+        // the agent crashed before writing, or a race condition on fast exits.
+        let stdout = match std::fs::read_to_string(&output_file) {
+            Ok(content) => content,
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                log::warn!(
+                    "Agent output file not found: {}. Retrying after 1s...",
+                    output_file.display()
+                );
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                match std::fs::read_to_string(&output_file) {
+                    Ok(content) => {
+                        log::info!("Agent output file found on retry");
+                        content
+                    }
+                    Err(_) => {
+                        log::error!(
+                            "Agent output file missing after retry: {}. \
+                             Continuing with empty output instead of aborting.",
+                            output_file.display()
+                        );
+                        String::new()
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!(
+                    "Failed to read agent output file {}: {}. Continuing with empty output.",
+                    output_file.display(),
+                    e
+                );
+                String::new()
+            }
+        };
 
         // temp_dir is dropped here, cleaning up automatically
 
