@@ -26,7 +26,7 @@ use std::time::Instant;
 use crate::models::DEFAULT_MAX_DEPTH;
 
 use json_parser::parse_json_output;
-pub use listeners::{ExecutionListener, NullListener, StderrListener};
+pub use listeners::{ExecutionListener, FileLogListener, NullListener, StderrListener};
 
 /// Maximum number of threads to spawn per parallel group.
 const MAX_PARALLEL_STEPS: usize = 50;
