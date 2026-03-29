@@ -20,6 +20,7 @@ impl Adapter for MockAdapter {
         _: Option<&str>,
         _: &str,
         _: Option<&str>,
+        _: Option<u64>,
     ) -> Result<String, anyhow::Error> {
         if prompt.contains("FAIL") {
             anyhow::bail!("Simulated failure");
@@ -185,6 +186,7 @@ fn test_parse_json_success_returns_parsed_output() {
             _: Option<&str>,
             _: &str,
             _: Option<&str>,
+            _: Option<u64>,
         ) -> Result<String, anyhow::Error> {
             Ok(r#"{"result": "success", "count": 42}"#.to_string())
         }

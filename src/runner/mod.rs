@@ -679,6 +679,7 @@ impl<A: Adapter> RecipeRunner<A> {
                         step.mode.as_deref(),
                         working_dir,
                         step.model.as_deref(),
+                        step.timeout,
                     )
                     .map_err(|e| StepExecutionError {
                         step_id: step.id.clone(),
@@ -782,6 +783,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     None,
                     working_dir,
                     None,
+                    None, // timeout
                 ) {
                     Ok(output)
                         if output.to_lowercase().contains("status: complete")
@@ -928,6 +930,7 @@ impl<A: Adapter> RecipeRunner<A> {
             None,
             working_dir,
             None,
+            None, // timeout
         ) {
             Ok(output) => Some(output),
             Err(e) => {
@@ -1266,6 +1269,7 @@ mod tests {
             _mode: Option<&str>,
             _working_dir: &str,
             _model: Option<&str>,
+            _timeout: Option<u64>,
         ) -> Result<String, anyhow::Error> {
             Ok(format!(
                 "Agent response for: {}",
@@ -1361,6 +1365,7 @@ steps:
             _mode: Option<&str>,
             _working_dir: &str,
             _model: Option<&str>,
+            _timeout: Option<u64>,
         ) -> Result<String, anyhow::Error> {
             Ok("agent output\n".to_string())
         }

@@ -280,12 +280,19 @@ impl Adapter for CLISubprocessAdapter {
         _mode: Option<&str>,
         _working_dir: &str,
         model: Option<&str>,
+        timeout: Option<u64>,
     ) -> Result<String, anyhow::Error> {
         log::debug!(
-            "CLISubprocessAdapter::execute_agent_step: prompt_len={}, model={:?}",
+            "CLISubprocessAdapter::execute_agent_step: prompt_len={}, model={:?}, timeout={:?}",
             prompt.len(),
-            model
+            model,
+            timeout
         );
+        // TODO: enforce timeout on agent steps by wrapping with wait_timeout
+        // For now, timeout is accepted but not yet enforced on agent steps
+        // (agent steps are long-running by nature; enforcing timeout requires
+        // careful handling of partial output and cleanup)
+        let _ = timeout;
         self.execute_agent_step_impl(prompt, system_prompt, model)
     }
 
