@@ -95,7 +95,11 @@ impl CLISubprocessAdapter {
     }
 
     fn supports_file_backed_prompt_transport(&self) -> bool {
-        matches!(self.cli.as_str(), "claude" | "launch" | "RustyClawd")
+        // Claude-family CLIs support --append-system-prompt for overflow.
+        // Copilot CLI does not, but we still need to avoid E2BIG.
+        // For Copilot: truncate -p and write overflow to a prompt file
+        // in the working dir that the agent can read via --add-dir.
+        true
     }
 
     fn should_use_file_backed_prompt_transport(
@@ -219,13 +223,24 @@ impl CLISubprocessAdapter {
                 prompt.len(),
                 effective_system_prompt.len()
             );
-            if let Some(prompt_file) = prompt_file {
-                cmd.args(["--append-system-prompt", &prompt_file.to_string_lossy()]);
+            if let Some(ref pf) = prompt_file {
+                // Claude-family CLIs support --append-system-prompt directly.
+                // Copilot CLI does not — use --add-dir so the agent can read the file.
+                if matches!(self.cli.as_str(), "claude" | "launch" | "RustyClawd") {
+                    cmd.args(["--append-system-prompt", &pf.to_string_lossy()]);
+                } else {
+                    // For Copilot and others: make the prompt file accessible via --add-dir
+                    // and include a note in the inline prompt pointing to it.
+                    cmd.args(["--add-dir", &output_dir.to_string_lossy()]);
+                }
             }
             cmd.args(["-p", &inline_prompt]);
         } else {
             cmd.args(["-p", prompt]);
-            cmd.args(["--system-prompt", &effective_system_prompt]);
+            // Only pass --system-prompt for CLIs that support it
+            if matches!(self.cli.as_str(), "claude" | "launch" | "RustyClawd") {
+                cmd.args(["--system-prompt", &effective_system_prompt]);
+            }
         }
 
         cmd.args(["--add-dir", &resolved_cwd.to_string_lossy()]);
@@ -822,7 +837,8 @@ mod tests {
 
     #[test]
     fn test_build_agent_command_always_includes_system_prompt() {
-        let adapter = CLISubprocessAdapter::new();
+        // Claude CLI gets --system-prompt; Copilot does not
+        let adapter = CLISubprocessAdapter::new().with_binary("claude");
         let tmp = tempfile::tempdir().unwrap();
         let cmd = adapter
             .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
@@ -857,10 +873,11 @@ mod tests {
     }
 
     #[test]
-    fn test_does_not_use_file_backed_prompt_transport_for_copilot() {
+    fn test_uses_file_backed_prompt_transport_for_copilot() {
+        // Copilot now also uses file-backed transport for large prompts
         let adapter = CLISubprocessAdapter::new().with_binary("copilot");
         let large_prompt = "x".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1);
-        assert!(!adapter.should_use_file_backed_prompt_transport(&large_prompt, None));
+        assert!(adapter.should_use_file_backed_prompt_transport(&large_prompt, None));
     }
 
     #[test]
