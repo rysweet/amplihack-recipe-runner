@@ -12,8 +12,8 @@ use std::env;
 use std::io::Write;
 use std::io::{BufRead, BufReader};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const NON_INTERACTIVE_FOOTER: &str = "\n\nIMPORTANT: Proceed autonomously. Do not ask questions. \
@@ -158,10 +158,10 @@ impl CLISubprocessAdapter {
         }
 
         let mut appended_prompt = String::new();
-        if let Some(sp) = system_prompt {
-            if !sp.is_empty() {
-                appended_prompt.push_str(sp);
-            }
+        if let Some(sp) = system_prompt
+            && !sp.is_empty()
+        {
+            appended_prompt.push_str(sp);
         }
         if !prompt_overflow.is_empty() {
             if !appended_prompt.is_empty() {
