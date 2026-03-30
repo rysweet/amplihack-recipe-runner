@@ -60,6 +60,8 @@ enum Token {
     Not,            // not (standalone, not followed by 'in')
     LParen,         // (
     RParen,         // )
+    LBracket,       // [
+    RBracket,       // ]
     Comma,          // ,
     Dot,            // .  (for method calls)
 }
@@ -79,6 +81,14 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ConditionError> {
             }
             ')' => {
                 tokens.push(Token::RParen);
+                i += 1;
+            }
+            '[' => {
+                tokens.push(Token::LBracket);
+                i += 1;
+            }
+            ']' => {
+                tokens.push(Token::RBracket);
                 i += 1;
             }
             ',' => {
@@ -345,25 +355,35 @@ impl<'a> ExprParser<'a> {
     // primary: atom postfix*
     // postfix: '.' IDENT '(' args ')' (method call)
     //        | '.' IDENT              (property access — dot-notation context lookup)
+    //        | '[' STRING ']'         (object key access)
+    //        | '[' NUMBER ']'         (array index access)
     fn parse_primary(&mut self) -> Result<Value, ConditionError> {
         let mut value = self.parse_atom()?;
 
-        // Handle method calls and property access: value.method(args...) or value.field
-        while self.peek() == Some(&Token::Dot) {
-            self.advance(); // consume '.'
-            let method_name = match self.peek().cloned() {
-                Some(Token::Ident(name)) => {
-                    self.advance();
-                    name
-                }
-                _ => {
-                    return Err(ConditionError::Parse(
-                        "expected method name after '.'".to_string(),
-                    ));
-                }
-            };
+        // Handle postfix access and method calls.
+        loop {
+            match self.peek() {
+                Some(Token::Dot) => {
+                    self.advance(); // consume '.'
+                    let method_name = match self.peek().cloned() {
+                        Some(Token::Ident(name)) => {
+                            self.advance();
+                            name
+                        }
+                        _ => {
+                            return Err(ConditionError::Parse(
+                                "expected method name after '.'".to_string(),
+                            ));
+                        }
+                    };
 
-            value = self.parse_dot_access(value, &method_name)?;
+                    value = self.parse_dot_access(value, &method_name)?;
+                }
+                Some(Token::LBracket) => {
+                    value = self.parse_bracket_access(value)?;
+                }
+                _ => break,
+            }
         }
 
         Ok(value)
@@ -420,6 +440,59 @@ impl<'a> ExprParser<'a> {
         self.advance();
 
         apply_method(&value, method_name, &args)
+    }
+
+    /// Parse bracket access: value['key'] or value[0]
+    fn parse_bracket_access(&mut self, value: Value) -> Result<Value, ConditionError> {
+        self.advance(); // consume '['
+
+        let accessed = match self.peek().cloned() {
+            Some(Token::String(key)) => {
+                self.advance();
+                if key.contains("__") {
+                    return Err(ConditionError::Unsafe(format!(
+                        "dunder key '{}' is not allowed",
+                        key
+                    )));
+                }
+                match value {
+                    Value::Object(map) => map.get(&key).cloned().unwrap_or(Value::Null),
+                    _ => Value::Null,
+                }
+            }
+            Some(Token::Number(n)) => {
+                self.advance();
+                if !n.is_finite() || n < 0.0 || n.fract() != 0.0 {
+                    return Err(ConditionError::Parse(format!(
+                        "array index must be a non-negative integer, got {}",
+                        n
+                    )));
+                }
+                let index = n as usize;
+                match value {
+                    Value::Array(items) => items.get(index).cloned().unwrap_or(Value::Null),
+                    _ => Value::Null,
+                }
+            }
+            Some(other) => {
+                return Err(ConditionError::Parse(format!(
+                    "expected string key or numeric index inside brackets, got {:?}",
+                    other
+                )));
+            }
+            None => {
+                return Err(ConditionError::Parse(
+                    "unexpected end of expression inside brackets".to_string(),
+                ));
+            }
+        };
+
+        if self.peek() != Some(&Token::RBracket) {
+            return Err(ConditionError::Parse("expected ']'".to_string()));
+        }
+        self.advance();
+
+        Ok(accessed)
     }
 
     /// Parse an expression that returns a Value (for function/method args)
@@ -999,5 +1072,24 @@ mod tests {
         assert!(evaluate_condition("b < a", &data).unwrap());
         assert!(evaluate_condition("a >= a", &data).unwrap());
         assert!(evaluate_condition("b <= b", &data).unwrap());
+    }
+
+    #[test]
+    fn test_bracket_access_object_key() {
+        let data = ctx(&[("scope", json!({"has_ambiguities": true}))]);
+        assert!(evaluate_condition("scope['has_ambiguities']", &data).unwrap());
+        assert!(evaluate_condition("scope['has_ambiguities'] == 'true'", &data).unwrap());
+    }
+
+    #[test]
+    fn test_bracket_access_works_in_legacy_guard_expression() {
+        let data = ctx(&[("scope", json!({"has_ambiguities": true}))]);
+        assert!(evaluate_condition("scope and scope['has_ambiguities']", &data).unwrap());
+    }
+
+    #[test]
+    fn test_bracket_access_array_index() {
+        let data = ctx(&[("items", json!(["alpha", "beta"]))]);
+        assert!(evaluate_condition("items[1] == 'beta'", &data).unwrap());
     }
 }
