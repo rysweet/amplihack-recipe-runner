@@ -9,14 +9,18 @@ use crate::adapters::Adapter;
 use anyhow::Context;
 use std::collections::HashMap;
 use std::env;
+use std::io::Write;
 use std::io::{BufRead, BufReader};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const NON_INTERACTIVE_FOOTER: &str = "\n\nIMPORTANT: Proceed autonomously. Do not ask questions. \
      Make reasonable decisions and continue.";
+const MAX_INLINE_AGENT_PROMPT_BYTES: usize = 32 * 1024;
+const FILE_BACKED_INLINE_PROMPT_BYTES: usize = 8 * 1024;
+const FILE_BACKED_PROMPT_CONTINUATION_NOTE: &str = "\n\nIMPORTANT: Additional task instructions, output requirements, and context continue in the appended system prompt. Treat that appended content as part of this same request and follow it fully.";
 
 pub struct CLISubprocessAdapter {
     cli: String,
@@ -83,6 +87,139 @@ impl CLISubprocessAdapter {
         );
 
         child_env
+    }
+
+    fn supports_file_backed_prompt_transport(&self) -> bool {
+        matches!(self.cli.as_str(), "claude" | "launch" | "RustyClawd")
+    }
+
+    fn should_use_file_backed_prompt_transport(
+        &self,
+        prompt: &str,
+        system_prompt: Option<&str>,
+    ) -> bool {
+        self.supports_file_backed_prompt_transport()
+            && prompt.len() + system_prompt.map_or(0, str::len) > MAX_INLINE_AGENT_PROMPT_BYTES
+    }
+
+    fn write_private_prompt_file(
+        output_dir: &std::path::Path,
+        content: &str,
+    ) -> Result<std::path::PathBuf, anyhow::Error> {
+        let prompt_file = output_dir.join("agent-system-prompt.md");
+        let mut file = std::fs::File::create(&prompt_file)
+            .with_context(|| format!("Failed to create prompt file {}", prompt_file.display()))?;
+        file.write_all(content.as_bytes())
+            .with_context(|| format!("Failed to write prompt file {}", prompt_file.display()))?;
+        file.flush()
+            .with_context(|| format!("Failed to flush prompt file {}", prompt_file.display()))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&prompt_file, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| {
+                    format!("Failed to chmod prompt file {}", prompt_file.display())
+                })?;
+        }
+
+        Ok(prompt_file)
+    }
+
+    fn clamp_char_boundary(text: &str, max_bytes: usize) -> usize {
+        let mut boundary = max_bytes.min(text.len());
+        while boundary > 0 && !text.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        boundary
+    }
+
+    fn build_file_backed_prompt_payload(
+        &self,
+        output_dir: &std::path::Path,
+        prompt: &str,
+        system_prompt: Option<&str>,
+    ) -> Result<(String, Option<std::path::PathBuf>), anyhow::Error> {
+        let preview_boundary = Self::clamp_char_boundary(prompt, FILE_BACKED_INLINE_PROMPT_BYTES);
+        let prompt_overflow = if preview_boundary < prompt.len() {
+            &prompt[preview_boundary..]
+        } else {
+            ""
+        };
+
+        let mut inline_prompt = if preview_boundary > 0 {
+            prompt[..preview_boundary].to_string()
+        } else {
+            String::new()
+        };
+        if !prompt_overflow.is_empty() {
+            inline_prompt.push_str(FILE_BACKED_PROMPT_CONTINUATION_NOTE);
+        }
+
+        let mut appended_prompt = String::new();
+        if let Some(sp) = system_prompt {
+            if !sp.is_empty() {
+                appended_prompt.push_str(sp);
+            }
+        }
+        if !prompt_overflow.is_empty() {
+            if !appended_prompt.is_empty() {
+                appended_prompt.push_str("\n\n");
+            }
+            appended_prompt.push_str("# Continued task instructions\n\n");
+            appended_prompt.push_str(prompt_overflow);
+        }
+
+        let prompt_file = if appended_prompt.is_empty() {
+            None
+        } else {
+            Some(Self::write_private_prompt_file(
+                output_dir,
+                &appended_prompt,
+            )?)
+        };
+
+        Ok((inline_prompt, prompt_file))
+    }
+
+    fn build_agent_command(
+        &self,
+        output_dir: &std::path::Path,
+        resolved_cwd: &std::path::Path,
+        prompt: &str,
+        system_prompt: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<std::process::Command, anyhow::Error> {
+        let mut cmd = std::process::Command::new("amplihack");
+        cmd.arg(&self.cli);
+
+        if self.should_use_file_backed_prompt_transport(prompt, system_prompt) {
+            let (inline_prompt, prompt_file) =
+                self.build_file_backed_prompt_payload(output_dir, prompt, system_prompt)?;
+            log::info!(
+                "Using file-backed prompt transport for '{}' (prompt={} bytes, system_prompt={} bytes)",
+                self.cli,
+                prompt.len(),
+                system_prompt.map_or(0, str::len)
+            );
+            if let Some(prompt_file) = prompt_file {
+                cmd.args(["--append-system-prompt", &prompt_file.to_string_lossy()]);
+            }
+            cmd.args(["-p", &inline_prompt]);
+        } else {
+            cmd.args(["-p", prompt]);
+            if let Some(sp) = system_prompt {
+                cmd.args(["--system-prompt", sp]);
+            }
+        }
+
+        cmd.args(["--add-dir", &resolved_cwd.to_string_lossy()]);
+        if let Some(m) = model {
+            cmd.args(["--model", m]);
+        }
+
+        Ok(cmd)
     }
 
     /// Internal: spawn agent with optional system prompt.
@@ -159,16 +296,13 @@ impl CLISubprocessAdapter {
         // Always launch via `amplihack <agent>` so the amplihack infrastructure
         // (env setup, guards, hooks) is properly initialized.
         // The agent runs from the real repo/worktree cwd, not a temp dir.
-        let mut cmd = std::process::Command::new("amplihack");
-        cmd.args([&self.cli, "-p", &full_prompt]);
-        // Tell the agent where the repo is via --add-dir so it can access files
-        cmd.args(["--add-dir", &resolved_cwd.to_string_lossy()]);
-        if let Some(sp) = system_prompt {
-            cmd.args(["--system-prompt", sp]);
-        }
-        if let Some(m) = model {
-            cmd.args(["--model", m]);
-        }
+        let mut cmd = self.build_agent_command(
+            &output_dir,
+            &resolved_cwd,
+            &full_prompt,
+            system_prompt,
+            model,
+        )?;
         let mut child = cmd
             .current_dir(&resolved_cwd)
             .env_remove("CLAUDECODE")
@@ -660,5 +794,140 @@ mod tests {
             "copilot",
             "child env must propagate the overridden agent binary"
         );
+    }
+
+    #[test]
+    fn test_should_use_file_backed_prompt_transport_for_large_claude_prompt() {
+        let adapter = CLISubprocessAdapter::new().with_binary("claude");
+        let large_prompt = "x".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1);
+        assert!(adapter.should_use_file_backed_prompt_transport(&large_prompt, None));
+    }
+
+    #[test]
+    fn test_does_not_use_file_backed_prompt_transport_for_copilot() {
+        let adapter = CLISubprocessAdapter::new().with_binary("copilot");
+        let large_prompt = "x".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1);
+        assert!(!adapter.should_use_file_backed_prompt_transport(&large_prompt, None));
+    }
+
+    #[test]
+    fn test_build_agent_command_inlines_small_prompts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_dir = tmp.path().join(".recipe-output");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let adapter = CLISubprocessAdapter::new().with_binary("claude");
+        let cmd = adapter
+            .build_agent_command(
+                &output_dir,
+                tmp.path(),
+                "short prompt",
+                Some("system"),
+                None,
+            )
+            .unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(args.iter().any(|arg| arg == "-p"));
+        assert!(args.iter().any(|arg| arg == "--system-prompt"));
+        assert!(!args.iter().any(|arg| arg == "--append-system-prompt"));
+    }
+
+    #[test]
+    fn test_build_agent_command_uses_file_transport_for_large_claude_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_dir = tmp.path().join(".recipe-output");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let adapter = CLISubprocessAdapter::new().with_binary("claude");
+        let large_prompt = format!(
+            "Task: implement prompt transport.\nOutput: json.\n\n{}",
+            "x".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1)
+        );
+        let prompt_with_footer = format!("{}{}", large_prompt, NON_INTERACTIVE_FOOTER);
+        let cmd = adapter
+            .build_agent_command(
+                &output_dir,
+                tmp.path(),
+                &prompt_with_footer,
+                Some("system"),
+                None,
+            )
+            .unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(args.iter().any(|arg| arg == "--append-system-prompt"));
+        assert!(!args.iter().any(|arg| arg == "--system-prompt"));
+
+        let prompt_arg_index = args.iter().position(|arg| arg == "-p").unwrap();
+        let inline_prompt = &args[prompt_arg_index + 1];
+        assert!(inline_prompt.starts_with("Task: implement prompt transport."));
+        assert!(inline_prompt.contains(FILE_BACKED_PROMPT_CONTINUATION_NOTE));
+        assert!(inline_prompt.len() < prompt_with_footer.len());
+
+        let prompt_file_index = args
+            .iter()
+            .position(|arg| arg == "--append-system-prompt")
+            .unwrap();
+        let prompt_file = std::path::PathBuf::from(&args[prompt_file_index + 1]);
+        let prompt_file_contents = std::fs::read_to_string(&prompt_file).unwrap();
+        assert!(prompt_file_contents.contains("system"));
+        assert!(prompt_file_contents.contains("# Continued task instructions"));
+        assert!(prompt_file_contents.contains(NON_INTERACTIVE_FOOTER));
+        assert!(prompt_file_contents.contains(&"x".repeat(1024)));
+        assert!(prompt_file_contents.contains(NON_INTERACTIVE_FOOTER));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = std::fs::metadata(&prompt_file)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn test_large_system_prompt_keeps_full_user_prompt_inline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_dir = tmp.path().join(".recipe-output");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let adapter = CLISubprocessAdapter::new().with_binary("claude");
+        let prompt = "Task: audit this workflow.";
+        let large_system_prompt = "s".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1);
+        let cmd = adapter
+            .build_agent_command(
+                &output_dir,
+                tmp.path(),
+                prompt,
+                Some(&large_system_prompt),
+                None,
+            )
+            .unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        let prompt_arg_index = args.iter().position(|arg| arg == "-p").unwrap();
+        assert_eq!(args[prompt_arg_index + 1], prompt);
+
+        let prompt_file_index = args
+            .iter()
+            .position(|arg| arg == "--append-system-prompt")
+            .unwrap();
+        let prompt_file = std::path::PathBuf::from(&args[prompt_file_index + 1]);
+        let prompt_file_contents = std::fs::read_to_string(&prompt_file).unwrap();
+        assert_eq!(prompt_file_contents, large_system_prompt);
     }
 }
