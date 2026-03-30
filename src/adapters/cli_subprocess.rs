@@ -18,6 +18,11 @@ use std::time::{Duration, Instant};
 
 const NON_INTERACTIVE_FOOTER: &str = "\n\nIMPORTANT: Proceed autonomously. Do not ask questions. \
      Make reasonable decisions and continue.";
+const RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT: &str = "You are already inside an active \
+     recipe-managed workflow step. This is not a new top-level user request. Do not invoke \
+     /dev, dev-orchestrator, ultrathink, smart-orchestrator, or any other workflow or recipe \
+     runner. Execute the requested step directly and return only the output requested by this \
+     step.";
 const MAX_INLINE_AGENT_PROMPT_BYTES: usize = 32 * 1024;
 const FILE_BACKED_INLINE_PROMPT_BYTES: usize = 8 * 1024;
 const FILE_BACKED_PROMPT_CONTINUATION_NOTE: &str = "\n\nIMPORTANT: Additional task instructions, output requirements, and context continue in the appended system prompt. Treat that appended content as part of this same request and follow it fully.";
@@ -100,6 +105,13 @@ impl CLISubprocessAdapter {
     ) -> bool {
         self.supports_file_backed_prompt_transport()
             && prompt.len() + system_prompt.map_or(0, str::len) > MAX_INLINE_AGENT_PROMPT_BYTES
+    }
+
+    fn build_effective_system_prompt(system_prompt: Option<&str>) -> String {
+        match system_prompt.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(existing) => format!("{existing}\n\n{RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT}"),
+            None => RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT.to_string(),
+        }
     }
 
     fn write_private_prompt_file(
@@ -193,15 +205,19 @@ impl CLISubprocessAdapter {
     ) -> Result<std::process::Command, anyhow::Error> {
         let mut cmd = std::process::Command::new("amplihack");
         cmd.arg(&self.cli);
+        let effective_system_prompt = Self::build_effective_system_prompt(system_prompt);
 
-        if self.should_use_file_backed_prompt_transport(prompt, system_prompt) {
-            let (inline_prompt, prompt_file) =
-                self.build_file_backed_prompt_payload(output_dir, prompt, system_prompt)?;
+        if self.should_use_file_backed_prompt_transport(prompt, Some(&effective_system_prompt)) {
+            let (inline_prompt, prompt_file) = self.build_file_backed_prompt_payload(
+                output_dir,
+                prompt,
+                Some(&effective_system_prompt),
+            )?;
             log::info!(
                 "Using file-backed prompt transport for '{}' (prompt={} bytes, system_prompt={} bytes)",
                 self.cli,
                 prompt.len(),
-                system_prompt.map_or(0, str::len)
+                effective_system_prompt.len()
             );
             if let Some(prompt_file) = prompt_file {
                 cmd.args(["--append-system-prompt", &prompt_file.to_string_lossy()]);
@@ -209,9 +225,7 @@ impl CLISubprocessAdapter {
             cmd.args(["-p", &inline_prompt]);
         } else {
             cmd.args(["-p", prompt]);
-            if let Some(sp) = system_prompt {
-                cmd.args(["--system-prompt", sp]);
-            }
+            cmd.args(["--system-prompt", &effective_system_prompt]);
         }
 
         cmd.args(["--add-dir", &resolved_cwd.to_string_lossy()]);
@@ -784,6 +798,45 @@ mod tests {
     }
 
     #[test]
+    fn test_no_reentry_system_prompt_constant() {
+        assert!(RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT.contains("/dev"));
+        assert!(RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT.contains("smart-orchestrator"));
+        assert!(
+            RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT.contains("Execute the requested step directly")
+        );
+    }
+
+    #[test]
+    fn test_build_effective_system_prompt_without_existing_prompt() {
+        let prompt = CLISubprocessAdapter::build_effective_system_prompt(None);
+        assert_eq!(prompt, RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn test_build_effective_system_prompt_with_existing_prompt() {
+        let prompt =
+            CLISubprocessAdapter::build_effective_system_prompt(Some("Existing system prompt"));
+        assert!(prompt.starts_with("Existing system prompt"));
+        assert!(prompt.contains(RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT));
+    }
+
+    #[test]
+    fn test_build_agent_command_always_includes_system_prompt() {
+        let adapter = CLISubprocessAdapter::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let cmd = adapter
+            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|w| {
+            w[0] == "--system-prompt" && w[1].contains(RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT)
+        }));
+    }
+
+    #[test]
     fn test_with_binary_propagates_agent_binary_env() {
         let adapter = CLISubprocessAdapter::new().with_binary("copilot");
         // Simulate what execute_agent_step_impl does: build env then insert
@@ -928,6 +981,7 @@ mod tests {
             .unwrap();
         let prompt_file = std::path::PathBuf::from(&args[prompt_file_index + 1]);
         let prompt_file_contents = std::fs::read_to_string(&prompt_file).unwrap();
-        assert_eq!(prompt_file_contents, large_system_prompt);
+        assert!(prompt_file_contents.starts_with(&large_system_prompt));
+        assert!(prompt_file_contents.contains(RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT));
     }
 }
