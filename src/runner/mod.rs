@@ -694,7 +694,8 @@ impl<A: Adapter> RecipeRunner<A> {
             StepType::Bash => {
                 let rendered = ctx.render_shell(step.command.as_deref().unwrap_or(""));
                 let (env_vars, context_file) = ctx.shell_env_for_step();
-                let result = self.adapter
+                let result = self
+                    .adapter
                     .execute_bash_step(&rendered, working_dir, step.timeout, &env_vars)
                     .map(|output| output.trim_end().to_string())
                     .map_err(|e| StepExecutionError {
@@ -702,10 +703,10 @@ impl<A: Adapter> RecipeRunner<A> {
                         message: format!("bash step failed: {:#}", e),
                     });
                 // Clean up temp context file after step completes
-                if let Some(path) = context_file {
-                    if let Err(e) = std::fs::remove_file(&path) {
-                        log::debug!("Failed to clean up context file {}: {}", path.display(), e);
-                    }
+                if let Some(path) = context_file
+                    && let Err(e) = std::fs::remove_file(&path)
+                {
+                    log::debug!("Failed to clean up context file {}: {}", path.display(), e);
                 }
                 result
             }
@@ -1159,7 +1160,12 @@ impl<A: Adapter> RecipeRunner<A> {
         let (env_vars, context_file) = ctx.shell_env_for_step();
         let working_dir = step.working_dir.as_deref().unwrap_or(default_working_dir);
 
-        let result = match adapter.execute_bash_step(&rendered, working_dir, step.timeout, &env_vars) {
+        let result = match adapter.execute_bash_step(
+            &rendered,
+            working_dir,
+            step.timeout,
+            &env_vars,
+        ) {
             Ok(raw_output) => {
                 // Strip trailing whitespace/newlines from bash output so that
                 // condition comparisons like `count != '1'` work correctly.
@@ -1218,10 +1224,7 @@ impl<A: Adapter> RecipeRunner<A> {
 
 /// Validate context variables against the recipe's context_validation rules.
 /// Returns a list of error messages (empty = all valid).
-fn validate_context(
-    rules: &HashMap<String, String>,
-    ctx: &HashMap<String, Value>,
-) -> Vec<String> {
+fn validate_context(rules: &HashMap<String, String>, ctx: &HashMap<String, Value>) -> Vec<String> {
     let mut errors = Vec::new();
     for (var_name, rule) in rules {
         let value = ctx.get(var_name);
@@ -1234,14 +1237,20 @@ fn validate_context(
                     _ => false,
                 };
                 if is_empty {
-                    errors.push(format!("  ✗ '{}' is required but empty or missing", var_name));
+                    errors.push(format!(
+                        "  ✗ '{}' is required but empty or missing",
+                        var_name
+                    ));
                 }
             }
             "git_repo" => {
                 let path = match value {
                     Some(Value::String(s)) if !s.is_empty() => s.clone(),
                     _ => {
-                        errors.push(format!("  ✗ '{}' is required (must be a git repo path)", var_name));
+                        errors.push(format!(
+                            "  ✗ '{}' is required (must be a git repo path)",
+                            var_name
+                        ));
                         continue;
                     }
                 };
@@ -1261,24 +1270,32 @@ fn validate_context(
                         .map(|o| !o.status.success())
                         .unwrap_or(true)
                 {
-                    errors.push(format!("  ✗ '{}' path '{}' is not a git repository", var_name, path));
+                    errors.push(format!(
+                        "  ✗ '{}' path '{}' is not a git repository",
+                        var_name, path
+                    ));
                 }
             }
-            "path" => {
-                match value {
-                    Some(Value::String(s)) if !s.is_empty() => {
-                        if !std::path::Path::new(s.as_str()).exists() {
-                            errors.push(format!("  ✗ '{}' path '{}' does not exist", var_name, s));
-                        }
-                    }
-                    _ => {
-                        errors.push(format!("  ✗ '{}' is required (must be a valid path)", var_name));
+            "path" => match value {
+                Some(Value::String(s)) if !s.is_empty() => {
+                    if !std::path::Path::new(s.as_str()).exists() {
+                        errors.push(format!("  ✗ '{}' path '{}' does not exist", var_name, s));
                     }
                 }
-            }
+                _ => {
+                    errors.push(format!(
+                        "  ✗ '{}' is required (must be a valid path)",
+                        var_name
+                    ));
+                }
+            },
             "optional" | "" => {} // no validation
             other => {
-                log::warn!("Unknown context_validation type '{}' for '{}'", other, var_name);
+                log::warn!(
+                    "Unknown context_validation type '{}' for '{}'",
+                    other,
+                    var_name
+                );
             }
         }
     }
@@ -1309,6 +1326,17 @@ fn git_stage_all(working_dir: &str) -> Option<String> {
     } else {
         Some(staged)
     }
+}
+
+fn chrono_now() -> String {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = duration.as_secs();
+    let hours = (secs / 3600) % 24;
+    let mins = (secs / 60) % 60;
+    let s = secs % 60;
+    format!("{:02}:{:02}:{:02}Z", hours, mins, s)
 }
 
 #[cfg(test)]
@@ -1507,15 +1535,4 @@ steps:
         // Verify the output was stored in context
         assert!(result.context.contains_key("result"));
     }
-}
-
-fn chrono_now() -> String {
-    let duration = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = duration.as_secs();
-    let hours = (secs / 3600) % 24;
-    let mins = (secs / 60) % 60;
-    let s = secs % 60;
-    format!("{:02}:{:02}:{:02}Z", hours, mins, s)
 }

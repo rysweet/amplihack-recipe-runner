@@ -87,7 +87,13 @@ impl FileLogListener {
     pub fn new(recipe_name: &str) -> Option<(Self, std::path::PathBuf)> {
         let safe_name: String = recipe_name
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .take(64)
             .collect();
         let path = std::env::temp_dir().join(format!(
@@ -110,7 +116,13 @@ impl FileLogListener {
                 );
                 let _ = f.flush();
                 eprintln!("[amplihack] recipe log: {}", path.display());
-                Some((Self { file: Mutex::new(f), path: path.clone() }, path))
+                Some((
+                    Self {
+                        file: Mutex::new(f),
+                        path: path.clone(),
+                    },
+                    path,
+                ))
             }
             Err(e) => {
                 log::warn!("Could not create recipe log file {}: {}", path.display(), e);
@@ -186,7 +198,9 @@ impl ExecutionListener for FileLogListener {
         self.write_event(&format!(
             r#"{{"type":"output","step":"{}","line":"{}","ts":{:.3}}}"#,
             step_id,
-            line.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"),
+            line.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n"),
             Self::timestamp()
         ));
     }

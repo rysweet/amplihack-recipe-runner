@@ -7,7 +7,7 @@ use log::{debug, info};
 use recipe_runner_rs::adapters::cli_subprocess::CLISubprocessAdapter;
 use recipe_runner_rs::discovery;
 use recipe_runner_rs::parser::RecipeParser;
-use recipe_runner_rs::runner::{RecipeRunner, FileLogListener, StderrListener};
+use recipe_runner_rs::runner::{FileLogListener, RecipeRunner, StderrListener};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
