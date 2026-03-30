@@ -683,7 +683,10 @@ impl<A: Adapter> RecipeRunner<A> {
             step.id,
             step.effective_type()
         );
-        let working_dir = step.working_dir.as_deref().unwrap_or(&self.working_dir);
+        // Render working_dir through template engine so {{worktree_setup.worktree_path}} resolves
+        let raw_working_dir = step.working_dir.as_deref().unwrap_or(&self.working_dir);
+        let working_dir_rendered = ctx.render(raw_working_dir);
+        let working_dir = working_dir_rendered.as_str();
         let st = step.effective_type();
 
         match st {
