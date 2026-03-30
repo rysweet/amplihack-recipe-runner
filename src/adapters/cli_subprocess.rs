@@ -94,17 +94,29 @@ impl CLISubprocessAdapter {
         prompt: &str,
         system_prompt: Option<&str>,
         model: Option<&str>,
+        working_dir: &str,
     ) -> Result<String, anyhow::Error> {
         log::debug!(
-            "execute_agent_step_impl: prompt_len={}, has_system_prompt={}, model={:?}",
+            "execute_agent_step_impl: prompt_len={}, has_system_prompt={}, model={:?}, working_dir={:?}",
             prompt.len(),
             system_prompt.is_some(),
-            model
+            model,
+            working_dir
         );
-        // Use a temp directory to avoid file races with the parent session (#2758)
+        // Resolve the actual working directory for the agent.
+        // Use the recipe's working_dir so agents operate against the real repo,
+        // not a disconnected temp dir (#3766, #3769).
+        let resolved_cwd = if working_dir.is_empty() || working_dir == "." {
+            std::path::PathBuf::from(&self.working_dir)
+        } else {
+            std::path::PathBuf::from(working_dir)
+        };
+
+        // Create a temp directory for the output log file only.
+        // The agent process itself runs from the resolved repo cwd.
         let temp_dir = tempfile::tempdir()
-            .with_context(|| "Failed to create temp directory for agent step")?;
-        let actual_cwd = temp_dir.path();
+            .with_context(|| "Failed to create temp directory for agent output")?;
+        let output_log_dir = temp_dir.path();
 
         // Append non-interactive footer so nested sessions never hang (#2464)
         let full_prompt = format!("{}{}", prompt, NON_INTERACTIVE_FOOTER);
@@ -113,8 +125,8 @@ impl CLISubprocessAdapter {
         // Ensure nested agent steps inherit the same agent binary preference
         child_env.insert("AMPLIHACK_AGENT_BINARY".to_string(), self.cli.clone());
 
-        // Create output log file
-        let output_dir = actual_cwd.join(".recipe-output");
+        // Create output log file in temp dir (not in repo to avoid polluting it)
+        let output_dir = output_log_dir.join(".recipe-output");
         std::fs::create_dir_all(&output_dir)?;
         let output_file = output_dir.join(format!(
             "agent-step-{}.log",
@@ -128,8 +140,11 @@ impl CLISubprocessAdapter {
 
         // Always launch via `amplihack <agent>` so the amplihack infrastructure
         // (env setup, guards, hooks) is properly initialized.
+        // The agent runs from the real repo/worktree cwd, not a temp dir.
         let mut cmd = std::process::Command::new("amplihack");
         cmd.args([&self.cli, "-p", &full_prompt]);
+        // Tell the agent where the repo is via --add-dir so it can access files
+        cmd.args(["--add-dir", &resolved_cwd.to_string_lossy()]);
         if let Some(sp) = system_prompt {
             cmd.args(["--system-prompt", sp]);
         }
@@ -137,7 +152,7 @@ impl CLISubprocessAdapter {
             cmd.args(["--model", m]);
         }
         let mut child = cmd
-            .current_dir(actual_cwd)
+            .current_dir(&resolved_cwd)
             .env_remove("CLAUDECODE")
             .envs(&child_env)
             .stdout(log_fh)
@@ -278,22 +293,19 @@ impl Adapter for CLISubprocessAdapter {
         _agent_name: Option<&str>,
         system_prompt: Option<&str>,
         _mode: Option<&str>,
-        _working_dir: &str,
+        working_dir: &str,
         model: Option<&str>,
         timeout: Option<u64>,
     ) -> Result<String, anyhow::Error> {
         log::debug!(
-            "CLISubprocessAdapter::execute_agent_step: prompt_len={}, model={:?}, timeout={:?}",
+            "CLISubprocessAdapter::execute_agent_step: prompt_len={}, model={:?}, timeout={:?}, working_dir={:?}",
             prompt.len(),
             model,
-            timeout
+            timeout,
+            working_dir
         );
-        // TODO: enforce timeout on agent steps by wrapping with wait_timeout
-        // For now, timeout is accepted but not yet enforced on agent steps
-        // (agent steps are long-running by nature; enforcing timeout requires
-        // careful handling of partial output and cleanup)
-        let _ = timeout;
-        self.execute_agent_step_impl(prompt, system_prompt, model)
+        let _ = timeout; // TODO: enforce timeout
+        self.execute_agent_step_impl(prompt, system_prompt, model, working_dir)
     }
 
     fn execute_bash_step(
