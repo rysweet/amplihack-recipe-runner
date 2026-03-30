@@ -109,8 +109,26 @@ impl CLISubprocessAdapter {
         let resolved_cwd = if working_dir.is_empty() || working_dir == "." {
             std::path::PathBuf::from(&self.working_dir)
         } else {
-            std::path::PathBuf::from(working_dir)
+            let p = std::path::PathBuf::from(working_dir);
+            if p.is_relative() {
+                // Resolve relative paths against the runner's working directory,
+                // not the process cwd (which may differ).
+                std::path::PathBuf::from(&self.working_dir).join(&p)
+            } else {
+                p
+            }
         };
+
+        // Verify the resolved cwd exists before launching the agent.
+        // A missing cwd causes a confusing "No such file or directory" on
+        // the amplihack binary itself, masking the real error.
+        if !resolved_cwd.is_dir() {
+            anyhow::bail!(
+                "Agent working directory does not exist: {}. \
+                 Check that step-04 created the worktree successfully.",
+                resolved_cwd.display()
+            );
+        }
 
         // Create a temp directory for the output log file only.
         // The agent process itself runs from the resolved repo cwd.
