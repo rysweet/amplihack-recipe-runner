@@ -575,7 +575,13 @@ impl RecipeCheckpoint {
     pub fn save(&self, recipe_name: &str) -> std::io::Result<std::path::PathBuf> {
         let safe_name: String = recipe_name
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .take(64)
             .collect();
         let path = std::env::temp_dir().join(format!(
@@ -583,10 +589,13 @@ impl RecipeCheckpoint {
             safe_name,
             std::process::id()
         ));
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(&path, json)?;
-        log::info!("Checkpoint saved: {} ({} steps completed)", path.display(), self.completed_steps.len());
+        log::info!(
+            "Checkpoint saved: {} ({} steps completed)",
+            path.display(),
+            self.completed_steps.len()
+        );
         Ok(path)
     }
 

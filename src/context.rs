@@ -6,8 +6,8 @@ use crate::condition::{ConditionError, evaluate_condition};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::LazyLock;
 use std::io::Write;
+use std::sync::LazyLock;
 
 static TEMPLATE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\{\{([a-zA-Z0-9_.\-]+)\}\}").unwrap());
@@ -245,13 +245,12 @@ impl RecipeContext {
     ///   `jq -r '.var_name' "$AMPLIHACK_CONTEXT_FILE"`
     ///
     /// The caller is responsible for cleaning up the temp file after step execution.
-    pub fn write_context_file(&self) -> std::io::Result<(std::path::PathBuf, HashMap<String, String>)> {
-        let json = serde_json::to_string_pretty(&self.data)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        let path = std::env::temp_dir().join(format!(
-            "amplihack-context-{}.json",
-            std::process::id()
-        ));
+    pub fn write_context_file(
+        &self,
+    ) -> std::io::Result<(std::path::PathBuf, HashMap<String, String>)> {
+        let json = serde_json::to_string_pretty(&self.data).map_err(std::io::Error::other)?;
+        let path =
+            std::env::temp_dir().join(format!("amplihack-context-{}.json", std::process::id()));
         let mut file = std::fs::File::create(&path)?;
         file.write_all(json.as_bytes())?;
         file.flush()?;
@@ -296,7 +295,12 @@ impl RecipeContext {
                     // Include a small subset of critical vars directly in env
                     // so basic scripts still work without jq
                     let mut combined = file_env;
-                    for key in ["task_description", "repo_path", "task_type", "workstream_count"] {
+                    for key in [
+                        "task_description",
+                        "repo_path",
+                        "task_type",
+                        "workstream_count",
+                    ] {
                         if let Some(val) = env_vars.get(&Self::env_key(key)) {
                             // Only include if the value is small
                             if val.len() < 4096 {
@@ -307,7 +311,10 @@ impl RecipeContext {
                     return (combined, Some(path));
                 }
                 Err(e) => {
-                    log::error!("Failed to write context file, falling back to env vars: {}", e);
+                    log::error!(
+                        "Failed to write context file, falling back to env vars: {}",
+                        e
+                    );
                     // Fall through to env vars — may still fail with E2BIG
                 }
             }
