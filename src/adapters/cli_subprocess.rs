@@ -209,6 +209,11 @@ impl CLISubprocessAdapter {
     ) -> Result<std::process::Command, anyhow::Error> {
         let mut cmd = std::process::Command::new("amplihack");
         cmd.arg(&self.cli);
+        // All subsequent flags (-p, --model, --add-dir, --system-prompt, etc.)
+        // are passthrough args for the underlying CLI (claude, copilot, codex).
+        // The `amplihack <agent>` subcommand requires `--` to separate its own
+        // flags from passthrough args (#4342).
+        cmd.arg("--");
         let effective_system_prompt = Self::build_effective_system_prompt(system_prompt);
 
         if self.should_use_file_backed_prompt_transport(prompt, Some(&effective_system_prompt)) {
@@ -1000,5 +1005,58 @@ mod tests {
         let prompt_file_contents = std::fs::read_to_string(&prompt_file).unwrap();
         assert!(prompt_file_contents.starts_with(&large_system_prompt));
         assert!(prompt_file_contents.contains(RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT));
+    }
+
+    #[test]
+    fn test_build_agent_command_includes_separator_before_passthrough_args() {
+        // All CLIs require `--` separator between `amplihack <agent>` flags
+        // and passthrough args like `-p`, `--model`, `--add-dir` (#4342).
+        for binary in &["claude", "copilot", "codex", "launch"] {
+            let adapter = CLISubprocessAdapter::new().with_binary(binary);
+            let tmp = tempfile::tempdir().unwrap();
+            let cmd = adapter
+                .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+                .unwrap();
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+
+            // First arg is the agent name, second must be "--"
+            assert_eq!(args[0], *binary, "first arg should be the agent binary");
+            assert_eq!(
+                args[1], "--",
+                "second arg must be '--' separator for {binary}"
+            );
+
+            // `-p` must come after the separator
+            let separator_pos = args.iter().position(|a| a == "--").unwrap();
+            let p_pos = args.iter().position(|a| a == "-p").unwrap();
+            assert!(
+                p_pos > separator_pos,
+                "-p must come after -- separator for {binary}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_agent_command_separator_with_model_flag() {
+        let adapter = CLISubprocessAdapter::new().with_binary("copilot");
+        let tmp = tempfile::tempdir().unwrap();
+        let cmd = adapter
+            .build_agent_command(tmp.path(), tmp.path(), "hello", None, Some("gpt-4"))
+            .unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        let separator_pos = args.iter().position(|a| a == "--").unwrap();
+        let model_pos = args.iter().position(|a| a == "--model").unwrap();
+        assert!(
+            model_pos > separator_pos,
+            "--model must come after -- separator"
+        );
+        assert_eq!(args[model_pos + 1], "gpt-4");
     }
 }
