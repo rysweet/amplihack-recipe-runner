@@ -1055,11 +1055,7 @@ mod tests {
             &data,
         )
         .unwrap());
-        assert!(!evaluate_condition(
-            "checkpoint in ['other', 'still-other']",
-            &data,
-        )
-        .unwrap());
+        assert!(!evaluate_condition("checkpoint in ['other', 'still-other']", &data,).unwrap());
     }
 
     #[test]
@@ -1070,7 +1066,10 @@ mod tests {
             &data,
         )
         .unwrap());
-        let data2 = ctx(&[("resume_checkpoint", json!("checkpoint-after-implementation"))]);
+        let data2 = ctx(&[(
+            "resume_checkpoint",
+            json!("checkpoint-after-implementation"),
+        )]);
         assert!(!evaluate_condition(
             "resume_checkpoint not in ['checkpoint-after-implementation', 'checkpoint-after-review-feedback']",
             &data2,
