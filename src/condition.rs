@@ -558,14 +558,18 @@ impl<'a> ExprParser<'a> {
                 Ok(Value::Bool(result))
             }
             Some(Token::LBracket) => {
-                // List literal: '[' (atom (',' atom)*)? ']'
+                // List literal: '[' (atom (',' atom)*)? ','? ']'
                 // Used as RHS for `in` / `not in` checks.
+                // Trailing commas are allowed for ergonomics.
                 self.advance();
                 let mut items: Vec<Value> = Vec::new();
                 if self.peek() != Some(&Token::RBracket) {
                     items.push(self.parse_atom()?);
                     while self.peek() == Some(&Token::Comma) {
                         self.advance();
+                        if self.peek() == Some(&Token::RBracket) {
+                            break;
+                        }
                         items.push(self.parse_atom()?);
                     }
                 }
@@ -1089,6 +1093,14 @@ mod tests {
         let data = ctx(&[("n", json!(2))]);
         assert!(evaluate_condition("n in [1, 2, 3]", &data).unwrap());
         assert!(!evaluate_condition("n in [4, 5]", &data).unwrap());
+    }
+
+    #[test]
+    fn test_list_literal_trailing_comma() {
+        let data = ctx(&[("x", json!("a"))]);
+        assert!(evaluate_condition("x in ['a', 'b',]", &data).unwrap());
+        assert!(evaluate_condition("x in ['a',]", &data).unwrap());
+        assert!(!evaluate_condition("x in ['b',]", &data).unwrap());
     }
 
     #[test]
