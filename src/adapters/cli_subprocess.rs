@@ -290,6 +290,20 @@ impl CLISubprocessAdapter {
             }
         };
 
+        // Canonicalize to an absolute path so downstream args like --add-dir
+        // are not re-resolved against the child process cwd. Without this,
+        // a relative resolved_cwd like "./worktrees/foo" gets passed to
+        // copilot's --add-dir, which copilot then joins to its cwd
+        // (already <worktree>) producing a doubled path that doesn't exist.
+        let resolved_cwd = match resolved_cwd.canonicalize() {
+            Ok(p) => p,
+            Err(_) => {
+                // Fall through to the existence check below to surface
+                // a clear error if the path is bogus.
+                resolved_cwd
+            }
+        };
+
         // Verify the resolved cwd exists before launching the agent.
         // A missing cwd causes a confusing "No such file or directory" on
         // the amplihack binary itself, masking the real error.
@@ -327,6 +341,20 @@ impl CLISubprocessAdapter {
 
         let log_fh = std::fs::File::create(&output_file)?;
 
+        // Capture stderr to a persistent file in /tmp so that on failure
+        // we can include the agent's actual error output in the bail message
+        // (the temp_dir gets cleaned up before the error is reported).
+        let stderr_persist_dir = std::path::PathBuf::from("/tmp/amplihack-agent-stderr");
+        std::fs::create_dir_all(&stderr_persist_dir).ok();
+        let stderr_file = stderr_persist_dir.join(format!(
+            "agent-stderr-{}.log",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let stderr_fh = std::fs::File::create(&stderr_file)?;
+
         // Always launch via `amplihack <agent>` so the amplihack infrastructure
         // (env setup, guards, hooks) is properly initialized.
         // The agent runs from the real repo/worktree cwd, not a temp dir.
@@ -342,7 +370,7 @@ impl CLISubprocessAdapter {
             .env_remove("CLAUDECODE")
             .envs(&child_env)
             .stdout(log_fh)
-            .stderr(std::process::Stdio::inherit())
+            .stderr(stderr_fh)
             .spawn()
             .with_context(|| format!("Failed to execute 'amplihack {}'", self.cli))?;
 
@@ -454,13 +482,21 @@ impl CLISubprocessAdapter {
         // temp_dir is dropped here, cleaning up automatically
 
         if !status.success() {
+            let stderr_tail = std::fs::read_to_string(&stderr_file)
+                .map(|s| crate::safe_tail(&s, 4000).to_string())
+                .unwrap_or_else(|_| String::from("(stderr file unreadable)"));
             anyhow::bail!(
-                "amplihack {} failed (exit {}): {}",
+                "amplihack {} failed (exit {})\n--- stdout (tail) ---\n{}\n--- stderr (tail) ---\n{}\n--- stderr-log: {}",
                 self.cli,
                 status.code().unwrap_or(-1),
-                crate::safe_tail(&stdout, 500)
+                crate::safe_tail(&stdout, 2000),
+                stderr_tail,
+                stderr_file.display()
             );
         }
+
+        // On success, remove the persistent stderr file
+        std::fs::remove_file(&stderr_file).ok();
 
         Ok(stdout.trim().to_string())
     }
