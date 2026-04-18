@@ -49,7 +49,11 @@ fn default_search_dirs() -> Vec<PathBuf> {
         }
     }
     dirs.extend([
+        // Installed amplihack bundle (current layout)
+        home.join(".amplihack").join("amplifier-bundle").join("recipes"),
+        // Legacy installed location (kept for back-compat)
         home.join(".amplihack").join(".claude").join("recipes"),
+        // Project-local layouts
         PathBuf::from("amplifier-bundle").join("recipes"),
         PathBuf::from("src")
             .join("amplihack")
@@ -239,6 +243,11 @@ pub fn find_recipe(name: &str, search_dirs: Option<&[PathBuf]>) -> Option<PathBu
 /// Verify that global recipe directories exist and contain recipes.
 pub fn verify_global_installation() -> serde_json::Value {
     let global_dirs = vec![
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".amplihack")
+            .join("amplifier-bundle")
+            .join("recipes"),
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".amplihack")
