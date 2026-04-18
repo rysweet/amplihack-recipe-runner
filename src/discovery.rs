@@ -50,7 +50,9 @@ fn default_search_dirs() -> Vec<PathBuf> {
     }
     dirs.extend([
         // Installed amplihack bundle (current layout)
-        home.join(".amplihack").join("amplifier-bundle").join("recipes"),
+        home.join(".amplihack")
+            .join("amplifier-bundle")
+            .join("recipes"),
         // Legacy installed location (kept for back-compat)
         home.join(".amplihack").join(".claude").join("recipes"),
         // Project-local layouts
