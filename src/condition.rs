@@ -430,6 +430,9 @@ impl<'a> ExprParser<'a> {
             args.push(self.parse_or_value()?);
             while self.peek() == Some(&Token::Comma) {
                 self.advance();
+                if self.peek() == Some(&Token::RParen) {
+                    break;
+                }
                 args.push(self.parse_or_value()?);
             }
         }
@@ -530,6 +533,9 @@ impl<'a> ExprParser<'a> {
                         args.push(self.parse_primary()?);
                         while self.peek() == Some(&Token::Comma) {
                             self.advance();
+                            if self.peek() == Some(&Token::RParen) {
+                                break;
+                            }
                             args.push(self.parse_primary()?);
                         }
                     }
@@ -1101,6 +1107,28 @@ mod tests {
         assert!(evaluate_condition("x in ['a', 'b',]", &data).unwrap());
         assert!(evaluate_condition("x in ['a',]", &data).unwrap());
         assert!(!evaluate_condition("x in ['b',]", &data).unwrap());
+    }
+
+    #[test]
+    fn test_list_literal_malformed_should_error() {
+        let data = ctx(&[("x", json!("a"))]);
+        // Empty list with only a comma: invalid
+        assert!(evaluate_condition("x in [,]", &data).is_err());
+        // Double comma: invalid
+        assert!(evaluate_condition("x in ['a',,]", &data).is_err());
+        // Double comma between elements: invalid
+        assert!(evaluate_condition("x in ['a',,'b']", &data).is_err());
+    }
+
+    #[test]
+    fn test_function_and_method_call_trailing_comma() {
+        let data = ctx(&[("s", json!("HELLO"))]);
+        // Function call trailing comma — symmetric with list literal behavior
+        assert!(evaluate_condition("len('abc',) == 3", &data).unwrap());
+        // Method call trailing comma
+        assert!(evaluate_condition("s.lower(,) == 'hello'", &data).is_err());
+        // Method with arg + trailing comma
+        assert!(evaluate_condition("'a,b,c'.split(',',) == ['a','b','c']", &data).unwrap());
     }
 
     #[test]
