@@ -307,7 +307,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     self.execute_parallel_group(&group_steps, recipe, &ctx, &*self.listener);
 
                 let mut group_failed = false;
-                for (gs, result) in group_steps.iter().zip(group_results.into_iter()) {
+                for (gs, result) in group_steps.iter().zip(group_results) {
                     self.total_steps.set(self.total_steps.get() + 1);
                     let failed = result.status == StepStatus::Failed;
 

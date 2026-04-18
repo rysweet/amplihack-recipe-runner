@@ -630,13 +630,8 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, ConditionError> {
                         crate::safe_truncate(s, 50)
                     ))
                 })?,
-                Value::Bool(b) => {
-                    if *b {
-                        1
-                    } else {
-                        0
-                    }
-                }
+                Value::Bool(true) => 1,
+                Value::Bool(false) => 0,
                 _ => 0,
             };
             Ok(Value::Number(serde_json::Number::from(n)))
@@ -651,13 +646,8 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, ConditionError> {
                         crate::safe_truncate(s, 50)
                     ))
                 })?,
-                Value::Bool(b) => {
-                    if *b {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                }
+                Value::Bool(true) => 1.0,
+                Value::Bool(false) => 0.0,
                 _ => 0.0,
             };
             Ok(serde_json::Number::from_f64(n)
