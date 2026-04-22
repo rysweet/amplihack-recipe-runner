@@ -246,18 +246,22 @@ impl Default for RecipeParser {
     }
 }
 
-/// Resolve single-level recipe inheritance via the `extends` field.
+/// Resolve recipe inheritance via the `extends` field, recursively.
 ///
 /// If `recipe.extends` is `Some`, finds and parses the parent recipe, then
-/// merges the parent into the child:
-/// - Child context values override parent context values
-/// - Child steps are appended after parent steps
-/// - Child name, version, description override parent
-/// - Parent tags are merged with child tags (union)
-/// - Recursion config: child overrides if set (non-default)
-/// - Hooks: child overrides if set
+/// recursively resolves the parent's own `extends` chain *before* merging
+/// the parent into the child. The merge semantics are:
 ///
-/// Only single-level inheritance is supported (parent's `extends` is ignored).
+/// - Child context values override parent context values
+/// - Child steps are appended after parent steps (ancestor-first ordering)
+/// - Child name, version, description override parent
+/// - Parent tags are merged with child tags (union, sorted)
+/// - Recursion config: child overrides if non-default, otherwise inherited
+/// - Hooks: each hook field is inherited individually if unset on the child
+///
+/// Cycles in the `extends` chain are detected via a path-based visited set
+/// and reported as an error of the form
+/// `"Circular extends detected: '<name>' was already visited in the extends chain"`.
 pub fn resolve_extends(recipe: &mut Recipe, search_dirs: &[PathBuf]) -> Result<(), ParseError> {
     info!(
         "resolve_extends: resolving extends for recipe '{}'",
@@ -563,6 +567,97 @@ steps:
         let mut recipe = parser.parse(yaml).unwrap();
         let err = resolve_extends(&mut recipe, &[]).unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_resolve_extends_recursive_three_level_chain() {
+        // grandparent <- parent <- child : steps must be ordered
+        // grandparent's steps, then parent's, then child's.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("grand.yaml"),
+            r#"
+name: "grand"
+context:
+  layer: "grand"
+  grand_only: "g"
+steps:
+  - id: "grand-step"
+    command: "echo grand"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("mid.yaml"),
+            r#"
+name: "mid"
+extends: "grand"
+context:
+  layer: "mid"
+  mid_only: "m"
+steps:
+  - id: "mid-step"
+    command: "echo mid"
+"#,
+        )
+        .unwrap();
+
+        let child_yaml = r#"
+name: "leaf"
+extends: "mid"
+context:
+  layer: "leaf"
+steps:
+  - id: "leaf-step"
+    command: "echo leaf"
+"#;
+        let parser = RecipeParser::new();
+        let mut recipe = parser.parse(child_yaml).unwrap();
+        let dirs = vec![tmp.path().to_path_buf()];
+        resolve_extends(&mut recipe, &dirs).unwrap();
+
+        // All three levels' steps appear in dependency order
+        let ids: Vec<&str> = recipe.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["grand-step", "mid-step", "leaf-step"]);
+        // Deepest child wins on overlapping context key
+        assert_eq!(
+            recipe.context.get("layer").and_then(|v| v.as_str()),
+            Some("leaf")
+        );
+        // Inherited keys from both ancestors are present
+        assert_eq!(
+            recipe.context.get("grand_only").and_then(|v| v.as_str()),
+            Some("g")
+        );
+        assert_eq!(
+            recipe.context.get("mid_only").and_then(|v| v.as_str()),
+            Some("m")
+        );
+        assert!(recipe.extends.is_none(), "extends must be consumed");
+    }
+
+    #[test]
+    fn test_resolve_extends_detects_cycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("a.yaml"),
+            "name: a\nextends: b\nsteps:\n  - id: a1\n    command: echo",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("b.yaml"),
+            "name: b\nextends: a\nsteps:\n  - id: b1\n    command: echo",
+        )
+        .unwrap();
+        let parser = RecipeParser::new();
+        let mut recipe = parser.parse_file(&tmp.path().join("a.yaml")).unwrap();
+        let err = resolve_extends(&mut recipe, &[tmp.path().to_path_buf()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Circular extends") || msg.to_lowercase().contains("circular"),
+            "expected cycle error, got: {}",
+            msg
+        );
     }
 
     // ── Edge cases (test-5) ──────────────────────────────

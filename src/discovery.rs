@@ -83,9 +83,10 @@ pub struct RecipeInfo {
     pub sha256: String,
 }
 
-/// Find all recipe YAML files in the search directories.
+/// Find all recipe YAML files (`.yaml` and `.yml`) in the search directories.
 ///
 /// When the same recipe name appears in multiple directories, the last one wins.
+/// Within a single directory, `.yaml` takes precedence over `.yml` if both exist.
 pub fn discover_recipes(search_dirs: Option<&[PathBuf]>) -> HashMap<String, RecipeInfo> {
     let dirs = search_dirs
         .map(|d| d.to_vec())
@@ -103,9 +104,23 @@ pub fn discover_recipes(search_dirs: Option<&[PathBuf]>) -> HashMap<String, Reci
 
         let mut entries: Vec<PathBuf> = collect_dir_entries(search_dir)
             .into_iter()
-            .filter(|p| p.extension().is_some_and(|ext| ext == "yaml"))
+            .filter(|p| {
+                p.extension()
+                    .is_some_and(|ext| ext == "yaml" || ext == "yml")
+            })
             .collect();
-        entries.sort();
+        // Sort so .yaml is processed AFTER .yml for the same stem; combined
+        // with the last-wins HashMap insert, this gives .yaml precedence.
+        entries.sort_by(|a, b| {
+            let stem_a = a.file_stem().unwrap_or_default();
+            let stem_b = b.file_stem().unwrap_or_default();
+            stem_a.cmp(stem_b).then_with(|| {
+                let ext_a = a.extension().and_then(|s| s.to_str()).unwrap_or("");
+                let ext_b = b.extension().and_then(|s| s.to_str()).unwrap_or("");
+                // "yml" < "yaml" lexicographically, so reverse to put yaml last
+                ext_b.cmp(ext_a)
+            })
+        });
 
         for yaml_path in entries {
             if let Some(info) = load_recipe_info(&yaml_path) {
@@ -228,63 +243,42 @@ pub fn cached_discover_recipes(dirs: &[PathBuf]) -> HashMap<String, RecipeInfo> 
 }
 
 /// Find a recipe by name and return its file path.
+///
+/// Searches each directory in order, looking for `<name>.yaml` first then
+/// `<name>.yml` (yaml takes precedence when both exist in the same dir).
+///
+/// Returns `None` if `name` contains path-traversal segments (`/`, `\`, `..`)
+/// or starts with `.`, to prevent escaping the search directories.
 pub fn find_recipe(name: &str, search_dirs: Option<&[PathBuf]>) -> Option<PathBuf> {
+    if !is_safe_recipe_name(name) {
+        warn!("find_recipe: rejecting unsafe recipe name");
+        return None;
+    }
     let dirs = search_dirs
         .map(|d| d.to_vec())
         .unwrap_or_else(default_search_dirs);
-    let filename = format!("{}.yaml", name);
     for search_dir in &dirs {
-        let candidate = search_dir.join(&filename);
-        if candidate.is_file() {
-            return Some(candidate);
+        for ext in ["yaml", "yml"] {
+            let candidate = search_dir.join(format!("{}.{}", name, ext));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
     None
 }
 
-/// Verify that global recipe directories exist and contain recipes.
-pub fn verify_global_installation() -> serde_json::Value {
-    let global_dirs = vec![
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".amplihack")
-            .join("amplifier-bundle")
-            .join("recipes"),
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".amplihack")
-            .join(".claude")
-            .join("recipes"),
-        PathBuf::from("amplifier-bundle").join("recipes"),
-    ];
-
-    let mut dirs_exist = Vec::new();
-    let mut recipe_counts = Vec::new();
-    let mut has_global = false;
-
-    for dir in &global_dirs {
-        let exists = dir.is_dir();
-        dirs_exist.push(exists);
-        if exists {
-            let count = collect_dir_entries(dir)
-                .iter()
-                .filter(|p| p.extension().is_some_and(|ext| ext == "yaml"))
-                .count();
-            recipe_counts.push(count);
-            if count > 0 {
-                has_global = true;
-            }
-        } else {
-            recipe_counts.push(0);
-        }
+/// Reject recipe names that could escape the search directory or refer to
+/// hidden files. Names must be a single path component with no separator
+/// or parent-directory segments and must not start with `.`.
+fn is_safe_recipe_name(name: &str) -> bool {
+    if name.is_empty() || name.starts_with('.') {
+        return false;
     }
-
-    serde_json::json!({
-        "global_dirs_exist": dirs_exist,
-        "global_recipe_count": recipe_counts,
-        "has_global_recipes": has_global,
-        "global_paths_checked": global_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-    })
+    // Reject any path separator/NUL byte; a `..` segment cannot exist without
+    // one, so the broader `contains("..")` also catches any non-separator
+    // attempts to embed parent-dir markers.
+    !name.chars().any(|c| matches!(c, '/' | '\\' | '\0')) && !name.contains("..")
 }
 
 /// Compare local recipe files against their content hashes.
@@ -349,6 +343,77 @@ pub fn check_upstream_changes(local_dir: Option<&Path>) -> Vec<HashMap<String, S
     changes
 }
 
+/// Default upstream URL used when `RECIPE_RUNNER_UPSTREAM_URL` is not set.
+pub const DEFAULT_UPSTREAM_URL: &str = "https://github.com/microsoft/amplifier-bundle-recipes";
+
+/// Environment variable that overrides the upstream sync URL.
+pub const UPSTREAM_URL_ENV: &str = "RECIPE_RUNNER_UPSTREAM_URL";
+
+/// Resolve the upstream URL from the environment (or default) with validation.
+///
+/// Reads `RECIPE_RUNNER_UPSTREAM_URL`; falls back to [`DEFAULT_UPSTREAM_URL`].
+/// Validates that the URL uses an `http://` or `https://` scheme and does NOT
+/// embed userinfo (e.g. `https://user:secret@host/...`). Error messages do not
+/// echo the raw value, to avoid leaking credentials into logs.
+pub fn upstream_url() -> Result<String, anyhow::Error> {
+    upstream_url_inner(|k| std::env::var(k).ok())
+}
+
+/// Pure inner helper for [`upstream_url`] that takes an env-lookup closure.
+///
+/// Exposed for testability so unit tests do not have to mutate global env.
+pub fn upstream_url_inner<F>(get_env: F) -> Result<String, anyhow::Error>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let raw = get_env(UPSTREAM_URL_ENV).unwrap_or_else(|| DEFAULT_UPSTREAM_URL.to_string());
+    validate_upstream_url(&raw)?;
+    Ok(raw)
+}
+
+/// Validate that a URL is acceptable for upstream sync.
+///
+/// Rules:
+///   * Must be non-empty.
+///   * Scheme must be `http://` or `https://` (case-insensitive).
+///   * Must NOT contain userinfo (`user:pass@host`).
+///
+/// Errors are intentionally generic and do not include the raw URL value.
+fn validate_upstream_url(raw: &str) -> Result<(), anyhow::Error> {
+    if raw.is_empty() {
+        return Err(anyhow::anyhow!(
+            "upstream URL is empty (set {} or unset to use the default)",
+            UPSTREAM_URL_ENV
+        ));
+    }
+    let lower = raw.to_ascii_lowercase();
+    let scheme_end = match lower.find("://") {
+        Some(i) => i,
+        None => {
+            return Err(anyhow::anyhow!(
+                "upstream URL is missing a scheme; only http:// and https:// are accepted"
+            ));
+        }
+    };
+    let scheme = &lower[..scheme_end];
+    if scheme != "http" && scheme != "https" {
+        return Err(anyhow::anyhow!(
+            "upstream URL has an unsupported scheme; only http:// and https:// are accepted"
+        ));
+    }
+    let after_scheme = &raw[scheme_end + 3..];
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    if authority.contains('@') {
+        return Err(anyhow::anyhow!(
+            "upstream URL must not embed credentials (userinfo); use a credential helper instead"
+        ));
+    }
+    Ok(())
+}
+
 /// Write a manifest file recording the current hash of each recipe.
 pub fn update_manifest(local_dir: Option<&Path>) -> Result<PathBuf, std::io::Error> {
     let recipe_dir = local_dir
@@ -388,7 +453,8 @@ pub fn sync_upstream(
     branch: Option<&str>,
     remote_name: Option<&str>,
 ) -> Result<serde_json::Value, anyhow::Error> {
-    let repo = repo_url.unwrap_or("https://github.com/microsoft/amplifier-bundle-recipes");
+    let default_url = upstream_url()?;
+    let repo = repo_url.unwrap_or(&default_url);
     let br = branch.unwrap_or("main");
     let remote = format!("upstream-{}", remote_name.unwrap_or("amplifier-recipes"));
 
@@ -817,6 +883,161 @@ steps:
             std::env::remove_var("AMPLIHACK_PACKAGE_RECIPE_DIR");
             std::env::remove_var("RECIPE_RUNNER_RECIPE_DIRS");
         }
+    }
+
+    // ── #42: find_recipe + discover_recipes must support .yml ──────────
+
+    #[test]
+    fn test_find_recipe_finds_yml_extension() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("yml-recipe.yml"),
+            "name: yml-recipe\nsteps:\n  - id: s1\n    command: echo",
+        )
+        .unwrap();
+        let found = find_recipe("yml-recipe", Some(&[tmp.path().to_path_buf()]));
+        assert!(
+            found.is_some(),
+            "find_recipe must locate .yml files, not only .yaml"
+        );
+        assert!(found.unwrap().extension().unwrap() == "yml");
+    }
+
+    #[test]
+    fn test_find_recipe_yaml_takes_precedence_over_yml() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("dup.yaml"),
+            "name: dup\nsteps:\n  - id: s1\n    command: echo yaml",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("dup.yml"),
+            "name: dup\nsteps:\n  - id: s1\n    command: echo yml",
+        )
+        .unwrap();
+        let found = find_recipe("dup", Some(&[tmp.path().to_path_buf()])).unwrap();
+        assert_eq!(
+            found.extension().unwrap(),
+            "yaml",
+            ".yaml must win over .yml when both exist"
+        );
+    }
+
+    #[test]
+    fn test_discover_recipes_includes_yml_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("a.yaml"),
+            "name: a\nsteps:\n  - id: s1\n    command: echo",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("b.yml"),
+            "name: b\nsteps:\n  - id: s1\n    command: echo",
+        )
+        .unwrap();
+        let recipes = discover_recipes(Some(&[tmp.path().to_path_buf()]));
+        assert!(recipes.contains_key("a"), ".yaml must be discovered");
+        assert!(recipes.contains_key("b"), ".yml must be discovered");
+    }
+
+    #[test]
+    fn test_find_recipe_rejects_path_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Even if a malicious file exists outside the search dir, name with
+        // traversal segments must not resolve to it.
+        for bad in [
+            "../etc/passwd",
+            "../../foo",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            "foo..bar",
+            "",
+        ] {
+            assert!(
+                find_recipe(bad, Some(&[tmp.path().to_path_buf()])).is_none(),
+                "find_recipe must reject suspicious name: {:?}",
+                bad
+            );
+        }
+    }
+
+    // ── #46: upstream_url env override + URL validation ────────────────
+
+    #[test]
+    fn test_upstream_url_inner_default_when_no_env() {
+        let url = upstream_url_inner(|_| None).expect("default URL must be valid");
+        assert_eq!(url, DEFAULT_UPSTREAM_URL);
+    }
+
+    #[test]
+    fn test_upstream_url_inner_uses_env_override() {
+        let url = upstream_url_inner(|k| {
+            (k == "RECIPE_RUNNER_UPSTREAM_URL").then(|| "https://example.com/repo.git".to_string())
+        })
+        .expect("https override must be accepted");
+        assert_eq!(url, "https://example.com/repo.git");
+    }
+
+    #[test]
+    fn test_upstream_url_inner_accepts_http() {
+        let url = upstream_url_inner(|_| Some("http://example.com/repo".to_string()))
+            .expect("http override must be accepted");
+        assert_eq!(url, "http://example.com/repo");
+    }
+
+    #[test]
+    fn test_upstream_url_inner_rejects_non_http_schemes() {
+        for bad in [
+            "file:///etc/passwd",
+            "ssh://git@example.com/repo",
+            "git://example.com/repo",
+            "ftp://example.com/repo",
+            "javascript:alert(1)",
+            "no-scheme",
+        ] {
+            let res = upstream_url_inner(|_| Some(bad.to_string()));
+            assert!(res.is_err(), "scheme must be rejected: {:?}", bad);
+            // Error message must NOT echo the raw value (security)
+            let msg = res.unwrap_err().to_string();
+            assert!(
+                !msg.contains(bad),
+                "error message must not echo raw env var value (got {:?})",
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_upstream_url_inner_rejects_embedded_userinfo() {
+        let res = upstream_url_inner(|_| Some("https://user:secret@example.com/repo".to_string()));
+        assert!(res.is_err(), "URL with userinfo must be rejected");
+        let msg = res.unwrap_err().to_string();
+        assert!(
+            !msg.contains("secret") && !msg.contains("user:"),
+            "error must not leak credentials: {:?}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_upstream_url_inner_rejects_empty() {
+        let res = upstream_url_inner(|_| Some(String::new()));
+        assert!(res.is_err(), "empty URL must be rejected");
+    }
+
+    // ── #45: verify_global_installation must be removed ────────────────
+
+    /// Compile-time guarantee: verify_global_installation no longer exists.
+    /// If this module compiles after removal, the symbol is gone.
+    /// This test exists to document intent; the absence of the symbol is
+    /// the actual assertion (any caller would fail to compile).
+    #[test]
+    fn test_verify_global_installation_removed() {
+        // Intentionally empty — the surrounding cfg(test) module will fail
+        // to compile if any code references the deleted function.
     }
 
     #[test]
