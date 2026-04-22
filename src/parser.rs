@@ -650,11 +650,8 @@ steps:
         )
         .unwrap();
         let parser = RecipeParser::new();
-        let mut recipe = parser
-            .parse_file(&tmp.path().join("a.yaml"))
-            .unwrap();
-        let err = resolve_extends(&mut recipe, &[tmp.path().to_path_buf()])
-            .unwrap_err();
+        let mut recipe = parser.parse_file(&tmp.path().join("a.yaml")).unwrap();
+        let err = resolve_extends(&mut recipe, &[tmp.path().to_path_buf()]).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("Circular extends") || msg.to_lowercase().contains("circular"),

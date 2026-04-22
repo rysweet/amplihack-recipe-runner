@@ -275,9 +275,7 @@ fn is_safe_recipe_name(name: &str) -> bool {
     if name.is_empty() || name.starts_with('.') {
         return false;
     }
-    !name
-        .chars()
-        .any(|c| c == '/' || c == '\\' || c == '\0')
+    !name.chars().any(|c| c == '/' || c == '\\' || c == '\0')
         && !name.split(['/', '\\']).any(|seg| seg == "..")
         && !name.contains("..")
 }
@@ -968,8 +966,7 @@ steps:
     #[test]
     fn test_upstream_url_inner_uses_env_override() {
         let url = upstream_url_inner(|k| {
-            (k == "RECIPE_RUNNER_UPSTREAM_URL")
-                .then(|| "https://example.com/repo.git".to_string())
+            (k == "RECIPE_RUNNER_UPSTREAM_URL").then(|| "https://example.com/repo.git".to_string())
         })
         .expect("https override must be accepted");
         assert_eq!(url, "https://example.com/repo.git");
@@ -1006,9 +1003,7 @@ steps:
 
     #[test]
     fn test_upstream_url_inner_rejects_embedded_userinfo() {
-        let res = upstream_url_inner(|_| {
-            Some("https://user:secret@example.com/repo".to_string())
-        });
+        let res = upstream_url_inner(|_| Some("https://user:secret@example.com/repo".to_string()));
         assert!(res.is_err(), "URL with userinfo must be rejected");
         let msg = res.unwrap_err().to_string();
         assert!(
