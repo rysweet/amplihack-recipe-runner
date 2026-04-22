@@ -358,9 +358,15 @@ impl<'a> ExprParser<'a> {
     //        | '[' STRING ']'         (object key access)
     //        | '[' NUMBER ']'         (array index access)
     fn parse_primary(&mut self) -> Result<Value, ConditionError> {
-        let mut value = self.parse_atom()?;
+        let value = self.parse_atom()?;
+        self.parse_postfix_chain(value)
+    }
 
-        // Handle postfix access and method calls.
+    /// Apply the postfix access chain (`.field`, `.method(...)`, `['k']`, `[i]`)
+    /// to an already-parsed value. Shared by `parse_primary` and `parse_or_value`
+    /// so method/function-call arguments support the same postfix syntax as
+    /// top-level expressions (e.g. `obj.contains(items['key'])`).
+    fn parse_postfix_chain(&mut self, mut value: Value) -> Result<Value, ConditionError> {
         loop {
             match self.peek() {
                 Some(Token::Dot) => {
@@ -498,9 +504,12 @@ impl<'a> ExprParser<'a> {
         Ok(accessed)
     }
 
-    /// Parse an expression that returns a Value (for function/method args)
+    /// Parse an expression that returns a Value (for function/method args).
+    /// Includes the postfix chain so arguments may use `.field` / `['k']` /
+    /// `[i]` accessors (e.g. `obj.contains(items['key'])`).
     fn parse_or_value(&mut self) -> Result<Value, ConditionError> {
-        self.parse_atom()
+        let value = self.parse_atom()?;
+        self.parse_postfix_chain(value)
     }
 
     // atom: STRING | NUMBER | IDENT | function_call | '(' or_expr ')'
@@ -588,8 +597,8 @@ impl<'a> ExprParser<'a> {
                 Ok(Value::Array(items))
             }
             Some(tok) => Err(ConditionError::Parse(format!(
-                "unexpected token: {:?}",
-                tok
+                "unexpected token: {:?} at position {}",
+                tok, self.pos
             ))),
             None => Err(ConditionError::Parse(
                 "unexpected end of expression".to_string(),
@@ -1183,5 +1192,129 @@ mod tests {
     fn test_bracket_access_array_index() {
         let data = ctx(&[("items", json!(["alpha", "beta"]))]);
         assert!(evaluate_condition("items[1] == 'beta'", &data).unwrap());
+    }
+
+    // -- Regression: condition parser bug (amplihack#4398, amplihack-rs#313) --
+    //
+    // These tests cover four scenario categories from the failing recipes:
+    //   1. quality-audit-cycle.yaml — `validated_findings and validated_findings['confirmed_count'] > 0`
+    //   2. default-workflow.yaml step-07-write-tests — chained `!=` with `and`
+    //   3. List literals as RHS of `in` operator
+    //   4. Postfix bracket/dot access on values used as method/function call arguments
+
+    #[test]
+    fn test_quality_audit_validated_findings_present() {
+        // From quality-audit-cycle.yaml: bracket access on object value combined with `and`.
+        let data = ctx(&[(
+            "validated_findings",
+            json!({"confirmed_count": 3, "rejected_count": 1}),
+        )]);
+        assert!(
+            evaluate_condition(
+                "validated_findings and validated_findings['confirmed_count'] > 0",
+                &data,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_quality_audit_validated_findings_missing_key() {
+        // Same condition shape, but the key is absent — must evaluate to false (not error).
+        let data = ctx(&[(
+            "validated_findings",
+            json!({"rejected_count": 1}),
+        )]);
+        assert!(
+            !evaluate_condition(
+                "validated_findings and validated_findings['confirmed_count'] > 0",
+                &data,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_default_workflow_step07_resume_checkpoint_true() {
+        // From default-workflow.yaml step-07-write-tests — true case (no resume checkpoint set).
+        let data = ctx(&[("resume_checkpoint", json!(""))]);
+        assert!(
+            evaluate_condition(
+                "resume_checkpoint != 'checkpoint-after-implementation' and \
+                 resume_checkpoint != 'checkpoint-after-review-feedback'",
+                &data,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_default_workflow_step07_resume_checkpoint_false() {
+        // Same condition, false case — resume_checkpoint matches one disallowed value.
+        let data = ctx(&[(
+            "resume_checkpoint",
+            json!("checkpoint-after-implementation"),
+        )]);
+        assert!(
+            !evaluate_condition(
+                "resume_checkpoint != 'checkpoint-after-implementation' and \
+                 resume_checkpoint != 'checkpoint-after-review-feedback'",
+                &data,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_list_literal_in_operator_match() {
+        let data = ctx(&[("task_type", json!("feature"))]);
+        assert!(
+            evaluate_condition("task_type in ['feature', 'bug']", &data).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_list_literal_in_operator_no_match() {
+        let data = ctx(&[("task_type", json!("chore"))]);
+        assert!(
+            !evaluate_condition("task_type in ['feature', 'bug']", &data).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_postfix_bracket_access_inside_method_call_arg() {
+        // Regression: `parse_or_value` previously called `parse_atom` directly,
+        // so postfix `['k']` on a method/function argument would not parse and
+        // produced "unexpected token: LBracket". Now it must parse and evaluate.
+        let data = ctx(&[
+            ("name", json!("alpha-beta")),
+            ("prefixes", json!({"default": "alpha"})),
+        ]);
+        assert!(
+            evaluate_condition("name.startswith(prefixes['default'])", &data).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_postfix_dot_access_inside_function_call_arg() {
+        // Same regression for dot-property access on a function argument.
+        let data = ctx(&[("config", json!({"items": [1, 2, 3]}))]);
+        assert!(
+            evaluate_condition("len(config.items) == 3", &data).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_unexpected_lbracket_error_includes_position() {
+        // The catch-all `parse_atom` error must mention "position" so future
+        // condition-parser bugs are easier to localize from logs.
+        let data: HashMap<String, Value> = HashMap::new();
+        let err = evaluate_condition("== ['a']", &data).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("position"),
+            "expected error message to mention token position, got: {}",
+            msg
+        );
     }
 }
