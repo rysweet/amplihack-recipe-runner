@@ -563,25 +563,67 @@ impl Adapter for CLISubprocessAdapter {
             working_dir
         };
 
-        let output = if let Some(secs) = timeout {
-            Command::new("timeout")
+        // Issue #80: argv + env must fit in ARG_MAX (~128 KiB on Linux). For
+        // large bash scripts (e.g. cleanup-helper / complete-session steps that
+        // accumulate round-results across multiple parallel workstreams), the
+        // inline `-c` form fails with `Argument list too long (os error 7)`.
+        // Spill the script to a tempfile and execute it as a script file.
+        const BASH_INLINE_LIMIT: usize = 64 * 1024;
+        let script_file: Option<tempfile::NamedTempFile> = if command.len() > BASH_INLINE_LIMIT {
+            let mut tf = tempfile::Builder::new()
+                .prefix("recipe-bash-step-")
+                .suffix(".sh")
+                .tempfile()
+                .with_context(|| "Failed to create tempfile for large bash step")?;
+            tf.write_all(command.as_bytes())
+                .with_context(|| "Failed to write large bash step to tempfile")?;
+            tf.flush().ok();
+            Some(tf)
+        } else {
+            None
+        };
+
+        let output = match (&script_file, timeout) {
+            (Some(tf), Some(secs)) => Command::new("timeout")
+                .args([
+                    secs.to_string().as_str(),
+                    "/bin/bash",
+                    tf.path().to_str().unwrap_or(""),
+                ])
+                .current_dir(effective_dir)
+                .env_remove("CLAUDECODE")
+                .envs(&child_env)
+                .envs(extra_env)
+                .output()
+                .with_context(|| "Failed to execute file-backed bash step with timeout")?,
+            (Some(tf), None) => Command::new("/bin/bash")
+                .arg(tf.path())
+                .current_dir(effective_dir)
+                .env_remove("CLAUDECODE")
+                .envs(&child_env)
+                .envs(extra_env)
+                .output()
+                .with_context(|| "Failed to execute file-backed bash step")?,
+            (None, Some(secs)) => Command::new("timeout")
                 .args([&secs.to_string(), "/bin/bash", "-c", command])
                 .current_dir(effective_dir)
                 .env_remove("CLAUDECODE")
                 .envs(&child_env)
                 .envs(extra_env)
                 .output()
-                .with_context(|| "Failed to execute bash step with timeout")?
-        } else {
-            Command::new("/bin/bash")
+                .with_context(|| "Failed to execute bash step with timeout")?,
+            (None, None) => Command::new("/bin/bash")
                 .args(["-c", command])
                 .current_dir(effective_dir)
                 .env_remove("CLAUDECODE")
                 .envs(&child_env)
                 .envs(extra_env)
                 .output()
-                .with_context(|| "Failed to execute bash step")?
+                .with_context(|| "Failed to execute bash step")?,
         };
+
+        // Drop the tempfile (auto-cleans on drop) only AFTER bash completed.
+        drop(script_file);
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -855,6 +897,60 @@ mod tests {
         let result = adapter.execute_bash_step("", ".", None, &empty_env);
         // Empty command succeeds with empty output in bash
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_execute_bash_step_large_script_uses_tempfile() {
+        // Issue #80: scripts > BASH_INLINE_LIMIT (64 KiB) must be spilled to a
+        // tempfile to avoid `Argument list too long (os error 7)`. Generate a
+        // ~96 KiB script that prints a sentinel — the inline `-c` form would
+        // crash on a system already near ARG_MAX, while the file-backed path
+        // executes cleanly.
+        let adapter = CLISubprocessAdapter::new();
+        let empty_env = std::collections::HashMap::new();
+        let mut large_script = String::with_capacity(100 * 1024);
+        // Pad with comment lines so the script size grows without changing its
+        // observable behavior. Each comment line is ~80 bytes; need ~1200 lines.
+        for i in 0..1300 {
+            large_script.push_str(&format!(
+                "# padding line {i:04} aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            ));
+        }
+        large_script.push_str("echo SENTINEL_OK\n");
+        assert!(
+            large_script.len() > 64 * 1024,
+            "test script must exceed BASH_INLINE_LIMIT, got {}",
+            large_script.len()
+        );
+
+        let result = adapter.execute_bash_step(&large_script, ".", None, &empty_env);
+        assert!(
+            result.is_ok(),
+            "large bash step should succeed via tempfile: {:?}",
+            result
+        );
+        assert_eq!(result.unwrap(), "SENTINEL_OK");
+    }
+
+    #[test]
+    fn test_execute_bash_step_large_script_with_timeout() {
+        // Same as above but exercising the (Some(tf), Some(secs)) match arm.
+        let adapter = CLISubprocessAdapter::new();
+        let empty_env = std::collections::HashMap::new();
+        let mut large_script = String::with_capacity(100 * 1024);
+        for i in 0..1300 {
+            large_script.push_str(&format!(
+                "# padding line {i:04} aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            ));
+        }
+        large_script.push_str("echo SENTINEL_TIMED\n");
+        let result = adapter.execute_bash_step(&large_script, ".", Some(10), &empty_env);
+        assert!(
+            result.is_ok(),
+            "large timed bash step should succeed via tempfile: {:?}",
+            result
+        );
+        assert_eq!(result.unwrap(), "SENTINEL_TIMED");
     }
 
     #[test]
