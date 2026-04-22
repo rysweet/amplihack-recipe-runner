@@ -32,7 +32,7 @@ pub use listeners::{ExecutionListener, FileLogListener, NullListener, StderrList
 const MAX_PARALLEL_STEPS: usize = 50;
 
 /// Maximum size of step output stored in memory (10 MB).
-const MAX_STEP_OUTPUT_BYTES: usize = 10_000_000;
+pub const MAX_STEP_OUTPUT_BYTES: usize = 10_000_000;
 
 /// Executes recipes by delegating steps to an adapter.
 pub struct RecipeRunner<A: Adapter> {

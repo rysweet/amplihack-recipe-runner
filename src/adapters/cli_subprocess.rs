@@ -9,8 +9,10 @@ use crate::adapters::Adapter;
 use anyhow::Context;
 use std::collections::HashMap;
 use std::env;
+use std::io::Read;
 use std::io::Write;
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +28,25 @@ const RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT: &str = "You are already inside an a
 const MAX_INLINE_AGENT_PROMPT_BYTES: usize = 32 * 1024;
 const FILE_BACKED_INLINE_PROMPT_BYTES: usize = 8 * 1024;
 const FILE_BACKED_PROMPT_CONTINUATION_NOTE: &str = "\n\nIMPORTANT: Additional task instructions, output requirements, and context continue in the appended system prompt. Treat that appended content as part of this same request and follow it fully.";
+
+/// Read at most `max_bytes + 1` bytes from `path`, returning UTF-8 (lossy).
+///
+/// The `+1` is a sentinel: callers can detect overflow when the returned
+/// length exceeds `max_bytes` and apply their own truncation/warning policy
+/// (see [`crate::runner::MAX_STEP_OUTPUT_BYTES`]). This caps agent-output
+/// memory growth at a fixed bound regardless of how large the on-disk file
+/// is, defending against runaway processes that produce multi-GB output.
+///
+/// Errors propagate from `File::open` (e.g. NotFound, PermissionDenied) so
+/// callers can decide whether to retry or fall back. UTF-8 errors do not
+/// fail; invalid sequences are replaced with U+FFFD.
+pub(crate) fn read_capped(path: &Path, max_bytes: usize) -> std::io::Result<String> {
+    let file = std::fs::File::open(path)?;
+    let cap = max_bytes.saturating_add(1);
+    let mut buf = Vec::with_capacity(std::cmp::min(cap, 64 * 1024));
+    file.take(cap as u64).read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
 
 pub struct CLISubprocessAdapter {
     cli: String,
@@ -456,7 +477,11 @@ impl CLISubprocessAdapter {
         // Read agent output with retry and graceful fallback (#3740).
         // The output file can be missing if: the temp dir was cleaned by the OS,
         // the agent crashed before writing, or a race condition on fast exits.
-        let stdout = match std::fs::read_to_string(&output_file) {
+        // Bounded read at MAX_STEP_OUTPUT_BYTES + 1 (#47): protects against
+        // unbounded memory growth from runaway agent processes; the runner
+        // detects len > MAX and applies safe_truncate as the final policy step.
+        let max_out = crate::runner::MAX_STEP_OUTPUT_BYTES;
+        let stdout = match read_capped(&output_file, max_out) {
             Ok(content) => content,
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
                 log::warn!(
@@ -464,7 +489,7 @@ impl CLISubprocessAdapter {
                     output_file.display()
                 );
                 std::thread::sleep(std::time::Duration::from_secs(1));
-                match std::fs::read_to_string(&output_file) {
+                match read_capped(&output_file, max_out) {
                     Ok(content) => {
                         log::info!("Agent output file found on retry");
                         content
@@ -687,6 +712,69 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── #47: read_capped enforces MAX+1 byte cap on agent output ──────
+
+    #[test]
+    fn test_read_capped_returns_full_content_under_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("small.txt");
+        let payload = "hello world";
+        std::fs::write(&path, payload).unwrap();
+        let out = read_capped(&path, 1024).expect("small read must succeed");
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn test_read_capped_caps_at_max_plus_one_byte() {
+        // Writes a file > MAX bytes; read_capped must return AT MOST MAX+1
+        // bytes of UTF-8 (the +1 is the sentinel that signals "overflow").
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("big.txt");
+        let max = 1024usize;
+        let oversize = max + 5000;
+        let payload = vec![b'x'; oversize];
+        std::fs::write(&path, &payload).unwrap();
+        let out = read_capped(&path, max).expect("read must not error on oversize");
+        assert!(
+            out.len() <= max + 1,
+            "read_capped returned {} bytes, must be <= MAX+1 ({})",
+            out.len(),
+            max + 1
+        );
+        assert!(
+            out.len() > max,
+            "read_capped returned {} bytes, must exceed MAX so caller can detect truncation",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn test_read_capped_missing_file_propagates_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nonexistent.txt");
+        assert!(read_capped(&path, 1024).is_err());
+    }
+
+    #[test]
+    fn test_read_capped_at_agent_output_limit_is_truncated() {
+        // Integration-style: write >MAX_STEP_OUTPUT_BYTES and confirm the
+        // bounded reader caps memory growth at the runner's limit.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("agent.out");
+        // Use 11 MB written in chunks to avoid a 10MB+ Vec literal.
+        let max = crate::runner::MAX_STEP_OUTPUT_BYTES;
+        let chunk = vec![b'a'; 1_000_000];
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&path).unwrap();
+            for _ in 0..(max / chunk.len() + 1) {
+                f.write_all(&chunk).unwrap();
+            }
+        }
+        let out = read_capped(&path, max).unwrap();
+        assert!(out.len() <= max + 1, "must cap at MAX+1; got {}", out.len());
     }
 
     #[test]
