@@ -118,10 +118,11 @@ fn parse_context_value(raw: &str) -> Value {
     {
         return v;
     }
-    // Try boolean
+    // Try boolean (capitalized only; lowercase is handled above by serde_json,
+    // which parses "true"/"false" as Value::Bool).
     match raw {
-        "true" | "True" => return Value::Bool(true),
-        "false" | "False" => return Value::Bool(false),
+        "True" => return Value::Bool(true),
+        "False" => return Value::Bool(false),
         _ => {}
     }
     // Try integer
@@ -411,6 +412,22 @@ mod tests {
     use serde_json::json;
 
     // -- RR-M7: parse_context_value unit tests --
+
+    #[test]
+    fn test_parse_context_value_bool_both_paths_after_dead_arm_removal() {
+        // After removing the unreachable `"true"`/`"false"` arms, both
+        // lowercase (handled by serde_json) and capitalized (handled by
+        // the explicit match arm) must still produce Value::Bool.
+        // Lowercase: takes the serde_json path (returns Value::Bool, !is_string()).
+        assert_eq!(parse_context_value("true"), json!(true));
+        assert_eq!(parse_context_value("false"), json!(false));
+        // Capitalized: not valid JSON, falls through to the match arm.
+        assert_eq!(parse_context_value("True"), json!(true));
+        assert_eq!(parse_context_value("False"), json!(false));
+        // Other capitalizations are NOT booleans (intentional, preserved).
+        assert_eq!(parse_context_value("TRUE"), json!("TRUE"));
+        assert_eq!(parse_context_value("tRuE"), json!("tRuE"));
+    }
 
     #[test]
     fn test_parse_context_value_string() {
