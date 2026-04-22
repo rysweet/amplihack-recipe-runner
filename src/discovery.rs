@@ -275,9 +275,10 @@ fn is_safe_recipe_name(name: &str) -> bool {
     if name.is_empty() || name.starts_with('.') {
         return false;
     }
-    !name.chars().any(|c| c == '/' || c == '\\' || c == '\0')
-        && !name.split(['/', '\\']).any(|seg| seg == "..")
-        && !name.contains("..")
+    // Reject any path separator/NUL byte; a `..` segment cannot exist without
+    // one, so the broader `contains("..")` also catches any non-separator
+    // attempts to embed parent-dir markers.
+    !name.chars().any(|c| matches!(c, '/' | '\\' | '\0')) && !name.contains("..")
 }
 
 /// Compare local recipe files against their content hashes.
@@ -946,7 +947,15 @@ steps:
         let tmp = tempfile::tempdir().unwrap();
         // Even if a malicious file exists outside the search dir, name with
         // traversal segments must not resolve to it.
-        for bad in ["../etc/passwd", "../../foo", "a/b", "a\\b", ".hidden"] {
+        for bad in [
+            "../etc/passwd",
+            "../../foo",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            "foo..bar",
+            "",
+        ] {
             assert!(
                 find_recipe(bad, Some(&[tmp.path().to_path_buf()])).is_none(),
                 "find_recipe must reject suspicious name: {:?}",
