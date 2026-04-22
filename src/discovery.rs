@@ -344,6 +344,77 @@ pub fn check_upstream_changes(local_dir: Option<&Path>) -> Vec<HashMap<String, S
     changes
 }
 
+/// Default upstream URL used when `RECIPE_RUNNER_UPSTREAM_URL` is not set.
+pub const DEFAULT_UPSTREAM_URL: &str = "https://github.com/microsoft/amplifier-bundle-recipes";
+
+/// Environment variable that overrides the upstream sync URL.
+pub const UPSTREAM_URL_ENV: &str = "RECIPE_RUNNER_UPSTREAM_URL";
+
+/// Resolve the upstream URL from the environment (or default) with validation.
+///
+/// Reads `RECIPE_RUNNER_UPSTREAM_URL`; falls back to [`DEFAULT_UPSTREAM_URL`].
+/// Validates that the URL uses an `http://` or `https://` scheme and does NOT
+/// embed userinfo (e.g. `https://user:secret@host/...`). Error messages do not
+/// echo the raw value, to avoid leaking credentials into logs.
+pub fn upstream_url() -> Result<String, anyhow::Error> {
+    upstream_url_inner(|k| std::env::var(k).ok())
+}
+
+/// Pure inner helper for [`upstream_url`] that takes an env-lookup closure.
+///
+/// Exposed for testability so unit tests do not have to mutate global env.
+pub fn upstream_url_inner<F>(get_env: F) -> Result<String, anyhow::Error>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let raw = get_env(UPSTREAM_URL_ENV).unwrap_or_else(|| DEFAULT_UPSTREAM_URL.to_string());
+    validate_upstream_url(&raw)?;
+    Ok(raw)
+}
+
+/// Validate that a URL is acceptable for upstream sync.
+///
+/// Rules:
+///   * Must be non-empty.
+///   * Scheme must be `http://` or `https://` (case-insensitive).
+///   * Must NOT contain userinfo (`user:pass@host`).
+///
+/// Errors are intentionally generic and do not include the raw URL value.
+fn validate_upstream_url(raw: &str) -> Result<(), anyhow::Error> {
+    if raw.is_empty() {
+        return Err(anyhow::anyhow!(
+            "upstream URL is empty (set {} or unset to use the default)",
+            UPSTREAM_URL_ENV
+        ));
+    }
+    let lower = raw.to_ascii_lowercase();
+    let scheme_end = match lower.find("://") {
+        Some(i) => i,
+        None => {
+            return Err(anyhow::anyhow!(
+                "upstream URL is missing a scheme; only http:// and https:// are accepted"
+            ));
+        }
+    };
+    let scheme = &lower[..scheme_end];
+    if scheme != "http" && scheme != "https" {
+        return Err(anyhow::anyhow!(
+            "upstream URL has an unsupported scheme; only http:// and https:// are accepted"
+        ));
+    }
+    let after_scheme = &raw[scheme_end + 3..];
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    if authority.contains('@') {
+        return Err(anyhow::anyhow!(
+            "upstream URL must not embed credentials (userinfo); use a credential helper instead"
+        ));
+    }
+    Ok(())
+}
+
 /// Write a manifest file recording the current hash of each recipe.
 pub fn update_manifest(local_dir: Option<&Path>) -> Result<PathBuf, std::io::Error> {
     let recipe_dir = local_dir
@@ -383,7 +454,8 @@ pub fn sync_upstream(
     branch: Option<&str>,
     remote_name: Option<&str>,
 ) -> Result<serde_json::Value, anyhow::Error> {
-    let repo = repo_url.unwrap_or("https://github.com/microsoft/amplifier-bundle-recipes");
+    let default_url = upstream_url()?;
+    let repo = repo_url.unwrap_or(&default_url);
     let br = branch.unwrap_or("main");
     let remote = format!("upstream-{}", remote_name.unwrap_or("amplifier-recipes"));
 
@@ -814,16 +886,6 @@ steps:
         }
     }
 
-    // ── #45: verify_global_installation must be removed ────────────────
-
-    /// Compile-time guarantee: verify_global_installation no longer exists.
-    /// If this module compiles after removal, the symbol is gone.
-    #[test]
-    fn test_verify_global_installation_removed() {
-        // Intentionally empty — the surrounding cfg(test) module will fail
-        // to compile if any code references the deleted function.
-    }
-
     // ── #42: find_recipe + discover_recipes must support .yml ──────────
 
     #[test]
@@ -893,6 +955,85 @@ steps:
                 bad
             );
         }
+    }
+
+    // ── #46: upstream_url env override + URL validation ────────────────
+
+    #[test]
+    fn test_upstream_url_inner_default_when_no_env() {
+        let url = upstream_url_inner(|_| None).expect("default URL must be valid");
+        assert_eq!(url, DEFAULT_UPSTREAM_URL);
+    }
+
+    #[test]
+    fn test_upstream_url_inner_uses_env_override() {
+        let url = upstream_url_inner(|k| {
+            (k == "RECIPE_RUNNER_UPSTREAM_URL")
+                .then(|| "https://example.com/repo.git".to_string())
+        })
+        .expect("https override must be accepted");
+        assert_eq!(url, "https://example.com/repo.git");
+    }
+
+    #[test]
+    fn test_upstream_url_inner_accepts_http() {
+        let url = upstream_url_inner(|_| Some("http://example.com/repo".to_string()))
+            .expect("http override must be accepted");
+        assert_eq!(url, "http://example.com/repo");
+    }
+
+    #[test]
+    fn test_upstream_url_inner_rejects_non_http_schemes() {
+        for bad in [
+            "file:///etc/passwd",
+            "ssh://git@example.com/repo",
+            "git://example.com/repo",
+            "ftp://example.com/repo",
+            "javascript:alert(1)",
+            "no-scheme",
+        ] {
+            let res = upstream_url_inner(|_| Some(bad.to_string()));
+            assert!(res.is_err(), "scheme must be rejected: {:?}", bad);
+            // Error message must NOT echo the raw value (security)
+            let msg = res.unwrap_err().to_string();
+            assert!(
+                !msg.contains(bad),
+                "error message must not echo raw env var value (got {:?})",
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_upstream_url_inner_rejects_embedded_userinfo() {
+        let res = upstream_url_inner(|_| {
+            Some("https://user:secret@example.com/repo".to_string())
+        });
+        assert!(res.is_err(), "URL with userinfo must be rejected");
+        let msg = res.unwrap_err().to_string();
+        assert!(
+            !msg.contains("secret") && !msg.contains("user:"),
+            "error must not leak credentials: {:?}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_upstream_url_inner_rejects_empty() {
+        let res = upstream_url_inner(|_| Some(String::new()));
+        assert!(res.is_err(), "empty URL must be rejected");
+    }
+
+    // ── #45: verify_global_installation must be removed ────────────────
+
+    /// Compile-time guarantee: verify_global_installation no longer exists.
+    /// If this module compiles after removal, the symbol is gone.
+    /// This test exists to document intent; the absence of the symbol is
+    /// the actual assertion (any caller would fail to compile).
+    #[test]
+    fn test_verify_global_installation_removed() {
+        // Intentionally empty — the surrounding cfg(test) module will fail
+        // to compile if any code references the deleted function.
     }
 
     #[test]
