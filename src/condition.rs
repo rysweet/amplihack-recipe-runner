@@ -430,6 +430,9 @@ impl<'a> ExprParser<'a> {
             args.push(self.parse_or_value()?);
             while self.peek() == Some(&Token::Comma) {
                 self.advance();
+                if self.peek() == Some(&Token::RParen) {
+                    break;
+                }
                 args.push(self.parse_or_value()?);
             }
         }
@@ -530,6 +533,9 @@ impl<'a> ExprParser<'a> {
                         args.push(self.parse_primary()?);
                         while self.peek() == Some(&Token::Comma) {
                             self.advance();
+                            if self.peek() == Some(&Token::RParen) {
+                                break;
+                            }
                             args.push(self.parse_primary()?);
                         }
                     }
@@ -556,6 +562,30 @@ impl<'a> ExprParser<'a> {
                 }
                 self.advance();
                 Ok(Value::Bool(result))
+            }
+            Some(Token::LBracket) => {
+                // List literal: '[' (atom (',' atom)*)? ','? ']'
+                // Used as RHS for `in` / `not in` checks.
+                // Trailing commas are allowed for ergonomics.
+                self.advance();
+                let mut items: Vec<Value> = Vec::new();
+                if self.peek() != Some(&Token::RBracket) {
+                    items.push(self.parse_atom()?);
+                    while self.peek() == Some(&Token::Comma) {
+                        self.advance();
+                        if self.peek() == Some(&Token::RBracket) {
+                            break;
+                        }
+                        items.push(self.parse_atom()?);
+                    }
+                }
+                if self.peek() != Some(&Token::RBracket) {
+                    return Err(ConditionError::Parse(
+                        "expected ']' to close list literal".to_string(),
+                    ));
+                }
+                self.advance();
+                Ok(Value::Array(items))
             }
             Some(tok) => Err(ConditionError::Parse(format!(
                 "unexpected token: {:?}",
@@ -645,7 +675,7 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, ConditionError> {
                         crate::safe_truncate(s, 50)
                     ))
                 })?,
-                Value::Bool(b) => f64::from(u8::from(*b)),
+                Value::Bool(b) => f64::from(*b),
                 _ => 0.0,
             };
             Ok(serde_json::Number::from_f64(n)
@@ -1025,6 +1055,80 @@ mod tests {
         let data = ctx(&[("task_type", json!("Development"))]);
         assert!(evaluate_condition("'Development' in task_type", &data).unwrap());
         assert!(!evaluate_condition("'Q&A' in task_type", &data).unwrap());
+    }
+
+    #[test]
+    fn test_in_list_literal() {
+        let data = ctx(&[("checkpoint", json!("checkpoint-after-implementation"))]);
+        assert!(evaluate_condition(
+            "checkpoint in ['checkpoint-after-implementation', 'checkpoint-after-review-feedback']",
+            &data,
+        )
+        .unwrap());
+        assert!(!evaluate_condition("checkpoint in ['other', 'still-other']", &data,).unwrap());
+    }
+
+    #[test]
+    fn test_not_in_list_literal() {
+        let data = ctx(&[("resume_checkpoint", json!("none"))]);
+        assert!(evaluate_condition(
+            "resume_checkpoint not in ['checkpoint-after-implementation', 'checkpoint-after-review-feedback']",
+            &data,
+        )
+        .unwrap());
+        let data2 = ctx(&[(
+            "resume_checkpoint",
+            json!("checkpoint-after-implementation"),
+        )]);
+        assert!(!evaluate_condition(
+            "resume_checkpoint not in ['checkpoint-after-implementation', 'checkpoint-after-review-feedback']",
+            &data2,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_empty_list_literal() {
+        let data = ctx(&[("x", json!("anything"))]);
+        assert!(!evaluate_condition("x in []", &data).unwrap());
+        assert!(evaluate_condition("x not in []", &data).unwrap());
+    }
+
+    #[test]
+    fn test_list_literal_numbers_and_mixed() {
+        let data = ctx(&[("n", json!(2))]);
+        assert!(evaluate_condition("n in [1, 2, 3]", &data).unwrap());
+        assert!(!evaluate_condition("n in [4, 5]", &data).unwrap());
+    }
+
+    #[test]
+    fn test_list_literal_trailing_comma() {
+        let data = ctx(&[("x", json!("a"))]);
+        assert!(evaluate_condition("x in ['a', 'b',]", &data).unwrap());
+        assert!(evaluate_condition("x in ['a',]", &data).unwrap());
+        assert!(!evaluate_condition("x in ['b',]", &data).unwrap());
+    }
+
+    #[test]
+    fn test_list_literal_malformed_should_error() {
+        let data = ctx(&[("x", json!("a"))]);
+        // Empty list with only a comma: invalid
+        assert!(evaluate_condition("x in [,]", &data).is_err());
+        // Double comma: invalid
+        assert!(evaluate_condition("x in ['a',,]", &data).is_err());
+        // Double comma between elements: invalid
+        assert!(evaluate_condition("x in ['a',,'b']", &data).is_err());
+    }
+
+    #[test]
+    fn test_function_and_method_call_trailing_comma() {
+        let data = ctx(&[("s", json!("HELLO"))]);
+        // Function call trailing comma — symmetric with list literal behavior
+        assert!(evaluate_condition("len('abc',) == 3", &data).unwrap());
+        // Method call trailing comma
+        assert!(evaluate_condition("s.lower(,) == 'hello'", &data).is_err());
+        // Method with arg + trailing comma
+        assert!(evaluate_condition("'a,b,c'.split(',',) == ['a','b','c']", &data).unwrap());
     }
 
     #[test]
