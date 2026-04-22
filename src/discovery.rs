@@ -282,51 +282,6 @@ fn is_safe_recipe_name(name: &str) -> bool {
         && !name.contains("..")
 }
 
-/// Verify that global recipe directories exist and contain recipes.
-pub fn verify_global_installation() -> serde_json::Value {
-    let global_dirs = vec![
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".amplihack")
-            .join("amplifier-bundle")
-            .join("recipes"),
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".amplihack")
-            .join(".claude")
-            .join("recipes"),
-        PathBuf::from("amplifier-bundle").join("recipes"),
-    ];
-
-    let mut dirs_exist = Vec::new();
-    let mut recipe_counts = Vec::new();
-    let mut has_global = false;
-
-    for dir in &global_dirs {
-        let exists = dir.is_dir();
-        dirs_exist.push(exists);
-        if exists {
-            let count = collect_dir_entries(dir)
-                .iter()
-                .filter(|p| p.extension().is_some_and(|ext| ext == "yaml"))
-                .count();
-            recipe_counts.push(count);
-            if count > 0 {
-                has_global = true;
-            }
-        } else {
-            recipe_counts.push(0);
-        }
-    }
-
-    serde_json::json!({
-        "global_dirs_exist": dirs_exist,
-        "global_recipe_count": recipe_counts,
-        "has_global_recipes": has_global,
-        "global_paths_checked": global_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-    })
-}
-
 /// Compare local recipe files against their content hashes.
 pub fn check_upstream_changes(local_dir: Option<&Path>) -> Vec<HashMap<String, String>> {
     let recipe_dir = match local_dir
@@ -857,6 +812,16 @@ steps:
             std::env::remove_var("AMPLIHACK_PACKAGE_RECIPE_DIR");
             std::env::remove_var("RECIPE_RUNNER_RECIPE_DIRS");
         }
+    }
+
+    // ── #45: verify_global_installation must be removed ────────────────
+
+    /// Compile-time guarantee: verify_global_installation no longer exists.
+    /// If this module compiles after removal, the symbol is gone.
+    #[test]
+    fn test_verify_global_installation_removed() {
+        // Intentionally empty — the surrounding cfg(test) module will fail
+        // to compile if any code references the deleted function.
     }
 
     // ── #42: find_recipe + discover_recipes must support .yml ──────────
