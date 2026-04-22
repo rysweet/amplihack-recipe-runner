@@ -1221,10 +1221,7 @@ mod tests {
     #[test]
     fn test_quality_audit_validated_findings_missing_key() {
         // Same condition shape, but the key is absent — must evaluate to false (not error).
-        let data = ctx(&[(
-            "validated_findings",
-            json!({"rejected_count": 1}),
-        )]);
+        let data = ctx(&[("validated_findings", json!({"rejected_count": 1}))]);
         assert!(
             !evaluate_condition(
                 "validated_findings and validated_findings['confirmed_count'] > 0",
@@ -1268,17 +1265,13 @@ mod tests {
     #[test]
     fn test_list_literal_in_operator_match() {
         let data = ctx(&[("task_type", json!("feature"))]);
-        assert!(
-            evaluate_condition("task_type in ['feature', 'bug']", &data).unwrap()
-        );
+        assert!(evaluate_condition("task_type in ['feature', 'bug']", &data).unwrap());
     }
 
     #[test]
     fn test_list_literal_in_operator_no_match() {
         let data = ctx(&[("task_type", json!("chore"))]);
-        assert!(
-            !evaluate_condition("task_type in ['feature', 'bug']", &data).unwrap()
-        );
+        assert!(!evaluate_condition("task_type in ['feature', 'bug']", &data).unwrap());
     }
 
     #[test]
@@ -1290,18 +1283,14 @@ mod tests {
             ("name", json!("alpha-beta")),
             ("prefixes", json!({"default": "alpha"})),
         ]);
-        assert!(
-            evaluate_condition("name.startswith(prefixes['default'])", &data).unwrap()
-        );
+        assert!(evaluate_condition("name.startswith(prefixes['default'])", &data).unwrap());
     }
 
     #[test]
     fn test_postfix_dot_access_inside_function_call_arg() {
         // Same regression for dot-property access on a function argument.
         let data = ctx(&[("config", json!({"items": [1, 2, 3]}))]);
-        assert!(
-            evaluate_condition("len(config.items) == 3", &data).unwrap()
-        );
+        assert!(evaluate_condition("len(config.items) == 3", &data).unwrap());
     }
 
     #[test]
