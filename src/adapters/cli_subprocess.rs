@@ -214,6 +214,16 @@ impl CLISubprocessAdapter {
         // The `amplihack <agent>` subcommand requires `--` to separate its own
         // flags from passthrough args (#4342).
         cmd.arg("--");
+        // Copilot CLI requires --allow-all-tools for non-interactive use; without it,
+        // nested copilot agents prompt for tool approval and hang/exit 1 (#88).
+        // Opt out by setting AMPLIHACK_NO_ALLOW_ALL_TOOLS to any non-empty value.
+        if self.cli == "copilot"
+            && env::var("AMPLIHACK_NO_ALLOW_ALL_TOOLS")
+                .map(|v| v.is_empty())
+                .unwrap_or(true)
+        {
+            cmd.arg("--allow-all-tools");
+        }
         let effective_system_prompt = Self::build_effective_system_prompt(system_prompt);
 
         if self.should_use_file_backed_prompt_transport(prompt, Some(&effective_system_prompt)) {
@@ -1094,5 +1104,108 @@ mod tests {
             "--model must come after -- separator"
         );
         assert_eq!(args[model_pos + 1], "gpt-4");
+    }
+
+    #[test]
+    fn test_build_agent_command_copilot_includes_allow_all_tools() {
+        // Copilot needs --allow-all-tools to run non-interactively without
+        // prompting for tool approval (#88). The flag must come after `--`
+        // so it is passed through to the copilot CLI.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new("AMPLIHACK_NO_ALLOW_ALL_TOOLS");
+        // SAFETY: test runs hold ENV_MUTEX to serialize env var access
+        unsafe {
+            env::remove_var("AMPLIHACK_NO_ALLOW_ALL_TOOLS");
+        }
+
+        let adapter = CLISubprocessAdapter::new().with_binary("copilot");
+        let tmp = tempfile::tempdir().unwrap();
+        let cmd = adapter
+            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let separator_pos = args.iter().position(|a| a == "--").unwrap();
+        let allow_pos = args
+            .iter()
+            .position(|a| a == "--allow-all-tools")
+            .expect("copilot command must include --allow-all-tools");
+        assert!(
+            allow_pos > separator_pos,
+            "--allow-all-tools must come after -- separator"
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_non_copilot_omits_allow_all_tools() {
+        // Only copilot needs --allow-all-tools; claude/codex/launch must not get it.
+        for binary in &["claude", "codex", "launch", "RustyClawd"] {
+            let adapter = CLISubprocessAdapter::new().with_binary(binary);
+            let tmp = tempfile::tempdir().unwrap();
+            let cmd = adapter
+                .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+                .unwrap();
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                !args.iter().any(|a| a == "--allow-all-tools"),
+                "{binary} must not include --allow-all-tools"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_agent_command_copilot_opt_out_via_env() {
+        // Setting AMPLIHACK_NO_ALLOW_ALL_TOOLS to any non-empty value
+        // suppresses the auto-injected --allow-all-tools flag.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new("AMPLIHACK_NO_ALLOW_ALL_TOOLS");
+        // SAFETY: test runs hold ENV_MUTEX to serialize env var access
+        unsafe {
+            env::set_var("AMPLIHACK_NO_ALLOW_ALL_TOOLS", "1");
+        }
+
+        let adapter = CLISubprocessAdapter::new().with_binary("copilot");
+        let tmp = tempfile::tempdir().unwrap();
+        let cmd = adapter
+            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !args.iter().any(|a| a == "--allow-all-tools"),
+            "AMPLIHACK_NO_ALLOW_ALL_TOOLS=1 must suppress --allow-all-tools"
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_copilot_empty_env_keeps_flag() {
+        // Empty string should NOT count as opt-out — flag stays.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new("AMPLIHACK_NO_ALLOW_ALL_TOOLS");
+        // SAFETY: test runs hold ENV_MUTEX to serialize env var access
+        unsafe {
+            env::set_var("AMPLIHACK_NO_ALLOW_ALL_TOOLS", "");
+        }
+
+        let adapter = CLISubprocessAdapter::new().with_binary("copilot");
+        let tmp = tempfile::tempdir().unwrap();
+        let cmd = adapter
+            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.iter().any(|a| a == "--allow-all-tools"),
+            "empty AMPLIHACK_NO_ALLOW_ALL_TOOLS must not suppress --allow-all-tools"
+        );
     }
 }
