@@ -83,9 +83,10 @@ pub struct RecipeInfo {
     pub sha256: String,
 }
 
-/// Find all recipe YAML files in the search directories.
+/// Find all recipe YAML files (`.yaml` and `.yml`) in the search directories.
 ///
 /// When the same recipe name appears in multiple directories, the last one wins.
+/// Within a single directory, `.yaml` takes precedence over `.yml` if both exist.
 pub fn discover_recipes(search_dirs: Option<&[PathBuf]>) -> HashMap<String, RecipeInfo> {
     let dirs = search_dirs
         .map(|d| d.to_vec())
@@ -103,9 +104,23 @@ pub fn discover_recipes(search_dirs: Option<&[PathBuf]>) -> HashMap<String, Reci
 
         let mut entries: Vec<PathBuf> = collect_dir_entries(search_dir)
             .into_iter()
-            .filter(|p| p.extension().is_some_and(|ext| ext == "yaml"))
+            .filter(|p| {
+                p.extension()
+                    .is_some_and(|ext| ext == "yaml" || ext == "yml")
+            })
             .collect();
-        entries.sort();
+        // Sort so .yaml is processed AFTER .yml for the same stem; combined
+        // with the last-wins HashMap insert, this gives .yaml precedence.
+        entries.sort_by(|a, b| {
+            let stem_a = a.file_stem().unwrap_or_default();
+            let stem_b = b.file_stem().unwrap_or_default();
+            stem_a.cmp(stem_b).then_with(|| {
+                let ext_a = a.extension().and_then(|s| s.to_str()).unwrap_or("");
+                let ext_b = b.extension().and_then(|s| s.to_str()).unwrap_or("");
+                // "yml" < "yaml" lexicographically, so reverse to put yaml last
+                ext_b.cmp(ext_a)
+            })
+        });
 
         for yaml_path in entries {
             if let Some(info) = load_recipe_info(&yaml_path) {
@@ -228,18 +243,43 @@ pub fn cached_discover_recipes(dirs: &[PathBuf]) -> HashMap<String, RecipeInfo> 
 }
 
 /// Find a recipe by name and return its file path.
+///
+/// Searches each directory in order, looking for `<name>.yaml` first then
+/// `<name>.yml` (yaml takes precedence when both exist in the same dir).
+///
+/// Returns `None` if `name` contains path-traversal segments (`/`, `\`, `..`)
+/// or starts with `.`, to prevent escaping the search directories.
 pub fn find_recipe(name: &str, search_dirs: Option<&[PathBuf]>) -> Option<PathBuf> {
+    if !is_safe_recipe_name(name) {
+        warn!("find_recipe: rejecting unsafe recipe name");
+        return None;
+    }
     let dirs = search_dirs
         .map(|d| d.to_vec())
         .unwrap_or_else(default_search_dirs);
-    let filename = format!("{}.yaml", name);
     for search_dir in &dirs {
-        let candidate = search_dir.join(&filename);
-        if candidate.is_file() {
-            return Some(candidate);
+        for ext in ["yaml", "yml"] {
+            let candidate = search_dir.join(format!("{}.{}", name, ext));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
     None
+}
+
+/// Reject recipe names that could escape the search directory or refer to
+/// hidden files. Names must be a single path component with no separator
+/// or parent-directory segments and must not start with `.`.
+fn is_safe_recipe_name(name: &str) -> bool {
+    if name.is_empty() || name.starts_with('.') {
+        return false;
+    }
+    !name
+        .chars()
+        .any(|c| c == '/' || c == '\\' || c == '\0')
+        && !name.split(['/', '\\']).any(|seg| seg == "..")
+        && !name.contains("..")
 }
 
 /// Verify that global recipe directories exist and contain recipes.
@@ -816,6 +856,77 @@ steps:
         unsafe {
             std::env::remove_var("AMPLIHACK_PACKAGE_RECIPE_DIR");
             std::env::remove_var("RECIPE_RUNNER_RECIPE_DIRS");
+        }
+    }
+
+    // ── #42: find_recipe + discover_recipes must support .yml ──────────
+
+    #[test]
+    fn test_find_recipe_finds_yml_extension() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("yml-recipe.yml"),
+            "name: yml-recipe\nsteps:\n  - id: s1\n    command: echo",
+        )
+        .unwrap();
+        let found = find_recipe("yml-recipe", Some(&[tmp.path().to_path_buf()]));
+        assert!(
+            found.is_some(),
+            "find_recipe must locate .yml files, not only .yaml"
+        );
+        assert!(found.unwrap().extension().unwrap() == "yml");
+    }
+
+    #[test]
+    fn test_find_recipe_yaml_takes_precedence_over_yml() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("dup.yaml"),
+            "name: dup\nsteps:\n  - id: s1\n    command: echo yaml",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("dup.yml"),
+            "name: dup\nsteps:\n  - id: s1\n    command: echo yml",
+        )
+        .unwrap();
+        let found = find_recipe("dup", Some(&[tmp.path().to_path_buf()])).unwrap();
+        assert_eq!(
+            found.extension().unwrap(),
+            "yaml",
+            ".yaml must win over .yml when both exist"
+        );
+    }
+
+    #[test]
+    fn test_discover_recipes_includes_yml_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("a.yaml"),
+            "name: a\nsteps:\n  - id: s1\n    command: echo",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("b.yml"),
+            "name: b\nsteps:\n  - id: s1\n    command: echo",
+        )
+        .unwrap();
+        let recipes = discover_recipes(Some(&[tmp.path().to_path_buf()]));
+        assert!(recipes.contains_key("a"), ".yaml must be discovered");
+        assert!(recipes.contains_key("b"), ".yml must be discovered");
+    }
+
+    #[test]
+    fn test_find_recipe_rejects_path_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Even if a malicious file exists outside the search dir, name with
+        // traversal segments must not resolve to it.
+        for bad in ["../etc/passwd", "../../foo", "a/b", "a\\b", ".hidden"] {
+            assert!(
+                find_recipe(bad, Some(&[tmp.path().to_path_buf()])).is_none(),
+                "find_recipe must reject suspicious name: {:?}",
+                bad
+            );
         }
     }
 
