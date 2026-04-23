@@ -11,12 +11,24 @@ use std::collections::HashMap;
 use std::env;
 use std::io::Read;
 use std::io::Write;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Format current wall-clock time as `HH:MM:SS` UTC with no external deps.
+fn utc_hms() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let day_secs = secs % 86_400;
+    let h = day_secs / 3600;
+    let m = (day_secs % 3600) / 60;
+    let s = day_secs % 60;
+    format!("{:02}:{:02}:{:02}", h, m, s)
+}
 
 const NON_INTERACTIVE_FOOTER: &str = "\n\nIMPORTANT: Proceed autonomously. Do not ask questions. \
      Make reasonable decisions and continue.";
@@ -429,22 +441,40 @@ impl CLISubprocessAdapter {
         let stop_clone = stop.clone();
         let output_path = output_file.clone();
         let child_pid = child.id();
+        let agent_label = self.cli.clone();
 
         let heartbeat = std::thread::spawn(move || {
+            // Issue #52: stream all new bytes between ticks (not just the
+            // last line) and prefix each line with `[HH:MM:SS] [agent:pid]`
+            // so operators can correlate with external logs.
             let mut last_size = 0u64;
             let mut last_activity = Instant::now();
             let start_time = Instant::now();
+            let label = format!("amplihack:{}:{}", agent_label, child_pid);
             while !stop_clone.load(Ordering::Relaxed) {
                 match std::fs::metadata(&output_path) {
                     Ok(meta) => {
                         let current_size = meta.len();
                         if current_size > last_size {
+                            // Read the *new* bytes since last tick (file-seek
+                            // semantics) so no output is silently dropped.
                             match std::fs::File::open(&output_path) {
-                                Ok(file) => {
-                                    let reader = BufReader::new(file);
-                                    if let Some(Ok(last_line)) = reader.lines().last() {
-                                        let truncated = crate::safe_truncate(&last_line, 120);
-                                        eprintln!("  [agent] {}", truncated);
+                                Ok(mut file) => {
+                                    use std::io::{Seek, SeekFrom};
+                                    if file.seek(SeekFrom::Start(last_size)).is_ok() {
+                                        let mut buf = String::new();
+                                        let _ = file.read_to_string(&mut buf);
+                                        for line in buf.lines() {
+                                            if line.is_empty() {
+                                                continue;
+                                            }
+                                            eprintln!(
+                                                "  [{}] [{}] {}",
+                                                utc_hms(),
+                                                label,
+                                                line
+                                            );
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -461,12 +491,17 @@ impl CLISubprocessAdapter {
                                 std::path::Path::new(&format!("/proc/{}", child_pid)).exists();
                             if pid_alive {
                                 eprintln!(
-                                    "  [agent] ... working ({}s elapsed, {}s since last output, pid {} alive)",
-                                    total_elapsed, idle_secs, child_pid
+                                    "  [{}] [{}] ... working ({}s elapsed, {}s since last output)",
+                                    utc_hms(),
+                                    label,
+                                    total_elapsed,
+                                    idle_secs
                                 );
                             } else {
                                 eprintln!(
-                                    "  [agent] ... waiting ({}s elapsed, process may be finishing)",
+                                    "  [{}] [{}] ... waiting ({}s elapsed, process may be finishing)",
+                                    utc_hms(),
+                                    label,
                                     total_elapsed
                                 );
                             }
