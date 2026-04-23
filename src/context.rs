@@ -207,6 +207,20 @@ impl RecipeContext {
 
     /// Return environment variables for all context values.
     /// Keys are prefixed with `RECIPE_VAR_` and dots replaced with `__`.
+    ///
+    /// For top-level scalar keys (string/null/number/bool), an uppercase
+    /// alias is also exported (e.g. `task_description` → `TASK_DESCRIPTION`)
+    /// for compatibility with recipes inherited from the legacy Python runner,
+    /// which exported plain uppercase names. The alias is only added when:
+    ///   - the key contains only `[a-zA-Z0-9_]` (so it round-trips cleanly to
+    ///     a shell identifier),
+    ///   - the value is a scalar (Object / Array stay namespaced under the
+    ///     `RECIPE_VAR_` prefix to avoid clobbering useful shell vars), and
+    ///   - the uppercase name does not collide with an existing reserved
+    ///     environment variable likely already set by the parent process
+    ///     (`PATH`, `HOME`, `PWD`, `USER`, `SHELL`, `TMPDIR`, `LANG`, `TERM`).
+    ///
+    /// See rysweet/amplihack-recipe-runner#95.
     pub fn shell_env_vars(&self) -> HashMap<String, String> {
         log::debug!(
             "RecipeContext::shell_env_vars: exporting {} context keys",
@@ -220,7 +234,16 @@ impl RecipeContext {
                 Value::Null => String::new(),
                 v => v.to_string(),
             };
-            env.insert(env_key, env_val);
+            env.insert(env_key.clone(), env_val.clone());
+
+            // Legacy alias: plain uppercase for top-level scalars.
+            if Self::is_scalar(value)
+                && let Some(alias) = Self::legacy_uppercase_alias(key)
+            {
+                // Don't overwrite if a real context key happens to already
+                // produce that alias (extremely unlikely but be safe).
+                env.entry(alias).or_insert(env_val);
+            }
 
             // Also export nested keys for dot-notation access
             if let Value::Object(map) = value {
@@ -228,6 +251,45 @@ impl RecipeContext {
             }
         }
         env
+    }
+
+    fn is_scalar(value: &Value) -> bool {
+        matches!(
+            value,
+            Value::String(_) | Value::Null | Value::Number(_) | Value::Bool(_)
+        )
+    }
+
+    /// Return an uppercase shell-identifier alias for `key`, or None if the
+    /// key is unsuitable (non-identifier chars, or collides with a reserved
+    /// shell env var likely set by the parent process).
+    fn legacy_uppercase_alias(key: &str) -> Option<String> {
+        if key.is_empty() {
+            return None;
+        }
+        // Must consist of [a-zA-Z0-9_] only and start with non-digit.
+        let mut chars = key.chars();
+        let first = chars.next()?;
+        if !(first.is_ascii_alphabetic() || first == '_') {
+            return None;
+        }
+        if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        let upper = key.to_ascii_uppercase();
+        // Avoid clobbering common shell-reserved env names. This list covers
+        // POSIX-standard names; shell builtins (`PWD`, `OLDPWD`) and locale
+        // (`LANG`, `LC_*`) names. `RECIPE_VAR_<key>` form is always exported
+        // separately and remains the safe canonical accessor.
+        const RESERVED: &[&str] = &[
+            "PATH", "HOME", "PWD", "OLDPWD", "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR", "TMP",
+            "LANG", "LC_ALL", "LC_CTYPE", "MAIL", "EDITOR", "VISUAL", "DISPLAY", "HOSTNAME", "IFS",
+            "PS1", "PS2", "PS3", "PS4",
+        ];
+        if RESERVED.contains(&upper.as_str()) || upper.starts_with("LC_") {
+            return None;
+        }
+        Some(upper)
     }
 
     /// Estimated total byte size of all RECIPE_VAR_* env vars.
@@ -425,6 +487,8 @@ mod tests {
         let c = ctx(vec![("cmd", json!("hello; rm -rf /"))]);
         let env = c.shell_env_vars();
         assert_eq!(env.get("RECIPE_VAR_cmd").unwrap(), "hello; rm -rf /");
+        // Issue #95: legacy uppercase alias for plain identifier scalar key.
+        assert_eq!(env.get("CMD").unwrap(), "hello; rm -rf /");
     }
 
     #[test]
@@ -433,6 +497,78 @@ mod tests {
         let env = c.shell_env_vars();
         assert_eq!(env.get("RECIPE_VAR_obj__status").unwrap(), "ok");
         assert_eq!(env.get("RECIPE_VAR_obj__count").unwrap(), "5");
+        // Object values should NOT get an uppercase alias (only scalars).
+        assert!(!env.contains_key("OBJ"));
+    }
+
+    #[test]
+    fn test_legacy_uppercase_alias_for_known_recipe_keys() {
+        // Issue #95: smart-orchestrator and friends reference $TASK_DESCRIPTION
+        // and $REPO_PATH directly; runner must export these aliases.
+        let c = ctx(vec![
+            ("task_description", json!("port a feature")),
+            ("repo_path", json!(".")),
+            ("issue_number", json!(42)),
+            ("dry_run", json!(true)),
+            ("nullable", json!(null)),
+        ]);
+        let env = c.shell_env_vars();
+        assert_eq!(env.get("TASK_DESCRIPTION").unwrap(), "port a feature");
+        assert_eq!(env.get("REPO_PATH").unwrap(), ".");
+        assert_eq!(env.get("ISSUE_NUMBER").unwrap(), "42");
+        assert_eq!(env.get("DRY_RUN").unwrap(), "true");
+        assert_eq!(env.get("NULLABLE").unwrap(), "");
+        // RECIPE_VAR_* form still present as canonical accessor.
+        assert_eq!(
+            env.get("RECIPE_VAR_task_description").unwrap(),
+            "port a feature"
+        );
+    }
+
+    #[test]
+    fn test_legacy_uppercase_alias_skips_reserved_names() {
+        // Don't clobber PATH/HOME/etc.
+        let c = ctx(vec![
+            ("path", json!("/should/not/clobber/PATH")),
+            ("home", json!("/nope")),
+            ("lang", json!("c")),
+            ("lc_messages", json!("c")),
+            ("ifs", json!(":")),
+        ]);
+        let env = c.shell_env_vars();
+        assert!(!env.contains_key("PATH"), "must not clobber PATH");
+        assert!(!env.contains_key("HOME"), "must not clobber HOME");
+        assert!(!env.contains_key("LANG"), "must not clobber LANG");
+        assert!(
+            !env.contains_key("LC_MESSAGES"),
+            "must not clobber any LC_* locale var"
+        );
+        assert!(!env.contains_key("IFS"), "must not clobber IFS");
+        // RECIPE_VAR_* form still works.
+        assert_eq!(
+            env.get("RECIPE_VAR_path").unwrap(),
+            "/should/not/clobber/PATH"
+        );
+    }
+
+    #[test]
+    fn test_legacy_uppercase_alias_skips_invalid_identifiers() {
+        // Keys with dashes / dots / leading digits / non-ASCII should not get
+        // an alias (they couldn't round-trip cleanly to a shell variable).
+        let c = ctx(vec![
+            ("with-dash", json!("a")),
+            ("with.dot", json!("b")),
+            ("9leading_digit", json!("c")),
+            ("naïve", json!("d")),
+        ]);
+        let env = c.shell_env_vars();
+        assert!(!env.contains_key("WITH-DASH"));
+        assert!(!env.contains_key("WITH.DOT"));
+        assert!(!env.contains_key("9LEADING_DIGIT"));
+        assert!(!env.contains_key("NAÏVE"));
+        // But the canonical RECIPE_VAR_* form replaces dashes/dots correctly.
+        assert_eq!(env.get("RECIPE_VAR_with_dash").unwrap(), "a");
+        assert_eq!(env.get("RECIPE_VAR_with__dot").unwrap(), "b");
     }
 
     #[test]
