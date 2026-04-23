@@ -25,6 +25,7 @@ flate2 = "1"
 tar = "0.4"
 semver = "1"
 libc = "0.2.185"
+tracing = "0.1.44"
 
 [dev-dependencies]
 proptest = "1.10.0"
