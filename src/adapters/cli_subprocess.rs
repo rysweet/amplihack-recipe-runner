@@ -89,6 +89,19 @@ impl CLISubprocessAdapter {
         let mut child_env: HashMap<String, String> =
             env::vars().filter(|(k, _)| k != "CLAUDECODE").collect();
 
+        // Defense-in-depth: ensure HOME and PATH are always present and non-empty,
+        // even when the parent shell has them unset. Mirrors amplihack-rs fork
+        // (fix #277) — empty HOME/PATH can break non-interactive child steps.
+        if child_env.get("HOME").is_none_or(|v| v.is_empty()) {
+            child_env.insert("HOME".to_string(), "/root".to_string());
+        }
+        if child_env.get("PATH").is_none_or(|v| v.is_empty()) {
+            child_env.insert(
+                "PATH".to_string(),
+                "/usr/local/bin:/usr/bin:/bin".to_string(),
+            );
+        }
+
         let current_depth: u32 = env::var("AMPLIHACK_SESSION_DEPTH")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -852,6 +865,17 @@ mod tests {
         assert!(env.contains_key("AMPLIHACK_MAX_SESSIONS"));
         // CLAUDECODE is never passed to children
         assert!(!env.contains_key("CLAUDECODE"));
+    }
+
+    #[test]
+    fn test_build_child_env_guarantees_home_and_path() {
+        // Fix #277 parity with amplihack-rs fork: HOME and PATH must always be
+        // present and non-empty, even when unset in parent.
+        let env = CLISubprocessAdapter::build_child_env();
+        assert!(env.contains_key("HOME"));
+        assert!(env.contains_key("PATH"));
+        assert!(!env.get("HOME").unwrap().is_empty());
+        assert!(!env.get("PATH").unwrap().is_empty());
     }
 
     #[test]
