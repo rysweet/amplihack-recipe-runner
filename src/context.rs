@@ -273,10 +273,7 @@ impl RecipeContext {
         if !(first.is_ascii_alphabetic() || first == '_') {
             return None;
         }
-        if !key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
+        if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return None;
         }
         let upper = key.to_ascii_uppercase();
@@ -285,9 +282,9 @@ impl RecipeContext {
         // (`LANG`, `LC_*`) names. `RECIPE_VAR_<key>` form is always exported
         // separately and remains the safe canonical accessor.
         const RESERVED: &[&str] = &[
-            "PATH", "HOME", "PWD", "OLDPWD", "USER", "LOGNAME", "SHELL", "TERM",
-            "TMPDIR", "TMP", "LANG", "LC_ALL", "LC_CTYPE", "MAIL", "EDITOR",
-            "VISUAL", "DISPLAY", "HOSTNAME", "IFS", "PS1", "PS2", "PS3", "PS4",
+            "PATH", "HOME", "PWD", "OLDPWD", "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR", "TMP",
+            "LANG", "LC_ALL", "LC_CTYPE", "MAIL", "EDITOR", "VISUAL", "DISPLAY", "HOSTNAME", "IFS",
+            "PS1", "PS2", "PS3", "PS4",
         ];
         if RESERVED.contains(&upper.as_str()) || upper.starts_with("LC_") {
             return None;
@@ -522,7 +519,10 @@ mod tests {
         assert_eq!(env.get("DRY_RUN").unwrap(), "true");
         assert_eq!(env.get("NULLABLE").unwrap(), "");
         // RECIPE_VAR_* form still present as canonical accessor.
-        assert_eq!(env.get("RECIPE_VAR_task_description").unwrap(), "port a feature");
+        assert_eq!(
+            env.get("RECIPE_VAR_task_description").unwrap(),
+            "port a feature"
+        );
     }
 
     #[test]
@@ -545,7 +545,10 @@ mod tests {
         );
         assert!(!env.contains_key("IFS"), "must not clobber IFS");
         // RECIPE_VAR_* form still works.
-        assert_eq!(env.get("RECIPE_VAR_path").unwrap(), "/should/not/clobber/PATH");
+        assert_eq!(
+            env.get("RECIPE_VAR_path").unwrap(),
+            "/should/not/clobber/PATH"
+        );
     }
 
     #[test]
