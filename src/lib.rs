@@ -30,6 +30,7 @@ pub mod models;
 pub mod parser;
 pub mod progress_validator;
 pub mod runner;
+pub mod sub_recipe_recovery;
 
 /// Safely truncate a string to at most `max_bytes` bytes at a UTF-8 boundary.
 ///
