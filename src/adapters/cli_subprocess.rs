@@ -312,16 +312,18 @@ impl CLISubprocessAdapter {
         Ok(cmd)
     }
 
-    /// Internal: spawn agent with optional system prompt.
+    /// Internal: spawn agent with optional system prompt and timeout.
     ///
-    /// Agent steps run without a timeout — they complete when the underlying
-    /// CLI process exits.
+    /// When `timeout` is `Some(secs)`, the agent process is killed after the
+    /// given number of seconds.  Without a timeout the step runs until the
+    /// underlying CLI process exits on its own.
     fn execute_agent_step_impl(
         &self,
         prompt: &str,
         system_prompt: Option<&str>,
         model: Option<&str>,
         working_dir: &str,
+        timeout: Option<u64>,
     ) -> Result<String, anyhow::Error> {
         log::debug!(
             "execute_agent_step_impl: prompt_len={}, has_system_prompt={}, model={:?}, working_dir={:?}",
@@ -511,7 +513,32 @@ impl CLISubprocessAdapter {
             }
         });
 
-        let status = child.wait()?;
+        // Enforce timeout: poll in a loop instead of blocking on wait().
+        let status = if let Some(secs) = timeout {
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            loop {
+                match child.try_wait()? {
+                    Some(s) => break s,
+                    None if Instant::now() >= deadline => {
+                        log::warn!(
+                            "Agent step timed out after {}s — killing pid {}",
+                            secs,
+                            child.id()
+                        );
+                        let pid = child.id();
+                        child.kill().ok();
+                        // Reap the zombie so we don't leak processes.
+                        let _ = child.wait();
+                        stop.store(true, Ordering::SeqCst);
+                        let _ = heartbeat.join();
+                        anyhow::bail!("Agent step timed out after {}s (killed pid {})", secs, pid);
+                    }
+                    None => std::thread::sleep(Duration::from_millis(250)),
+                }
+            }
+        } else {
+            child.wait()?
+        };
         stop.store(true, Ordering::SeqCst);
         if let Err(e) = heartbeat.join() {
             log::warn!("Heartbeat thread panicked: {:?}", e);
@@ -604,8 +631,7 @@ impl Adapter for CLISubprocessAdapter {
             timeout,
             working_dir
         );
-        let _ = timeout; // TODO: enforce timeout
-        self.execute_agent_step_impl(prompt, system_prompt, model, working_dir)
+        self.execute_agent_step_impl(prompt, system_prompt, model, working_dir, timeout)
     }
 
     fn execute_bash_step(

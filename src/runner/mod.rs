@@ -1508,6 +1508,69 @@ steps:
         );
     }
 
+    /// Adapter that fails after the timeout value it receives on agent steps,
+    /// simulating a timeout error from the real adapter.
+    struct TimeoutFailAdapter;
+    impl Adapter for TimeoutFailAdapter {
+        fn execute_agent_step(
+            &self,
+            _prompt: &str,
+            _agent_name: Option<&str>,
+            _system_prompt: Option<&str>,
+            _mode: Option<&str>,
+            _working_dir: &str,
+            _model: Option<&str>,
+            timeout: Option<u64>,
+        ) -> Result<String, anyhow::Error> {
+            if let Some(secs) = timeout {
+                anyhow::bail!("Agent step timed out after {}s", secs);
+            }
+            Ok("ok".to_string())
+        }
+        fn execute_bash_step(
+            &self,
+            command: &str,
+            _working_dir: &str,
+            _timeout: Option<u64>,
+            _extra_env: &std::collections::HashMap<String, String>,
+        ) -> Result<String, anyhow::Error> {
+            Ok(format!("Bash output for: {}", command))
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &str {
+            "timeout-fail-mock"
+        }
+    }
+
+    /// Verify that the timeout field from a recipe agent step propagates to
+    /// the adapter and that a timeout failure is reported correctly.
+    #[test]
+    fn test_agent_step_timeout_propagated_and_reported() {
+        let yaml = r#"
+name: "test-agent-timeout"
+steps:
+  - id: "timed-agent"
+    prompt: "do something"
+    timeout: 300
+"#;
+        let parser = RecipeParser::new();
+        let recipe = parser.parse(yaml).unwrap();
+        let runner = RecipeRunner::new(TimeoutFailAdapter);
+        let result = runner.execute(&recipe, None);
+        assert!(
+            !result.success,
+            "adapter timeout error should cause step failure"
+        );
+        assert_eq!(result.step_results[0].status, StepStatus::Failed);
+        assert!(
+            result.step_results[0].error.contains("timed out"),
+            "error should mention timeout: {}",
+            result.step_results[0].error
+        );
+    }
+
     /// C2-RD-10: timeout:0 edge case — verify step still executes and completes
     /// normally. A zero timeout is passed to the adapter as `Some(0)` and the
     /// adapter decides what to do with it (mock adapter ignores timeout).
