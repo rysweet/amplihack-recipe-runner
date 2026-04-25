@@ -300,4 +300,197 @@ mod tests {
         };
         assert!(r.should_attempt_recovery(&ctx));
     }
+
+    // ── Property-based tests (PR5: audit/proptest-state-machines) ───────
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        // SR-1: classify_failure never panics on arbitrary input
+        proptest! {
+            #[test]
+            fn classify_failure_no_panic(
+                error in "\\PC{0,500}",
+                exit_code in proptest::option::of(0..256i32),
+            ) {
+                let r = SubRecipeRecovery::new();
+                let _ = r.classify_failure(&error, exit_code);
+            }
+        }
+
+        // SR-2: classify_failure always returns a valid FailureClass variant
+        proptest! {
+            #[test]
+            fn classify_failure_returns_valid_class(
+                error in "\\PC{0,200}",
+                exit_code in proptest::option::of(0..256i32),
+            ) {
+                let r = SubRecipeRecovery::new();
+                let class = r.classify_failure(&error, exit_code);
+                // Exhaustive match ensures totality — compiler would catch missing variants
+                match class {
+                    FailureClass::Recoverable | FailureClass::Unrecoverable | FailureClass::Unknown => {}
+                }
+            }
+        }
+
+        // SR-3: classify_failure is case-insensitive for known patterns
+        proptest! {
+            #[test]
+            fn classify_case_insensitive(
+                pattern in prop_oneof![
+                    Just("permission denied"),
+                    Just("test failed"),
+                    Just("fatal:"),
+                    Just("syntax error"),
+                ],
+            ) {
+                let r = SubRecipeRecovery::new();
+                let lower = r.classify_failure(pattern, None);
+                let upper = r.classify_failure(&pattern.to_uppercase(), None);
+                prop_assert_eq!(
+                    lower, upper,
+                    "classify_failure should be case-insensitive: '{}' vs '{}'",
+                    pattern, pattern.to_uppercase(),
+                );
+            }
+        }
+
+        // SR-4: Unrecoverable failures are never retried via should_attempt_recovery()
+        proptest! {
+            #[test]
+            fn unrecoverable_never_retried(attempt in 0..10u32) {
+                let r = SubRecipeRecovery::new();
+                let ctx = FailureContext {
+                    recipe_name: "test".into(),
+                    step_id: "s1".into(),
+                    error_message: "error".into(),
+                    exit_code: None,
+                    failure_class: FailureClass::Unrecoverable,
+                    attempt,
+                };
+                prop_assert!(
+                    !r.should_attempt_recovery(&ctx),
+                    "Unrecoverable failures should never be retried (attempt {})",
+                    attempt,
+                );
+            }
+        }
+
+        // SR-5: should_attempt_recovery() respects max_attempts for non-Unrecoverable
+        proptest! {
+            #[test]
+            fn max_attempts_respected(
+                max in 1..10u32,
+                attempt in 0..20u32,
+                class in prop_oneof![
+                    Just(FailureClass::Recoverable),
+                    Just(FailureClass::Unknown),
+                ],
+            ) {
+                let r = SubRecipeRecovery::with_max_attempts(max);
+                let ctx = FailureContext {
+                    recipe_name: "test".into(),
+                    step_id: "s1".into(),
+                    error_message: "error".into(),
+                    exit_code: None,
+                    failure_class: class,
+                    attempt,
+                };
+                let should = r.should_attempt_recovery(&ctx);
+                if attempt >= max {
+                    prop_assert!(
+                        !should,
+                        "attempt {} >= max {} should not be retried",
+                        attempt, max,
+                    );
+                } else {
+                    prop_assert!(
+                        should,
+                        "attempt {} < max {} should be retried for {:?}",
+                        attempt, max, class,
+                    );
+                }
+            }
+        }
+
+        // SR-6: parse_recovery_response never panics on arbitrary input
+        proptest! {
+            #[test]
+            fn parse_response_no_panic(
+                response in "\\PC{0,500}",
+                attempt in 0..100u32,
+            ) {
+                let r = SubRecipeRecovery::new();
+                let _ = r.parse_recovery_response(&response, attempt);
+            }
+        }
+
+        // SR-7: parse_recovery_response marks "UNRECOVERABLE" as not recovered
+        proptest! {
+            #[test]
+            fn unrecoverable_keyword_detected(
+                prefix in "[a-zA-Z ]{0,50}",
+                suffix in "[a-zA-Z ]{0,50}",
+            ) {
+                let r = SubRecipeRecovery::new();
+                let response = format!("{}UNRECOVERABLE{}", prefix, suffix);
+                let result = r.parse_recovery_response(&response, 0);
+                prop_assert!(
+                    !result.recovered,
+                    "Response containing 'UNRECOVERABLE' should not be marked recovered: {}",
+                    response,
+                );
+                prop_assert_eq!(
+                    result.strategy,
+                    "agent_declared_unrecoverable",
+                    "Strategy should be 'agent_declared_unrecoverable'",
+                );
+            }
+        }
+
+        // SR-8: build_recovery_prompt includes all context fields
+        proptest! {
+            #[test]
+            fn recovery_prompt_contains_context(
+                recipe_name in "[a-zA-Z][a-zA-Z0-9_-]{0,20}",
+                step_id in "[a-zA-Z][a-zA-Z0-9_-]{0,20}",
+                error_msg in "[a-zA-Z0-9 .,!?]{1,50}",
+                attempt in 0..5u32,
+            ) {
+                let r = SubRecipeRecovery::new();
+                let ctx = FailureContext {
+                    recipe_name: recipe_name.clone(),
+                    step_id: step_id.clone(),
+                    error_message: error_msg.clone(),
+                    exit_code: None,
+                    failure_class: FailureClass::Recoverable,
+                    attempt,
+                };
+                let prompt = r.build_recovery_prompt(&ctx);
+                prop_assert!(prompt.contains(&recipe_name), "Prompt missing recipe_name");
+                prop_assert!(prompt.contains(&step_id), "Prompt missing step_id");
+                prop_assert!(prompt.contains(&error_msg), "Prompt missing error_message");
+            }
+        }
+
+        // SR-9: Exit codes 126, 127, 137 are always classified as Unrecoverable
+        proptest! {
+            #[test]
+            fn fatal_exit_codes_unrecoverable(
+                code in prop_oneof![Just(126), Just(127), Just(137)],
+                error in "[a-zA-Z0-9 ]{0,50}",
+            ) {
+                let r = SubRecipeRecovery::new();
+                let class = r.classify_failure(&error, Some(code));
+                prop_assert_eq!(
+                    class,
+                    FailureClass::Unrecoverable,
+                    "Exit code {} should always be Unrecoverable regardless of error text '{}'",
+                    code, error,
+                );
+            }
+        }
+    }
 }
