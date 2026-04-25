@@ -1306,4 +1306,151 @@ mod tests {
             msg
         );
     }
+
+    // ---- proptest fuzz tests ----
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        // Safe variable name: starts with a letter, no consecutive underscores,
+        // avoids keywords (and, or, not, in, len, true, false, none).
+        fn safe_var() -> impl Strategy<Value = String> {
+            prop::sample::select(vec![
+                "status",
+                "flag",
+                "count",
+                "name",
+                "path",
+                "val",
+                "x",
+                "y",
+                "task_type",
+                "checkpoint",
+                "scope",
+                "items",
+                "config",
+                "my_var",
+                "result",
+                "mode",
+                "level",
+                "step_id",
+            ])
+            .prop_map(String::from)
+        }
+
+        // Arbitrary string never panics the condition evaluator.
+        proptest! {
+            #[test]
+            fn fuzz_evaluate_never_panics(s in "\\PC{0,200}") {
+                let data: HashMap<String, Value> = HashMap::new();
+                let _ = evaluate_condition(&s, &data);
+            }
+        }
+
+        // Tokenizer never panics on arbitrary input.
+        proptest! {
+            #[test]
+            fn fuzz_tokenize_never_panics(s in "\\PC{0,200}") {
+                let _ = tokenize(&s);
+            }
+        }
+
+        // Conditions exceeding MAX_CONDITION_LEN always return an error.
+        proptest! {
+            #[test]
+            fn overlong_conditions_rejected(s in ".{8193,9000}") {
+                let data: HashMap<String, Value> = HashMap::new();
+                let result = evaluate_condition(&s, &data);
+                prop_assert!(result.is_err(), "overlong condition must be rejected");
+                let msg = result.unwrap_err().to_string();
+                prop_assert!(msg.contains("too long"), "error should mention length: {}", msg);
+            }
+        }
+
+        // Evaluation is deterministic: calling twice yields the same result.
+        proptest! {
+            #[test]
+            fn evaluate_is_deterministic(
+                var in safe_var(),
+                val in "[a-z]{1,5}",
+            ) {
+                let condition = format!("{} == '{}'", var, val);
+                let data = ctx(&[(&*var, serde_json::json!("hello"))]);
+                let r1 = evaluate_condition(&condition, &data);
+                let r2 = evaluate_condition(&condition, &data);
+                match (r1, r2) {
+                    (Ok(a), Ok(b)) => prop_assert_eq!(a, b),
+                    (Err(_), Err(_)) => {},
+                    (a, b) => prop_assert!(false, "mismatch: {:?} vs {:?}", a, b),
+                }
+            }
+        }
+
+        // Simple equality conditions with string variables always parse and
+        // evaluate correctly.
+        proptest! {
+            #[test]
+            fn simple_equality_never_panics(
+                var in safe_var(),
+                val in "[a-zA-Z0-9]{1,20}",
+            ) {
+                let condition = format!("{} == '{}'", var, val);
+                let data = ctx(&[(&*var, serde_json::json!(val.clone()))]);
+                let result = evaluate_condition(&condition, &data);
+                prop_assert!(result.is_ok(), "simple equality should parse: {:?}", result);
+                prop_assert!(result.unwrap(), "var == 'val' should be true when var contains val");
+            }
+        }
+
+        // `in` list conditions parse and evaluate correctly.
+        proptest! {
+            #[test]
+            fn in_list_never_panics(
+                var in safe_var(),
+                items in prop::collection::vec("[a-zA-Z0-9]{1,10}", 1..5),
+            ) {
+                let list = items.iter().map(|s| format!("'{}'", s)).collect::<Vec<_>>().join(", ");
+                let condition = format!("{} in [{}]", var, list);
+                let data = ctx(&[(&*var, serde_json::json!(items[0].clone()))]);
+                let result = evaluate_condition(&condition, &data);
+                prop_assert!(result.is_ok(), "in-list should parse: {:?}", result);
+                prop_assert!(result.unwrap(), "var should be in list when it contains var's value");
+            }
+        }
+
+        // Boolean connectives (and/or) with valid sub-conditions never panic.
+        proptest! {
+            #[test]
+            fn boolean_connectives_never_panic(
+                a_val in "[a-z]{1,5}",
+                b_val in "[a-z]{1,5}",
+                op in prop::sample::select(vec!["and", "or"]),
+            ) {
+                let condition = format!("x == '{}' {} y == '{}'", a_val, op, b_val);
+                let data = ctx(&[
+                    ("x", serde_json::json!(a_val)),
+                    ("y", serde_json::json!(b_val)),
+                ]);
+                let result = evaluate_condition(&condition, &data);
+                prop_assert!(result.is_ok(), "bool connective should parse: {:?}", result);
+            }
+        }
+
+        // `not in` conditions parse correctly.
+        proptest! {
+            #[test]
+            fn not_in_list_never_panics(
+                var in safe_var(),
+                items in prop::collection::vec("[a-zA-Z0-9]{1,10}", 1..5),
+            ) {
+                let list = items.iter().map(|s| format!("'{}'", s)).collect::<Vec<_>>().join(", ");
+                let condition = format!("{} not in [{}]", var, list);
+                let data = ctx(&[(&*var, serde_json::json!("ZZZZ_ABSENT"))]);
+                let result = evaluate_condition(&condition, &data);
+                prop_assert!(result.is_ok(), "not-in should parse: {:?}", result);
+                prop_assert!(result.unwrap(), "var not in list should be true when value is absent");
+            }
+        }
+    }
 }
