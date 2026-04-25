@@ -186,13 +186,23 @@ pub fn atomic_write_json(path: &Path, payload: &serde_json::Value) -> std::io::R
             drop(f);
             match std::fs::rename(&tmp_path, path) {
                 Ok(()) => return Ok(()),
-                Err(_) => {
-                    let _ = std::fs::remove_file(&tmp_path);
+                Err(rename_err) => {
+                    log::debug!(
+                        "Atomic rename failed ({}), falling back to direct write",
+                        rename_err
+                    );
+                    if let Err(e) = std::fs::remove_file(&tmp_path) {
+                        log::debug!("Failed to clean up temp file {}: {}", tmp_path.display(), e);
+                    }
                     // Fall through to direct write.
                 }
             }
         }
-        Err(_) => {
+        Err(e) => {
+            log::debug!(
+                "Atomic write temp file creation failed ({}), falling back to direct write",
+                e
+            );
             // Fall through to direct write.
         }
     }

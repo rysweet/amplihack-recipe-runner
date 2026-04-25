@@ -403,7 +403,13 @@ impl CLISubprocessAdapter {
         // we can include the agent's actual error output in the bail message
         // (the temp_dir gets cleaned up before the error is reported).
         let stderr_persist_dir = std::path::PathBuf::from("/tmp/amplihack-agent-stderr");
-        std::fs::create_dir_all(&stderr_persist_dir).ok();
+        if let Err(e) = std::fs::create_dir_all(&stderr_persist_dir) {
+            log::warn!(
+                "Failed to create stderr persist dir {}: {}",
+                stderr_persist_dir.display(),
+                e
+            );
+        }
         let stderr_file = stderr_persist_dir.join(format!(
             "agent-stderr-{}.log",
             std::time::SystemTime::now()
@@ -465,7 +471,9 @@ impl CLISubprocessAdapter {
                                     use std::io::{Seek, SeekFrom};
                                     if file.seek(SeekFrom::Start(last_size)).is_ok() {
                                         let mut buf = String::new();
-                                        let _ = file.read_to_string(&mut buf);
+                                        if let Err(e) = file.read_to_string(&mut buf) {
+                                            log::debug!("heartbeat: read_to_string failed: {}", e);
+                                        }
                                         for line in buf.lines() {
                                             if line.is_empty() {
                                                 continue;
@@ -601,7 +609,13 @@ impl CLISubprocessAdapter {
         }
 
         // On success, remove the persistent stderr file
-        std::fs::remove_file(&stderr_file).ok();
+        if let Err(e) = std::fs::remove_file(&stderr_file) {
+            log::debug!(
+                "Failed to clean up stderr file {}: {}",
+                stderr_file.display(),
+                e
+            );
+        }
 
         Ok(stdout.trim().to_string())
     }
@@ -671,7 +685,8 @@ impl Adapter for CLISubprocessAdapter {
                 .with_context(|| "Failed to create tempfile for large bash step")?;
             tf.write_all(command.as_bytes())
                 .with_context(|| "Failed to write large bash step to tempfile")?;
-            tf.flush().ok();
+            tf.flush()
+                .with_context(|| "Failed to flush large bash step tempfile")?;
             Some(tf)
         } else {
             None
