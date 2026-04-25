@@ -261,12 +261,8 @@ impl<A: Adapter> RecipeRunner<A> {
 
         let mut step_idx = 0;
         while step_idx < recipe.steps.len() {
-            if recipe.steps[step_idx].parallel_group.is_some() {
-                let group_name = recipe.steps[step_idx]
-                    .parallel_group
-                    .as_ref()
-                    .unwrap()
-                    .clone();
+            if let Some(group_name) = &recipe.steps[step_idx].parallel_group {
+                let group_name = group_name.clone();
                 let group_start = step_idx;
                 while step_idx < recipe.steps.len()
                     && recipe.steps[step_idx].parallel_group.as_deref() == Some(&group_name)

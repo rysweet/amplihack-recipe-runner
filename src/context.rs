@@ -9,15 +9,17 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::LazyLock;
 
-static TEMPLATE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\{\{([a-zA-Z0-9_.\-]+)\}\}").unwrap());
+static TEMPLATE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\{\{([a-zA-Z0-9_.\-]+)\}\}").expect("valid template placeholder regex")
+});
 
 /// Matches heredoc start markers: <<WORD, <<-WORD, <<'WORD', <<"WORD"
 /// Cannot use backreferences in Rust regex, so we match each quote style
 /// as separate alternatives.
 /// Group 1 = single-quoted delimiter, Group 2 = double-quoted, Group 3 = unquoted
 static HEREDOC_START_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"<<-?\s*(?:'([A-Za-z_]\w*)'|"([A-Za-z_]\w*)"|([A-Za-z_]\w*))"#).unwrap()
+    Regex::new(r#"<<-?\s*(?:'([A-Za-z_]\w*)'|"([A-Za-z_]\w*)"|([A-Za-z_]\w*))"#)
+        .expect("valid heredoc start regex")
 });
 
 /// Mutable context that accumulates step outputs and renders templates.
