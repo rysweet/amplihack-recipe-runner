@@ -402,7 +402,11 @@ impl CLISubprocessAdapter {
         // (the temp_dir gets cleaned up before the error is reported).
         let stderr_persist_dir = std::path::PathBuf::from("/tmp/amplihack-agent-stderr");
         if let Err(e) = std::fs::create_dir_all(&stderr_persist_dir) {
-            log::warn!("Failed to create stderr persist dir {}: {}", stderr_persist_dir.display(), e);
+            log::warn!(
+                "Failed to create stderr persist dir {}: {}",
+                stderr_persist_dir.display(),
+                e
+            );
         }
         let stderr_file = stderr_persist_dir.join(format!(
             "agent-stderr-{}.log",
@@ -579,7 +583,11 @@ impl CLISubprocessAdapter {
 
         // On success, remove the persistent stderr file
         if let Err(e) = std::fs::remove_file(&stderr_file) {
-            log::debug!("Failed to clean up stderr file {}: {}", stderr_file.display(), e);
+            log::debug!(
+                "Failed to clean up stderr file {}: {}",
+                stderr_file.display(),
+                e
+            );
         }
 
         Ok(stdout.trim().to_string())
