@@ -784,7 +784,7 @@ steps:
         /// Strategy: generate syntactically valid minimal YAML recipes.
         fn valid_recipe_yaml() -> impl Strategy<Value = String> {
             (
-                "[a-zA-Z][a-zA-Z0-9_-]{0,30}",  // recipe name
+                "[a-zA-Z][a-zA-Z0-9_-]{0,30}", // recipe name
                 proptest::collection::vec(
                     "[a-zA-Z][a-zA-Z0-9_-]{0,20}", // step IDs
                     1..=5,
