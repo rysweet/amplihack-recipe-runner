@@ -9,8 +9,9 @@ use regex::Regex;
 use serde_json::Value;
 use std::sync::LazyLock;
 
-static JSON_FENCE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?s)```(?:json)?\s*\n?(.*?)\n?\s*```").expect("valid JSON fence regex"));
+static JSON_FENCE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)```(?:json)?\s*\n?(.*?)\n?\s*```").expect("valid JSON fence regex")
+});
 
 /// Try to parse JSON from LLM output using multiple strategies.
 ///
