@@ -732,4 +732,229 @@ mod tests {
         assert!(workstream_progress_sidecar_path().is_none());
         assert!(workstream_state_file_path().is_none());
     }
+
+    // ── Property-based tests (PR5: audit/proptest-state-machines) ───────
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Strategy: generate arbitrary ProgressStatus values
+        fn arb_status() -> impl Strategy<Value = ProgressStatus> {
+            prop_oneof![
+                Just(ProgressStatus::Running),
+                Just(ProgressStatus::Completed),
+                Just(ProgressStatus::Failed),
+                Just(ProgressStatus::Skipped),
+                Just(ProgressStatus::Unknown),
+            ]
+        }
+
+        // PV-1: Terminal states have no valid outgoing transitions
+        proptest! {
+            #[test]
+            fn terminal_states_have_no_transitions(
+                status in prop_oneof![
+                    Just(ProgressStatus::Completed),
+                    Just(ProgressStatus::Failed),
+                    Just(ProgressStatus::Skipped),
+                ],
+            ) {
+                prop_assert!(
+                    status.valid_transitions().is_empty(),
+                    "{:?} is terminal but has non-empty transitions: {:?}",
+                    status, status.valid_transitions(),
+                );
+                prop_assert!(
+                    status.is_terminal(),
+                    "{:?} should report is_terminal() == true",
+                    status,
+                );
+            }
+        }
+
+        // PV-2: Non-terminal states have at least one valid transition
+        proptest! {
+            #[test]
+            fn non_terminal_states_have_transitions(
+                status in prop_oneof![
+                    Just(ProgressStatus::Running),
+                    Just(ProgressStatus::Unknown),
+                ],
+            ) {
+                prop_assert!(
+                    !status.valid_transitions().is_empty(),
+                    "{:?} is non-terminal but has no transitions",
+                    status,
+                );
+                prop_assert!(
+                    !status.is_terminal(),
+                    "{:?} should report is_terminal() == false",
+                    status,
+                );
+            }
+        }
+
+        // PV-3: validate_transition accepts self-transitions for all statuses
+        proptest! {
+            #[test]
+            fn self_transition_always_ok(status in arb_status()) {
+                prop_assert!(
+                    validate_transition(status, status).is_ok(),
+                    "{:?} → {:?} should be accepted (self-transition)",
+                    status, status,
+                );
+            }
+        }
+
+        // PV-4: validate_transition rejects transitions FROM terminal states to different states
+        proptest! {
+            #[test]
+            fn terminal_to_different_rejected(
+                from in prop_oneof![
+                    Just(ProgressStatus::Completed),
+                    Just(ProgressStatus::Failed),
+                    Just(ProgressStatus::Skipped),
+                ],
+                to in arb_status(),
+            ) {
+                if from != to {
+                    prop_assert!(
+                        validate_transition(from, to).is_err(),
+                        "Terminal {:?} → {:?} should be rejected",
+                        from, to,
+                    );
+                }
+            }
+        }
+
+        // PV-5: All transitions listed in valid_transitions() are accepted by validate_transition
+        proptest! {
+            #[test]
+            fn valid_transitions_are_accepted(from in arb_status()) {
+                for &to in from.valid_transitions() {
+                    prop_assert!(
+                        validate_transition(from, to).is_ok(),
+                        "{:?}.valid_transitions() includes {:?} but validate_transition rejects it",
+                        from, to,
+                    );
+                }
+            }
+        }
+
+        // PV-6: validate_filename never panics on arbitrary strings
+        proptest! {
+            #[test]
+            fn validate_filename_no_panic(s in "\\PC{0,200}") {
+                let _ = validate_filename(&s);
+            }
+        }
+
+        // PV-7: safe_progress_name always produces a string within MAX_SAFE_NAME_LEN
+        proptest! {
+            #[test]
+            fn safe_name_length_bounded(name in "\\PC{0,300}") {
+                let safe = safe_progress_name(&name);
+                prop_assert!(
+                    safe.len() <= MAX_SAFE_NAME_LEN,
+                    "safe_progress_name({:?}) produced {} chars (max {})",
+                    name, safe.len(), MAX_SAFE_NAME_LEN,
+                );
+            }
+        }
+
+        // PV-8: safe_progress_name only contains [a-zA-Z0-9_]
+        proptest! {
+            #[test]
+            fn safe_name_chars_valid(name in "\\PC{1,100}") {
+                let safe = safe_progress_name(&name);
+                for ch in safe.chars() {
+                    prop_assert!(
+                        ch.is_ascii_alphanumeric() || ch == '_',
+                        "safe_progress_name({:?}) produced invalid char '{}' in '{}'",
+                        name, ch, safe,
+                    );
+                }
+            }
+        }
+
+        // PV-9: progress_file_path roundtrips through validate_filename
+        proptest! {
+            #[test]
+            fn progress_path_roundtrips_through_filename_validation(
+                name in "[a-zA-Z][a-zA-Z0-9_]{0,20}",
+                pid in 1..100_000u32,
+            ) {
+                if let Ok(path) = progress_file_path(&name, pid) {
+                    let filename = path.file_name()
+                        .and_then(|f| f.to_str())
+                        .expect("path should have a filename");
+                    let result = validate_filename(filename);
+                    prop_assert!(
+                        result.is_ok(),
+                        "progress_file_path produced filename '{}' that validate_filename rejects: {:?}",
+                        filename, result.err(),
+                    );
+                    let (_, parsed_pid) = result.unwrap();
+                    prop_assert_eq!(
+                        parsed_pid, pid,
+                        "PID mismatch: generated with {} but parsed as {}",
+                        pid, parsed_pid,
+                    );
+                }
+            }
+        }
+
+        // PV-10: validate_fields rejects step names exceeding MAX_STEP_NAME_LEN
+        proptest! {
+            #[test]
+            fn oversized_step_name_rejected(extra in 1..500usize) {
+                let step_name = "x".repeat(MAX_STEP_NAME_LEN + extra);
+                let payload = ProgressPayload {
+                    status: ProgressStatus::Running,
+                    step_name,
+                    timestamp: now_ts(),
+                    recipe_name: None,
+                    pid: None,
+                    current_step: None,
+                    total_steps: None,
+                    elapsed_seconds: None,
+                };
+                let result = validate_fields(&payload);
+                prop_assert!(result.is_err(), "Step name with {} chars should be rejected", MAX_STEP_NAME_LEN + extra);
+                prop_assert!(
+                    matches!(result.unwrap_err(), ValidationError::StepNameTooLong(_)),
+                    "Should be StepNameTooLong error"
+                );
+            }
+        }
+
+        // PV-11: validate_age rejects timestamps far in the future
+        proptest! {
+            #[test]
+            fn future_timestamps_rejected(drift in 31.0..10000.0f64) {
+                let ts = now_ts() + drift;
+                let result = validate_age(ts);
+                prop_assert!(
+                    result.is_err(),
+                    "Timestamp {:.0}s in the future should be rejected",
+                    drift,
+                );
+            }
+        }
+
+        // PV-12: validate_age rejects stale timestamps
+        proptest! {
+            #[test]
+            fn stale_timestamps_rejected(age in 7201.0..100000.0f64) {
+                let ts = now_ts() - age;
+                let result = validate_age(ts);
+                prop_assert!(
+                    result.is_err(),
+                    "Timestamp {:.0}s old should be rejected",
+                    age,
+                );
+            }
+        }
+    }
 }
