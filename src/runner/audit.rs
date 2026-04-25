@@ -33,7 +33,9 @@ pub fn open_audit_log(audit_dir: &Path, recipe_name: &str) -> Option<std::fs::Fi
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+                if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+                    warn!("Failed to set audit log permissions to 0600: {}", e);
+                }
             }
             Some(f)
         }

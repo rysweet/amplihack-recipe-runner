@@ -489,8 +489,10 @@ impl<A: Adapter> RecipeRunner<A> {
             {
                 warn!("{} hook failed for step '{}': {}", hook_name, step_id, e);
             }
-            if let Some(path) = context_file {
-                let _ = std::fs::remove_file(&path);
+            if let Some(path) = context_file
+                && let Err(e) = std::fs::remove_file(&path)
+            {
+                log::debug!("Failed to clean up context file {}: {}", path.display(), e);
             }
         }
     }
@@ -1211,8 +1213,10 @@ impl<A: Adapter> RecipeRunner<A> {
             },
         };
         // Clean up temp context file
-        if let Some(path) = context_file {
-            let _ = std::fs::remove_file(&path);
+        if let Some(path) = context_file
+            && let Err(e) = std::fs::remove_file(&path)
+        {
+            log::debug!("Failed to clean up context file {}: {}", path.display(), e);
         }
         result
     }

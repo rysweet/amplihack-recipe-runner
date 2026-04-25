@@ -107,14 +107,18 @@ impl FileLogListener {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs_f64())
                     .unwrap_or(0.0);
-                let _ = writeln!(
+                if let Err(e) = writeln!(
                     f,
                     r#"{{"type":"recipe_start","recipe":"{}","ts":{:.3},"pid":{}}}"#,
                     recipe_name,
                     ts,
                     std::process::id()
-                );
-                let _ = f.flush();
+                ) {
+                    log::warn!("Failed to write recipe log header: {}", e);
+                }
+                if let Err(e) = f.flush() {
+                    log::warn!("Failed to flush recipe log header: {}", e);
+                }
                 eprintln!("[amplihack] recipe log: {}", path.display());
                 Some((
                     Self {
@@ -133,8 +137,12 @@ impl FileLogListener {
 
     fn write_event(&self, event: &str) {
         if let Ok(mut f) = self.file.lock() {
-            let _ = writeln!(f, "{}", event);
-            let _ = f.flush();
+            if let Err(e) = writeln!(f, "{}", event) {
+                log::warn!("Failed to write recipe log event: {}", e);
+            }
+            if let Err(e) = f.flush() {
+                log::warn!("Failed to flush recipe log: {}", e);
+            }
         }
     }
 
