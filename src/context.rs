@@ -1181,4 +1181,208 @@ mod tests {
         // The heredoc structure is preserved
         assert!(rendered.starts_with("cat <<'EOF'\n"));
     }
+
+    // ── Property-based tests (PR4: audit/proptest-parser-template) ──────
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Strategy: generate context data with string values
+        fn context_data() -> impl Strategy<Value = HashMap<String, Value>> {
+            proptest::collection::hash_map(
+                "[a-zA-Z][a-zA-Z0-9_]{0,10}",
+                "[a-zA-Z0-9 .,!?()]{0,50}".prop_map(|s| json!(s)),
+                0..=5,
+            )
+        }
+
+        // CT-1: render() never panics on arbitrary template strings
+        proptest! {
+            #[test]
+            fn render_no_panic(
+                template in "\\PC{0,200}",
+                data in context_data(),
+            ) {
+                let c = RecipeContext::new(data);
+                let _ = c.render(&template);
+            }
+        }
+
+        // CT-2: render_shell() never panics on arbitrary template strings
+        proptest! {
+            #[test]
+            fn render_shell_no_panic(
+                template in "\\PC{0,300}",
+                data in context_data(),
+            ) {
+                let c = RecipeContext::new(data);
+                let _ = c.render_shell(&template);
+            }
+        }
+
+        // CT-3: render() produces no {{var}} placeholders when all vars are defined
+        proptest! {
+            #[test]
+            fn render_resolves_all_defined_vars(
+                data in context_data(),
+            ) {
+                let c = RecipeContext::new(data.clone());
+                // Build template using only keys that exist in context
+                let template: String = data.keys()
+                    .take(3)
+                    .map(|k| format!("{{{{{}}}}}", k))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !template.is_empty() {
+                    let rendered = c.render(&template);
+                    // No unresolved {{...}} should remain for defined variables
+                    for key in data.keys().take(3) {
+                        let placeholder = format!("{{{{{}}}}}", key);
+                        prop_assert!(
+                            !rendered.contains(&placeholder),
+                            "Rendered output still contains placeholder {} in: {}",
+                            placeholder, rendered
+                        );
+                    }
+                }
+            }
+        }
+
+        // CT-4: shell_env_vars() produces valid env var names
+        proptest! {
+            #[test]
+            fn shell_env_var_names_are_valid(
+                data in context_data(),
+            ) {
+                let c = RecipeContext::new(data);
+                let env = c.shell_env_vars();
+                for key in env.keys() {
+                    if key.starts_with("RECIPE_VAR_") {
+                        for ch in key.chars() {
+                            prop_assert!(
+                                ch.is_ascii_alphanumeric() || ch == '_',
+                                "Invalid char '{}' in env var name: {}",
+                                ch, key
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // CT-5: render_shell outside heredocs wraps vars in double-quoted env refs
+        proptest! {
+            #[test]
+            fn render_shell_outside_heredoc_uses_quoted_env_refs(
+                var_name in "[a-zA-Z][a-zA-Z0-9_]{0,10}",
+                value in "[a-zA-Z0-9]{1,20}",
+            ) {
+                let data = vec![(var_name.as_str(), json!(value))];
+                let c = ctx(data);
+                let template = format!("echo {{{{{}}}}}", var_name);
+                let rendered = c.render_shell(&template);
+                let env_key = format!("RECIPE_VAR_{}", var_name);
+                let expected = format!("echo \"${}\"", env_key);
+                prop_assert_eq!(rendered, expected,
+                    "Outside heredoc: {{{}}} should become \"${}\"", var_name, env_key);
+            }
+        }
+
+        // CT-6: render_shell inside unquoted heredoc uses unquoted env refs
+        proptest! {
+            #[test]
+            fn render_shell_heredoc_body_uses_unquoted_refs(
+                var_name in "[a-zA-Z][a-zA-Z0-9_]{0,10}",
+                value in "[a-zA-Z0-9]{1,20}",
+            ) {
+                let data = vec![(var_name.as_str(), json!(value))];
+                let c = ctx(data);
+                let template = format!("cat <<EOF\n{{{{{}}}}}\nEOF", var_name);
+                let rendered = c.render_shell(&template);
+                let env_key = format!("RECIPE_VAR_{}", var_name);
+                let lines: Vec<&str> = rendered.split('\n').collect();
+                prop_assert_eq!(
+                    lines[1],
+                    &format!("${}", env_key),
+                    "Heredoc body: {{{}}} should become ${} (no quotes)",
+                    var_name, env_key,
+                );
+            }
+        }
+
+        // CT-7: render_shell inside quoted heredoc inlines actual values
+        proptest! {
+            #[test]
+            fn render_shell_quoted_heredoc_inlines_values(
+                var_name in "[a-zA-Z][a-zA-Z0-9_]{0,10}",
+                value in "[a-zA-Z0-9 ]{1,20}",
+            ) {
+                let data = vec![(var_name.as_str(), json!(value.clone()))];
+                let c = ctx(data);
+                let template = format!("cat <<'EOF'\n{{{{{}}}}}\nEOF", var_name);
+                let rendered = c.render_shell(&template);
+                let lines: Vec<&str> = rendered.split('\n').collect();
+                prop_assert_eq!(
+                    lines[1],
+                    &value,
+                    "Quoted heredoc body: {{{}}} should be inlined as '{}'",
+                    var_name, value,
+                );
+                prop_assert!(
+                    !rendered.contains("$RECIPE_VAR"),
+                    "Quoted heredoc must not contain $RECIPE_VAR refs",
+                );
+            }
+        }
+
+        // CT-8: legacy uppercase aliases are never produced for POSIX-reserved names
+        proptest! {
+            #[test]
+            fn no_alias_for_reserved_names(
+                reserved in prop_oneof![
+                    Just("path".to_string()),
+                    Just("home".to_string()),
+                    Just("user".to_string()),
+                    Just("shell".to_string()),
+                    Just("tmpdir".to_string()),
+                    Just("lang".to_string()),
+                    Just("term".to_string()),
+                ],
+            ) {
+                let c = ctx(vec![(Box::leak(reserved.clone().into_boxed_str()), json!("x"))]);
+                let env = c.shell_env_vars();
+                let upper = reserved.to_ascii_uppercase();
+                prop_assert!(
+                    !env.contains_key(&upper),
+                    "Must not produce alias {} for reserved name {}",
+                    upper, reserved,
+                );
+            }
+        }
+
+        // CT-9: dot-notation get() is consistent with nested JSON access
+        proptest! {
+            #[test]
+            fn dot_notation_consistent_with_nested_json(
+                key in "[a-zA-Z][a-zA-Z0-9]{0,5}",
+                subkey in "[a-zA-Z][a-zA-Z0-9]{0,5}",
+                value in "[a-zA-Z0-9]{1,10}",
+            ) {
+                let nested = json!({subkey.clone(): value.clone()});
+                let c = ctx(vec![(Box::leak(key.clone().into_boxed_str()), nested)]);
+                let dot_path = format!("{}.{}", key, subkey);
+                let result = c.get(&dot_path);
+                prop_assert!(
+                    result.is_some(),
+                    "get('{}') should find nested value", dot_path,
+                );
+                prop_assert_eq!(
+                    result.unwrap(),
+                    &json!(value),
+                    "get('{}') should return '{}'", dot_path, value,
+                );
+            }
+        }
+    }
 }

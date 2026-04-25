@@ -774,4 +774,120 @@ steps:
         assert!(result.is_ok());
         assert_eq!(result.unwrap().name, "test-recipe_v2.1 (beta)");
     }
+
+    // ── Property-based tests (PR4: audit/proptest-parser-template) ──────
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Strategy: generate syntactically valid minimal YAML recipes.
+        fn valid_recipe_yaml() -> impl Strategy<Value = String> {
+            (
+                "[a-zA-Z][a-zA-Z0-9_-]{0,30}", // recipe name
+                proptest::collection::vec(
+                    "[a-zA-Z][a-zA-Z0-9_-]{0,20}", // step IDs
+                    1..=5,
+                ),
+            )
+                .prop_map(|(name, step_ids)| {
+                    let mut yaml = format!("name: \"{}\"\nsteps:\n", name);
+                    // Deduplicate step IDs
+                    let mut seen = std::collections::HashSet::new();
+                    for (i, id) in step_ids.iter().enumerate() {
+                        let unique_id = if seen.insert(id.clone()) {
+                            id.clone()
+                        } else {
+                            format!("{}-dup{}", id, i)
+                        };
+                        yaml.push_str(&format!(
+                            "  - id: \"{}\"\n    command: \"echo step {}\"\n",
+                            unique_id, i
+                        ));
+                    }
+                    yaml
+                })
+        }
+
+        // P4-1: Parser never panics on arbitrary byte strings
+        proptest! {
+            #[test]
+            fn parser_no_panic_on_arbitrary_input(s in "\\PC{0,500}") {
+                let parser = RecipeParser::new();
+                let _ = parser.parse(&s);
+            }
+        }
+
+        // P4-2: Valid YAML recipes always parse successfully
+        proptest! {
+            #[test]
+            fn valid_recipes_always_parse(yaml in valid_recipe_yaml()) {
+                let parser = RecipeParser::new();
+                let result = parser.parse(&yaml);
+                prop_assert!(result.is_ok(), "Failed to parse valid YAML:\n{}\nError: {:?}", yaml, result.err());
+            }
+        }
+
+        // P4-3: Size limit is enforced — any input > MAX_YAML_SIZE_BYTES is rejected
+        proptest! {
+            #[test]
+            fn oversized_yaml_rejected(extra in 1..1000usize) {
+                let parser = RecipeParser::new();
+                let base = "name: test\nsteps:\n  - id: s1\n    command: echo ";
+                let padding = "x".repeat(MAX_YAML_SIZE_BYTES - base.len() + extra);
+                let yaml = format!("{}{}", base, padding);
+                prop_assert!(yaml.len() > MAX_YAML_SIZE_BYTES);
+                let result = parser.parse(&yaml);
+                prop_assert!(result.is_err(), "Oversized YAML should be rejected");
+                let err_msg = result.unwrap_err().to_string();
+                prop_assert!(err_msg.contains("too large"), "Error should mention size limit: {}", err_msg);
+            }
+        }
+
+        // P4-4: Parse then validate roundtrip — parsed recipes always validate without panic
+        proptest! {
+            #[test]
+            fn parse_then_validate_no_panic(yaml in valid_recipe_yaml()) {
+                let parser = RecipeParser::new();
+                if let Ok(recipe) = parser.parse(&yaml) {
+                    let _warnings = parser.validate(&recipe);
+                    // Also test validate_with_yaml path
+                    let _warnings_with_yaml = parser.validate_with_yaml(&recipe, Some(&yaml));
+                }
+            }
+        }
+
+        // P4-5: Duplicate step IDs are always detected
+        proptest! {
+            #[test]
+            fn duplicate_ids_detected(
+                name in "[a-zA-Z][a-zA-Z0-9]{0,10}",
+                dup_id in "[a-zA-Z][a-zA-Z0-9]{0,10}",
+            ) {
+                let yaml = format!(
+                    "name: \"{}\"\nsteps:\n  - id: \"{}\"\n    command: echo a\n  - id: \"{}\"\n    command: echo b\n",
+                    name, dup_id, dup_id
+                );
+                let parser = RecipeParser::new();
+                let result = parser.parse(&yaml);
+                prop_assert!(result.is_err(), "Duplicate IDs should be rejected");
+                let msg = result.unwrap_err().to_string();
+                prop_assert!(msg.contains("Duplicate"), "Error should mention duplicate: {}", msg);
+            }
+        }
+
+        // P4-6: Empty names are always rejected
+        proptest! {
+            #[test]
+            fn empty_name_rejected(step_cmd in "[a-zA-Z0-9 ]{1,30}") {
+                let yaml = format!(
+                    "name: \"\"\nsteps:\n  - id: \"s1\"\n    command: \"{}\"\n",
+                    step_cmd
+                );
+                let parser = RecipeParser::new();
+                let result = parser.parse(&yaml);
+                prop_assert!(result.is_err(), "Empty name should be rejected");
+            }
+        }
+    }
 }
