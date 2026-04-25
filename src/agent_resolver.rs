@@ -8,7 +8,7 @@ use regex::Regex;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-static SAFE_NAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_-]+$").unwrap());
+static SAFE_NAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_-]+$").expect("valid safe-name regex"));
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentResolveError {
