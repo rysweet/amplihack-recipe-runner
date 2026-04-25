@@ -1536,8 +1536,12 @@ steps:
         ) -> Result<String, anyhow::Error> {
             Ok(format!("Bash output for: {}", command))
         }
-        fn is_available(&self) -> bool { true }
-        fn name(&self) -> &str { "timeout-fail-mock" }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &str {
+            "timeout-fail-mock"
+        }
     }
 
     /// Verify that the timeout field from a recipe agent step propagates to
@@ -1555,7 +1559,10 @@ steps:
         let recipe = parser.parse(yaml).unwrap();
         let runner = RecipeRunner::new(TimeoutFailAdapter);
         let result = runner.execute(&recipe, None);
-        assert!(!result.success, "adapter timeout error should cause step failure");
+        assert!(
+            !result.success,
+            "adapter timeout error should cause step failure"
+        );
         assert_eq!(result.step_results[0].status, StepStatus::Failed);
         assert!(
             result.step_results[0].error.contains("timed out"),

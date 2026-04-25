@@ -531,11 +531,7 @@ impl CLISubprocessAdapter {
                         let _ = child.wait();
                         stop.store(true, Ordering::SeqCst);
                         let _ = heartbeat.join();
-                        anyhow::bail!(
-                            "Agent step timed out after {}s (killed pid {})",
-                            secs,
-                            pid
-                        );
+                        anyhow::bail!("Agent step timed out after {}s (killed pid {})", secs, pid);
                     }
                     None => std::thread::sleep(Duration::from_millis(250)),
                 }
