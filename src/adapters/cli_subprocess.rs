@@ -468,12 +468,7 @@ impl CLISubprocessAdapter {
                                             if line.is_empty() {
                                                 continue;
                                             }
-                                            eprintln!(
-                                                "  [{}] [{}] {}",
-                                                utc_hms(),
-                                                label,
-                                                line
-                                            );
+                                            eprintln!("  [{}] [{}] {}", utc_hms(), label, line);
                                         }
                                     }
                                 }
