@@ -1317,9 +1317,24 @@ mod tests {
         // avoids keywords (and, or, not, in, len, true, false, none).
         fn safe_var() -> impl Strategy<Value = String> {
             prop::sample::select(vec![
-                "status", "flag", "count", "name", "path", "val", "x", "y",
-                "task_type", "checkpoint", "scope", "items", "config",
-                "my_var", "result", "mode", "level", "step_id",
+                "status",
+                "flag",
+                "count",
+                "name",
+                "path",
+                "val",
+                "x",
+                "y",
+                "task_type",
+                "checkpoint",
+                "scope",
+                "items",
+                "config",
+                "my_var",
+                "result",
+                "mode",
+                "level",
+                "step_id",
             ])
             .prop_map(String::from)
         }
