@@ -172,7 +172,16 @@ mod tests {
 
     #[test]
     fn validate_rejects_path_traversal() {
-        for bad in ["", ".hidden", "..", "../escape", "a/b", "a\\b", "a..b", "a b"] {
+        for bad in [
+            "",
+            ".hidden",
+            "..",
+            "../escape",
+            "a/b",
+            "a\\b",
+            "a..b",
+            "a b",
+        ] {
             assert!(
                 validate_sub_recipe_name(bad).is_err(),
                 "must reject: {bad:?}"
@@ -221,7 +230,8 @@ mod tests {
         let dirs = anchored_search_dirs(None, &nested);
         let canonical_bundle = bundle.canonicalize().unwrap();
         assert!(
-            dirs.iter().any(|d| d.canonicalize().ok() == Some(canonical_bundle.clone())),
+            dirs.iter()
+                .any(|d| d.canonicalize().ok() == Some(canonical_bundle.clone())),
             "expected walk-up to find repo-root bundle; got: {dirs:?}"
         );
     }

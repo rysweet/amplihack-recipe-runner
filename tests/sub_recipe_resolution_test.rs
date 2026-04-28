@@ -93,7 +93,11 @@ fn sub_recipe_resolves_from_recipe_origin_dir() {
     assert!(
         result.success,
         "sub-recipe must resolve from recipe-origin dir; got: {:?}",
-        result.step_results.iter().map(|s| (&s.step_id, &s.status)).collect::<Vec<_>>()
+        result
+            .step_results
+            .iter()
+            .map(|s| (&s.step_id, &s.status))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -110,10 +114,13 @@ fn sub_recipe_resolves_from_working_dir_bundle() {
 
     let parser = RecipeParser::new();
     let recipe = parser.parse_file(&parent_path).unwrap();
-    let runner = RecipeRunner::new(NoopAdapter)
-        .with_working_dir(project_root.path().to_str().unwrap());
+    let runner =
+        RecipeRunner::new(NoopAdapter).with_working_dir(project_root.path().to_str().unwrap());
     let result = runner.execute(&recipe, None);
-    assert!(result.success, "sub-recipe must resolve via working_dir/amplifier-bundle/recipes");
+    assert!(
+        result.success,
+        "sub-recipe must resolve via working_dir/amplifier-bundle/recipes"
+    );
 }
 
 /// (c) Walk-up resolution: parent invoked from a subdir of a repo whose root
@@ -233,12 +240,8 @@ fn sub_recipe_symlink_escape_is_rejected() {
     // search dir (e.g. ~/.amplihack/amplifier-bundle/recipes), so that
     // resolution failure unambiguously tests the containment check.
     let unique = format!("sym-escape-{}", std::process::id());
-    let parent_yaml = format!(
-        "name: parent\nsteps:\n  - id: dispatch\n    recipe: \"{unique}\"\n"
-    );
-    let child_yaml = format!(
-        "name: {unique}\nsteps:\n  - id: noop\n    command: \"echo\"\n"
-    );
+    let parent_yaml = format!("name: parent\nsteps:\n  - id: dispatch\n    recipe: \"{unique}\"\n");
+    let child_yaml = format!("name: {unique}\nsteps:\n  - id: noop\n    command: \"echo\"\n");
 
     let bundle_dir = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();

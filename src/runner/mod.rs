@@ -1033,7 +1033,11 @@ impl<A: Adapter> RecipeRunner<A> {
         // are stable and documented; enumerate them here so the diagnostic
         // is complete without exposing internal helpers.
         if let Some(home) = dirs::home_dir() {
-            all.push(home.join(".amplihack").join("amplifier-bundle").join("recipes"));
+            all.push(
+                home.join(".amplihack")
+                    .join("amplifier-bundle")
+                    .join("recipes"),
+            );
             all.push(home.join(".amplihack").join(".claude").join("recipes"));
         }
         if let Ok(amplihack_home) = std::env::var("AMPLIHACK_HOME")
