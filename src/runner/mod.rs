@@ -6,6 +6,7 @@
 pub mod audit;
 pub mod json_parser;
 pub mod listeners;
+pub mod sub_recipe_paths;
 
 use crate::adapters::Adapter;
 use crate::agent_resolver::{AgentResolveError, AgentResolver};
@@ -46,6 +47,11 @@ pub struct RecipeRunner<A: Adapter> {
     max_depth: Cell<u32>,
     max_total_steps: Cell<u32>,
     recipe_search_dirs: Vec<PathBuf>,
+    /// Directory containing the top-level recipe file that was loaded at
+    /// runner entry. Used as the highest-priority anchor when resolving
+    /// sub-recipes referenced by `recipe:`-typed steps. See
+    /// [`sub_recipe_paths::anchored_search_dirs`].
+    recipe_origin_dir: Option<PathBuf>,
     audit_dir: Option<PathBuf>,
     active_tags: Vec<String>,
     exclude_tags: Vec<String>,
@@ -70,6 +76,7 @@ impl<A: Adapter> RecipeRunner<A> {
             max_depth: Cell::new(DEFAULT_MAX_DEPTH),
             max_total_steps: Cell::new(200),
             recipe_search_dirs: Vec::new(),
+            recipe_origin_dir: None,
             audit_dir: None,
             active_tags: Vec::new(),
             exclude_tags: Vec::new(),
@@ -106,6 +113,18 @@ impl<A: Adapter> RecipeRunner<A> {
     pub fn with_recipe_search_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
         log::debug!("RecipeRunner::with_recipe_search_dirs: {} dirs", dirs.len());
         self.recipe_search_dirs = dirs;
+        self
+    }
+
+    /// Set the directory containing the top-level recipe file (typically the
+    /// parent of the file path passed to `recipe-runner-rs`). This anchors
+    /// sub-recipe resolution to the same location the user invoked the
+    /// recipe from, so a sub-recipe co-located with its parent is found
+    /// even when `recipe-runner-rs`'s subprocess `cwd` differs from the
+    /// invocation directory. See issue rysweet/amplihack-rs#480.
+    pub fn with_recipe_origin_dir(mut self, dir: PathBuf) -> Self {
+        log::debug!("RecipeRunner::with_recipe_origin_dir: dir={:?}", dir);
+        self.recipe_origin_dir = Some(dir);
         self
     }
 
@@ -778,7 +797,11 @@ impl<A: Adapter> RecipeRunner<A> {
             .find_recipe_path(recipe_name)
             .ok_or_else(|| StepExecutionError {
                 step_id: step.id.clone(),
-                message: format!("Sub-recipe '{}' not found", recipe_name),
+                message: format!(
+                    "Sub-recipe '{}' not found. Searched the following directories (in order):\n{}",
+                    recipe_name,
+                    self.sub_recipe_search_diagnostic()
+                ),
             })?;
 
         let parser = RecipeParser::new();
@@ -943,25 +966,108 @@ impl<A: Adapter> RecipeRunner<A> {
 
     fn find_recipe_path(&self, name: &str) -> Option<String> {
         log::debug!("find_recipe_path: name={:?}", name);
-        // First try discovery module
+        // Security: reject names with path separators / parent-dir markers
+        // before any filesystem resolution. Failures bubble up as part of
+        // the Zero-BS diagnostic emitted by the caller.
+        if let Err(reason) = sub_recipe_paths::validate_sub_recipe_name(name) {
+            log::warn!(
+                "find_recipe_path: rejecting unsafe sub-recipe name {:?}: {}",
+                name,
+                reason
+            );
+            return None;
+        }
+
+        // 1. Explicit user-provided search dirs win first (matches the prior
+        //    behavior; preserves -R / --recipe-dir override semantics).
         if !self.recipe_search_dirs.is_empty()
             && let Some(path) = discovery::find_recipe(name, Some(&self.recipe_search_dirs))
         {
             return Some(path.display().to_string());
         }
 
-        // Fall back to discovery module default paths
+        // 2. Anchored search: recipe-local → working_dir → walk-up to .git.
+        //    These dirs are computed from the runner's `working_dir` (-C
+        //    arg) rather than the subprocess cwd, so resolution is stable
+        //    regardless of how `recipe-runner-rs` was invoked.
+        let anchored = sub_recipe_paths::anchored_search_dirs(
+            self.recipe_origin_dir.as_deref(),
+            Path::new(&self.working_dir),
+        );
+        if !anchored.is_empty()
+            && let Some(path) = discovery::find_recipe(name, Some(&anchored))
+        {
+            // Defense in depth: ensure the resolved file physically lives
+            // within one of the anchored roots, so a symlink in those roots
+            // cannot be used to read an arbitrary file off the filesystem.
+            if sub_recipe_paths::is_within_any(&path, &anchored) {
+                return Some(path.display().to_string());
+            }
+            log::warn!(
+                "find_recipe_path: rejecting candidate {} — resolves outside anchored search roots",
+                path.display()
+            );
+        }
+
+        // 3. Fall back to discovery module's default search dirs
+        //    (~/.amplihack, $AMPLIHACK_HOME, etc.).
         if let Some(path) = discovery::find_recipe(name, None) {
             return Some(path.display().to_string());
         }
 
-        // Finally check working directory
-        let filename = format!("{}.yaml", name);
-        let local = Path::new(&self.working_dir).join(&filename);
-        if local.is_file() {
-            return Some(local.display().to_string());
-        }
         None
+    }
+
+    /// Build the human-readable list of directories that were consulted while
+    /// trying to resolve a sub-recipe. Used to produce a Zero-BS diagnostic
+    /// when resolution fails — the user must be told exactly where we looked
+    /// (paths only; no raw env-var values, to avoid leaking secrets).
+    fn sub_recipe_search_diagnostic(&self) -> String {
+        let mut all: Vec<PathBuf> = Vec::new();
+        all.extend(self.recipe_search_dirs.iter().cloned());
+        all.extend(sub_recipe_paths::anchored_search_dirs(
+            self.recipe_origin_dir.as_deref(),
+            Path::new(&self.working_dir),
+        ));
+        // The discovery module's defaults are private, but their contents
+        // are stable and documented; enumerate them here so the diagnostic
+        // is complete without exposing internal helpers.
+        if let Some(home) = dirs::home_dir() {
+            all.push(home.join(".amplihack").join("amplifier-bundle").join("recipes"));
+            all.push(home.join(".amplihack").join(".claude").join("recipes"));
+        }
+        if let Ok(amplihack_home) = std::env::var("AMPLIHACK_HOME")
+            && !amplihack_home.is_empty()
+        {
+            all.push(
+                PathBuf::from(amplihack_home)
+                    .join("amplifier-bundle")
+                    .join("recipes"),
+            );
+        }
+        all.push(PathBuf::from("amplifier-bundle").join("recipes"));
+        all.push(
+            PathBuf::from("src")
+                .join("amplihack")
+                .join("amplifier-bundle")
+                .join("recipes"),
+        );
+        all.push(PathBuf::from(".claude").join("recipes"));
+
+        // De-dupe while preserving order.
+        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        let mut lines = String::new();
+        for d in all {
+            if seen.insert(d.clone()) {
+                lines.push_str("  - ");
+                lines.push_str(&d.display().to_string());
+                if !d.is_dir() {
+                    lines.push_str(" (does not exist)");
+                }
+                lines.push('\n');
+            }
+        }
+        lines
     }
 
     /// Retry an agent step with an explicit JSON-only instruction.
