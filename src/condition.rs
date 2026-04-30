@@ -1348,11 +1348,13 @@ mod tests {
             ("goal_already_met", json!("false")),
             ("commit_result", json!({"pushed": "true"})),
         ]);
-        assert!(evaluate_condition(
-            "goal_already_met != 'true' && commit_result.pushed == 'true'",
-            &data
-        )
-        .unwrap());
+        assert!(
+            evaluate_condition(
+                "goal_already_met != 'true' && commit_result.pushed == 'true'",
+                &data
+            )
+            .unwrap()
+        );
     }
 
     #[test]
