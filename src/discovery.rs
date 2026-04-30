@@ -48,6 +48,23 @@ fn default_search_dirs() -> Vec<PathBuf> {
             }
         }
     }
+
+    // AMPLIHACK_HOME: the user's amplihack installation root (set by the
+    // amplihack-cli launcher and consumed by recipes that need to locate
+    // bundled assets). Derived from this is the per-install recipe dir,
+    // which the CLI-side `amplihack recipe list` already searches.
+    // Including it here brings runtime sub-recipe resolution into parity
+    // with `recipe list` (issue rysweet/amplihack-rs#480).
+    if let Ok(amplihack_home) = std::env::var("AMPLIHACK_HOME")
+        && !amplihack_home.is_empty()
+    {
+        dirs.push(
+            PathBuf::from(amplihack_home)
+                .join("amplifier-bundle")
+                .join("recipes"),
+        );
+    }
+
     dirs.extend([
         // Installed amplihack bundle (current layout)
         home.join(".amplihack")

@@ -359,6 +359,16 @@ fn run() -> i32 {
         .with_recipe_search_dirs(cli.recipe_dirs.into_iter().map(PathBuf::from).collect())
         .with_tags(cli.include_tags, cli.exclude_tags);
 
+    // Anchor sub-recipe resolution to the directory holding the top-level
+    // recipe file. Without this, sub-recipes co-located with the parent
+    // recipe are unfindable when the runner subprocess's cwd differs from
+    // the invocation directory (issue rysweet/amplihack-rs#480).
+    if let Some(parent) = resolved_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        runner = runner.with_recipe_origin_dir(parent.to_path_buf());
+    }
+
     if let Some(ref audit_dir) = cli.audit_dir {
         runner = runner.with_audit_dir(audit_dir.clone());
     }
