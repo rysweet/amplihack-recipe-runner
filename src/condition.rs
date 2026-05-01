@@ -119,6 +119,14 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ConditionError> {
                 tokens.push(Token::Gt);
                 i += 1;
             }
+            '&' if i + 1 < chars.len() && chars[i + 1] == '&' => {
+                tokens.push(Token::And);
+                i += 2;
+            }
+            '|' if i + 1 < chars.len() && chars[i + 1] == '|' => {
+                tokens.push(Token::Or);
+                i += 2;
+            }
             '\'' | '"' => {
                 let quote = chars[i];
                 i += 1;
@@ -1305,6 +1313,57 @@ mod tests {
             "expected error message to mention token position, got: {}",
             msg
         );
+    }
+
+    #[test]
+    fn test_double_ampersand_operator_equivalent_to_and() {
+        // Regression for amplihack-rs step-16-create-draft-pr failure:
+        //   `goal_already_met != 'true' && commit_result.pushed == 'true'`
+        // produced "Parse error: unexpected character: '&'".
+        let data = ctx(&[("a", json!("yes")), ("b", json!("yes"))]);
+        assert!(evaluate_condition("a == 'yes' && b == 'yes'", &data).unwrap());
+        assert!(!evaluate_condition("a == 'yes' && b == 'no'", &data).unwrap());
+        assert_eq!(
+            evaluate_condition("a == 'yes' && b == 'yes'", &data).unwrap(),
+            evaluate_condition("a == 'yes' and b == 'yes'", &data).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_double_pipe_operator_equivalent_to_or() {
+        let data = ctx(&[("a", json!("no")), ("b", json!("yes"))]);
+        assert!(evaluate_condition("a == 'yes' || b == 'yes'", &data).unwrap());
+        assert!(!evaluate_condition("a == 'no2' || b == 'no2'", &data).unwrap());
+        assert_eq!(
+            evaluate_condition("a == 'yes' || b == 'yes'", &data).unwrap(),
+            evaluate_condition("a == 'yes' or b == 'yes'", &data).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_step16_create_draft_pr_condition() {
+        // Verbatim condition from amplifier-bundle/recipes/workflow-publish.yaml:215
+        // in rysweet/amplihack-rs.
+        let data = ctx(&[
+            ("goal_already_met", json!("false")),
+            ("commit_result", json!({"pushed": "true"})),
+        ]);
+        assert!(
+            evaluate_condition(
+                "goal_already_met != 'true' && commit_result.pushed == 'true'",
+                &data
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_single_ampersand_still_errors() {
+        // A bare `&` is still a parse error — only `&&` is recognized.
+        let data: HashMap<String, Value> = HashMap::new();
+        let err = evaluate_condition("a & b", &data).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("unexpected character"));
     }
 
     // ---- proptest fuzz tests ----
