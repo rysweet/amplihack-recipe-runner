@@ -73,8 +73,29 @@ pub(crate) fn is_rate_limit(text: &str) -> bool {
         "429",
         "too many requests",
     ];
-    let lower = text.to_lowercase();
-    SIGNALS.iter().any(|s| lower.contains(s))
+    let haystack = text.as_bytes();
+    SIGNALS
+        .iter()
+        .any(|s| contains_ignore_ascii_case(haystack, s.as_bytes()))
+}
+
+/// Case-insensitive ASCII substring search with no heap allocation.
+///
+/// Equivalent to `haystack.to_lowercase().contains(needle)` when `needle` is
+/// lowercase ASCII (all rate-limit signals are), but avoids allocating a full
+/// lowercase copy of `haystack` — which on the failure path can be multi-MB of
+/// captured agent output. Non-ASCII bytes (>= 0x80) never match an ASCII needle
+/// since `eq_ignore_ascii_case` only folds ASCII, so this is byte-exact safe.
+fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle))
 }
 
 /// Bounded exponential backoff delay for a rate-limit retry (#839).
@@ -737,9 +758,10 @@ impl CLISubprocessAdapter {
 
             // Only retry transient rate-limit failures (#839). Every other
             // failure (auth, logic, missing binary, ...) must fail fast, exactly
-            // as before — never blanket-retry all errors.
-            let combined = format!("{}\n{}", stdout, stderr_tail);
-            if is_rate_limit(&combined) {
+            // as before — never blanket-retry all errors. Scan stdout and the
+            // (small) stderr tail separately to avoid concatenating a fresh
+            // multi-MB copy of stdout just for detection.
+            if is_rate_limit(&stdout) || is_rate_limit(&stderr_tail) {
                 if attempt < total_executions {
                     let wait =
                         backoff_delay(attempt, rl_config.base_delay_secs, rl_config.max_delay_secs);
