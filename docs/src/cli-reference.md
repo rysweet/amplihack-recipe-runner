@@ -330,6 +330,20 @@ export RECIPE_RUNNER_RECIPE_DIRS="/opt/shared-recipes"
 recipe-runner-rs my-recipe --recipe-dir ./local-recipes
 ```
 
+### Rate-Limit Retry Knobs
+
+Agent steps automatically retry on transient provider rate limits with bounded
+exponential backoff. Tune the behavior with these variables (see
+[Rate-Limit Handling](rate-limit-handling.md) for full details):
+
+| Variable | Default | Description |
+|---|---|---|
+| `AMPLIHACK_RATELIMIT_MAX_RETRIES` | `5` | Max retries after the initial attempt. |
+| `AMPLIHACK_RATELIMIT_BASE_DELAY_SECS` | `60` | Base backoff window; `0` = instant. |
+| `AMPLIHACK_RATELIMIT_MAX_DELAY_SECS` | `600` | Cap on any single backoff delay. |
+| `AMPLIHACK_RATELIMIT_FALLBACK_AUTO_MODEL` | _unset_ | Force `--model auto` on the final retry. |
+| `AMPLIHACK_LAUNCHER_BINARY` | `amplihack` | Test-only launcher override. |
+
 ## Usage Examples
 
 ### Basic Usage

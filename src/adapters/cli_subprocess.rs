@@ -60,6 +60,115 @@ pub(crate) fn read_capped(path: &Path, max_bytes: usize) -> std::io::Result<Stri
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Detect transient agent rate-limit signals in captured output (#839).
+///
+/// Matches case-insensitively against the documented signal phrases. A match
+/// means the failure is transient and retryable; a non-match means the failure
+/// is a genuine logic/auth error that must keep failing fast (no retry).
+pub(crate) fn is_rate_limit(text: &str) -> bool {
+    const SIGNALS: [&str; 5] = [
+        "hit your rate limit",
+        "reset in",
+        "rate limit",
+        "429",
+        "too many requests",
+    ];
+    let haystack = text.as_bytes();
+    SIGNALS
+        .iter()
+        .any(|s| contains_ignore_ascii_case(haystack, s.as_bytes()))
+}
+
+/// Case-insensitive ASCII substring search with no heap allocation.
+///
+/// Equivalent to `haystack.to_lowercase().contains(needle)` when `needle` is
+/// lowercase ASCII (all rate-limit signals are), but avoids allocating a full
+/// lowercase copy of `haystack` — which on the failure path can be multi-MB of
+/// captured agent output. Non-ASCII bytes (>= 0x80) never match an ASCII needle
+/// since `eq_ignore_ascii_case` only folds ASCII, so this is byte-exact safe.
+fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle))
+}
+
+/// Bounded exponential backoff delay for a rate-limit retry (#839).
+///
+/// `retry` is the 1-based retry counter (the just-failed attempt number), so
+/// the first wait is `base_secs * 2^0 = base_secs`. The result is clamped to
+/// `cap_secs`. A `base_secs` of 0 yields an instant retry (used by tests).
+/// Arithmetic saturates so a hostile/large `retry` can never panic or overflow.
+pub(crate) fn backoff_delay(retry: u32, base_secs: u64, cap_secs: u64) -> Duration {
+    if base_secs == 0 {
+        return Duration::from_secs(0);
+    }
+    let exp = retry.saturating_sub(1);
+    // 1 << exp saturates to u64::MAX once exp >= 64 (checked_shl returns None).
+    let factor = 1u64.checked_shl(exp).unwrap_or(u64::MAX);
+    let delay = base_secs.saturating_mul(factor);
+    Duration::from_secs(delay.min(cap_secs))
+}
+
+/// Hard ceiling on `max_retries` so a hostile env value cannot create an
+/// unbounded execution budget.
+const RATELIMIT_MAX_RETRIES_CEILING: u32 = 100;
+
+/// Configuration for rate-limit retry/backoff, loaded from env (#839).
+///
+/// All knobs parse with a default fallback (never panic on bad input):
+/// - `AMPLIHACK_RATELIMIT_MAX_RETRIES` (default 5, clamped to <=100)
+/// - `AMPLIHACK_RATELIMIT_BASE_DELAY_SECS` (default 60; 0 => instant retries)
+/// - `AMPLIHACK_RATELIMIT_MAX_DELAY_SECS` (default 600; raised to >= base)
+/// - `AMPLIHACK_RATELIMIT_FALLBACK_AUTO_MODEL` (default off; non-empty => on)
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RateLimitConfig {
+    pub max_retries: u32,
+    pub base_delay_secs: u64,
+    pub max_delay_secs: u64,
+    pub fallback_auto_model: bool,
+}
+
+impl RateLimitConfig {
+    pub(crate) fn from_env() -> Self {
+        let max_retries = env::var("AMPLIHACK_RATELIMIT_MAX_RETRIES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(5)
+            .min(RATELIMIT_MAX_RETRIES_CEILING);
+
+        let base_delay_secs = env::var("AMPLIHACK_RATELIMIT_BASE_DELAY_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(60);
+
+        let mut max_delay_secs = env::var("AMPLIHACK_RATELIMIT_MAX_DELAY_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(600);
+        // Never let the cap invert the formula.
+        if max_delay_secs < base_delay_secs {
+            max_delay_secs = base_delay_secs;
+        }
+
+        let fallback_auto_model = env::var("AMPLIHACK_RATELIMIT_FALLBACK_AUTO_MODEL")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+
+        Self {
+            max_retries,
+            base_delay_secs,
+            max_delay_secs,
+            fallback_auto_model,
+        }
+    }
+}
+
 pub struct CLISubprocessAdapter {
     cli: String,
     working_dir: String,
@@ -253,7 +362,15 @@ impl CLISubprocessAdapter {
         system_prompt: Option<&str>,
         model: Option<&str>,
     ) -> Result<std::process::Command, anyhow::Error> {
-        let mut cmd = std::process::Command::new("amplihack");
+        // Launch via `amplihack <agent>` by default so the amplihack
+        // infrastructure (env setup, guards, hooks) is properly initialized.
+        // Tests inject a fake launcher via AMPLIHACK_LAUNCHER_BINARY; when
+        // unset, behavior is identical to the previous hardcoded "amplihack".
+        let launcher = env::var("AMPLIHACK_LAUNCHER_BINARY")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "amplihack".to_string());
+        let mut cmd = std::process::Command::new(launcher);
         cmd.arg(&self.cli);
         // All subsequent flags (-p, --model, --add-dir, --system-prompt, etc.)
         // are passthrough args for the underlying CLI (claude, copilot, codex).
@@ -386,218 +503,318 @@ impl CLISubprocessAdapter {
         // Ensure nested agent steps inherit the same agent binary preference
         child_env.insert("AMPLIHACK_AGENT_BINARY".to_string(), self.cli.clone());
 
-        // Create output log file in temp dir (not in repo to avoid polluting it)
-        let output_dir = output_log_dir.join(".recipe-output");
-        std::fs::create_dir_all(&output_dir)?;
-        let output_file = output_dir.join(format!(
-            "agent-step-{}.log",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        ));
+        // Bounded rate-limit retry loop (#839). Total executions = 1 + max_retries.
+        // Only transient rate-limit failures are retried with exponential
+        // backoff; every other failure still fails fast on the first attempt.
+        let rl_config = RateLimitConfig::from_env();
+        let total_executions = rl_config.max_retries.saturating_add(1);
 
-        let log_fh = std::fs::File::create(&output_file)?;
+        let mut attempt: u32 = 1;
+        loop {
+            let is_final_attempt = attempt == total_executions;
+            // On the final attempt, optionally force `--model auto` as the
+            // rate-limit message suggests (opt-in via env, overrides `model`).
+            let effective_model: Option<&str> = if is_final_attempt && rl_config.fallback_auto_model
+            {
+                Some("auto")
+            } else {
+                model
+            };
 
-        // Capture stderr to a persistent file in /tmp so that on failure
-        // we can include the agent's actual error output in the bail message
-        // (the temp_dir gets cleaned up before the error is reported).
-        let stderr_persist_dir = std::path::PathBuf::from("/tmp/amplihack-agent-stderr");
-        if let Err(e) = std::fs::create_dir_all(&stderr_persist_dir) {
-            log::warn!(
-                "Failed to create stderr persist dir {}: {}",
-                stderr_persist_dir.display(),
-                e
-            );
-        }
-        let stderr_file = stderr_persist_dir.join(format!(
-            "agent-stderr-{}.log",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        let stderr_fh = std::fs::File::create(&stderr_file)?;
+            // Create output log file in temp dir (not in repo to avoid polluting it).
+            // The attempt number keeps per-attempt filenames unique.
+            let output_dir = output_log_dir.join(".recipe-output");
+            std::fs::create_dir_all(&output_dir)?;
+            let output_file = output_dir.join(format!(
+                "agent-step-{}-{}.log",
+                attempt,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
 
-        // Always launch via `amplihack <agent>` so the amplihack infrastructure
-        // (env setup, guards, hooks) is properly initialized.
-        // The agent runs from the real repo/worktree cwd, not a temp dir.
-        let mut cmd = self.build_agent_command(
-            &output_dir,
-            &resolved_cwd,
-            &full_prompt,
-            system_prompt,
-            model,
-        )?;
-        let mut child = cmd
-            .current_dir(&resolved_cwd)
-            .env_remove("CLAUDECODE")
-            .envs(&child_env)
-            .stdout(log_fh)
-            .stderr(stderr_fh)
-            .spawn()
-            .with_context(|| format!("Failed to execute 'amplihack {}'", self.cli))?;
+            let log_fh = std::fs::File::create(&output_file)?;
 
-        // Background heartbeat thread for progress reporting.
-        // Monitors the output log file for growth and prints status updates
-        // to stderr.  When the agent is working but producing no stdout
-        // (common with `claude -p` which writes all output at the end),
-        // the heartbeat shows elapsed time and confirms the process is alive
-        // so the user (or parent orchestrator) does not mistake silence for
-        // a hang.  See issue #3266.
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_clone = stop.clone();
-        let output_path = output_file.clone();
-        let child_pid = child.id();
-        let agent_label = self.cli.clone();
-
-        let heartbeat = std::thread::spawn(move || {
-            // Issue #52: stream all new bytes between ticks (not just the
-            // last line) and prefix each line with `[HH:MM:SS] [agent:pid]`
-            // so operators can correlate with external logs.
-            let mut last_size = 0u64;
-            let mut last_activity = Instant::now();
-            let start_time = Instant::now();
-            let label = format!("amplihack:{}:{}", agent_label, child_pid);
-            while !stop_clone.load(Ordering::Relaxed) {
-                match std::fs::metadata(&output_path) {
-                    Ok(meta) => {
-                        let current_size = meta.len();
-                        if current_size > last_size {
-                            // Read the *new* bytes since last tick (file-seek
-                            // semantics) so no output is silently dropped.
-                            match std::fs::File::open(&output_path) {
-                                Ok(mut file) => {
-                                    use std::io::{Seek, SeekFrom};
-                                    if file.seek(SeekFrom::Start(last_size)).is_ok() {
-                                        let mut buf = String::new();
-                                        if let Err(e) = file.read_to_string(&mut buf) {
-                                            log::debug!("heartbeat: read_to_string failed: {}", e);
-                                        }
-                                        for line in buf.lines() {
-                                            if line.is_empty() {
-                                                continue;
-                                            }
-                                            eprintln!("  [{}] [{}] {}", utc_hms(), label, line);
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    log::debug!("heartbeat: cannot open output file: {}", e);
-                                }
-                            }
-                            last_size = current_size;
-                            last_activity = Instant::now();
-                        } else if last_activity.elapsed() > Duration::from_secs(30) {
-                            let total_elapsed = start_time.elapsed().as_secs();
-                            let idle_secs = last_activity.elapsed().as_secs();
-                            // Check if the child process is still alive via /proc
-                            let pid_alive =
-                                std::path::Path::new(&format!("/proc/{}", child_pid)).exists();
-                            if pid_alive {
-                                eprintln!(
-                                    "  [{}] [{}] ... working ({}s elapsed, {}s since last output)",
-                                    utc_hms(),
-                                    label,
-                                    total_elapsed,
-                                    idle_secs
-                                );
-                            } else {
-                                eprintln!(
-                                    "  [{}] [{}] ... waiting ({}s elapsed, process may be finishing)",
-                                    utc_hms(),
-                                    label,
-                                    total_elapsed
-                                );
-                            }
-                            last_activity = Instant::now();
-                        }
-                    }
-                    Err(e) => {
-                        log::debug!("heartbeat: cannot stat output file: {}", e);
-                    }
-                }
-                std::thread::sleep(Duration::from_secs(2));
-            }
-        });
-
-        // Enforce timeout: poll in a loop instead of blocking on wait().
-        let status = if let Some(secs) = timeout {
-            let deadline = Instant::now() + Duration::from_secs(secs);
-            loop {
-                match child.try_wait()? {
-                    Some(s) => break s,
-                    None if Instant::now() >= deadline => {
-                        log::warn!(
-                            "Agent step timed out after {}s — killing pid {}",
-                            secs,
-                            child.id()
-                        );
-                        let pid = child.id();
-                        child.kill().ok();
-                        // Reap the zombie so we don't leak processes.
-                        let _ = child.wait();
-                        stop.store(true, Ordering::SeqCst);
-                        let _ = heartbeat.join();
-                        anyhow::bail!("Agent step timed out after {}s (killed pid {})", secs, pid);
-                    }
-                    None => std::thread::sleep(Duration::from_millis(250)),
-                }
-            }
-        } else {
-            child.wait()?
-        };
-        stop.store(true, Ordering::SeqCst);
-        if let Err(e) = heartbeat.join() {
-            log::warn!("Heartbeat thread panicked: {:?}", e);
-        }
-
-        // Read agent output with retry and graceful fallback (#3740).
-        // The output file can be missing if: the temp dir was cleaned by the OS,
-        // the agent crashed before writing, or a race condition on fast exits.
-        // Bounded read at MAX_STEP_OUTPUT_BYTES + 1 (#47): protects against
-        // unbounded memory growth from runaway agent processes; the runner
-        // detects len > MAX and applies safe_truncate as the final policy step.
-        let max_out = crate::runner::MAX_STEP_OUTPUT_BYTES;
-        let stdout = match read_capped(&output_file, max_out) {
-            Ok(content) => content,
-            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Capture stderr to a persistent file in /tmp so that on failure
+            // we can include the agent's actual error output in the bail message
+            // (the temp_dir gets cleaned up before the error is reported).
+            let stderr_persist_dir = std::path::PathBuf::from("/tmp/amplihack-agent-stderr");
+            if let Err(e) = std::fs::create_dir_all(&stderr_persist_dir) {
                 log::warn!(
-                    "Agent output file not found: {}. Retrying after 1s...",
-                    output_file.display()
-                );
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                match read_capped(&output_file, max_out) {
-                    Ok(content) => {
-                        log::info!("Agent output file found on retry");
-                        content
-                    }
-                    Err(_) => {
-                        log::error!(
-                            "Agent output file missing after retry: {}. \
-                             Continuing with empty output instead of aborting.",
-                            output_file.display()
-                        );
-                        String::new()
-                    }
-                }
-            }
-            Err(e) => {
-                log::error!(
-                    "Failed to read agent output file {}: {}. Continuing with empty output.",
-                    output_file.display(),
+                    "Failed to create stderr persist dir {}: {}",
+                    stderr_persist_dir.display(),
                     e
                 );
-                String::new()
             }
-        };
+            let stderr_file = stderr_persist_dir.join(format!(
+                "agent-stderr-{}-{}.log",
+                attempt,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            let stderr_fh = std::fs::File::create(&stderr_file)?;
 
-        // temp_dir is dropped here, cleaning up automatically
+            // Always launch via `amplihack <agent>` so the amplihack infrastructure
+            // (env setup, guards, hooks) is properly initialized.
+            // The agent runs from the real repo/worktree cwd, not a temp dir.
+            let mut cmd = self.build_agent_command(
+                &output_dir,
+                &resolved_cwd,
+                &full_prompt,
+                system_prompt,
+                effective_model,
+            )?;
+            let mut child = cmd
+                .current_dir(&resolved_cwd)
+                .env_remove("CLAUDECODE")
+                .envs(&child_env)
+                .stdout(log_fh)
+                .stderr(stderr_fh)
+                .spawn()
+                .with_context(|| format!("Failed to execute 'amplihack {}'", self.cli))?;
 
-        if !status.success() {
+            // Background heartbeat thread for progress reporting.
+            // Monitors the output log file for growth and prints status updates
+            // to stderr.  When the agent is working but producing no stdout
+            // (common with `claude -p` which writes all output at the end),
+            // the heartbeat shows elapsed time and confirms the process is alive
+            // so the user (or parent orchestrator) does not mistake silence for
+            // a hang.  See issue #3266.
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_clone = stop.clone();
+            let output_path = output_file.clone();
+            let child_pid = child.id();
+            let agent_label = self.cli.clone();
+
+            let heartbeat = std::thread::spawn(move || {
+                // Issue #52: stream all new bytes between ticks (not just the
+                // last line) and prefix each line with `[HH:MM:SS] [agent:pid]`
+                // so operators can correlate with external logs.
+                let mut last_size = 0u64;
+                let mut last_activity = Instant::now();
+                let start_time = Instant::now();
+                let label = format!("amplihack:{}:{}", agent_label, child_pid);
+                while !stop_clone.load(Ordering::Relaxed) {
+                    match std::fs::metadata(&output_path) {
+                        Ok(meta) => {
+                            let current_size = meta.len();
+                            if current_size > last_size {
+                                // Read the *new* bytes since last tick (file-seek
+                                // semantics) so no output is silently dropped.
+                                match std::fs::File::open(&output_path) {
+                                    Ok(mut file) => {
+                                        use std::io::{Seek, SeekFrom};
+                                        if file.seek(SeekFrom::Start(last_size)).is_ok() {
+                                            let mut buf = String::new();
+                                            if let Err(e) = file.read_to_string(&mut buf) {
+                                                log::debug!(
+                                                    "heartbeat: read_to_string failed: {}",
+                                                    e
+                                                );
+                                            }
+                                            for line in buf.lines() {
+                                                if line.is_empty() {
+                                                    continue;
+                                                }
+                                                eprintln!("  [{}] [{}] {}", utc_hms(), label, line);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::debug!("heartbeat: cannot open output file: {}", e);
+                                    }
+                                }
+                                last_size = current_size;
+                                last_activity = Instant::now();
+                            } else if last_activity.elapsed() > Duration::from_secs(30) {
+                                let total_elapsed = start_time.elapsed().as_secs();
+                                let idle_secs = last_activity.elapsed().as_secs();
+                                // Check if the child process is still alive via /proc
+                                let pid_alive =
+                                    std::path::Path::new(&format!("/proc/{}", child_pid)).exists();
+                                if pid_alive {
+                                    eprintln!(
+                                        "  [{}] [{}] ... working ({}s elapsed, {}s since last output)",
+                                        utc_hms(),
+                                        label,
+                                        total_elapsed,
+                                        idle_secs
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "  [{}] [{}] ... waiting ({}s elapsed, process may be finishing)",
+                                        utc_hms(),
+                                        label,
+                                        total_elapsed
+                                    );
+                                }
+                                last_activity = Instant::now();
+                            }
+                        }
+                        Err(e) => {
+                            log::debug!("heartbeat: cannot stat output file: {}", e);
+                        }
+                    }
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            });
+
+            // Enforce timeout: poll in a loop instead of blocking on wait().
+            let status = if let Some(secs) = timeout {
+                let deadline = Instant::now() + Duration::from_secs(secs);
+                loop {
+                    match child.try_wait()? {
+                        Some(s) => break s,
+                        None if Instant::now() >= deadline => {
+                            log::warn!(
+                                "Agent step timed out after {}s — killing pid {}",
+                                secs,
+                                child.id()
+                            );
+                            let pid = child.id();
+                            child.kill().ok();
+                            // Reap the zombie so we don't leak processes.
+                            let _ = child.wait();
+                            stop.store(true, Ordering::SeqCst);
+                            let _ = heartbeat.join();
+                            anyhow::bail!(
+                                "Agent step timed out after {}s (killed pid {})",
+                                secs,
+                                pid
+                            );
+                        }
+                        None => std::thread::sleep(Duration::from_millis(250)),
+                    }
+                }
+            } else {
+                child.wait()?
+            };
+            stop.store(true, Ordering::SeqCst);
+            if let Err(e) = heartbeat.join() {
+                log::warn!("Heartbeat thread panicked: {:?}", e);
+            }
+
+            // Read agent output with retry and graceful fallback (#3740).
+            // The output file can be missing if: the temp dir was cleaned by the OS,
+            // the agent crashed before writing, or a race condition on fast exits.
+            // Bounded read at MAX_STEP_OUTPUT_BYTES + 1 (#47): protects against
+            // unbounded memory growth from runaway agent processes; the runner
+            // detects len > MAX and applies safe_truncate as the final policy step.
+            let max_out = crate::runner::MAX_STEP_OUTPUT_BYTES;
+            let stdout = match read_capped(&output_file, max_out) {
+                Ok(content) => content,
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    log::warn!(
+                        "Agent output file not found: {}. Retrying after 1s...",
+                        output_file.display()
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    match read_capped(&output_file, max_out) {
+                        Ok(content) => {
+                            log::info!("Agent output file found on retry");
+                            content
+                        }
+                        Err(_) => {
+                            log::error!(
+                                "Agent output file missing after retry: {}. \
+                             Continuing with empty output instead of aborting.",
+                                output_file.display()
+                            );
+                            String::new()
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!(
+                        "Failed to read agent output file {}: {}. Continuing with empty output.",
+                        output_file.display(),
+                        e
+                    );
+                    String::new()
+                }
+            };
+
+            // temp_dir is dropped after the loop exits, cleaning up automatically.
+
+            if status.success() {
+                // On success, remove the persistent stderr file.
+                if let Err(e) = std::fs::remove_file(&stderr_file) {
+                    log::debug!(
+                        "Failed to clean up stderr file {}: {}",
+                        stderr_file.display(),
+                        e
+                    );
+                }
+                return Ok(stdout.trim().to_string());
+            }
+
+            // Non-zero exit: read the stderr tail for diagnostics + detection.
             let stderr_tail = std::fs::read_to_string(&stderr_file)
                 .map(|s| crate::safe_tail(&s, 4000).to_string())
                 .unwrap_or_else(|_| String::from("(stderr file unreadable)"));
+
+            // Only retry transient rate-limit failures (#839). Every other
+            // failure (auth, logic, missing binary, ...) must fail fast, exactly
+            // as before — never blanket-retry all errors. Scan stdout and the
+            // (small) stderr tail separately to avoid concatenating a fresh
+            // multi-MB copy of stdout just for detection.
+            if is_rate_limit(&stdout) || is_rate_limit(&stderr_tail) {
+                if attempt < total_executions {
+                    let wait =
+                        backoff_delay(attempt, rl_config.base_delay_secs, rl_config.max_delay_secs);
+                    // Surface the backoff LOUDLY to stderr — never silent.
+                    eprintln!(
+                        "  [{}] [amplihack:{}] RATE LIMIT detected (exit {}); backing off {}s \
+                         then retrying (attempt {} of {})...",
+                        utc_hms(),
+                        self.cli,
+                        status.code().unwrap_or(-1),
+                        wait.as_secs(),
+                        attempt + 1,
+                        total_executions
+                    );
+                    log::warn!(
+                        "Rate limit detected on attempt {}/{}; waiting {}s before retry",
+                        attempt,
+                        total_executions,
+                        wait.as_secs()
+                    );
+                    // Remove this failed attempt's stderr file before retrying
+                    // so transient files don't leak across attempts.
+                    if let Err(e) = std::fs::remove_file(&stderr_file) {
+                        log::debug!(
+                            "Failed to clean up stderr file {}: {}",
+                            stderr_file.display(),
+                            e
+                        );
+                    }
+                    if !wait.is_zero() {
+                        std::thread::sleep(wait);
+                    }
+                    attempt += 1;
+                    continue;
+                }
+
+                // Retries exhausted on a persistent rate limit: fail explicitly
+                // with a clear message — never loop forever.
+                anyhow::bail!(
+                    "amplihack {} failed: rate limit persisted after {} retries \
+                     ({} total attempts, last exit {})\n--- stdout (tail) ---\n{}\n\
+                     --- stderr (tail) ---\n{}\n--- stderr-log: {}",
+                    self.cli,
+                    rl_config.max_retries,
+                    total_executions,
+                    status.code().unwrap_or(-1),
+                    crate::safe_tail(&stdout, 2000),
+                    stderr_tail,
+                    stderr_file.display()
+                );
+            }
+
+            // Non-rate-limit failure: preserve the existing fail-fast message.
             anyhow::bail!(
                 "amplihack {} failed (exit {})\n--- stdout (tail) ---\n{}\n--- stderr (tail) ---\n{}\n--- stderr-log: {}",
                 self.cli,
@@ -607,17 +824,6 @@ impl CLISubprocessAdapter {
                 stderr_file.display()
             );
         }
-
-        // On success, remove the persistent stderr file
-        if let Err(e) = std::fs::remove_file(&stderr_file) {
-            log::debug!(
-                "Failed to clean up stderr file {}: {}",
-                stderr_file.display(),
-                e
-            );
-        }
-
-        Ok(stdout.trim().to_string())
     }
 }
 
@@ -1486,5 +1692,525 @@ mod tests {
             args.iter().any(|a| a == "--allow-all-tools"),
             "empty AMPLIHACK_NO_ALLOW_ALL_TOOLS must not suppress --allow-all-tools"
         );
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Issue #839: rate-limit detection + bounded retry/backoff
+    //
+    // These tests are written test-first (TDD) and DEFINE the contract for
+    // the implementation. They exercise:
+    //   * `is_rate_limit(&str) -> bool`           — pure signal detector
+    //   * `backoff_delay(retry, base, cap)`        — pure backoff math
+    //   * `RateLimitConfig::from_env()`            — env-driven config
+    //   * `execute_agent_step_impl` retry loop     — integration behavior
+    //   * `AMPLIHACK_LAUNCHER_BINARY` override      — test-only launcher inject
+    //
+    // Backoff delays are made instant via AMPLIHACK_RATELIMIT_BASE_DELAY_SECS=0
+    // so the integration tests run fast.
+    // ════════════════════════════════════════════════════════════════════
+
+    // ── Unit: is_rate_limit signal detection (case-insensitive) ──────────
+
+    #[test]
+    fn test_is_rate_limit_detects_hit_your_rate_limit() {
+        // The canonical Copilot enterprise message from issue #839.
+        let msg = "You've hit your rate limit. Please wait for your limit to \
+                   reset in under a minute or switch to auto model to continue.";
+        assert!(is_rate_limit(msg));
+    }
+
+    #[test]
+    fn test_is_rate_limit_detects_all_signal_phrases() {
+        // Every documented signal phrase must match (case-insensitive).
+        let cases = [
+            "hit your rate limit",
+            "please wait for your limit to RESET IN under a minute",
+            "Rate Limit exceeded",
+            "HTTP 429 Too Many Requests",
+            "429",
+            "too many requests",
+        ];
+        for c in cases {
+            assert!(is_rate_limit(c), "expected rate-limit signal in: {c:?}");
+        }
+    }
+
+    #[test]
+    fn test_is_rate_limit_is_case_insensitive() {
+        assert!(is_rate_limit("HIT YOUR RATE LIMIT"));
+        assert!(is_rate_limit("hit your RATE limit"));
+    }
+
+    #[test]
+    fn test_is_rate_limit_rejects_non_rate_limit_failures() {
+        // Genuine failures that must NOT be treated as rate limits — these
+        // have to keep failing fast (no retry).
+        let non_matches = [
+            "error: authentication failed (401 Unauthorized)",
+            "panic: index out of bounds",
+            "command not found: amplihack",
+            "compilation error: expected `;`",
+            "permission denied",
+            "",
+        ];
+        for c in non_matches {
+            assert!(!is_rate_limit(c), "must NOT flag as rate-limit: {c:?}");
+        }
+    }
+
+    // ── Unit: backoff_delay exponential math with cap + saturation ───────
+
+    #[test]
+    fn test_backoff_delay_exponential_progression() {
+        // delay(retry) = min(base * 2^(retry-1), cap). retry starts at 1.
+        let base = 60u64;
+        let cap = 600u64;
+        assert_eq!(backoff_delay(1, base, cap).as_secs(), 60);
+        assert_eq!(backoff_delay(2, base, cap).as_secs(), 120);
+        assert_eq!(backoff_delay(3, base, cap).as_secs(), 240);
+        assert_eq!(backoff_delay(4, base, cap).as_secs(), 480);
+    }
+
+    #[test]
+    fn test_backoff_delay_respects_cap() {
+        // The 5th retry would be 960s but must be clamped to the 600s cap.
+        assert_eq!(backoff_delay(5, 60, 600).as_secs(), 600);
+        assert_eq!(backoff_delay(6, 60, 600).as_secs(), 600);
+    }
+
+    #[test]
+    fn test_backoff_delay_zero_base_is_instant() {
+        // base = 0 (used by tests) makes every wait instant.
+        for retry in 1..=5 {
+            assert_eq!(
+                backoff_delay(retry, 0, 600).as_secs(),
+                0,
+                "base=0 must yield zero delay for retry {retry}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_backoff_delay_saturates_without_overflow() {
+        // A hostile/large retry count must never panic or overflow; the
+        // result is always clamped to the cap.
+        let d = backoff_delay(1000, 60, 600);
+        assert_eq!(d.as_secs(), 600, "extreme retry must saturate to cap");
+    }
+
+    // ── Unit: RateLimitConfig::from_env defaults, overrides, clamping ────
+
+    #[test]
+    fn test_rate_limit_config_defaults_when_unset() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _g1 = EnvGuard::new("AMPLIHACK_RATELIMIT_MAX_RETRIES");
+        let _g2 = EnvGuard::new("AMPLIHACK_RATELIMIT_BASE_DELAY_SECS");
+        let _g3 = EnvGuard::new("AMPLIHACK_RATELIMIT_MAX_DELAY_SECS");
+        let _g4 = EnvGuard::new("AMPLIHACK_RATELIMIT_FALLBACK_AUTO_MODEL");
+        // SAFETY: test holds ENV_MUTEX to serialize env var access
+        unsafe {
+            env::remove_var("AMPLIHACK_RATELIMIT_MAX_RETRIES");
+            env::remove_var("AMPLIHACK_RATELIMIT_BASE_DELAY_SECS");
+            env::remove_var("AMPLIHACK_RATELIMIT_MAX_DELAY_SECS");
+            env::remove_var("AMPLIHACK_RATELIMIT_FALLBACK_AUTO_MODEL");
+        }
+
+        let cfg = RateLimitConfig::from_env();
+        assert_eq!(cfg.max_retries, 5);
+        assert_eq!(cfg.base_delay_secs, 60);
+        assert_eq!(cfg.max_delay_secs, 600);
+        assert!(!cfg.fallback_auto_model);
+    }
+
+    #[test]
+    fn test_rate_limit_config_reads_overrides() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _g1 = EnvGuard::new("AMPLIHACK_RATELIMIT_MAX_RETRIES");
+        let _g2 = EnvGuard::new("AMPLIHACK_RATELIMIT_BASE_DELAY_SECS");
+        let _g3 = EnvGuard::new("AMPLIHACK_RATELIMIT_MAX_DELAY_SECS");
+        let _g4 = EnvGuard::new("AMPLIHACK_RATELIMIT_FALLBACK_AUTO_MODEL");
+        // SAFETY: test holds ENV_MUTEX to serialize env var access
+        unsafe {
+            env::set_var("AMPLIHACK_RATELIMIT_MAX_RETRIES", "8");
+            env::set_var("AMPLIHACK_RATELIMIT_BASE_DELAY_SECS", "0");
+            env::set_var("AMPLIHACK_RATELIMIT_MAX_DELAY_SECS", "120");
+            env::set_var("AMPLIHACK_RATELIMIT_FALLBACK_AUTO_MODEL", "1");
+        }
+
+        let cfg = RateLimitConfig::from_env();
+        assert_eq!(cfg.max_retries, 8);
+        assert_eq!(cfg.base_delay_secs, 0);
+        assert_eq!(cfg.max_delay_secs, 120);
+        assert!(cfg.fallback_auto_model);
+    }
+
+    #[test]
+    fn test_rate_limit_config_unparseable_falls_back_to_default() {
+        // Garbage values must fall back to defaults, never panic or fail the run.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _g1 = EnvGuard::new("AMPLIHACK_RATELIMIT_MAX_RETRIES");
+        let _g2 = EnvGuard::new("AMPLIHACK_RATELIMIT_BASE_DELAY_SECS");
+        // SAFETY: test holds ENV_MUTEX to serialize env var access
+        unsafe {
+            env::set_var("AMPLIHACK_RATELIMIT_MAX_RETRIES", "not-a-number");
+            env::set_var("AMPLIHACK_RATELIMIT_BASE_DELAY_SECS", "");
+        }
+
+        let cfg = RateLimitConfig::from_env();
+        assert_eq!(cfg.max_retries, 5, "bad max_retries must use default 5");
+        assert_eq!(cfg.base_delay_secs, 60, "empty base must use default 60");
+    }
+
+    #[test]
+    fn test_rate_limit_config_clamps_max_retries_to_ceiling() {
+        // A hostile MAX_RETRIES must be clamped to the hard ceiling (100) so
+        // the worst-case execution budget stays bounded.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _g = EnvGuard::new("AMPLIHACK_RATELIMIT_MAX_RETRIES");
+        // SAFETY: test holds ENV_MUTEX to serialize env var access
+        unsafe {
+            env::set_var("AMPLIHACK_RATELIMIT_MAX_RETRIES", "100000");
+        }
+
+        let cfg = RateLimitConfig::from_env();
+        assert!(
+            cfg.max_retries <= 100,
+            "max_retries must be clamped to <=100, got {}",
+            cfg.max_retries
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_config_enforces_max_delay_ge_base() {
+        // If a user sets max_delay < base_delay, the config must raise max_delay
+        // to at least base_delay so the backoff formula never inverts.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _g1 = EnvGuard::new("AMPLIHACK_RATELIMIT_BASE_DELAY_SECS");
+        let _g2 = EnvGuard::new("AMPLIHACK_RATELIMIT_MAX_DELAY_SECS");
+        // SAFETY: test holds ENV_MUTEX to serialize env var access
+        unsafe {
+            env::set_var("AMPLIHACK_RATELIMIT_BASE_DELAY_SECS", "300");
+            env::set_var("AMPLIHACK_RATELIMIT_MAX_DELAY_SECS", "100");
+        }
+
+        let cfg = RateLimitConfig::from_env();
+        assert!(
+            cfg.max_delay_secs >= cfg.base_delay_secs,
+            "max_delay ({}) must be >= base_delay ({})",
+            cfg.max_delay_secs,
+            cfg.base_delay_secs
+        );
+    }
+
+    // ── Unit: AMPLIHACK_LAUNCHER_BINARY override in build_agent_command ──
+
+    #[test]
+    fn test_build_agent_command_uses_launcher_override() {
+        // When AMPLIHACK_LAUNCHER_BINARY is set, the spawned program must be
+        // that path instead of the hardcoded "amplihack".
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _g = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
+        // SAFETY: test holds ENV_MUTEX to serialize env var access
+        unsafe {
+            env::set_var("AMPLIHACK_LAUNCHER_BINARY", "/path/to/fake-launcher");
+        }
+
+        let adapter = CLISubprocessAdapter::new().with_binary("claude");
+        let tmp = tempfile::tempdir().unwrap();
+        let cmd = adapter
+            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .unwrap();
+        assert_eq!(
+            cmd.get_program().to_string_lossy(),
+            "/path/to/fake-launcher",
+            "launcher override must replace the 'amplihack' program"
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_defaults_to_amplihack_launcher() {
+        // Unset override => production behavior unchanged (program == amplihack).
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _g = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
+        // SAFETY: test holds ENV_MUTEX to serialize env var access
+        unsafe {
+            env::remove_var("AMPLIHACK_LAUNCHER_BINARY");
+        }
+
+        let adapter = CLISubprocessAdapter::new().with_binary("claude");
+        let tmp = tempfile::tempdir().unwrap();
+        let cmd = adapter
+            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .unwrap();
+        assert_eq!(cmd.get_program().to_string_lossy(), "amplihack");
+    }
+
+    // ── Integration helpers: fake launcher injection ────────────────────
+
+    /// Write an executable fake-launcher shell script at `path` (mode 0o755).
+    ///
+    /// The script increments a counter file (whose path is read from the
+    /// `AMPLIHACK_TEST_RL_COUNTER` env var it inherits) on every invocation,
+    /// then runs `body`. Inside `body`, `$c` is the 1-based invocation count
+    /// and `$@` are the passthrough launcher args.
+    fn write_fake_launcher(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             set -u\n\
+             f=\"$AMPLIHACK_TEST_RL_COUNTER\"\n\
+             c=$(cat \"$f\" 2>/dev/null || echo 0)\n\
+             c=$((c+1))\n\
+             echo \"$c\" > \"$f\"\n\
+             {body}\n"
+        );
+        std::fs::write(path, script).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    const RATE_LIMIT_MSG: &str = "You've hit your rate limit. Please wait for your limit to reset in under a minute \
+         or switch to auto model to continue.";
+
+    // (a) Transient rate limit: fail on attempts 1-2, succeed on attempt 3.
+    #[test]
+    fn test_execute_agent_step_retries_then_succeeds_on_rate_limit() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _g_launcher = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
+        let _g_base = EnvGuard::new("AMPLIHACK_RATELIMIT_BASE_DELAY_SECS");
+        let _g_retries = EnvGuard::new("AMPLIHACK_RATELIMIT_MAX_RETRIES");
+        let _g_counter = EnvGuard::new("AMPLIHACK_TEST_RL_COUNTER");
+        let _g_agent = EnvGuard::new("AMPLIHACK_AGENT_BINARY");
+
+        let script_dir = tempfile::tempdir().unwrap();
+        let counter_dir = tempfile::tempdir().unwrap();
+        let work_dir = tempfile::tempdir().unwrap();
+        let launcher = script_dir.path().join("fake-launcher.sh");
+        let counter_file = counter_dir.path().join("count");
+
+        write_fake_launcher(
+            &launcher,
+            &format!(
+                "if [ \"$c\" -le 2 ]; then\n\
+                 echo \"{RATE_LIMIT_MSG}\" 1>&2\n\
+                 exit 1\n\
+                 fi\n\
+                 echo \"AGENT_OK\"\n\
+                 exit 0",
+            ),
+        );
+
+        // SAFETY: test holds ENV_MUTEX to serialize env var access
+        unsafe {
+            env::set_var("AMPLIHACK_LAUNCHER_BINARY", launcher.to_str().unwrap());
+            env::set_var("AMPLIHACK_RATELIMIT_BASE_DELAY_SECS", "0");
+            env::set_var("AMPLIHACK_RATELIMIT_MAX_RETRIES", "5");
+            env::set_var("AMPLIHACK_TEST_RL_COUNTER", counter_file.to_str().unwrap());
+            env::set_var("AMPLIHACK_AGENT_BINARY", "claude");
+        }
+
+        let adapter = CLISubprocessAdapter::new();
+        let result = adapter.execute_agent_step_impl(
+            "hello",
+            None,
+            None,
+            work_dir.path().to_str().unwrap(),
+            Some(60),
+        );
+
+        assert!(
+            result.is_ok(),
+            "step must succeed after transient rate limits, got: {result:?}"
+        );
+        assert!(
+            result.unwrap().contains("AGENT_OK"),
+            "successful output must come from the final (successful) attempt"
+        );
+        let count: u32 = std::fs::read_to_string(&counter_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(count, 3, "expected 2 throttled attempts + 1 success");
+    }
+
+    // (b) Persistent rate limit: retries exhausted => clear, bounded error.
+    #[test]
+    fn test_execute_agent_step_exhausts_retries_on_persistent_rate_limit() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _g_launcher = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
+        let _g_base = EnvGuard::new("AMPLIHACK_RATELIMIT_BASE_DELAY_SECS");
+        let _g_retries = EnvGuard::new("AMPLIHACK_RATELIMIT_MAX_RETRIES");
+        let _g_counter = EnvGuard::new("AMPLIHACK_TEST_RL_COUNTER");
+        let _g_agent = EnvGuard::new("AMPLIHACK_AGENT_BINARY");
+
+        let script_dir = tempfile::tempdir().unwrap();
+        let counter_dir = tempfile::tempdir().unwrap();
+        let work_dir = tempfile::tempdir().unwrap();
+        let launcher = script_dir.path().join("fake-launcher.sh");
+        let counter_file = counter_dir.path().join("count");
+
+        // Always throttle.
+        write_fake_launcher(
+            &launcher,
+            &format!("echo \"{RATE_LIMIT_MSG}\" 1>&2\nexit 1"),
+        );
+
+        // SAFETY: test holds ENV_MUTEX to serialize env var access
+        unsafe {
+            env::set_var("AMPLIHACK_LAUNCHER_BINARY", launcher.to_str().unwrap());
+            env::set_var("AMPLIHACK_RATELIMIT_BASE_DELAY_SECS", "0");
+            env::set_var("AMPLIHACK_RATELIMIT_MAX_RETRIES", "3");
+            env::set_var("AMPLIHACK_TEST_RL_COUNTER", counter_file.to_str().unwrap());
+            env::set_var("AMPLIHACK_AGENT_BINARY", "claude");
+        }
+
+        let adapter = CLISubprocessAdapter::new();
+        let result = adapter.execute_agent_step_impl(
+            "hello",
+            None,
+            None,
+            work_dir.path().to_str().unwrap(),
+            Some(60),
+        );
+
+        let err = result.expect_err("persistent rate limit must eventually fail");
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            msg.contains("rate limit") && msg.contains("persist"),
+            "exhaustion error must clearly state the rate limit persisted, got: {err:#}"
+        );
+
+        // Bounded: exactly 1 initial attempt + 3 retries = 4 executions.
+        let count: u32 = std::fs::read_to_string(&counter_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(count, 4, "executions must be bounded to 1 + max_retries");
+    }
+
+    // (c) Non-rate-limit failure: must fail fast with NO retry.
+    #[test]
+    fn test_execute_agent_step_does_not_retry_non_rate_limit_failure() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _g_launcher = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
+        let _g_base = EnvGuard::new("AMPLIHACK_RATELIMIT_BASE_DELAY_SECS");
+        let _g_retries = EnvGuard::new("AMPLIHACK_RATELIMIT_MAX_RETRIES");
+        let _g_counter = EnvGuard::new("AMPLIHACK_TEST_RL_COUNTER");
+        let _g_agent = EnvGuard::new("AMPLIHACK_AGENT_BINARY");
+
+        let script_dir = tempfile::tempdir().unwrap();
+        let counter_dir = tempfile::tempdir().unwrap();
+        let work_dir = tempfile::tempdir().unwrap();
+        let launcher = script_dir.path().join("fake-launcher.sh");
+        let counter_file = counter_dir.path().join("count");
+
+        // Generic, non-rate-limit failure (e.g. an auth error).
+        write_fake_launcher(
+            &launcher,
+            "echo \"error: authentication failed (401 Unauthorized)\" 1>&2\nexit 2",
+        );
+
+        // SAFETY: test holds ENV_MUTEX to serialize env var access
+        unsafe {
+            env::set_var("AMPLIHACK_LAUNCHER_BINARY", launcher.to_str().unwrap());
+            env::set_var("AMPLIHACK_RATELIMIT_BASE_DELAY_SECS", "0");
+            env::set_var("AMPLIHACK_RATELIMIT_MAX_RETRIES", "5");
+            env::set_var("AMPLIHACK_TEST_RL_COUNTER", counter_file.to_str().unwrap());
+            env::set_var("AMPLIHACK_AGENT_BINARY", "claude");
+        }
+
+        let adapter = CLISubprocessAdapter::new();
+        let result = adapter.execute_agent_step_impl(
+            "hello",
+            None,
+            None,
+            work_dir.path().to_str().unwrap(),
+            Some(60),
+        );
+
+        let err = result.expect_err("non-rate-limit failure must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed (exit 2)"),
+            "must preserve the existing fail-fast error message, got: {msg}"
+        );
+        let count: u32 = std::fs::read_to_string(&counter_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(count, 1, "non-rate-limit failures must NOT be retried");
+    }
+
+    // (d) Optional --model auto fallback on the final attempt.
+    #[test]
+    fn test_execute_agent_step_falls_back_to_model_auto_on_final_attempt() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _g_launcher = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
+        let _g_base = EnvGuard::new("AMPLIHACK_RATELIMIT_BASE_DELAY_SECS");
+        let _g_retries = EnvGuard::new("AMPLIHACK_RATELIMIT_MAX_RETRIES");
+        let _g_fallback = EnvGuard::new("AMPLIHACK_RATELIMIT_FALLBACK_AUTO_MODEL");
+        let _g_counter = EnvGuard::new("AMPLIHACK_TEST_RL_COUNTER");
+        let _g_agent = EnvGuard::new("AMPLIHACK_AGENT_BINARY");
+
+        let script_dir = tempfile::tempdir().unwrap();
+        let counter_dir = tempfile::tempdir().unwrap();
+        let work_dir = tempfile::tempdir().unwrap();
+        let launcher = script_dir.path().join("fake-launcher.sh");
+        let counter_file = counter_dir.path().join("count");
+
+        // Throttle until the launcher is invoked with `--model auto`; only the
+        // final retry (with fallback enabled) supplies it, so success proves
+        // the fallback was applied on the last attempt.
+        write_fake_launcher(
+            &launcher,
+            &format!(
+                "has_auto=0\n\
+                 for a in \"$@\"; do if [ \"$a\" = \"auto\" ]; then has_auto=1; fi; done\n\
+                 if [ \"$has_auto\" = \"1\" ]; then\n\
+                 echo \"AGENT_OK_AUTO\"\n\
+                 exit 0\n\
+                 fi\n\
+                 echo \"{RATE_LIMIT_MSG}\" 1>&2\n\
+                 exit 1",
+            ),
+        );
+
+        // SAFETY: test holds ENV_MUTEX to serialize env var access
+        unsafe {
+            env::set_var("AMPLIHACK_LAUNCHER_BINARY", launcher.to_str().unwrap());
+            env::set_var("AMPLIHACK_RATELIMIT_BASE_DELAY_SECS", "0");
+            env::set_var("AMPLIHACK_RATELIMIT_MAX_RETRIES", "1");
+            env::set_var("AMPLIHACK_RATELIMIT_FALLBACK_AUTO_MODEL", "1");
+            env::set_var("AMPLIHACK_TEST_RL_COUNTER", counter_file.to_str().unwrap());
+            env::set_var("AMPLIHACK_AGENT_BINARY", "claude");
+        }
+
+        let adapter = CLISubprocessAdapter::new();
+        let result = adapter.execute_agent_step_impl(
+            "hello",
+            None,
+            None,
+            work_dir.path().to_str().unwrap(),
+            Some(60),
+        );
+
+        assert!(
+            result.is_ok(),
+            "final-attempt --model auto fallback must allow success, got: {result:?}"
+        );
+        assert!(
+            result.unwrap().contains("AGENT_OK_AUTO"),
+            "success must come from the --model auto fallback attempt"
+        );
+        let count: u32 = std::fs::read_to_string(&counter_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(count, 2, "1 throttled attempt + 1 auto-model retry");
     }
 }

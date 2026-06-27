@@ -7,6 +7,7 @@
 - [YAML Recipe Format](yaml-format.md)
 - [CLI Reference](cli-reference.md)
 - [Condition Language](conditions.md)
+- [Rate-Limit Handling](rate-limit-handling.md)
 
 # Examples
 - [Tutorials](examples-tutorials.md)
