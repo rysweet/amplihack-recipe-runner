@@ -1,0 +1,81 @@
+# cargo-deny configuration — supply-chain policy gate.
+#
+# Enforced in CI by the `security-audit` job (.github/workflows/ci.yml) via
+# `cargo deny check`, which runs all four checks below: advisories, bans,
+# licenses, and sources. Keep this file in sync with the dependency tree;
+# every entry that loosens a default carries a short justification.
+#
+# Schema reference: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Evaluate the dependency graph for the platforms we actually build and ship
+# (see release.yml build matrix). Platform-exclusive deps for other targets are
+# pruned, keeping the policy focused on code that can reach our binaries.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+all-features = true
+
+[advisories]
+# Use the RustSec advisory database (default). Any security vulnerability fails
+# the check. Yanked crates are treated as errors so a compromised/withdrawn
+# release cannot silently remain in Cargo.lock.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# No advisories are currently ignored. If a transitive advisory ever needs a
+# temporary waiver, add it here with an explicit reason and a tracking issue,
+# e.g. { id = "RUSTSEC-XXXX-NNNN", reason = "...", }.
+ignore = []
+
+[licenses]
+# Allow-list of OSI/FSF-approved permissive (and permissive-data) licenses
+# present in the dependency tree. Every crate must resolve to at least one of
+# these. Verified against `cargo deny list` for the committed Cargo.lock.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "0BSD",
+    "Zlib",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "Unlicense",
+]
+confidence-threshold = 0.9
+# Per-crate exceptions for licenses we accept only for a specific dependency
+# rather than blanket-allowing across the whole tree.
+exceptions = [
+    # option-ext is MPL-2.0 (weak, file-level copyleft). It is a transitive
+    # dependency pulled in via dirs -> dirs-sys and is not modified by us, so
+    # the file-level copyleft obligation is satisfied without affecting our
+    # MIT-licensed sources.
+    { crate = "option-ext", allow = ["MPL-2.0"] },
+]
+
+[licenses.private]
+# This crate (recipe-runner-rs) is published, so do not skip workspace members.
+ignore = false
+
+[bans]
+# Duplicate versions are reported but not fatal — they are common and churny in
+# transitive trees, and blocking on them would create constant CI noise.
+multiple-versions = "warn"
+# Wildcard ("*") version requirements are forbidden: they undermine
+# reproducibility. None exist today; this keeps it that way.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# Only crates.io is permitted. Unknown registries or git sources fail the
+# check, preventing a dependency from being silently sourced from an
+# untrusted/unaudited location.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
