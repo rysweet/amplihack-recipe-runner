@@ -5,75 +5,132 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Least-privilege default for GITHUB_TOKEN. Only the jobs that push commits or
-# tags / publish a release elevate to contents: write below.
+# Least-privilege default for GITHUB_TOKEN. Only the jobs that open the version
+# bump PR or push tags / publish a release elevate their permissions below.
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
+# Serialize release runs on a ref so two closely-spaced pushes cannot race the
+# tag push / GitHub Release publish step for the same version.
+concurrency:
+  group: auto-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  version-bump:
-    name: Auto-bump version
+  # Decide, for this push, whether to propose the next version bump (as a PR) or
+  # to build + publish the version currently in Cargo.toml. Exactly one of the
+  # two downstream paths runs, so we never push the bump commit to protected main.
+  plan:
+    name: Plan release action
     runs-on: ubuntu-latest
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
-    # Pushes the auto-bump commit back to main.
-    permissions:
-      contents: write
+    if: "!contains(github.event.head_commit.message, '[skip release]')"
     outputs:
-      version: ${{ steps.bump.outputs.version }}
-      sha: ${{ steps.bump.outputs.sha }}
+      action: ${{ steps.plan.outputs.action }}
+      version: ${{ steps.plan.outputs.version }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Bump patch version
-        id: bump
-        run: |
-          set -euo pipefail
-          CURRENT=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          IFS='.' read -r MAJOR MINOR PATCH <<< "${CURRENT}"
-
-          LATEST_TAG=$(gh release list --limit 50 --json tagName --jq '.[].tagName' \
-            | grep -E "^v${MAJOR}\.${MINOR}\.[0-9]+$" \
-            | sort -t. -k3 -n -r \
-            | head -1 || true)
-
-          if [ -n "${LATEST_TAG}" ]; then
-            LATEST_PATCH=$(echo "${LATEST_TAG}" | sed "s/^v${MAJOR}\.${MINOR}\.\([0-9]*\)/\1/")
-            NEW_PATCH=$((LATEST_PATCH + 1))
-          else
-            NEW_PATCH="${PATCH}"
-          fi
-
-          NEW_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
-
-          if [ "${NEW_VERSION}" = "${CURRENT}" ]; then
-            echo "version=${CURRENT}" >> "$GITHUB_OUTPUT"
-            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          sed -i "s/^version = \"${CURRENT}\"/version = \"${NEW_VERSION}\"/" Cargo.toml
-          cargo generate-lockfile 2>/dev/null || true
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock
-          git commit -m "chore: auto-bump version ${CURRENT} → ${NEW_VERSION} [skip ci]"
-          git push
-
-          echo "version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Decide release action
+        id: plan
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          line="$(grep -m1 '^version' Cargo.toml)"
+          current="${line#*\"}"
+          current="${current%\"*}"
+          echo "Current Cargo.toml version: ${current}"
+
+          if gh release view "v${current}" >/dev/null 2>&1; then
+            IFS='.' read -r major minor patch <<< "${current}"
+            next="${major}.${minor}.$((patch + 1))"
+            echo "Release v${current} already exists -> propose bump to ${next} via PR"
+            {
+              echo "action=bump"
+              echo "version=${next}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "Release v${current} does not exist -> build and publish it"
+            {
+              echo "action=release"
+              echo "version=${current}"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+  # Bump path: open (or refresh) a pull request that bumps the crate version.
+  # Merging it produces the follow-up push to main that triggers the release path.
+  bump-pr:
+    name: Open version-bump PR
+    needs: plan
+    if: needs.plan.outputs.action == 'bump'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply version bump
+        env:
+          NEW_VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          line="$(grep -m1 '^version' Cargo.toml)"
+          current="${line#*\"}"
+          current="${current%\"*}"
+
+          sed -i "s/^version = \"${current}\"/version = \"${NEW_VERSION}\"/" Cargo.toml
+
+          # Surgically update the crate's own entry in Cargo.lock, leaving all
+          # dependency versions untouched so the bump PR stays minimal.
+          if [ -f Cargo.lock ]; then
+            awk -v new="${NEW_VERSION}" '
+              $0 == "name = \"recipe-runner-rs\"" {
+                print
+                if ((getline nextline) > 0) {
+                  sub(/version = ".*"/, "version = \"" new "\"", nextline)
+                  print nextline
+                }
+                next
+              }
+              { print }
+            ' Cargo.lock > Cargo.lock.tmp && mv Cargo.lock.tmp Cargo.lock
+          fi
+
+      - name: Create version-bump pull request
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: bump version to ${{ needs.plan.outputs.version }}"
+          branch: chore/auto-bump-${{ needs.plan.outputs.version }}
+          delete-branch: true
+          base: main
+          title: "chore: release v${{ needs.plan.outputs.version }}"
+          labels: |
+            automated
+            release
+          body: |
+            Automated version bump proposed by the **Auto Release** workflow.
+
+            Merging this PR sets the crate version to
+            `${{ needs.plan.outputs.version }}`. The follow-up push to `main` then
+            triggers the build + tag + GitHub Release for
+            `v${{ needs.plan.outputs.version }}`.
+
+            This replaces the previous flow that pushed the bump commit directly to
+            the protected `main` branch (which failed with `GH006`). See #126.
 
   build:
     name: Build ${{ matrix.target }}
-    needs: version-bump
+    needs: plan
+    if: needs.plan.outputs.action == 'release'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -93,8 +150,6 @@ jobs:
             gnu_cross_toolchain: false
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ needs.version-bump.outputs.sha }}
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: ${{ matrix.target }}
@@ -107,11 +162,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-          echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> "$GITHUB_ENV"
-          echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-          echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
+          {
+            echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
+            echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++"
+            echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar"
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
+            echo "PKG_CONFIG_ALLOW_CROSS=1"
+          } >> "$GITHUB_ENV"
 
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
@@ -120,7 +177,7 @@ jobs:
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/recipe-runner-rs dist/ 2>/dev/null || true
-          cd dist && tar czf ../recipe-runner-rs-${{ matrix.target }}.tar.gz *
+          cd dist && tar czf ../recipe-runner-rs-${{ matrix.target }}.tar.gz -- *
           cd .. && sha256sum recipe-runner-rs-${{ matrix.target }}.tar.gz > recipe-runner-rs-${{ matrix.target }}.tar.gz.sha256
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -133,15 +190,15 @@ jobs:
 
   release:
     name: Create Release
-    needs: [version-bump, build]
+    needs: [plan, build]
+    if: needs.plan.outputs.action == 'release'
     runs-on: ubuntu-latest
-    # Pushes the version tag and creates the GitHub Release.
+    # Pushes the version tag (refs/tags/*, not the protected branch) and
+    # creates the GitHub Release.
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ needs.version-bump.outputs.sha }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -153,12 +210,12 @@ jobs:
           find artifacts -name '*.tar.gz' -exec cp {} release-assets/ \;
           find artifacts -name '*.sha256' -exec cp {} release-assets/ \;
 
-      - name: Create tag and release
+      - name: Create tag and push
         run: |
-          TAG="v${{ needs.version-bump.outputs.version }}"
+          TAG="v${{ needs.plan.outputs.version }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "${TAG}" -m "Release ${TAG}" "${{ needs.version-bump.outputs.sha }}" || true
+          git tag -a "${TAG}" -m "Release ${TAG}" "${GITHUB_SHA}" || true
           git push origin "${TAG}" || true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -166,8 +223,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          tag_name: v${{ needs.version-bump.outputs.version }}
-          name: "recipe-runner-rs v${{ needs.version-bump.outputs.version }}"
+          tag_name: v${{ needs.plan.outputs.version }}
+          name: "recipe-runner-rs v${{ needs.plan.outputs.version }}"
           files: release-assets/*
           generate_release_notes: true
           body: |
@@ -175,7 +232,7 @@ jobs:
 
             ```bash
             # Linux x86_64
-            curl -fsSL https://github.com/rysweet/amplihack-recipe-runner/releases/download/v${{ needs.version-bump.outputs.version }}/recipe-runner-rs-x86_64-unknown-linux-gnu.tar.gz | tar xz -C ~/.local/bin/
+            curl -fsSL https://github.com/rysweet/amplihack-recipe-runner/releases/download/v${{ needs.plan.outputs.version }}/recipe-runner-rs-x86_64-unknown-linux-gnu.tar.gz | tar xz -C ~/.local/bin/
 
             # Or via cargo
             cargo install --git https://github.com/rysweet/amplihack-recipe-runner
