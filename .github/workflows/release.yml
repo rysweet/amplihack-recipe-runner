@@ -13,6 +13,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Serialize release runs on a ref so two closely-spaced pushes cannot race the
+# tag push / GitHub Release publish step for the same version.
+concurrency:
+  group: auto-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # Decide, for this push, whether to propose the next version bump (as a PR) or
   # to build + publish the version currently in Cargo.toml. Exactly one of the
