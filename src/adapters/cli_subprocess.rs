@@ -1022,6 +1022,16 @@ impl Adapter for CLISubprocessAdapter {
         // child env with the per-step extra_env and enforce an aggregate byte
         // budget BEFORE spawning, so no arm can hit `execve` `E2BIG`. Computed
         // once and applied to all four spawn arms below.
+        //
+        // CRITICAL: every arm calls `.env_clear()` before `.envs(&bounded)`.
+        // `Command` inherits the parent (recipe-runner) process env by DEFAULT,
+        // and `.envs()` only ADDS/overrides keys — it never removes inherited
+        // ones. Without `env_clear`, the oversized entries that `build_child_env`
+        // and `bounded_env` deliberately dropped would leak straight back in via
+        // inheritance, re-inflating envp past ARG_MAX and re-triggering the very
+        // E2BIG this guards against. `bounded` is the COMPLETE authoritative env
+        // (build_child_env already captured all of `env::vars()`, sanitized, and
+        // excludes CLAUDECODE), so clearing first loses nothing legitimate.
         let extra_pairs: Vec<(String, String)> = extra_env
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -1057,28 +1067,28 @@ impl Adapter for CLISubprocessAdapter {
                     tf.path().to_str().unwrap_or(""),
                 ])
                 .current_dir(effective_dir)
-                .env_remove("CLAUDECODE")
+                .env_clear()
                 .envs(bounded.iter().map(|(k, v)| (k, v)))
                 .output()
                 .with_context(|| "Failed to execute file-backed bash step with timeout")?,
             (Some(tf), None) => Command::new("/bin/bash")
                 .arg(tf.path())
                 .current_dir(effective_dir)
-                .env_remove("CLAUDECODE")
+                .env_clear()
                 .envs(bounded.iter().map(|(k, v)| (k, v)))
                 .output()
                 .with_context(|| "Failed to execute file-backed bash step")?,
             (None, Some(secs)) => Command::new("timeout")
                 .args([&secs.to_string(), "/bin/bash", "-c", command])
                 .current_dir(effective_dir)
-                .env_remove("CLAUDECODE")
+                .env_clear()
                 .envs(bounded.iter().map(|(k, v)| (k, v)))
                 .output()
                 .with_context(|| "Failed to execute bash step with timeout")?,
             (None, None) => Command::new("/bin/bash")
                 .args(["-c", command])
                 .current_dir(effective_dir)
-                .env_remove("CLAUDECODE")
+                .env_clear()
                 .envs(bounded.iter().map(|(k, v)| (k, v)))
                 .output()
                 .with_context(|| "Failed to execute bash step")?,
@@ -2596,5 +2606,49 @@ mod tests {
             "allow-list var must survive trim and be visible under set -u: {result:?}"
         );
         assert_eq!(result.unwrap(), "ship_issue_130");
+    }
+
+    // ── T4: env_clear — dropped inherited vars must NOT leak via inheritance ─
+
+    #[test]
+    fn test_execute_bash_step_env_clear_drops_oversized_inherited_leak() {
+        // Issue #130 (deeper cause): `Command` inherits the parent process env
+        // by DEFAULT and `.envs()` only overrides keys. `build_child_env` /
+        // `bounded_env` drop oversized inherited entries, but WITHOUT
+        // `.env_clear()` those entries leak straight back in via inheritance,
+        // re-inflating envp and re-triggering `execve` E2BIG. This test sets a
+        // REAL oversized var in the runner's own process env, then asserts the
+        // spawned bash step (a) succeeds and (b) does NOT see the oversized var
+        // — proving the child env is exactly `bounded`, not `bounded` merged on
+        // top of the inherited (bloated) parent env. Fails before the
+        // `env_clear` fix (var is inherited → visible), passes after.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _g = EnvGuard::new("OVERSIZED_INHERITED_LEAK_130");
+        // > MAX_ENV_VALUE_BYTES so build_child_env drops it; each string stays
+        // < MAX_ARG_STRLEN (128 KiB) so we exercise the aggregate/inheritance
+        // path, not the per-string limit.
+        let big = "z".repeat(MAX_ENV_VALUE_BYTES + 8 * 1024);
+        // SAFETY: test holds ENV_MUTEX to serialize env var access
+        unsafe {
+            env::set_var("OVERSIZED_INHERITED_LEAK_130", &big);
+        }
+
+        let adapter = CLISubprocessAdapter::new();
+        let empty: HashMap<String, String> = HashMap::new();
+        let result = adapter.execute_bash_step(
+            "if [ -n \"${OVERSIZED_INHERITED_LEAK_130:-}\" ]; then echo LEAK; else echo ok; fi",
+            ".",
+            None,
+            &empty,
+        );
+        assert!(
+            result.is_ok(),
+            "dropped oversized inherited var must not re-inflate envp (E2BIG #130): {result:?}"
+        );
+        assert_eq!(
+            result.unwrap(),
+            "ok",
+            "oversized inherited var must be cleared from the child env, not leaked via inheritance"
+        );
     }
 }
