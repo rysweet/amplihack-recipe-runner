@@ -9,6 +9,17 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::LazyLock;
 
+/// Aggregate byte budget (~1.5 MB) for a bash step's environment block.
+///
+/// `execve(2)` charges argv **and** envp together against `ARG_MAX` (typically
+/// ~2 MiB on Linux). This budget reserves ~500 KiB of headroom below that
+/// ceiling for argv and base process strings. It is the single source of truth
+/// shared by the context layer ([`RecipeContext::shell_env_for_step`], which
+/// spills to a file-backed context above this size) and the subprocess adapter
+/// (`cli_subprocess::MAX_TOTAL_ENV_BYTES`, which re-exports this value), so the
+/// same budget is enforced at both layers with no risk of drift (#130).
+pub const MAX_ENV_BYTES: usize = 1_500_000;
+
 static TEMPLATE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\{\{([a-zA-Z0-9_.\-]+)\}\}").expect("valid template placeholder regex")
 });
@@ -344,7 +355,6 @@ impl RecipeContext {
     /// Returns (env_vars, Option<temp_file_path>). The caller must clean up
     /// the temp file after the step completes.
     pub fn shell_env_for_step(&self) -> (HashMap<String, String>, Option<std::path::PathBuf>) {
-        const MAX_ENV_BYTES: usize = 1_500_000; // ~1.5MB, well under 2MB OS limit
         let env_vars = self.shell_env_vars();
         let total_size: usize = env_vars.iter().map(|(k, v)| k.len() + v.len() + 1).sum();
 

@@ -1,3 +1,7 @@
 /target/
 /worktrees/
 .claude/runtime/
+
+# amplihack tooling state (blarify staleness markers, local caches)
+.amplihack/blarify_stale
+.amplihack/*.cache

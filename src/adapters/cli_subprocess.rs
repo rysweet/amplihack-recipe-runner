@@ -51,9 +51,10 @@ const FILE_BACKED_PROMPT_CONTINUATION_NOTE: &str = "\n\nIMPORTANT: Additional ta
 /// at `execve` before the script ever runs (observed at late workflow steps
 /// such as `step-19d-verification-gate`).
 ///
-/// 1.5 MB mirrors `context.rs::MAX_ENV_BYTES` and reserves ~500 KB of headroom
-/// below the ~2 MiB ceiling for argv and the pre-existing base environment.
-const MAX_TOTAL_ENV_BYTES: usize = 1_500_000;
+/// 1.5 MB re-exports the shared [`crate::context::MAX_ENV_BYTES`] budget (single
+/// source of truth — no drift) and reserves ~500 KB of headroom below the ~2 MiB
+/// ceiling for argv and the pre-existing base environment.
+const MAX_TOTAL_ENV_BYTES: usize = crate::context::MAX_ENV_BYTES;
 
 /// Per-value cap (96 KiB) applied to INHERITED `env::vars()` entries in
 /// [`CLISubprocessAdapter::build_child_env`]. Mirrors the per-value cap used by
