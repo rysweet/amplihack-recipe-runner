@@ -41,6 +41,119 @@ const MAX_INLINE_AGENT_PROMPT_BYTES: usize = 32 * 1024;
 const FILE_BACKED_INLINE_PROMPT_BYTES: usize = 8 * 1024;
 const FILE_BACKED_PROMPT_CONTINUATION_NOTE: &str = "\n\nIMPORTANT: Additional task instructions, output requirements, and context continue in the appended system prompt. Treat that appended content as part of this same request and follow it fully.";
 
+/// Aggregate byte budget for a child process's environment block (#130).
+///
+/// `execve(2)` charges argv **and** envp together against `ARG_MAX`
+/// (`min(sysconf(_SC_ARG_MAX), stack_rlimit/4)` — typically ~2 MiB on Linux;
+/// per-string `MAX_ARG_STRLEN` is a hard 128 KiB). Passing the full inherited
+/// env plus RECIPE_VAR_* context to `/bin/bash` can push envp past this limit
+/// even for a tiny script body, producing `Argument list too long (os error 7)`
+/// at `execve` before the script ever runs (observed at late workflow steps
+/// such as `step-19d-verification-gate`).
+///
+/// 1.5 MB mirrors `context.rs::MAX_ENV_BYTES` and reserves ~500 KB of headroom
+/// below the ~2 MiB ceiling for argv and the pre-existing base environment.
+const MAX_TOTAL_ENV_BYTES: usize = 1_500_000;
+
+/// Per-value cap (96 KiB) applied to INHERITED `env::vars()` entries in
+/// [`CLISubprocessAdapter::build_child_env`]. Mirrors the per-value cap used by
+/// the context layer and stays well under `MAX_ARG_STRLEN` (128 KiB). Oversized
+/// inherited values are dropped (not truncated) from the child env; their data
+/// remains reachable via the context file + `{{placeholder}}` substitution.
+const MAX_ENV_VALUE_BYTES: usize = 96 * 1024;
+
+/// Environment variables that must NEVER be dropped by the aggregate trimmer.
+///
+/// `PATH`/`HOME` guard binary resolution and `$HOME` expansion; the rest are
+/// required control scalars scripts reference (often under `set -u`). Matched by
+/// exact name here or by fixed prefix in [`ENV_ALLOW_PREFIXES`] — no substring
+/// or regex matching, to prevent allow-list bypass.
+const ENV_ALLOW_LIST: &[&str] = &[
+    "TASK_DESCRIPTION",
+    "REPO_PATH",
+    "TASK_TYPE",
+    "WORKSTREAM_COUNT",
+    "PATH",
+    "HOME",
+];
+
+/// Prefix-matched protected variables. `AMPLIHACK_*` are session-tree control
+/// vars; `RECIPE_VAR_*` are the canonical accessors that `{{var}}` placeholder
+/// substitution renders into script bodies — dropping either would break
+/// substituted scripts under `set -u`.
+const ENV_ALLOW_PREFIXES: &[&str] = &["AMPLIHACK_", "RECIPE_VAR_"];
+
+/// True if `key` is on the never-drop allow-list (exact name or fixed prefix).
+fn is_env_protected(key: &str) -> bool {
+    ENV_ALLOW_LIST.contains(&key) || ENV_ALLOW_PREFIXES.iter().any(|p| key.starts_with(p))
+}
+
+/// The envp byte cost the kernel charges against `ARG_MAX` for one variable:
+/// `key.len() + value.len() + 2` (the `=` separator and NUL terminator).
+fn env_pair_bytes(key: &str, value: &str) -> usize {
+    key.len() + value.len() + 2
+}
+
+/// Merge `child_env` then `extra_env` (last-writer-wins — `extra_env` overrides
+/// on key collision) and enforce the [`MAX_TOTAL_ENV_BYTES`] aggregate budget so
+/// the resulting env block can never trigger `execve` `E2BIG` (#130).
+///
+/// When over budget, the LARGEST non-allow-list values are dropped first
+/// (deterministic order: value length descending, then name ascending), until
+/// the total fits. Allow-list vars ([`is_env_protected`]) are never dropped.
+/// Dropped variable NAMES are `warn`-logged (never values or value lengths);
+/// their data remains reachable via the context file. Output is sorted by name
+/// for reproducibility.
+fn bounded_env(
+    child_env: &HashMap<String, String>,
+    extra_env: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut merged: HashMap<String, String> = child_env.clone();
+    for (k, v) in extra_env {
+        merged.insert(k.clone(), v.clone());
+    }
+
+    let mut total: usize = merged.iter().map(|(k, v)| env_pair_bytes(k, v)).sum();
+
+    if total > MAX_TOTAL_ENV_BYTES {
+        // Candidate droppable keys: non-allow-list, sorted largest value first,
+        // tie-broken by name ascending for deterministic, reproducible output.
+        let mut candidates: Vec<(usize, String)> = merged
+            .iter()
+            .filter(|(k, _)| !is_env_protected(k))
+            .map(|(k, v)| (v.len(), k.clone()))
+            .collect();
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut dropped: Vec<String> = Vec::new();
+        for (_, key) in candidates {
+            if total <= MAX_TOTAL_ENV_BYTES {
+                break;
+            }
+            if let Some(value) = merged.remove(&key) {
+                total -= env_pair_bytes(&key, &value);
+                dropped.push(key);
+            }
+        }
+
+        if !dropped.is_empty() {
+            dropped.sort();
+            // NAMES ONLY — never log values or value lengths (may hold secrets).
+            log::warn!(
+                "bounded_env: dropped {} env var(s) to fit the {}-byte ARG_MAX budget; \
+                 their values remain reachable via the context file: [{}]",
+                dropped.len(),
+                MAX_TOTAL_ENV_BYTES,
+                dropped.join(", ")
+            );
+        }
+    }
+
+    let mut out: Vec<(String, String)> = merged.into_iter().collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 /// Read at most `max_bytes + 1` bytes from `path`, returning UTF-8 (lossy).
 ///
 /// The `+1` is a sentinel: callers can detect overflow when the returned
@@ -207,8 +320,35 @@ impl CLISubprocessAdapter {
     /// - Generates a tree ID if none exists.
     fn build_child_env() -> HashMap<String, String> {
         log::debug!("CLISubprocessAdapter::build_child_env: building child environment");
-        let mut child_env: HashMap<String, String> =
-            env::vars().filter(|(k, _)| k != "CLAUDECODE").collect();
+        // Sanitize the INHERITED env (#130): the runner's own process env can be
+        // bloated by the parent (amplihack-rs mirrors the whole context to env
+        // with only a per-value cap). Drop any inherited entry whose value
+        // exceeds MAX_ENV_VALUE_BYTES so the inherited baseline can never be the
+        // ARG_MAX bloat source; protected control vars are always kept. Dropped
+        // values remain reachable via the context file.
+        let mut oversized_inherited: Vec<String> = Vec::new();
+        let mut child_env: HashMap<String, String> = HashMap::new();
+        for (k, v) in env::vars() {
+            if k == "CLAUDECODE" {
+                continue;
+            }
+            if !is_env_protected(&k) && v.len() > MAX_ENV_VALUE_BYTES {
+                oversized_inherited.push(k);
+                continue;
+            }
+            child_env.insert(k, v);
+        }
+        if !oversized_inherited.is_empty() {
+            oversized_inherited.sort();
+            // NAMES ONLY — never log values.
+            log::warn!(
+                "build_child_env: dropped {} oversized inherited env var(s) (> {} bytes) \
+                 from child env; values remain reachable via the context file: [{}]",
+                oversized_inherited.len(),
+                MAX_ENV_VALUE_BYTES,
+                oversized_inherited.join(", ")
+            );
+        }
 
         // Defense-in-depth: ensure HOME and PATH are always present and non-empty,
         // even when the parent shell has them unset. Mirrors amplihack-rs fork
@@ -877,6 +1017,16 @@ impl Adapter for CLISubprocessAdapter {
             working_dir
         };
 
+        // Issue #130: argv + envp share the ARG_MAX budget. Merge the inherited
+        // child env with the per-step extra_env and enforce an aggregate byte
+        // budget BEFORE spawning, so no arm can hit `execve` `E2BIG`. Computed
+        // once and applied to all four spawn arms below.
+        let extra_pairs: Vec<(String, String)> = extra_env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let bounded = bounded_env(&child_env, &extra_pairs);
+
         // Issue #80: argv + env must fit in ARG_MAX (~128 KiB on Linux). For
         // large bash scripts (e.g. cleanup-helper / complete-session steps that
         // accumulate round-results across multiple parallel workstreams), the
@@ -907,32 +1057,28 @@ impl Adapter for CLISubprocessAdapter {
                 ])
                 .current_dir(effective_dir)
                 .env_remove("CLAUDECODE")
-                .envs(&child_env)
-                .envs(extra_env)
+                .envs(bounded.iter().map(|(k, v)| (k, v)))
                 .output()
                 .with_context(|| "Failed to execute file-backed bash step with timeout")?,
             (Some(tf), None) => Command::new("/bin/bash")
                 .arg(tf.path())
                 .current_dir(effective_dir)
                 .env_remove("CLAUDECODE")
-                .envs(&child_env)
-                .envs(extra_env)
+                .envs(bounded.iter().map(|(k, v)| (k, v)))
                 .output()
                 .with_context(|| "Failed to execute file-backed bash step")?,
             (None, Some(secs)) => Command::new("timeout")
                 .args([&secs.to_string(), "/bin/bash", "-c", command])
                 .current_dir(effective_dir)
                 .env_remove("CLAUDECODE")
-                .envs(&child_env)
-                .envs(extra_env)
+                .envs(bounded.iter().map(|(k, v)| (k, v)))
                 .output()
                 .with_context(|| "Failed to execute bash step with timeout")?,
             (None, None) => Command::new("/bin/bash")
                 .args(["-c", command])
                 .current_dir(effective_dir)
                 .env_remove("CLAUDECODE")
-                .envs(&child_env)
-                .envs(extra_env)
+                .envs(bounded.iter().map(|(k, v)| (k, v)))
                 .output()
                 .with_context(|| "Failed to execute bash step")?,
         };
@@ -2212,5 +2358,242 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(count, 2, "1 throttled attempt + 1 auto-model retry");
+    }
+
+    // ── #130: bounded_env guards ARG_MAX / E2BIG for bash steps ─────────
+    //
+    // These tests are written TDD-first: they define the contract for the
+    // yet-to-be-added `bounded_env` helper, the `MAX_TOTAL_ENV_BYTES` /
+    // `MAX_ENV_VALUE_BYTES` constants, and the `build_child_env` per-value
+    // cap. Until the implementation lands they fail to compile (T1 group) or
+    // reproduce the real `Argument list too long (os error 7)` crash (T2/T3).
+
+    use std::sync::OnceLock;
+
+    /// Approximates the envp byte cost the kernel charges against ARG_MAX:
+    /// `Σ(key.len() + value.len() + 2)` (the `=` separator and NUL terminator).
+    fn env_bytes(pairs: &[(String, String)]) -> usize {
+        pairs.iter().map(|(k, v)| k.len() + v.len() + 2).sum()
+    }
+
+    // A capturing logger so we can assert `bounded_env` never logs VALUES.
+    // Installed at most once per test binary; if another logger is already
+    // set, capture is inactive and the value-safety test degrades gracefully
+    // (its sentinel invariant can never be violated by unrelated log lines).
+    static LOG_CAPTURE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    struct CaptureLogger;
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, _m: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            if let Ok(mut buf) = LOG_CAPTURE.lock() {
+                buf.push(format!("{}", record.args()));
+            }
+        }
+        fn flush(&self) {}
+    }
+    static CAPTURE_LOGGER: CaptureLogger = CaptureLogger;
+    static CAPTURE_INIT: OnceLock<bool> = OnceLock::new();
+
+    fn ensure_capture_logger() -> bool {
+        *CAPTURE_INIT.get_or_init(|| {
+            let ok = log::set_logger(&CAPTURE_LOGGER).is_ok();
+            if ok {
+                log::set_max_level(log::LevelFilter::Trace);
+            }
+            ok
+        })
+    }
+
+    // ── T1: bounded_env unit contract ──────────────────────────────────
+
+    #[test]
+    fn test_bounded_env_drops_largest_to_fit_and_keeps_allowlist() {
+        let mut child: HashMap<String, String> = HashMap::new();
+        child.insert("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into());
+        child.insert("HOME".into(), "/root".into());
+        child.insert("TASK_DESCRIPTION".into(), "finalize the PR".into());
+        child.insert("REPO_PATH".into(), "/work/repo".into());
+        child.insert("TASK_TYPE".into(), "review".into());
+        child.insert("WORKSTREAM_COUNT".into(), "3".into());
+        child.insert("AMPLIHACK_TREE_ID".into(), "abc123".into());
+        // Three oversized NON-allow-list values; aggregate > MAX_TOTAL_ENV_BYTES.
+        let big = "x".repeat(600_000);
+        child.insert("BLOB_A".into(), big.clone());
+        child.insert("BLOB_B".into(), big.clone());
+        child.insert("BLOB_C".into(), big.clone());
+
+        let out = bounded_env(&child, &[]);
+        let map: HashMap<String, String> = out.iter().cloned().collect();
+
+        assert!(
+            env_bytes(&out) <= MAX_TOTAL_ENV_BYTES,
+            "bounded env {} must be <= MAX_TOTAL_ENV_BYTES {}",
+            env_bytes(&out),
+            MAX_TOTAL_ENV_BYTES
+        );
+        for k in [
+            "PATH",
+            "HOME",
+            "TASK_DESCRIPTION",
+            "REPO_PATH",
+            "TASK_TYPE",
+            "WORKSTREAM_COUNT",
+            "AMPLIHACK_TREE_ID",
+        ] {
+            assert!(map.contains_key(k), "allow-list var {k} must survive trim");
+        }
+        let kept_blobs = ["BLOB_A", "BLOB_B", "BLOB_C"]
+            .iter()
+            .filter(|k| map.contains_key(**k))
+            .count();
+        assert!(
+            kept_blobs < 3,
+            "largest non-allow-list values must be dropped to fit the budget"
+        );
+    }
+
+    #[test]
+    fn test_bounded_env_is_deterministic() {
+        let mut child: HashMap<String, String> = HashMap::new();
+        child.insert("PATH".into(), "/usr/bin".into());
+        // Equal-length values exercise the tie-break rule (name ascending).
+        let v = "y".repeat(500_000);
+        child.insert("ZED".into(), v.clone());
+        child.insert("ALPHA".into(), v.clone());
+        child.insert("MID".into(), v.clone());
+
+        let first = bounded_env(&child, &[]);
+        let second = bounded_env(&child, &[]);
+        assert_eq!(
+            first, second,
+            "bounded_env output (including order) must be reproducible"
+        );
+    }
+
+    #[test]
+    fn test_bounded_env_extra_overrides_child() {
+        let mut child: HashMap<String, String> = HashMap::new();
+        child.insert("TASK_TYPE".into(), "from_child".into());
+        let extra = vec![("TASK_TYPE".to_string(), "from_extra".to_string())];
+        let out = bounded_env(&child, &extra);
+        let map: HashMap<String, String> = out.iter().cloned().collect();
+        assert_eq!(
+            map.get("TASK_TYPE").map(String::as_str),
+            Some("from_extra"),
+            "extra_env must win on key collision (last-writer-wins)"
+        );
+    }
+
+    #[test]
+    fn test_bounded_env_never_logs_values() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let active = ensure_capture_logger();
+        if active {
+            LOG_CAPTURE.lock().unwrap().clear();
+        }
+        // Unique sentinel: no other code in this process logs this string, so
+        // "no captured line contains SENTINEL" can only be violated by a leak
+        // of the dropped value itself.
+        const SENTINEL: &str = "S3CR3T_SENTINEL_VALUE_bounded_env_test";
+        let mut child: HashMap<String, String> = HashMap::new();
+        child.insert("PATH".into(), "/usr/bin".into());
+        let secret = SENTINEL.repeat(60_000); // > budget => dropped (+ warn-logged)
+        child.insert("SECRET_BLOB".into(), secret);
+
+        let _ = bounded_env(&child, &[]);
+
+        if active {
+            let lines = LOG_CAPTURE.lock().unwrap().clone();
+            for line in &lines {
+                assert!(
+                    !line.contains(SENTINEL),
+                    "dropped-var log must NEVER contain the value; offending line: {line}"
+                );
+            }
+            assert!(
+                lines.iter().any(|l| l.contains("SECRET_BLOB")),
+                "a name-only warn log for the dropped var SECRET_BLOB is expected"
+            );
+        }
+    }
+
+    // ── build_child_env per-value cap on INHERITED entries ──────────────
+
+    #[test]
+    fn test_build_child_env_drops_oversized_inherited_keeps_control_vars() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _g = EnvGuard::new("BLOATED_INHERITED_VAR");
+        let big = "z".repeat(MAX_ENV_VALUE_BYTES + 4096);
+        // SAFETY: test holds ENV_MUTEX to serialize env var access
+        unsafe {
+            env::set_var("BLOATED_INHERITED_VAR", &big);
+        }
+
+        let child = CLISubprocessAdapter::build_child_env();
+
+        assert!(
+            !child.contains_key("BLOATED_INHERITED_VAR"),
+            "inherited value exceeding MAX_ENV_VALUE_BYTES must be dropped (relocated to context file)"
+        );
+        assert!(child.contains_key("PATH"), "PATH must always be preserved");
+        assert!(child.contains_key("HOME"), "HOME must always be preserved");
+        assert!(
+            child.contains_key("AMPLIHACK_TREE_ID"),
+            "AMPLIHACK_* control vars must always be preserved"
+        );
+    }
+
+    // ── T2: regression — oversized env + tiny script must NOT E2BIG ─────
+
+    #[test]
+    fn test_execute_bash_step_huge_env_tiny_script_regression() {
+        // Issue #130: combined child+extra env exceeding ARG_MAX must not blow
+        // up the tiny `echo ok` at execve. On current main
+        // (`.envs(&child_env).envs(extra_env)`) this fails with
+        // "Argument list too long (os error 7)"; after the bounded_env fix the
+        // oversized NON-allow-list values are trimmed and the step succeeds.
+        let adapter = CLISubprocessAdapter::new();
+        // 50 x 100 KiB ≈ 5 MiB of extra env; each value < MAX_ARG_STRLEN
+        // (128 KiB) so the failure is aggregate (total envp), matching the real
+        // crash rather than a single over-long string.
+        let big = "x".repeat(100 * 1024);
+        let mut extra_env: HashMap<String, String> = HashMap::new();
+        for i in 0..50 {
+            extra_env.insert(format!("BLOAT_{i}"), big.clone());
+        }
+
+        let result = adapter.execute_bash_step("echo ok", ".", None, &extra_env);
+        assert!(
+            result.is_ok(),
+            "tiny script must survive oversized env (E2BIG regression #130): {result:?}"
+        );
+        assert_eq!(result.unwrap(), "ok");
+    }
+
+    // ── T3: allow-list var survives trim and is visible to the script ───
+
+    #[test]
+    fn test_execute_bash_step_allowlist_var_survives_trim_and_visible() {
+        // A required allow-list var (TASK_DESCRIPTION) must survive aggregate
+        // trimming and remain visible to the script under `set -u`, even when
+        // the env is padded well past the byte budget by droppable bloat.
+        let adapter = CLISubprocessAdapter::new();
+        let big = "y".repeat(100 * 1024);
+        let mut extra_env: HashMap<String, String> = HashMap::new();
+        extra_env.insert("TASK_DESCRIPTION".to_string(), "ship_issue_130".to_string());
+        for i in 0..50 {
+            extra_env.insert(format!("BLOAT_{i}"), big.clone());
+        }
+
+        let result =
+            adapter.execute_bash_step("set -u; echo \"$TASK_DESCRIPTION\"", ".", None, &extra_env);
+        assert!(
+            result.is_ok(),
+            "allow-list var must survive trim and be visible under set -u: {result:?}"
+        );
+        assert_eq!(result.unwrap(), "ship_issue_130");
     }
 }

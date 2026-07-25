@@ -277,7 +277,10 @@ then escalates to `SIGKILL`.
 **Environment propagation**: `build_child_env()` forwards session-tracking
 variables (`AMPLIHACK_SESSION_DEPTH`, `AMPLIHACK_TREE_ID`, `AMPLIHACK_MAX_DEPTH`,
 `AMPLIHACK_MAX_SESSIONS`) and strips `CLAUDECODE` to prevent nested session
-confusion.
+confusion. It also enforces a **per-value cap** on inherited environment entries
+and a shared **aggregate byte budget** across the full env block handed to bash,
+so long workflows can never overflow the OS `ARG_MAX` limit. See
+[Bounded Child Environment](#bounded-child-environment-arg_max--e2big-guard).
 
 ---
 
@@ -448,6 +451,144 @@ attacks.
   Claude process from attaching to the parent's session.
 - Session depth tracking (`AMPLIHACK_SESSION_DEPTH`) prevents runaway recursive
   spawning.
+
+---
+
+## Bounded Child Environment (ARG_MAX / E2BIG guard)
+
+Bash steps are spawned with the runner's inherited process environment merged
+with per-step context variables. On Linux, `execve(2)` limits the **combined**
+size of `argv` **and** `envp` to roughly `ARG_MAX` (typically stack/4 ≈ 2 MB,
+with a per-string `MAX_ARG_STRLEN` of 128 KiB). If the environment block grows
+too large, bash fails to launch with:
+
+```
+bash step failed: Failed to execute bash step: Argument list too long (os error 7)
+```
+
+Because `build_child_env()` inherits the runner's entire environment — and that
+runner is itself launched by amplihack-rs with the full task context mirrored to
+env vars — a long workflow can accumulate several megabytes of environment. The
+failure surfaces at *late* steps (e.g. `step-19d-verification-gate`) even when
+the script body is tiny, because the crash is in the `execve` of bash **before**
+the script runs. Spilling only the *script body* to a tempfile (issue #80) does
+not help: the overflow is in the env block, not `argv`.
+
+The subprocess adapter defends against this on two axes.
+
+### 1. Per-value cap on inherited entries (`build_child_env`)
+
+When collecting `env::vars()`, any **inherited** entry whose value exceeds
+`MAX_ENV_VALUE_BYTES` (96 KiB) is **dropped** — not truncated, to avoid
+corrupting a partial value or exposing a fragment of a secret. This cap is
+independent of the context layer, which enforces only an *aggregate* budget
+(`context.rs::MAX_ENV_BYTES`, 1.5 MB) plus a 4 KiB inline-subset threshold when
+falling back to file-based context — it has no 96 KiB per-value cap of its own.
+Injected control variables (`AMPLIHACK_*`) and the
+`HOME` / `PATH` defensive defaults are never affected; they are always small.
+
+This ensures a single oversized inherited variable can never be the source of
+env bloat.
+
+### 2. Aggregate byte budget (`bounded_env`)
+
+Before spawning bash, the adapter computes the final environment with a shared
+helper:
+
+```rust
+fn bounded_env(
+    child_env: &HashMap<String, String>,
+    extra_env: &[(String, String)],
+) -> Vec<(String, String)>
+```
+
+`bounded_env` merges `child_env` first, then overlays `extra_env`
+(**last-writer-wins**: a per-step context var overrides an inherited var of the
+same name — preserving the previous `.envs(&child_env).envs(extra_env)`
+semantics). It then measures the total footprint as `Σ(key.len() + value.len() + 2)`
+and, if it exceeds `MAX_TOTAL_ENV_BYTES`, drops entries until it fits.
+
+**Constants** (with `ARG_MAX`-math comments in source):
+
+| Constant | Value | Purpose |
+| --- | --- | --- |
+| `MAX_TOTAL_ENV_BYTES` | `1_500_000` (~1.5 MB) | Aggregate `envp` budget. This is the **same budget** the context layer applies as `context.rs::MAX_ENV_BYTES`; to prevent silent drift the two are promoted to a single shared `pub const` (exported from `context.rs` and re-used by `bounded_env`) rather than two independent literals. Reserves ~500 KB headroom under the ~2 MB `ARG_MAX` limit for `argv` and base process strings. |
+| `MAX_ENV_VALUE_BYTES` | `96 * 1024` (96 KiB) | Per-value cap for inherited entries. Well under the 128 KiB `MAX_ARG_STRLEN` per-string limit. |
+
+**Drop policy (deterministic):**
+
+1. The required **allow-list** is never dropped. Protection is by **exact name**
+   or **fixed prefix** (no substring/regex matching, to prevent bypass):
+
+   - **Protected prefixes:** `RECIPE_VAR_` and `AMPLIHACK_`.
+   - **Protected exact names:** `TASK_DESCRIPTION`, `REPO_PATH`, `TASK_TYPE`,
+     `WORKSTREAM_COUNT`, `PATH`, `HOME`.
+
+   The `RECIPE_VAR_` prefix is the critical entry. `{{var}}` placeholders are
+   rendered by `context.rs` into a **`$RECIPE_VAR_var` environment *reference***
+   (`replace_vars_quoted` / `replace_vars_unquoted`), and `RECIPE_VAR_<key>`
+   (lowercase key preserved) is the *canonical* accessor for **every** context
+   value — the bare uppercase `TASK_*` / `REPO_PATH` / `WORKSTREAM_COUNT` names
+   are only *legacy aliases* that `context.rs::legacy_uppercase_alias` exports
+   for top-level scalars. If `bounded_env` dropped a `RECIPE_VAR_*` entry it
+   would silently break exactly the (often large) value a substituted script
+   references at runtime, yielding an empty expansion or a `set -u` failure.
+   Protecting the `RECIPE_VAR_` prefix guarantees a substituted script body
+   always resolves. `PATH` / `HOME` are kept to avoid breaking binary
+   resolution and `set -u` guards; the uppercase aliases are retained for
+   backward compatibility with scripts that read them directly.
+
+   > **Consequence for the aggregate budget.** Because all `RECIPE_VAR_*`
+   > entries are protected, `bounded_env` can only reclaim space from
+   > *inherited* (`env::vars()`) junk — not from recipe context. Oversized
+   > *context* is a separate concern already handled one layer up by
+   > `context.rs::shell_env_for_step`, which spills to a file-backed context
+   > once the context env exceeds the same 1.5 MB budget (see below). The two
+   > mechanisms are complementary and never fight over the same bytes.
+2. Remaining (droppable) entries are sorted by **value length descending**,
+   tie-broken by **name ascending**, and dropped from the front until the total
+   is within budget. This ordering is content-independent and fully reproducible.
+3. Each drop is logged at `warn` with **names only** — values and value lengths
+   are never logged, since env values may contain secrets
+   (`GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, …).
+
+Example log line:
+
+```
+WARN bounded_env: dropped 3 env vars to fit ARG_MAX budget: [BIG_BLOB_A, BIG_BLOB_B, CACHED_MANIFEST]
+```
+
+### Interaction with placeholder substitution and file-based context
+
+Dropping a large value is only safe for entries a script does **not** read at
+runtime. Two existing mechanisms interact here and must be kept consistent:
+
+- **`{{placeholder}}` substitution renders env *references*, not literals.**
+  `context.rs` rewrites `{{var}}` to `"$RECIPE_VAR_var"` in the script body, so
+  the substituted body still depends on `RECIPE_VAR_var` being present in the
+  child environment. Dropping that entry would **not** make the value "reachable
+  from the body" — it would make the reference expand to empty. This is exactly
+  why the `RECIPE_VAR_` prefix is on the never-drop allow-list (see the drop
+  policy above): a substituted script is guaranteed to resolve its references.
+
+- **File-based context fallback handles oversized *context*.**
+  `context.rs::shell_env_for_step` spills the full context to a `0600` JSON file
+  (`AMPLIHACK_CONTEXT_FILE`) once the *context* env exceeds the 1.5 MB threshold,
+  keeping only a small inline subset. `bounded_env` complements this by bounding
+  the **inherited** `env::vars()` that the context layer never sees. Because both
+  use the shared `MAX_ENV_BYTES` / `MAX_TOTAL_ENV_BYTES` `pub const`, the same
+  budget is enforced at both layers with no risk of drift, and the two never
+  contend for the same bytes (context is protected in `bounded_env`; inherited
+  junk is invisible to the context layer).
+
+### Applied to all four spawn arms
+
+`execute_bash_step` spawns bash in one of four configurations
+(file-backed vs. inline `-c`, each with or without a `timeout` wrapper).
+`bounded_env` is computed **once** and applied via a single `.envs(&bounded)` in
+**every** arm, so no arm can regress into the unbounded path. The
+`env_remove("CLAUDECODE")` call and each arm's timeout structure are unchanged
+(the timeout contract of issue #439 is preserved).
 
 ---
 
