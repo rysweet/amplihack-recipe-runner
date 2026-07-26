@@ -19,3 +19,4 @@
 
 # Reference
 - [Architecture](architecture.md)
+- [Environment Budget & Safe Spawning](env-budget.md)

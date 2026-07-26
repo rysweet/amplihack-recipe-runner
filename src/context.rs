@@ -8,6 +8,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::LazyLock;
+#[cfg(test)]
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
 static TEMPLATE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\{\{([a-zA-Z0-9_.\-]+)\}\}").expect("valid template placeholder regex")
@@ -21,6 +24,132 @@ static HEREDOC_START_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"<<-?\s*(?:'([A-Za-z_]\w*)'|"([A-Za-z_]\w*)"|([A-Za-z_]\w*))"#)
         .expect("valid heredoc start regex")
 });
+
+// ── #130: measured env byte budget (single source of truth) ───────────────
+//
+// The child environment must fit inside the OS argument/environment limit or
+// `execve` fails with `E2BIG` (`os error 7`). Rather than hardcode a literal
+// ceiling (the old, host-blind `MAX_ENV_BYTES = 1_500_000`), we MEASURE the
+// budget once from the host:
+//
+//   budget = min(sysconf(_SC_ARG_MAX), RLIMIT_STACK / 4)
+//              - ARGV_RESERVE_BYTES        (headroom for the command + argv)
+//
+// clamped to a conservative floor. Because every spawn uses
+// `Command::env_clear()` and installs ONLY the curated `bounded_env` result,
+// that curated set IS the child's entire environment block — there is no
+// separately-inherited baseline to subtract. The budget therefore bounds the
+// whole environment block directly; `ARGV_RESERVE_BYTES` reserves room for the
+// command path and argv (large argv/scripts are spilled to files elsewhere).
+//
+// The value is cached in a `OnceLock` and exposed through the single accessor
+// [`env_byte_budget`], which both the context layer
+// ([`RecipeContext::shell_env_for_step`]) and the subprocess layer
+// (`cli_subprocess::bounded_env`) consult so the two can never drift.
+
+/// Conservative floor used only when `sysconf`/`getrlimit` are unavailable or
+/// when subtracting the argv reserve would leave a pathologically small (or
+/// underflowed) budget. 256 KiB comfortably exceeds a curated file-first env
+/// yet stays well under any real `ARG_MAX`.
+pub(crate) const ENV_BUDGET_FLOOR: usize = 256 * 1024;
+
+/// Headroom reserved for the command path plus argv, kept separate from the
+/// environment. Matches Linux's `MAX_ARG_STRLEN` single-argument cap so a
+/// realistic command line cannot, by itself, tip the child over `ARG_MAX`.
+const ARGV_RESERVE_BYTES: usize = 128 * 1024;
+
+static ENV_BYTE_BUDGET: OnceLock<usize> = OnceLock::new();
+
+/// Serializes the budget test seam so parallel tests cannot observe a partially
+/// mutated override. Exposed to sibling modules' test code only.
+#[cfg(test)]
+pub(crate) static ENV_BUDGET_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Test-only override for the measured budget. `None` means "use the measured
+/// value". Never an env var — that would leak into the child environment we are
+/// trying to bound and become an injection surface.
+#[cfg(test)]
+static ENV_BUDGET_TEST_OVERRIDE: Mutex<Option<usize>> = Mutex::new(None);
+
+/// Inject a tiny (or large) ceiling for tests exercising the fail-loud path.
+#[cfg(test)]
+pub(crate) fn set_env_byte_budget_for_test(value: usize) {
+    *ENV_BUDGET_TEST_OVERRIDE
+        .lock()
+        .expect("ENV_BUDGET_TEST_OVERRIDE mutex poisoned") = Some(value);
+}
+
+/// Restore the measured budget after a test override.
+#[cfg(test)]
+pub(crate) fn clear_env_byte_budget_for_test() {
+    *ENV_BUDGET_TEST_OVERRIDE
+        .lock()
+        .expect("ENV_BUDGET_TEST_OVERRIDE mutex poisoned") = None;
+}
+
+/// The single shared accessor for the child-env byte budget.
+///
+/// Returns the test override when one is set, otherwise the `OnceLock`-cached
+/// measured value. Callers MUST route every budget decision through here so the
+/// context and subprocess layers agree.
+pub(crate) fn env_byte_budget() -> usize {
+    #[cfg(test)]
+    {
+        if let Some(v) = *ENV_BUDGET_TEST_OVERRIDE
+            .lock()
+            .expect("ENV_BUDGET_TEST_OVERRIDE mutex poisoned")
+        {
+            return v;
+        }
+    }
+    *ENV_BYTE_BUDGET.get_or_init(measure_env_byte_budget)
+}
+
+/// Compute the budget from the live host limits. Called at most once.
+fn measure_env_byte_budget() -> usize {
+    // SAFETY: `sysconf` is a pure, side-effect-free query of a host limit.
+    let arg_max = unsafe { libc::sysconf(libc::_SC_ARG_MAX) };
+    // If sysconf is unavailable (<= 0), fall back to the conservative floor
+    // rather than guessing a ceiling.
+    if arg_max <= 0 {
+        log::warn!("sysconf(_SC_ARG_MAX) unavailable; using conservative env budget floor");
+        return ENV_BUDGET_FLOOR;
+    }
+    let mut ceiling = arg_max as usize;
+
+    // Bound further by RLIMIT_STACK/4 when available and finite: the kernel
+    // copies argv+envp onto (a fraction of) the child's stack.
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `rl` is a valid, fully-owned rlimit struct; getrlimit only writes.
+    let stack_ok = unsafe { libc::getrlimit(libc::RLIMIT_STACK, &mut rl) } == 0;
+    if stack_ok && rl.rlim_cur != libc::RLIM_INFINITY && rl.rlim_cur > 0 {
+        let stack_quarter = (rl.rlim_cur as usize) / 4;
+        if stack_quarter > 0 {
+            ceiling = ceiling.min(stack_quarter);
+        }
+    }
+
+    // The curated `bounded_env` result becomes the child's ENTIRE environment
+    // (every spawn does `env_clear()` first), so the budget bounds the whole
+    // env block directly. We reserve only argv headroom — subtracting the
+    // ambient baseline here would double-count it (the baseline is not
+    // separately inherited under `env_clear`) and needlessly shrink the budget.
+    let budget = ceiling
+        .saturating_sub(ARGV_RESERVE_BYTES)
+        .max(ENV_BUDGET_FLOOR);
+
+    log::debug!(
+        "measured env byte budget: {} (arg_max={}, ceiling={}, reserve={})",
+        budget,
+        arg_max,
+        ceiling,
+        ARGV_RESERVE_BYTES,
+    );
+    budget
+}
 
 /// Mutable context that accumulates step outputs and renders templates.
 #[derive(Debug, Clone)]
@@ -344,15 +473,18 @@ impl RecipeContext {
     /// Returns (env_vars, Option<temp_file_path>). The caller must clean up
     /// the temp file after the step completes.
     pub fn shell_env_for_step(&self) -> (HashMap<String, String>, Option<std::path::PathBuf>) {
-        const MAX_ENV_BYTES: usize = 1_500_000; // ~1.5MB, well under 2MB OS limit
+        // Single source of truth: the runtime-MEASURED budget (replaces the old
+        // hardcoded `MAX_ENV_BYTES = 1_500_000` literal). Shared with
+        // `cli_subprocess::bounded_env` so the layers never disagree.
+        let max_env_bytes = env_byte_budget();
         let env_vars = self.shell_env_vars();
         let total_size: usize = env_vars.iter().map(|(k, v)| k.len() + v.len() + 1).sum();
 
-        if total_size > MAX_ENV_BYTES {
+        if total_size > max_env_bytes {
             log::warn!(
-                "Context env size ({} bytes) exceeds threshold ({} bytes) — using file-based context",
+                "Context env size ({} bytes) exceeds measured budget ({} bytes) — using file-based context",
                 total_size,
-                MAX_ENV_BYTES,
+                max_env_bytes,
             );
             match self.write_context_file() {
                 Ok((path, file_env)) => {
@@ -1180,6 +1312,107 @@ mod tests {
         assert!(rendered.contains("line one\nline two"));
         // The heredoc structure is preserved
         assert!(rendered.starts_with("cat <<'EOF'\n"));
+    }
+
+    // ── #130: measured env byte budget (replaces hardcoded 1_500_000) ─────
+    //
+    // These tests define the contract for the runtime-MEASURED env budget that
+    // replaces the previous `const MAX_ENV_BYTES = 1_500_000` literal. The
+    // budget is derived from `sysconf(_SC_ARG_MAX)` / RLIMIT_STACK and shared,
+    // via a single accessor (`env_byte_budget`), with
+    // `cli_subprocess::bounded_env` so the two layers can never drift. A
+    // `#[cfg(test)]` seam (`set/clear_env_byte_budget_for_test`, serialized by
+    // `ENV_BUDGET_TEST_LOCK`) lets tests inject a tiny ceiling without touching
+    // the process environment.
+
+    #[test]
+    fn test_env_byte_budget_derives_from_sysconf_not_literal() {
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        clear_env_byte_budget_for_test();
+
+        let budget = env_byte_budget();
+
+        // Must NOT be the removed hardcoded ceiling — proves it is computed,
+        // not the old literal. Two prior attempts hardcoded this.
+        assert_ne!(
+            budget, 1_500_000,
+            "budget must be measured from sysconf(_SC_ARG_MAX), not the old \
+             1_500_000 literal"
+        );
+
+        // Must fall within [floor, sysconf(_SC_ARG_MAX)], proving derivation
+        // from the host limit rather than a constant.
+        // SAFETY: sysconf is a pure, side-effect-free query.
+        let arg_max = unsafe { libc::sysconf(libc::_SC_ARG_MAX) };
+        assert!(arg_max > 0, "test host must expose _SC_ARG_MAX");
+        let arg_max = arg_max as usize;
+
+        assert!(
+            budget >= ENV_BUDGET_FLOOR,
+            "budget {budget} must be >= conservative floor {ENV_BUDGET_FLOOR}"
+        );
+        assert!(
+            budget <= arg_max,
+            "budget {budget} must not exceed sysconf(_SC_ARG_MAX) {arg_max}"
+        );
+    }
+
+    #[test]
+    fn test_env_byte_budget_is_cached_and_stable() {
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        clear_env_byte_budget_for_test();
+        let a = env_byte_budget();
+        let b = env_byte_budget();
+        assert_eq!(a, b, "measured budget must be stable (OnceLock-cached)");
+    }
+
+    #[test]
+    fn test_env_byte_budget_test_seam_overrides_measured_value() {
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        // Inject a tiny ceiling through the test seam and confirm the accessor
+        // honours it — this is the seam the fail-loud tests rely on.
+        set_env_byte_budget_for_test(4096);
+        assert_eq!(
+            env_byte_budget(),
+            4096,
+            "seam must override the measured budget"
+        );
+
+        clear_env_byte_budget_for_test();
+        assert_ne!(
+            env_byte_budget(),
+            4096,
+            "clearing the seam must restore the measured budget"
+        );
+    }
+
+    #[test]
+    fn test_shell_env_for_step_uses_shared_budget_accessor() {
+        // With the old 1_500_000 literal an 8 KiB env would NOT spill; forcing a
+        // tiny shared budget must make shell_env_for_step spill to a file-first
+        // context (AMPLIHACK_CONTEXT_FILE), proving it reads the single shared
+        // accessor rather than a hardcoded ceiling.
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        set_env_byte_budget_for_test(64);
+
+        let c = ctx(vec![
+            ("task_description", json!("do the thing")),
+            ("big", json!("x".repeat(8192))),
+        ]);
+        let (env, temp) = c.shell_env_for_step();
+
+        assert!(
+            env.contains_key("AMPLIHACK_CONTEXT_FILE"),
+            "tiny shared budget must trigger file-first spill (not the 1_500_000 literal)"
+        );
+        assert!(
+            temp.is_some(),
+            "spill must return a temp file path for the caller to clean up"
+        );
+        if let Some(p) = temp {
+            let _ = std::fs::remove_file(p);
+        }
+        clear_env_byte_budget_for_test();
     }
 
     // ── Property-based tests (PR4: audit/proptest-parser-template) ──────

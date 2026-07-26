@@ -60,6 +60,146 @@ pub(crate) fn read_capped(path: &Path, max_bytes: usize) -> std::io::Result<Stri
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// #130: names a child environment must never drop, because losing them would
+/// silently break the child (broken `PATH`/`HOME`), sever the session tree
+/// (`AMPLIHACK_*`), or discard required recipe inputs (`RECIPE_VAR_*` and the
+/// critical scalars). Everything else is inherited convenience that MAY be
+/// dropped losslessly — its full value still lives in the file-first context
+/// referenced by `AMPLIHACK_CONTEXT_FILE`.
+pub(crate) fn is_env_protected(name: &str) -> bool {
+    const PROTECTED_NAMES: &[&str] = &[
+        "PATH",
+        "HOME",
+        "TASK_DESCRIPTION",
+        "REPO_PATH",
+        "TASK_TYPE",
+        "WORKSTREAM_COUNT",
+    ];
+    name.starts_with("AMPLIHACK_")
+        || name.starts_with("RECIPE_VAR_")
+        || PROTECTED_NAMES.contains(&name)
+}
+
+/// Byte cost of a single `key=value\0` environment entry, matching the kernel's
+/// accounting for argv/envp copied during `execve`.
+fn env_pair_bytes(key: &str, value: &str) -> usize {
+    key.len() + value.len() + 1
+}
+
+/// #130: the env budget was exceeded by *protected* variables that cannot be
+/// dropped. Carries NAMES and SIZES only — never values — so it is safe to log,
+/// `Display`, and `Debug` without leaking secrets (R1).
+#[derive(Debug, Clone)]
+pub(crate) struct EnvBudgetError {
+    /// Names of the protected variables that cannot be dropped. Names only.
+    offending: Vec<String>,
+    /// Total bytes required by all protected variables (a size, not a value).
+    protected_bytes: usize,
+    /// The measured budget those protected variables must fit inside.
+    budget: usize,
+}
+
+impl EnvBudgetError {
+    /// The protected variable names (never values) that overflowed the budget.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn offending_vars(&self) -> &[String] {
+        &self.offending
+    }
+}
+
+impl std::fmt::Display for EnvBudgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "child environment exceeds the measured argument/env budget: protected \
+             variable(s) {:?} require {} bytes but only {} bytes are available, and \
+             these variables cannot be dropped. Move large payloads out of the \
+             environment and into the file-first context referenced by \
+             AMPLIHACK_CONTEXT_FILE instead of passing them as env vars.",
+            self.offending, self.protected_bytes, self.budget,
+        )
+    }
+}
+
+impl std::error::Error for EnvBudgetError {}
+
+/// #130: build a child environment guaranteed to fit inside the MEASURED byte
+/// budget ([`crate::context::env_byte_budget`]).
+///
+/// Non-protected inherited variables are dropped largest-first (lossless — they
+/// remain recoverable from `AMPLIHACK_CONTEXT_FILE`) with a NAMES-only warning.
+/// If, after dropping every non-protected entry, the remaining *protected*
+/// variables still exceed the budget, this FAILS LOUD with an
+/// [`EnvBudgetError`] naming them — it never silently drops a protected value
+/// and never lets a raw `execve` `E2BIG` (`os error 7`) reach the user.
+pub(crate) fn bounded_env(
+    vars: &HashMap<String, String>,
+) -> Result<Vec<(String, String)>, EnvBudgetError> {
+    let budget = crate::context::env_byte_budget();
+
+    let mut protected: Vec<(String, String)> = Vec::new();
+    let mut droppable: Vec<(String, String)> = Vec::new();
+    for (k, v) in vars {
+        if is_env_protected(k) {
+            protected.push((k.clone(), v.clone()));
+        } else {
+            droppable.push((k.clone(), v.clone()));
+        }
+    }
+
+    let protected_bytes: usize = protected.iter().map(|(k, v)| env_pair_bytes(k, v)).sum();
+
+    // Fail loud: protected variables alone cannot be made to fit. Naming them
+    // (names only) lets the operator relocate the payload into the file-first
+    // context rather than hitting an opaque E2BIG.
+    if protected_bytes > budget {
+        let offending: Vec<String> = protected.iter().map(|(k, _)| k.clone()).collect();
+        log::error!(
+            "bounded_env: protected env var(s) exceed measured budget ({} > {} bytes); \
+             refusing to spawn. Offending (names only): {:?}. Relocate large values to \
+             AMPLIHACK_CONTEXT_FILE.",
+            protected_bytes,
+            budget,
+            offending,
+        );
+        return Err(EnvBudgetError {
+            offending,
+            protected_bytes,
+            budget,
+        });
+    }
+
+    // Greedily keep the smallest non-protected entries first to retain as many
+    // as possible; drop the rest (largest-first) losslessly.
+    droppable.sort_by_key(|(k, v)| env_pair_bytes(k, v));
+    let mut result = protected;
+    let mut used = protected_bytes;
+    let mut dropped: Vec<String> = Vec::new();
+    for (k, v) in droppable {
+        let sz = env_pair_bytes(&k, &v);
+        if used.saturating_add(sz) <= budget {
+            used += sz;
+            result.push((k, v));
+        } else {
+            dropped.push(k);
+        }
+    }
+
+    if !dropped.is_empty() {
+        log::warn!(
+            "bounded_env: dropped {} non-protected inherited env var(s) to keep the child \
+             environment under the measured execve budget ({} bytes). These are ambient \
+             (non-required) variables; protected/required values (AMPLIHACK_*, RECIPE_VAR_*, \
+             PATH, HOME) are never dropped. Dropped (names only): {:?}",
+            dropped.len(),
+            budget,
+            dropped,
+        );
+    }
+
+    Ok(result)
+}
+
 /// Detect transient agent rate-limit signals in captured output (#839).
 ///
 /// Matches case-insensitively against the documented signal phrases. A match
@@ -207,8 +347,38 @@ impl CLISubprocessAdapter {
     /// - Generates a tree ID if none exists.
     fn build_child_env() -> HashMap<String, String> {
         log::debug!("CLISubprocessAdapter::build_child_env: building child environment");
-        let mut child_env: HashMap<String, String> =
-            env::vars().filter(|(k, _)| k != "CLAUDECODE").collect();
+
+        // #130 root-cause defense: a single inherited env value larger than the
+        // kernel's per-argument cap (`MAX_ARG_STRLEN`, 128 KiB) makes `execve`
+        // fail with `E2BIG` (`os error 7`) no matter how small our own vars are.
+        // Such an oversized *inherited* value is unusable by any child anyway,
+        // so we sanitize it out here (names only in the log). The variables we
+        // explicitly set below (session tree, PATH/HOME) are always small and
+        // are added after this filter, so they are never affected.
+        const MAX_SINGLE_ENV_VALUE_BYTES: usize = 128 * 1024;
+        let mut oversized: Vec<String> = Vec::new();
+        let mut child_env: HashMap<String, String> = env::vars()
+            .filter(|(k, _)| k != "CLAUDECODE")
+            .filter(|(k, v)| {
+                if v.len() > MAX_SINGLE_ENV_VALUE_BYTES {
+                    oversized.push(k.clone());
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        if !oversized.is_empty() {
+            log::warn!(
+                "build_child_env: dropped {} oversized inherited env var(s) (> {} bytes each) \
+                 that would blow execve regardless of any other setting. Pass large payloads \
+                 to steps via the file-first context (AMPLIHACK_CONTEXT_FILE) instead of the \
+                 environment. Dropped (names only): {:?}",
+                oversized.len(),
+                MAX_SINGLE_ENV_VALUE_BYTES,
+                oversized,
+            );
+        }
 
         // Defense-in-depth: ensure HOME and PATH are always present and non-empty,
         // even when the parent shell has them unset. Mirrors amplihack-rs fork
@@ -502,6 +672,14 @@ impl CLISubprocessAdapter {
         let mut child_env = Self::build_child_env();
         // Ensure nested agent steps inherit the same agent binary preference
         child_env.insert("AMPLIHACK_AGENT_BINARY".to_string(), self.cli.clone());
+        // Bound the child environment to the MEASURED budget once, before the
+        // retry loop, so an oversized inherited env can never blow execve for
+        // the agent process either. Fails loud (naming protected vars) instead
+        // of surfacing a raw E2BIG.
+        let bounded_child = bounded_env(&child_env).with_context(|| {
+            "Refusing to spawn agent step: child environment exceeds the measured \
+             argument/env budget (see AMPLIHACK_CONTEXT_FILE for the file-first context)"
+        })?;
 
         // Bounded rate-limit retry loop (#839). Total executions = 1 + max_retries.
         // Only transient rate-limit failures are retried with exponential
@@ -569,8 +747,8 @@ impl CLISubprocessAdapter {
             )?;
             let mut child = cmd
                 .current_dir(&resolved_cwd)
-                .env_remove("CLAUDECODE")
-                .envs(&child_env)
+                .env_clear()
+                .envs(bounded_child.iter().map(|(k, v)| (k, v)))
                 .stdout(log_fh)
                 .stderr(stderr_fh)
                 .spawn()
@@ -871,6 +1049,17 @@ impl Adapter for CLISubprocessAdapter {
         // Propagate agent binary preference so scripts spawning nested agents
         // use the same binary as the parent (mirrors execute_agent_step_impl).
         child_env.insert("AMPLIHACK_AGENT_BINARY".to_string(), self.cli.clone());
+        // Merge caller-supplied step vars (they override inherited/base values),
+        // then bound the whole set to the MEASURED env budget before spawning.
+        // `bounded_env` drops non-protected leftovers losslessly and FAILS LOUD
+        // (naming protected vars) rather than letting a raw E2BIG surface.
+        for (k, v) in extra_env {
+            child_env.insert(k.clone(), v.clone());
+        }
+        let bounded = bounded_env(&child_env).with_context(|| {
+            "Refusing to spawn bash step: child environment exceeds the measured \
+             argument/env budget (see AMPLIHACK_CONTEXT_FILE for the file-first context)"
+        })?;
         let effective_dir = if working_dir.is_empty() || working_dir == "." {
             &self.working_dir
         } else {
@@ -906,33 +1095,29 @@ impl Adapter for CLISubprocessAdapter {
                     tf.path().to_str().unwrap_or(""),
                 ])
                 .current_dir(effective_dir)
-                .env_remove("CLAUDECODE")
-                .envs(&child_env)
-                .envs(extra_env)
+                .env_clear()
+                .envs(bounded.iter().map(|(k, v)| (k, v)))
                 .output()
                 .with_context(|| "Failed to execute file-backed bash step with timeout")?,
             (Some(tf), None) => Command::new("/bin/bash")
                 .arg(tf.path())
                 .current_dir(effective_dir)
-                .env_remove("CLAUDECODE")
-                .envs(&child_env)
-                .envs(extra_env)
+                .env_clear()
+                .envs(bounded.iter().map(|(k, v)| (k, v)))
                 .output()
                 .with_context(|| "Failed to execute file-backed bash step")?,
             (None, Some(secs)) => Command::new("timeout")
                 .args([&secs.to_string(), "/bin/bash", "-c", command])
                 .current_dir(effective_dir)
-                .env_remove("CLAUDECODE")
-                .envs(&child_env)
-                .envs(extra_env)
+                .env_clear()
+                .envs(bounded.iter().map(|(k, v)| (k, v)))
                 .output()
                 .with_context(|| "Failed to execute bash step with timeout")?,
             (None, None) => Command::new("/bin/bash")
                 .args(["-c", command])
                 .current_dir(effective_dir)
-                .env_remove("CLAUDECODE")
-                .envs(&child_env)
-                .envs(extra_env)
+                .env_clear()
+                .envs(bounded.iter().map(|(k, v)| (k, v)))
                 .output()
                 .with_context(|| "Failed to execute bash step")?,
         };
@@ -2212,5 +2397,205 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(count, 2, "1 throttled attempt + 1 auto-model retry");
+    }
+
+    // ── #130: measured env budget + fail-loud bounded_env ─────────────────
+    //
+    // Contract for the runtime-MEASURED env budget (replacing the hardcoded
+    // 1_500_000 literal) and the fail-loud `bounded_env`. `bounded_env` MAY
+    // drop NON-protected leftovers (lossless — recoverable via
+    // AMPLIHACK_CONTEXT_FILE) but MUST fail loud with a NAMED error (names +
+    // sizes only, never values) when protected vars alone exceed the budget,
+    // so a raw execve E2BIG (`os error 7`) can never surface. Protected =
+    // AMPLIHACK_*/RECIPE_VAR_* prefixes + PATH/HOME + the critical scalar
+    // subset. The budget accessor lives in `context` and is shared, so both
+    // layers agree.
+
+    use crate::context::{
+        ENV_BUDGET_TEST_LOCK, clear_env_byte_budget_for_test, env_byte_budget,
+        set_env_byte_budget_for_test,
+    };
+
+    fn map_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_is_env_protected_allow_list() {
+        // Protected: explicit critical names + AMPLIHACK_/RECIPE_VAR_ prefixes.
+        for name in [
+            "PATH",
+            "HOME",
+            "AMPLIHACK_TREE_ID",
+            "AMPLIHACK_SESSION_DEPTH",
+            "AMPLIHACK_CONTEXT_FILE",
+            "RECIPE_VAR_task_description",
+            "TASK_DESCRIPTION",
+            "REPO_PATH",
+            "TASK_TYPE",
+            "WORKSTREAM_COUNT",
+        ] {
+            assert!(is_env_protected(name), "{name} must be protected");
+        }
+        // Not protected: arbitrary inherited vars that MAY be dropped.
+        for name in ["LS_COLORS", "SOME_RANDOM_VAR", "CARGO_HOME", "PATHOLOGICAL"] {
+            assert!(!is_env_protected(name), "{name} must NOT be protected");
+        }
+    }
+
+    #[test]
+    fn test_bounded_env_drops_non_protected_losslessly() {
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        // Budget large enough for the small protected vars but not the huge
+        // non-protected one.
+        set_env_byte_budget_for_test(4096);
+
+        let huge = "y".repeat(64 * 1024);
+        let mut vars = map_of(&[
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", "/home/tester"),
+            ("AMPLIHACK_TREE_ID", "abc12345"),
+        ]);
+        vars.insert("BIG_NON_PROTECTED".to_string(), huge);
+
+        let result = bounded_env(&vars).expect("must succeed by dropping the non-protected var");
+        let keys: std::collections::HashSet<&str> =
+            result.iter().map(|(k, _)| k.as_str()).collect();
+
+        assert!(keys.contains("PATH"), "protected PATH must be kept");
+        assert!(keys.contains("HOME"), "protected HOME must be kept");
+        assert!(
+            keys.contains("AMPLIHACK_TREE_ID"),
+            "protected AMPLIHACK_* var must be kept"
+        );
+        assert!(
+            !keys.contains("BIG_NON_PROTECTED"),
+            "oversized non-protected var must be dropped (lossless via file)"
+        );
+
+        let total: usize = result.iter().map(|(k, v)| k.len() + v.len() + 1).sum();
+        assert!(
+            total <= env_byte_budget(),
+            "resulting env {total} must fit the budget {}",
+            env_byte_budget()
+        );
+
+        clear_env_byte_budget_for_test();
+    }
+
+    #[test]
+    fn test_bounded_env_fails_loud_when_protected_exceeds_budget() {
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        // Ceiling so tiny a protected var alone cannot fit -> must FAIL LOUD,
+        // never silently drop and never let raw `os error 7` reach the user.
+        set_env_byte_budget_for_test(16);
+
+        let secret_value = "SUPER_SECRET_TOKEN_VALUE_do_not_log_me_1234567890";
+        let mut vars = map_of(&[("HOME", "/home/tester")]);
+        // PATH is protected and, alone, exceeds the 16-byte ceiling.
+        vars.insert("PATH".to_string(), secret_value.to_string());
+
+        let err = bounded_env(&vars).expect_err(
+            "protected var over budget must return Err, not silently drop / os error 7",
+        );
+
+        // Names only: the offending protected var must be named.
+        assert!(
+            err.offending_vars().iter().any(|n| n == "PATH"),
+            "error must name the offending protected var PATH; got {:?}",
+            err.offending_vars()
+        );
+
+        // R1: never leak values. Neither the offending-names list, nor Display,
+        // nor Debug rendering may contain the secret value.
+        assert!(
+            !err.offending_vars()
+                .iter()
+                .any(|n| n.contains(secret_value)),
+            "offending var list must be names-only, never values"
+        );
+        let shown = format!("{err}");
+        assert!(
+            !shown.contains(secret_value),
+            "Display must never contain a variable value"
+        );
+        assert!(
+            !format!("{err:?}").contains(secret_value),
+            "Debug must never contain a variable value"
+        );
+        // Guidance must point the user at the file-first context for recovery.
+        assert!(
+            shown.contains("AMPLIHACK_CONTEXT_FILE"),
+            "error must reference AMPLIHACK_CONTEXT_FILE for recovery"
+        );
+
+        clear_env_byte_budget_for_test();
+    }
+
+    #[test]
+    fn test_bounded_env_never_drops_protected_var() {
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        set_env_byte_budget_for_test(8);
+        // A single protected AMPLIHACK_* var over budget: must Err (naming it),
+        // never return an Ok that silently dropped it.
+        let vars = map_of(&[("AMPLIHACK_TREE_ID", "abcdefabcdef")]);
+        let err = bounded_env(&vars).expect_err("over-budget protected var must fail loud");
+        assert!(
+            err.offending_vars()
+                .iter()
+                .any(|n| n == "AMPLIHACK_TREE_ID"),
+            "must name the protected var it refused to drop"
+        );
+        clear_env_byte_budget_for_test();
+    }
+
+    #[test]
+    fn test_bounded_env_keeps_everything_under_normal_budget() {
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        clear_env_byte_budget_for_test(); // use the real measured budget
+        let vars = map_of(&[
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", "/home/tester"),
+            ("AMPLIHACK_TREE_ID", "abc12345"),
+            ("RECIPE_VAR_task_description", "small task"),
+            ("LS_COLORS", "rs=0:di=01;34"),
+        ]);
+        let result = bounded_env(&vars).expect("small env must fit the real budget");
+        assert_eq!(
+            result.len(),
+            vars.len(),
+            "no var should be dropped when everything fits the measured budget"
+        );
+    }
+
+    #[test]
+    fn test_oversized_inherited_env_regression_echo_ok() {
+        // #130 regression: an oversized *inherited* (non-protected) parent env
+        // var must not blow execve. With the fix, the bash spawn path clears and
+        // bounds the env (via bounded_env + env_clear) before spawning, so a tiny
+        // `echo ok` still runs. A single ~4 MiB var exceeds MAX_ARG_STRLEN
+        // (128 KiB) so the OLD inherit-everything path would fail with
+        // `Argument list too long (os error 7)`.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new("AMPLIHACK_OVERSIZED_INHERITED");
+
+        // SAFETY: ENV_MUTEX serializes env mutation across tests.
+        unsafe {
+            env::set_var("AMPLIHACK_OVERSIZED_INHERITED", "z".repeat(4 * 1024 * 1024));
+        }
+
+        let adapter = CLISubprocessAdapter::new();
+        let empty_env = std::collections::HashMap::new();
+        let result = adapter.execute_bash_step("echo ok", ".", None, &empty_env);
+
+        assert!(
+            result.is_ok(),
+            "oversized inherited env must not cause E2BIG (os error 7): {result:?}"
+        );
+        assert_eq!(result.unwrap(), "ok");
     }
 }
