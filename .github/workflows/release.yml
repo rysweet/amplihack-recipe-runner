@@ -104,10 +104,35 @@ jobs:
             ' Cargo.lock > Cargo.lock.tmp && mv Cargo.lock.tmp Cargo.lock
           fi
 
+      # Issue #137: a PR opened with GITHUB_TOKEN does not trigger workflows --
+      # GitHub suppresses that deliberately to prevent recursive runs. The
+      # release PR therefore got NO CI, its combined status stayed `pending`,
+      # GitHub reported it UNSTABLE, and it could never merge. v0.3.7 sat open
+      # from 2026-07-04 to 2026-08-28 for exactly this reason, silently, while
+      # the last release stayed at v0.3.6 from 2026-05-01.
+      #
+      # RELEASE_PAT (a PAT or GitHub App token with `repo` scope) makes the PR
+      # look human-authored, so CI runs normally. Falling back to GITHUB_TOKEN
+      # keeps the workflow working without it -- but the guard step below fails
+      # the job loudly rather than opening another PR that can never merge.
+      # Deliberately a warning, not a failure: without RELEASE_PAT the release
+      # PR is still worth opening (a human can trigger CI on it), and failing
+      # the job would break working automation to report a degraded mode.
+      # What must not happen again is the SILENT version.
+      - name: Note whether the release PR will receive CI
+        env:
+          HAVE_PAT: ${{ secrets.RELEASE_PAT != '' }}
+        run: |
+          if [ "$HAVE_PAT" = "true" ]; then
+            echo "RELEASE_PAT present: the release PR will receive CI normally."
+          else
+            echo "::warning::RELEASE_PAT is not set, so this release PR is opened with GITHUB_TOKEN and will receive NO CI (issue #137). It cannot merge until CI is triggered on it -- run the CI workflow via workflow_dispatch, or reopen the PR from a human account. Setting RELEASE_PAT fixes this permanently."
+          fi
+
       - name: Create version-bump pull request
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
           commit-message: "chore: bump version to ${{ needs.plan.outputs.version }}"
           branch: chore/auto-bump-${{ needs.plan.outputs.version }}
           delete-branch: true
@@ -118,6 +143,14 @@ jobs:
             release
           body: |
             Automated version bump proposed by the **Auto Release** workflow.
+
+            > **If this PR shows no CI checks:** it was opened with
+            > `GITHUB_TOKEN`, which GitHub deliberately excludes from
+            > triggering workflows. It cannot merge in that state. Trigger the
+            > CI workflow on this branch via `workflow_dispatch`, or close and
+            > reopen this PR from a human account. Setting a `RELEASE_PAT`
+            > secret fixes it permanently. See issue #137 -- v0.3.7 sat open
+            > from 2026-07-04 to 2026-08-28 for exactly this reason.
 
             Merging this PR sets the crate version to
             `${{ needs.plan.outputs.version }}`. The follow-up push to `main` then
