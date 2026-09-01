@@ -761,9 +761,23 @@ impl CLISubprocessAdapter {
             // the heartbeat shows elapsed time and confirms the process is alive
             // so the user (or parent orchestrator) does not mistake silence for
             // a hang.  See issue #3266.
+            //
+            // Issue #1421: it used to infer liveness from the existence of
+            // `/proc/<pid>` and, when that said "gone", print
+            // `... waiting (Ns elapsed, process may be finishing)` — a progress
+            // message about a process that had already died. `/proc` does not
+            // exist on macOS at all, so that branch was taken on EVERY tick
+            // there, and an operator watched a run report progress for
+            // fifty-five minutes with nothing behind it. The guess is gone: the
+            // thread that reaps the child publishes the real exit into
+            // `exit_slot`, and the heartbeat reports that exit (with the
+            // child's stderr tail when it ended badly) and stops.
             let stop = Arc::new(AtomicBool::new(false));
+            let exit_slot: ExitSlot = Arc::new(std::sync::Mutex::new(None));
             let stop_clone = stop.clone();
+            let exit_clone = exit_slot.clone();
             let output_path = output_file.clone();
+            let stderr_path = stderr_file.clone();
             let child_pid = child.id();
             let agent_label = self.cli.clone();
 
@@ -771,82 +785,38 @@ impl CLISubprocessAdapter {
                 // Issue #52: stream all new bytes between ticks (not just the
                 // last line) and prefix each line with `[HH:MM:SS] [agent:pid]`
                 // so operators can correlate with external logs.
-                let mut last_size = 0u64;
-                let mut last_activity = Instant::now();
-                let start_time = Instant::now();
                 let label = format!("amplihack:{}:{}", agent_label, child_pid);
-                while !stop_clone.load(Ordering::Relaxed) {
-                    match std::fs::metadata(&output_path) {
-                        Ok(meta) => {
-                            let current_size = meta.len();
-                            if current_size > last_size {
-                                // Read the *new* bytes since last tick (file-seek
-                                // semantics) so no output is silently dropped.
-                                match std::fs::File::open(&output_path) {
-                                    Ok(mut file) => {
-                                        use std::io::{Seek, SeekFrom};
-                                        if file.seek(SeekFrom::Start(last_size)).is_ok() {
-                                            let mut buf = String::new();
-                                            if let Err(e) = file.read_to_string(&mut buf) {
-                                                log::debug!(
-                                                    "heartbeat: read_to_string failed: {}",
-                                                    e
-                                                );
-                                            }
-                                            for line in buf.lines() {
-                                                if line.is_empty() {
-                                                    continue;
-                                                }
-                                                eprintln!("  [{}] [{}] {}", utc_hms(), label, line);
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log::debug!("heartbeat: cannot open output file: {}", e);
-                                    }
-                                }
-                                last_size = current_size;
-                                last_activity = Instant::now();
-                            } else if last_activity.elapsed() > Duration::from_secs(30) {
-                                let total_elapsed = start_time.elapsed().as_secs();
-                                let idle_secs = last_activity.elapsed().as_secs();
-                                // Check if the child process is still alive via /proc
-                                let pid_alive =
-                                    std::path::Path::new(&format!("/proc/{}", child_pid)).exists();
-                                if pid_alive {
-                                    eprintln!(
-                                        "  [{}] [{}] ... working ({}s elapsed, {}s since last output)",
-                                        utc_hms(),
-                                        label,
-                                        total_elapsed,
-                                        idle_secs
-                                    );
-                                } else {
-                                    eprintln!(
-                                        "  [{}] [{}] ... waiting ({}s elapsed, process may be finishing)",
-                                        utc_hms(),
-                                        label,
-                                        total_elapsed
-                                    );
-                                }
-                                last_activity = Instant::now();
-                            }
-                        }
-                        Err(e) => {
-                            log::debug!("heartbeat: cannot stat output file: {}", e);
-                        }
-                    }
-                    std::thread::sleep(Duration::from_secs(2));
-                }
+                let mut emit = |line: &str| eprintln!("{}", line);
+                run_heartbeat(
+                    &HeartbeatConfig {
+                        output_path: &output_path,
+                        stderr_path: &stderr_path,
+                        label: &label,
+                        tick: HEARTBEAT_TICK,
+                        idle_threshold: HEARTBEAT_IDLE_THRESHOLD,
+                    },
+                    &stop_clone,
+                    &exit_clone,
+                    &mut emit,
+                );
             });
 
-            // Enforce timeout: poll in a loop instead of blocking on wait().
-            let status = if let Some(secs) = timeout {
-                let deadline = Instant::now() + Duration::from_secs(secs);
-                loop {
-                    match child.try_wait()? {
-                        Some(s) => break s,
-                        None if Instant::now() >= deadline => {
+            // Issue #1421: `try_wait` is polled in BOTH the timeout and the
+            // no-timeout case. The no-timeout case used to block in `wait()`,
+            // which left the heartbeat with no way to ever learn the child was
+            // gone — the exit was observable only by the thread that could not
+            // report it. Polling publishes the exit the moment it happens.
+            let deadline = timeout.map(|secs| Instant::now() + Duration::from_secs(secs));
+            let status = loop {
+                match child.try_wait()? {
+                    Some(s) => {
+                        publish_exit(&exit_slot, &s);
+                        break s;
+                    }
+                    None => {
+                        let expired = deadline.is_some_and(|d| Instant::now() >= d);
+                        if expired {
+                            let secs = timeout.unwrap_or_default();
                             log::warn!(
                                 "Agent step timed out after {}s — killing pid {}",
                                 secs,
@@ -854,8 +824,12 @@ impl CLISubprocessAdapter {
                             );
                             let pid = child.id();
                             child.kill().ok();
-                            // Reap the zombie so we don't leak processes.
-                            let _ = child.wait();
+                            // Reap the zombie so we don't leak processes, and
+                            // publish the result so the heartbeat's last word is
+                            // the kill rather than a claim of progress.
+                            if let Ok(killed) = child.wait() {
+                                publish_exit(&exit_slot, &killed);
+                            }
                             stop.store(true, Ordering::SeqCst);
                             let _ = heartbeat.join();
                             anyhow::bail!(
@@ -864,11 +838,9 @@ impl CLISubprocessAdapter {
                                 pid
                             );
                         }
-                        None => std::thread::sleep(Duration::from_millis(250)),
+                        std::thread::sleep(Duration::from_millis(250));
                     }
                 }
-            } else {
-                child.wait()?
             };
             stop.store(true, Ordering::SeqCst);
             if let Err(e) = heartbeat.join() {
@@ -1150,6 +1122,487 @@ impl Adapter for CLISubprocessAdapter {
     fn name(&self) -> &str {
         log::trace!("CLISubprocessAdapter::name: returning 'cli-subprocess'");
         "cli-subprocess"
+    }
+}
+
+/// How often the heartbeat wakes up.
+const HEARTBEAT_TICK: Duration = Duration::from_secs(2);
+/// How long the child may be silent before the heartbeat says it is still working.
+const HEARTBEAT_IDLE_THRESHOLD: Duration = Duration::from_secs(30);
+
+/// How the child process ended, as observed by `Child::try_wait`.
+///
+/// Issue #1421: the heartbeat used to guess liveness from the existence of
+/// `/proc/<pid>`, which is Linux-only. On macOS that path never exists, so the
+/// guess was "not alive" on every single tick — for healthy, working children
+/// as much as for dead ones. This type replaces the guess with the fact: it is
+/// written by the thread that actually reaps the child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChildExit {
+    /// Exit code, or `None` when the process was terminated by a signal.
+    pub(crate) code: Option<i32>,
+}
+
+impl ChildExit {
+    pub(crate) fn from_status(status: &std::process::ExitStatus) -> Self {
+        Self {
+            code: status.code(),
+        }
+    }
+
+    fn succeeded(self) -> bool {
+        self.code == Some(0)
+    }
+
+    fn describe(self) -> String {
+        match self.code {
+            Some(0) => "exit 0".to_string(),
+            Some(code) => format!("exit {}", code),
+            None => "terminated by signal".to_string(),
+        }
+    }
+}
+
+/// Shared slot the waiting thread publishes the child's exit into, so the
+/// heartbeat reports a fact rather than an inference.
+pub(crate) type ExitSlot = Arc<std::sync::Mutex<Option<ChildExit>>>;
+
+/// What the heartbeat has to say on one tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HeartbeatReport {
+    /// Nothing worth saying yet. Keep polling.
+    Silent,
+    /// The child is alive and has been quiet for a while. This is the ONLY
+    /// report that claims progress, and it is only reachable while the child
+    /// has demonstrably not exited.
+    Working { elapsed_secs: u64, idle_secs: u64 },
+    /// The child is gone. Report how it ended — and, when it ended badly, what
+    /// it said on the way out. A wrapper that reports failure as progress is
+    /// worse than one that just fails.
+    Exited {
+        elapsed_secs: u64,
+        exit: ChildExit,
+        stderr_tail: String,
+    },
+}
+
+/// Trailing stderr lines quoted when a child exits badly. Enough to carry an
+/// `API Error: 404 ...` line and the context around it; not so many that a
+/// noisy child floods the run log.
+pub(crate) const HEARTBEAT_STDERR_TAIL_LINES: usize = 12;
+
+/// Decide what the heartbeat should print. Pure: same inputs, same report.
+///
+/// The precedence is the whole point of issue #1421. An observed exit is
+/// reported IMMEDIATELY and unconditionally — it does not wait for the idle
+/// threshold, and it can never be downgraded into a progress message. Only when
+/// no exit has been observed may the "working" line be printed at all.
+pub(crate) fn heartbeat_report(
+    elapsed_secs: u64,
+    idle_secs: u64,
+    idle_threshold_secs: u64,
+    exit: Option<ChildExit>,
+    stderr_tail: &str,
+) -> HeartbeatReport {
+    if let Some(exit) = exit {
+        return HeartbeatReport::Exited {
+            elapsed_secs,
+            exit,
+            // A clean exit needs no post-mortem; a bad one is exactly the case
+            // this bug hid, so quote what the child said.
+            stderr_tail: if exit.succeeded() {
+                String::new()
+            } else {
+                stderr_tail.trim_end().to_string()
+            },
+        };
+    }
+    if idle_secs >= idle_threshold_secs {
+        return HeartbeatReport::Working {
+            elapsed_secs,
+            idle_secs,
+        };
+    }
+    HeartbeatReport::Silent
+}
+
+impl HeartbeatReport {
+    /// Render to the lines the heartbeat prints, or `None` when silent.
+    pub(crate) fn render(&self, timestamp: &str, label: &str) -> Option<String> {
+        match self {
+            Self::Silent => None,
+            Self::Working {
+                elapsed_secs,
+                idle_secs,
+            } => Some(format!(
+                "  [{}] [{}] ... working ({}s elapsed, {}s since last output)",
+                timestamp, label, elapsed_secs, idle_secs
+            )),
+            Self::Exited {
+                elapsed_secs,
+                exit,
+                stderr_tail,
+            } => {
+                let mut out = format!(
+                    "  [{}] [{}] child process ended: {} after {}s",
+                    timestamp,
+                    label,
+                    exit.describe(),
+                    elapsed_secs
+                );
+                if !stderr_tail.is_empty() {
+                    out.push_str(&format!(
+                        "\n  [{}] [{}] last {} stderr line(s) from the child:",
+                        timestamp, label, HEARTBEAT_STDERR_TAIL_LINES
+                    ));
+                    for line in stderr_tail.lines() {
+                        out.push_str(&format!("\n  [{}] [{}] | {}", timestamp, label, line));
+                    }
+                }
+                Some(out)
+            }
+        }
+    }
+}
+
+/// The last `HEARTBEAT_STDERR_TAIL_LINES` non-blank lines of `text`.
+pub(crate) fn stderr_tail(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(HEARTBEAT_STDERR_TAIL_LINES);
+    lines[start..].join("\n")
+}
+
+/// Read the tail of the child's stderr log, tolerating a missing/unreadable
+/// file — a post-mortem that panics is worse than one that is empty.
+fn read_stderr_tail(path: &Path) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(text) => stderr_tail(&text),
+        Err(e) => {
+            log::debug!(
+                "heartbeat: cannot read stderr log {}: {}",
+                path.display(),
+                e
+            );
+            String::new()
+        }
+    }
+}
+
+/// Stream any bytes appended to `output_path` since `*last_size`, returning
+/// `true` when something was emitted (which counts as activity).
+fn drain_new_output(output_path: &Path, last_size: &mut u64, emit: &mut dyn FnMut(&str)) -> bool {
+    let Ok(meta) = std::fs::metadata(output_path) else {
+        return false;
+    };
+    let current_size = meta.len();
+    if current_size <= *last_size {
+        return false;
+    }
+    // Read the *new* bytes since last tick (file-seek semantics) so no output
+    // is silently dropped.
+    match std::fs::File::open(output_path) {
+        Ok(mut file) => {
+            use std::io::{Seek, SeekFrom};
+            if file.seek(SeekFrom::Start(*last_size)).is_ok() {
+                let mut buf = String::new();
+                if let Err(e) = file.read_to_string(&mut buf) {
+                    log::debug!("heartbeat: read_to_string failed: {}", e);
+                }
+                for line in buf.lines() {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    emit(line);
+                }
+            }
+        }
+        Err(e) => {
+            log::debug!("heartbeat: cannot open output file: {}", e);
+        }
+    }
+    *last_size = current_size;
+    true
+}
+
+/// Body of the heartbeat thread, with its clock, its output and its exit
+/// observation injected so it can be driven deterministically in tests.
+///
+/// It returns as soon as the child's exit has been observed — having reported
+/// that exit — or when `stop` is set. It never keeps polling a child it knows
+/// is gone: that is the fifty-five-minute failure mode in issue #1421.
+pub(crate) struct HeartbeatConfig<'a> {
+    /// The child's stdout log, streamed to the operator as it grows.
+    pub(crate) output_path: &'a Path,
+    /// The child's stderr log, quoted only in a post-mortem.
+    pub(crate) stderr_path: &'a Path,
+    /// `amplihack:<agent>:<pid>`, so lines correlate with external logs.
+    pub(crate) label: &'a str,
+    /// How often to wake up.
+    pub(crate) tick: Duration,
+    /// How long the child may be silent before we say it is still working.
+    pub(crate) idle_threshold: Duration,
+}
+
+pub(crate) fn run_heartbeat(
+    cfg: &HeartbeatConfig<'_>,
+    stop: &AtomicBool,
+    exit_slot: &std::sync::Mutex<Option<ChildExit>>,
+    emit_line: &mut dyn FnMut(&str),
+) {
+    let HeartbeatConfig {
+        output_path,
+        stderr_path,
+        label,
+        tick,
+        idle_threshold,
+    } = *cfg;
+    let started = Instant::now();
+    let mut last_size = 0u64;
+    let mut last_activity = Instant::now();
+    loop {
+        let streamed = {
+            let mut streamed_line =
+                |line: &str| emit_line(&format!("  [{}] [{}] {}", utc_hms(), label, line));
+            drain_new_output(output_path, &mut last_size, &mut streamed_line)
+        };
+        if streamed {
+            last_activity = Instant::now();
+        }
+
+        // The exit is checked BEFORE `stop`. The reaping thread publishes the
+        // exit and then sets `stop`; checking `stop` first would let the very
+        // report this whole change exists to produce be raced away.
+        let observed = exit_slot.lock().ok().and_then(|slot| *slot);
+        let tail = match observed {
+            Some(exit) if !exit.succeeded() => read_stderr_tail(stderr_path),
+            _ => String::new(),
+        };
+        let report = heartbeat_report(
+            started.elapsed().as_secs(),
+            last_activity.elapsed().as_secs(),
+            idle_threshold.as_secs(),
+            observed,
+            &tail,
+        );
+        if let Some(text) = report.render(&utc_hms(), label) {
+            emit_line(&text);
+            if matches!(report, HeartbeatReport::Working { .. }) {
+                last_activity = Instant::now();
+            }
+        }
+        if observed.is_some() || stop.load(Ordering::Relaxed) {
+            return;
+        }
+        std::thread::sleep(tick);
+    }
+}
+
+/// Publish an observed exit so the heartbeat can report it as a fact.
+fn publish_exit(slot: &ExitSlot, status: &std::process::ExitStatus) {
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some(ChildExit::from_status(status));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1421 — the heartbeat must never report a dead child as progress.
+//
+// The bug it replaces: liveness was inferred from `Path::new("/proc/<pid>")`,
+// and when that said "gone" the heartbeat printed
+//   `... waiting (32s elapsed, process may be finishing)`
+// every thirty seconds — indefinitely, and indistinguishably from a genuinely
+// long step. `/proc` does not exist on macOS, so that branch was taken on every
+// tick there regardless of the child's actual state.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    const IDLE: u64 = 30;
+
+    fn collector() -> (Arc<std::sync::Mutex<Vec<String>>>, impl FnMut(&str)) {
+        let lines: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        let emit = move |line: &str| {
+            sink.lock().unwrap().push(line.to_string());
+        };
+        (lines, emit)
+    }
+
+    /// The core of the bug. An observed exit outranks everything: it is
+    /// reported immediately, and it can never be downgraded into a message
+    /// that claims the child is still making progress.
+    #[test]
+    fn an_observed_exit_is_never_reported_as_progress() {
+        for code in [Some(0), Some(1), Some(127), None] {
+            let report = heartbeat_report(3_300, 3_300, IDLE, Some(ChildExit { code }), "boom");
+            assert!(
+                matches!(report, HeartbeatReport::Exited { .. }),
+                "a child that has exited ({code:?}) must be reported as exited, got {report:?}"
+            );
+            let rendered = report.render("00:00:00", "amplihack:claude:123").unwrap();
+            assert!(
+                !rendered.contains("may be finishing"),
+                "the exit report must not claim the child is still finishing: {rendered}"
+            );
+            assert!(
+                !rendered.contains("working"),
+                "the exit report must not claim work in progress: {rendered}"
+            );
+        }
+    }
+
+    /// The report has to be *useful*, not merely honest: it names how the child
+    /// ended and quotes what it said on the way out. The reporter's 404 was
+    /// sitting in the child's stderr the whole time and was never surfaced.
+    #[test]
+    fn a_failed_exit_names_the_status_and_quotes_the_child_stderr() {
+        let stderr = "API Error: 404 {\"type\":\"error\",\"error\":\
+                      {\"type\":\"not_found_error\",\
+                      \"message\":\"model: claude-opus-4-1-20250805\"}}";
+        let report = heartbeat_report(32, 32, IDLE, Some(ChildExit { code: Some(1) }), stderr);
+        let rendered = report.render("12:00:00", "amplihack:claude:4242").unwrap();
+        assert!(
+            rendered.contains("exit 1"),
+            "must name the exit code: {rendered}"
+        );
+        assert!(
+            rendered.contains("32s"),
+            "must name the elapsed time: {rendered}"
+        );
+        assert!(
+            rendered.contains("not_found_error"),
+            "must quote the child's stderr tail: {rendered}"
+        );
+    }
+
+    /// A clean exit is still reported, but needs no post-mortem.
+    #[test]
+    fn a_clean_exit_is_reported_without_a_stderr_dump() {
+        let report = heartbeat_report(5, 0, IDLE, Some(ChildExit { code: Some(0) }), "noise");
+        let rendered = report.render("12:00:00", "l").unwrap();
+        assert!(rendered.contains("exit 0"), "{rendered}");
+        assert!(
+            !rendered.contains("noise"),
+            "a clean exit needs no stderr dump: {rendered}"
+        );
+    }
+
+    /// The progress line is still available — but ONLY while no exit has been
+    /// observed. That is the whole safety property.
+    #[test]
+    fn a_live_and_quiet_child_still_gets_a_progress_line() {
+        let report = heartbeat_report(90, 31, IDLE, None, "");
+        assert_eq!(
+            report,
+            HeartbeatReport::Working {
+                elapsed_secs: 90,
+                idle_secs: 31
+            }
+        );
+        let rendered = report.render("12:00:00", "l").unwrap();
+        assert!(rendered.contains("working"), "{rendered}");
+    }
+
+    /// A live child that has just produced output says nothing at all.
+    #[test]
+    fn a_live_and_busy_child_is_silent() {
+        assert_eq!(
+            heartbeat_report(90, 2, IDLE, None, ""),
+            HeartbeatReport::Silent
+        );
+        assert_eq!(
+            heartbeat_report(90, 2, IDLE, None, "").render("t", "l"),
+            None
+        );
+    }
+
+    /// The loop-level property: once the child's exit is observable, the
+    /// heartbeat reports it and RETURNS. It does not keep ticking. The old
+    /// loop had no exit to observe at all and would have run until the process
+    /// was killed — fifty-five minutes, in the report.
+    #[test]
+    fn the_heartbeat_reports_the_exit_and_stops_polling() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out.log");
+        let stderr = dir.path().join("err.log");
+        std::fs::File::create(&output).unwrap();
+        std::fs::write(
+            &stderr,
+            "API Error: 404 not_found_error model: claude-opus-4-1-20250805
+",
+        )
+        .unwrap();
+
+        // A real child, really exited, really reaped — exactly the state the
+        // old `/proc` probe was trying (and failing) to detect.
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let status = child.wait().unwrap();
+        let slot: std::sync::Mutex<Option<ChildExit>> =
+            std::sync::Mutex::new(Some(ChildExit::from_status(&status)));
+
+        let (lines, mut emit) = collector();
+        let stop = AtomicBool::new(false);
+        let started = Instant::now();
+        run_heartbeat(
+            &HeartbeatConfig {
+                output_path: &output,
+                stderr_path: &stderr,
+                label: "amplihack:claude:1",
+                // A one-hour tick: if the loop were to sleep even once, this
+                // test would hang instead of passing. Returning proves it did not.
+                tick: Duration::from_secs(3600),
+                idle_threshold: Duration::from_secs(IDLE),
+            },
+            &stop,
+            &slot,
+            &mut emit,
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the heartbeat must return on an observed exit, not sleep on it"
+        );
+
+        let emitted = lines.lock().unwrap().join("\n");
+        assert!(
+            emitted.contains("child process ended: exit 1"),
+            "the exit must be reported: {emitted}"
+        );
+        assert!(
+            emitted.contains("not_found_error"),
+            "the child's stderr tail must be surfaced: {emitted}"
+        );
+        assert!(
+            !emitted.contains("may be finishing"),
+            "a dead child must never be reported as finishing: {emitted}"
+        );
+    }
+
+    /// The stderr tail is bounded, and keeps the END of the log — the
+    /// terminating error lives at the tail, not at the top.
+    #[test]
+    fn the_stderr_tail_is_bounded_and_keeps_the_end() {
+        let many = (1..=200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tail = stderr_tail(&many);
+        assert_eq!(tail.lines().count(), HEARTBEAT_STDERR_TAIL_LINES);
+        assert!(tail.ends_with("line 200"), "{tail}");
+        assert!(!tail.contains("line 1\n"), "{tail}");
+    }
+
+    /// A missing stderr log must not take the post-mortem down with it.
+    #[test]
+    fn a_missing_stderr_log_yields_an_empty_tail_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_stderr_tail(&dir.path().join("nope.log")), "");
     }
 }
 
