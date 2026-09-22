@@ -102,7 +102,21 @@ A variable is protected if its name is one of:
 - `RECIPE_VAR_`
 
 `PATH` is protected specifically so that binary resolution in the child can never
-be altered by budget trimming.
+be altered by budget trimming. For bash steps the one live dependency is the
+`timeout` binary: a step with a `timeout:` spawns `timeout <secs> <bash> …`, and
+`timeout` is located by name against the **child's** `PATH`. If `PATH` were
+droppable, every timed step would fail with `timeout: not found`.
+
+The bash interpreter itself does **not** depend on this. It is resolved to an
+absolute path against the *parent's* `PATH` before the child environment is
+built (see
+[Bash interpreter resolution](architecture.md#bash-interpreter-resolution)), and
+`execvp` never searches `PATH` for an argument containing `/`. That independence
+is exactly what resolving in the parent buys.
+
+`AMPLIHACK_BASH` is itself protected, by the `AMPLIHACK_` prefix rule above, so
+an operator's interpreter pin survives trimming and is inherited by every child
+the runner spawns — including any that invokes `recipe-runner-rs` in turn.
 
 Everything else is **non-protected** and may be trimmed.
 
@@ -273,3 +287,5 @@ child process or be triggered in production.
 - [Architecture](architecture.md) — where the subprocess adapter and context
   layer sit in the overall design.
 - [CLI Reference](cli-reference.md) — invoking recipes that spawn subprocesses.
+- [`AMPLIHACK_BASH`](cli-reference.md#amplihack_bash) — choosing the interpreter
+  those bash subprocesses run under.
