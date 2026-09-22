@@ -350,13 +350,15 @@ inline (`-c`) or file-backed, with or without a `timeout` wrapper.
 
 | # | Rule | Condition | Result |
 |---|---|---|---|
-| 1 | `AMPLIHACK_BASH` | Set and non-empty | That path, after validation. **Invalid values abort the step — they never fall through to rule 2.** |
+| 1 | `AMPLIHACK_BASH` | Set and non-empty | That path, after validation. **Invalid values abort the step — they never fall through to rule 2.** A value that is set but not valid UTF-8 is rejected the same way; only an *unset* variable reaches rule 2. |
 | 2 | `PATH` | Any absolute `PATH` entry contains an executable `bash` | The **first** match, in `PATH` order. |
 | 3 | Last resort | Nothing above matched | `/bin/bash` |
 
 An empty `AMPLIHACK_BASH` (`AMPLIHACK_BASH=`) is treated as unset and falls
 through to rule 2. There is no trimming: a whitespace-only value is a path, and
-it fails loudly like any other bad one.
+it fails loudly like any other bad one. A value containing bytes that are not
+valid UTF-8 is *not* treated as unset — you named an interpreter, so running a
+different one silently is the one outcome rule 1 exists to prevent.
 
 Non-absolute and empty `PATH` entries are skipped during the rule-2 scan. An
 empty entry means "current directory" to POSIX, and the current directory of a
@@ -386,13 +388,19 @@ AMPLIHACK_BASH is set to "<path>" but <reason>. Unset AMPLIHACK_BASH to resolve
 bash from PATH, or point it at an absolute path to an executable bash.
 ```
 
-`<reason>` is one of three fixed strings:
+`<reason>` is one of a fixed set of strings:
 
 | Reason | Triggered by | Example value |
 |---|---|---|
+| is not valid UTF-8 | bytes that are not decodable as UTF-8 | a path pasted from a mis-encoded locale |
 | not an absolute path | anything without a leading `/` | `bash`, `./bash`, `~/bin/bash` |
 | not a regular file | missing paths, dangling symlinks, directories | `/nonexistent/bash`, `/opt/bash/` |
+| not accessible (permission denied) | present, but some directory on the path cannot be traversed | `/root/bin/bash` as a non-root user |
 | not executable | present and a regular file, but no execute bit set | `/opt/bin/bash` at mode `0644` |
+
+The permission-denied case is called out separately on purpose: an executable
+bash under an unreadable parent directory *exists*, and reporting it as missing
+would send you looking for a file that is already there.
 
 Two properties of that message are worth knowing before you paste it into a bug
 report:

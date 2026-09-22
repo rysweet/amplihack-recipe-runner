@@ -281,6 +281,84 @@ fn test_directory_amplihack_bash_fails_loud() {
     );
 }
 
+/// A pin that is SET but not valid UTF-8 must be rejected, not treated as
+/// absent. `env::var(..).ok()` conflates `NotUnicode` with `NotPresent`, which
+/// downgrades an explicit operator choice into a silent PATH search — the run
+/// stays green while a different interpreter executes. This is the one
+/// rejection that cannot be unit-tested through the pure function: the defect
+/// lives entirely in the env READ, so it only exists once a real process reads
+/// a real variable.
+#[test]
+fn test_non_utf8_amplihack_bash_fails_loud() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    // Lone 0xFF/0xFE: valid in a POSIX path, never valid UTF-8.
+    let bad = OsStr::from_bytes(b"/nonexistent/\xff\xfe/bash");
+
+    assert_fails_loud(
+        Path::new(bad),
+        "not valid UTF-8",
+        &["AMPLIHACK_BASH", "not valid UTF-8"],
+    );
+}
+
+/// An executable, regular bash under a parent directory the runner cannot
+/// traverse must be reported as inaccessible — not as "not a regular file",
+/// which sends the operator hunting for a file that is sitting right there.
+#[test]
+fn test_unreadable_parent_amplihack_bash_reports_permission_denied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    let bash = locked.join("bash");
+    write_executable(&bash, "#!/bin/sh\nexec /bin/bash \"$@\"\n");
+
+    let restore = std::fs::metadata(&locked).unwrap().permissions();
+    let mut sealed = restore.clone();
+    sealed.set_mode(0o000);
+    std::fs::set_permissions(&locked, sealed).unwrap();
+
+    // root ignores the mode bits, so the EACCES this test is about never
+    // happens. Restore and skip rather than assert something untrue.
+    let traversable = std::fs::metadata(&bash).is_ok();
+
+    let outcome = if traversable {
+        None
+    } else {
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let recipe = write_recipe(tmp.path(), "touch step.ran", None);
+        let out = run_recipe(&recipe, &work, Some(&bash));
+        Some((
+            combined(&out),
+            out.status.success(),
+            work.join("step.ran").exists(),
+        ))
+    };
+
+    // Restore BEFORE asserting so a failure cannot leave an undeletable tempdir.
+    std::fs::set_permissions(&locked, restore).unwrap();
+
+    let Some((text, success, step_ran)) = outcome else {
+        return;
+    };
+    assert!(
+        !success,
+        "an inaccessible AMPLIHACK_BASH must fail the run:\n{text}"
+    );
+    assert!(
+        !step_ran,
+        "the step ran anyway — the pin was ignored:\n{text}"
+    );
+    let lower = text.to_lowercase();
+    assert!(lower.contains("amplihack_bash"), "{text}");
+    assert!(
+        lower.contains("permission denied"),
+        "message must name the real cause, not a missing file:\n{text}"
+    );
+}
+
 /// An unusable `AMPLIHACK_BASH` must be rejected on the timed arms too, not
 /// just deferred into a confusing exit-127 from `timeout`'s `execvp`.
 #[test]
@@ -364,8 +442,9 @@ fn test_amplihack_bash_can_pin_legacy_bin_bash() {
 // The resolved interpreter is recorded
 // ══════════════════════════════════════════════════════════════════════
 
-/// #143 asks for the resolved interpreter in the run log, which is what turns
-/// the downstream amplihack-rs#1457 symptom into a one-line diagnosis.
+/// #143 asks for the resolved interpreter in the run log. This test injects
+/// `RUST_LOG=debug` itself, so what it pins is the line's CONTENT and FORMAT —
+/// the path and the deciding rule — not that an operator sees it by default.
 #[test]
 fn test_resolved_interpreter_is_logged() {
     let tmp = tempfile::tempdir().unwrap();

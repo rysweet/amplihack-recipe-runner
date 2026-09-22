@@ -101,6 +101,12 @@ pub(crate) const BASH_LAST_RESORT: &str = "/bin/bash";
 fn exec_file_rejection(path: &Path) -> Option<&'static str> {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(path) {
+        // EACCES anywhere in the path prefix must NOT be reported as a missing
+        // file: the file is sitting right there, and "not a regular file" sends
+        // the operator hunting for something that exists.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            Some("not accessible (permission denied)")
+        }
         // A missing path and a dangling symlink are indistinguishable here, and
         // both are "not a regular file" from the operator's point of view.
         Err(_) => Some("not a regular file"),
@@ -192,7 +198,19 @@ pub(crate) fn resolve_bash_interpreter_from(
 /// `pub` because `tests/integration.rs` is an external crate and its bash
 /// fixture must resolve identically to production.
 pub fn resolve_bash_interpreter() -> anyhow::Result<PathBuf> {
-    let amplihack_bash = env::var("AMPLIHACK_BASH").ok();
+    // NOT `.ok()`: that conflates `NotUnicode` with `NotPresent`, so a pin the
+    // operator actually SET would silently downgrade to a PATH search — the
+    // precise fail-open that rule 1 forbids. A set-but-unreadable value is a
+    // rejection, not an absence.
+    let amplihack_bash = match env::var("AMPLIHACK_BASH") {
+        Ok(raw) => Some(raw),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(raw)) => anyhow::bail!(
+            "AMPLIHACK_BASH is set to {raw:?} but is not valid UTF-8. Unset \
+             AMPLIHACK_BASH to resolve bash from PATH, or point it at an \
+             absolute path to an executable bash."
+        ),
+    };
     let path = env::var("PATH").ok();
     let (resolved, rule) =
         resolve_bash_interpreter_from(amplihack_bash.as_deref(), path.as_deref())?;
@@ -3251,12 +3269,18 @@ mod tests {
     // #143: bash interpreter resolution
     // ══════════════════════════════════════════════════════════════════
     //
-    // NOTE: not one test below mutates the process environment. Under edition
-    // 2024 `std::env::set_var` is `unsafe` and unsound alongside Cargo's
-    // multi-threaded test runner; splitting the env read into a thin wrapper is
-    // what makes these plain function calls. The wrapper's env read is covered
-    // instead by `tests/bash_interpreter_tests.rs`, which sets the variable on
-    // a CHILD process.
+    // NOTE: not one test below mutates the process environment, and exactly
+    // one — `test_resolve_bash_interpreter_wrapper_returns_absolute_path` —
+    // READS it. That one therefore asserts nothing an ambient `AMPLIHACK_BASH`
+    // could falsify: a developer with a bad value exported is supposed to get a
+    // rejection, and failing the test for it would name the wrong culprit.
+    //
+    // Under edition 2024 `std::env::set_var` is `unsafe` and unsound alongside
+    // Cargo's multi-threaded test runner; splitting the env read into a thin
+    // wrapper is what makes these plain function calls. The wrapper's env read
+    // is covered instead by `tests/bash_interpreter_tests.rs`, which sets the
+    // variable on a CHILD process — including the non-UTF-8 case, which is
+    // unrepresentable in this module's `Option<&str>` calls by construction.
 
     use std::ffi::{OsStr, OsString};
     use std::path::PathBuf;
@@ -3554,13 +3578,63 @@ mod tests {
     /// The public wrapper must always hand back an ABSOLUTE path. §4: `execvp`
     /// never searches PATH for an argument containing `/`, so absoluteness is
     /// precisely what makes the child-PATH question vacuous at all four arms.
+    ///
+    /// This is the only test here that reads the ambient environment, so it
+    /// asserts on the `Ok` arm ONLY. A developer or CI runner with a bad
+    /// `AMPLIHACK_BASH` exported is supposed to get an error — failing this
+    /// test for it would name the wrong culprit for a correct rejection.
     #[test]
     fn test_resolve_bash_interpreter_wrapper_returns_absolute_path() {
-        let resolved = resolve_bash_interpreter().expect("resolution must succeed in a test env");
+        if let Ok(resolved) = resolve_bash_interpreter() {
+            assert!(
+                resolved.is_absolute(),
+                "resolved interpreter must be absolute, got {resolved:?}"
+            );
+        }
+    }
 
+    /// EACCES must be diagnosed as itself. A regular, executable bash under a
+    /// parent the process cannot traverse is present — reporting it as "not a
+    /// regular file" sends the operator looking for a missing file that is
+    /// sitting right there, which is the opposite of this predicate's job.
+    #[test]
+    fn test_unreadable_parent_is_reported_as_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let locked = tmp.path().join("locked");
+        let bash = write_fake_bash(&locked, "bash", 0o755);
+
+        let restore = std::fs::metadata(&locked).unwrap().permissions();
+        let mut sealed = restore.clone();
+        sealed.set_mode(0o000);
+        std::fs::set_permissions(&locked, sealed).unwrap();
+
+        // root ignores mode bits, so the EACCES under test never occurs.
+        let skip = std::fs::metadata(&bash).is_ok();
+        let result = if skip {
+            None
+        } else {
+            Some(resolve_bash_interpreter_from(
+                Some(bash.to_str().unwrap()),
+                None,
+            ))
+        };
+
+        // Restore before asserting: a panic here must not leave an
+        // undeletable directory behind for the tempdir drop.
+        std::fs::set_permissions(&locked, restore).unwrap();
+
+        let Some(result) = result else { return };
+        let err = result.expect_err("an untraversable interpreter must be rejected");
+        let msg = err.to_string();
         assert!(
-            resolved.is_absolute(),
-            "resolved interpreter must be absolute, got {resolved:?}"
+            msg.contains("permission denied"),
+            "must name the real cause, got: {msg}"
+        );
+        assert!(
+            !msg.contains("not a regular file"),
+            "must not claim the file is missing, got: {msg}"
         );
     }
 
@@ -3623,8 +3697,9 @@ mod tests {
             vec![0xff, 0xfe],              // wholly invalid UTF-8
             vec![b' ', 0xff, b'a', b'\n'], // invalid, needs trimming too
             "unicode: \u{4f60}\u{597d} \u{1f600}\n".as_bytes().to_vec(),
-            // Multi-byte whitespace is NOT trimmed by `str::trim`'s ASCII-plus-
-            // Unicode rules the same way as a naive byte trim would be; pin it.
+            // U+00A0 carries the `White_Space` property, so `str::trim` DOES
+            // strip it while a naive ASCII byte trim would not. Pin the
+            // multi-byte case so the replacement keeps following `str::trim`.
             "\u{a0}nbsp\u{a0}".as_bytes().to_vec(),
         ];
         for bytes in cases {

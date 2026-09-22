@@ -296,15 +296,20 @@ environment is built and before any temporary script file is created:
 3. Otherwise `/bin/bash`.
 
 Validation is `metadata()` (symlinks followed) plus `is_file()` and the
-owner/group/other execute bits. A set-but-unusable `AMPLIHACK_BASH` — relative,
-missing, a directory, or not executable — aborts the step with a single error
-string naming the variable, the rejected path, one of three fixed reasons, and
-the remedy. It does **not** fall through to rules 2
+owner/group/other execute bits. A set-but-unusable `AMPLIHACK_BASH` — not valid
+UTF-8, relative, missing, a directory, unreadable, or not executable — aborts
+the step with a single error string naming the variable, the rejected value, a
+fixed reason, and the remedy. Note that "set" is decided on `NotPresent` alone:
+a value that is present but not decodable is a rejection, never an absence. It
+does **not** fall through to rules 2
 or 3; see [CLI Reference](cli-reference.md#amplihack_bash) for the operator-facing
 contract.
 
-The resolved path and the rule tag are logged once **per bash step** — resolution
-is per-call and uncached, so there is one line per step, not one per process.
+The resolved path and the rule tag are logged once **per bash-step execution,
+including lifecycle hooks** — resolution is per-call and uncached, and hooks are
+themselves bash steps, so a recipe with both `pre_step` and `post_step` emits up
+to three lines per step. It is one line per bash-step execution, not one per
+process.
 The line is emitted at `info`. (`main.rs` calls `env_logger::init()` with no
 default filter, so it needs `RUST_LOG` set to be shown.) The line and the error text carry the
 resolved or rejected path plus the rule/reason and nothing else — never `PATH`,
