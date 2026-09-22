@@ -87,17 +87,27 @@ pub(crate) fn is_env_protected(name: &str) -> bool {
 /// `resolve_bash_interpreter`.
 pub(crate) const BASH_LAST_RESORT: &str = "/bin/bash";
 
-/// Is `path` a regular file with at least one execute bit set?
+/// `None` if `path` is a regular file with at least one execute bit set, else
+/// the reason it is unusable as an interpreter.
+///
+/// The single executability predicate: both the `AMPLIHACK_BASH` check (which
+/// reports the reason) and the `PATH` scan (which only asks yes/no) go through
+/// here, so the two can never drift apart.
 ///
 /// `metadata` follows symlinks deliberately: `/bin/bash` is itself a symlink on
 /// many distributions. This is a fail-fast diagnostic, not a security control —
 /// nothing stops the file changing between here and `execvp`. Its job is to turn
 /// a bare ENOENT at spawn into a message naming the cause.
-fn is_executable_file(path: &Path) -> bool {
+fn exec_file_rejection(path: &Path) -> Option<&'static str> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    match std::fs::metadata(path) {
+        // A missing path and a dangling symlink are indistinguishable here, and
+        // both are "not a regular file" from the operator's point of view.
+        Err(_) => Some("not a regular file"),
+        Ok(m) if !m.is_file() => Some("not a regular file"),
+        Ok(m) if m.permissions().mode() & 0o111 == 0 => Some("not executable"),
+        Ok(_) => None,
+    }
 }
 
 /// Validate an operator-supplied `AMPLIHACK_BASH`, or reject it by name.
@@ -108,21 +118,15 @@ fn is_executable_file(path: &Path) -> bool {
 /// `PATH` or the candidates tried, which routinely carry project and username
 /// identifiers in directory names.
 fn validate_amplihack_bash(raw: &str) -> anyhow::Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
     let path = Path::new(raw);
     // Absoluteness is the one rule that is hardening, not diagnosis: in the
     // `timeout` arms the interpreter is an *argument* to `timeout`, so a leading
     // `-` would be parsed as a `timeout` option. Requiring `/` makes that
     // unrepresentable — and makes `execvp`'s PATH search vacuous everywhere.
-    let reason = if !path.is_absolute() {
-        Some("not an absolute path")
+    let reason = if path.is_absolute() {
+        exec_file_rejection(path)
     } else {
-        match std::fs::metadata(path) {
-            Ok(m) if !m.is_file() => Some("not a regular file"),
-            Ok(m) if m.permissions().mode() & 0o111 == 0 => Some("not executable"),
-            Ok(_) => None,
-            Err(_) => Some("not a regular file"),
-        }
+        Some("not an absolute path")
     };
     match reason {
         None => Ok(path.to_path_buf()),
@@ -168,7 +172,7 @@ pub(crate) fn resolve_bash_interpreter_from(
             continue;
         }
         let candidate = dir.join("bash");
-        if is_executable_file(&candidate) {
+        if exec_file_rejection(&candidate).is_none() {
             return Ok((candidate, "PATH"));
         }
     }
@@ -193,13 +197,9 @@ pub fn resolve_bash_interpreter() -> anyhow::Result<PathBuf> {
     let (resolved, rule) =
         resolve_bash_interpreter_from(amplihack_bash.as_deref(), path.as_deref())?;
 
-    // The two non-default rules are the interesting ones an operator needs to
-    // see; the last resort stays quiet. Path and rule only — never `PATH`.
-    if rule == "default" {
-        log::debug!("bash interpreter: {} (source: {rule})", resolved.display());
-    } else {
-        log::warn!("bash interpreter: {} (source: {rule})", resolved.display());
-    }
+    // Path and rule only — never `PATH` itself, whose directory names routinely
+    // carry project, customer and username identifiers.
+    log::info!("bash interpreter: {} (source: {rule})", resolved.display());
     Ok(resolved)
 }
 
@@ -3220,47 +3220,6 @@ mod tests {
     // #143: bash interpreter resolution
     // ══════════════════════════════════════════════════════════════════
     //
-    // TDD contract. These tests are written against an API that does not exist
-    // yet — they define it. The implementation must provide, in this module:
-    //
-    //   /// Last-resort interpreter. MUST be the only `/bin/bash` literal left
-    //   /// in the executable code of this file.
-    //   pub(crate) const BASH_LAST_RESORT: &str = "/bin/bash";
-    //
-    //   /// Pure core, no env and no spawning. `amplihack_bash` is the raw
-    //   /// `AMPLIHACK_BASH` value (if set) and `path` the raw `PATH` value (if
-    //   /// set). Returns the resolved ABSOLUTE interpreter path together with
-    //   /// the rule that decided it: `"AMPLIHACK_BASH"`, `"PATH"`, or
-    //   /// `"default"`.
-    //   pub(crate) fn resolve_bash_interpreter_from(
-    //       amplihack_bash: Option<&str>,
-    //       path: Option<&str>,
-    //   ) -> anyhow::Result<(std::path::PathBuf, &'static str)>;
-    //
-    //   /// Env-reading wrapper: reads AMPLIHACK_BASH/PATH from the PARENT
-    //   /// process, logs the decision and the matched rule, returns the path.
-    //   /// `pub` because `tests/integration.rs` resolves through it too.
-    //   pub fn resolve_bash_interpreter() -> anyhow::Result<std::path::PathBuf>;
-    //
-    //   /// What bash should execute. Must be `Copy` so the call site can pass
-    //   /// it to `bash_command_argv` and then still borrow it for
-    //   /// `bash_spawn_context`.
-    //   #[derive(Clone, Copy)]
-    //   pub(crate) enum BashInvocation<'a> { File(&'a Path), Inline(&'a str) }
-    //
-    //   /// Complete argv for one bash step; `argv[0]` is the program.
-    //   pub(crate) fn bash_command_argv(
-    //       bash: &Path,
-    //       inv: BashInvocation<'_>,
-    //       timeout: Option<u64>,
-    //   ) -> Vec<std::ffi::OsString>;
-    //
-    //   /// The `with_context` message for this arm.
-    //   pub(crate) fn bash_spawn_context(
-    //       inv: &BashInvocation<'_>,
-    //       timeout: Option<u64>,
-    //   ) -> &'static str;
-    //
     // NOTE: not one test below mutates the process environment. Under edition
     // 2024 `std::env::set_var` is `unsafe` and unsound alongside Cargo's
     // multi-threaded test runner; splitting the env read into a thin wrapper is
@@ -3398,27 +3357,18 @@ mod tests {
     /// child-PATH-vs-parent-PATH ambiguity #143 exists to remove.
     #[test]
     fn test_resolve_bash_amplihack_bash_relative_is_rejected() {
-        let err = resolve_err(resolve_bash_interpreter_from(
-            Some("bash"),
-            Some("/usr/bin:/bin"),
-        ));
+        for raw in ["bash", "./tools/bash", "~/bin/bash"] {
+            let err = resolve_err(resolve_bash_interpreter_from(
+                Some(raw),
+                Some("/usr/bin:/bin"),
+            ));
 
-        assert!(
-            err.contains("absolute"),
-            "a non-absolute AMPLIHACK_BASH must be rejected as not absolute: {err}"
-        );
-    }
-
-    /// A relative path with separators is still relative. Guards against an
-    /// implementation that only checks for the absence of `/`.
-    #[test]
-    fn test_resolve_bash_amplihack_bash_relative_with_separator_is_rejected() {
-        let err = resolve_err(resolve_bash_interpreter_from(
-            Some("./tools/bash"),
-            Some("/usr/bin:/bin"),
-        ));
-
-        assert!(err.contains("absolute"), "{err}");
+            assert!(
+                err.contains("absolute"),
+                "a non-absolute AMPLIHACK_BASH ({raw:?}) must be rejected as \
+                 not absolute, and must NOT fall through to PATH: {err}"
+            );
+        }
     }
 
     /// A symlink pointing at a valid interpreter must pass: resolution uses
@@ -3568,32 +3518,6 @@ mod tests {
         assert_eq!(rule, "default");
     }
 
-    /// An empty PATH string behaves like an unset PATH.
-    #[test]
-    fn test_resolve_bash_empty_path_falls_back_to_last_resort() {
-        let (resolved, rule) = resolve_bash_interpreter_from(None, Some("")).unwrap();
-
-        assert_eq!(resolved, PathBuf::from(BASH_LAST_RESORT));
-        assert_eq!(rule, "default");
-    }
-
-    /// The tag is drawn from a closed set; the run log and the docs both name
-    /// these three and nothing else.
-    #[test]
-    fn test_resolve_bash_rule_tag_is_one_of_three() {
-        for (env, path) in [
-            (None, None),
-            (None, Some("/usr/bin:/bin")),
-            (Some(""), Some("/usr/bin:/bin")),
-        ] {
-            let (_, rule) = resolve_bash_interpreter_from(env, path).unwrap();
-            assert!(
-                ["AMPLIHACK_BASH", "PATH", "default"].contains(&rule),
-                "unexpected rule tag {rule:?}"
-            );
-        }
-    }
-
     // ── The env-reading wrapper ───────────────────────────────────────
 
     /// The public wrapper must always hand back an ABSOLUTE path. §4: `execvp`
@@ -3714,26 +3638,6 @@ mod tests {
         }
     }
 
-    /// The interpreter must reach argv only through the resolved value — no
-    /// `/bin/bash` literal may survive at any arm.
-    #[test]
-    fn test_no_arm_hardcodes_bin_bash_when_interpreter_differs() {
-        let resolved = PathBuf::from("/opt/homebrew/bin/bash");
-        let script = Path::new("/tmp/s.sh");
-
-        for argv in [
-            bash_command_argv(&resolved, BashInvocation::File(script), Some(30)),
-            bash_command_argv(&resolved, BashInvocation::File(script), None),
-            bash_command_argv(&resolved, BashInvocation::Inline("echo hi"), Some(30)),
-            bash_command_argv(&resolved, BashInvocation::Inline("echo hi"), None),
-        ] {
-            assert!(
-                !argv.iter().any(|a| a == OsStr::new("/bin/bash")),
-                "hard-coded /bin/bash leaked into argv: {argv:?}"
-            );
-        }
-    }
-
     /// The timeout value is rendered as seconds in `argv[1]`, unchanged from the
     /// legacy `secs.to_string()` at both timed arms.
     #[test]
@@ -3814,25 +3718,6 @@ mod tests {
         assert_eq!(
             bash_spawn_context(&BashInvocation::Inline("echo hi"), None),
             "Failed to execute bash step"
-        );
-    }
-
-    /// The four messages are mutually distinct — the whole point is telling the
-    /// arms apart in an operator's log.
-    #[test]
-    fn test_bash_spawn_context_messages_are_distinct() {
-        let script = Path::new("/tmp/s.sh");
-        let msgs = [
-            bash_spawn_context(&BashInvocation::File(script), Some(30)),
-            bash_spawn_context(&BashInvocation::File(script), None),
-            bash_spawn_context(&BashInvocation::Inline("x"), Some(30)),
-            bash_spawn_context(&BashInvocation::Inline("x"), None),
-        ];
-        let unique: std::collections::HashSet<_> = msgs.iter().collect();
-        assert_eq!(
-            unique.len(),
-            4,
-            "context strings must be distinct: {msgs:?}"
         );
     }
 

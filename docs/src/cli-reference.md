@@ -416,25 +416,16 @@ file literally called `x;evil`.
 
 #### Resolution is logged
 
-Each bash step logs the interpreter it resolved and which rule chose it.
-Resolution is per step and uncached, so a recipe with N bash steps emits N
-lines.
-
-| Rule | Level |
-|---|---|
-| `AMPLIHACK_BASH` | `warn` |
-| `PATH` | `warn` |
-| `default` | `debug` |
-
-The two non-default rules log at `warn` precisely because they are the
-interesting cases; the `/bin/bash` last resort stays quiet at `debug`.
+Each bash step logs the interpreter it resolved and which rule chose it, at
+`info`. Resolution is per step and uncached, so a recipe with N bash steps emits
+N lines.
 
 The binary initialises `env_logger` with no default filter, so **nothing below
 `error` is shown until you set `RUST_LOG`**:
 
 ```console
-$ RUST_LOG=warn recipe-runner-rs build
-[2026-09-22T17:04:11Z WARN  recipe_runner_rs::adapters::cli_subprocess] bash interpreter: /opt/homebrew/bin/bash (source: PATH)
+$ RUST_LOG=info recipe-runner-rs build
+[2026-09-22T17:04:11Z INFO  recipe_runner_rs::adapters::cli_subprocess] bash interpreter: /opt/homebrew/bin/bash (source: PATH)
 ```
 
 The message body — the part after `env_logger`'s timestamp/level/target prefix —

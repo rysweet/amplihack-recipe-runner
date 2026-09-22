@@ -305,10 +305,8 @@ contract.
 
 The resolved path and the rule tag are logged once **per bash step** — resolution
 is per-call and uncached, so there is one line per step, not one per process.
-The `AMPLIHACK_BASH` and `PATH` rules log at `warn` and the `/bin/bash` last
-resort at `debug`, so the interesting cases surface without the common case
-adding noise. (`main.rs` calls `env_logger::init()` with no default filter, so
-even `warn` needs `RUST_LOG` set.) The line and the error text carry the
+The line is emitted at `info`. (`main.rs` calls `env_logger::init()` with no
+default filter, so it needs `RUST_LOG` set to be shown.) The line and the error text carry the
 resolved or rejected path plus the rule/reason and nothing else — never `PATH`,
 never the candidate list, which routinely carry project and username
 identifiers in directory names.
@@ -374,8 +372,8 @@ necessarily what executes**, in the two `timeout` arms. `build_child_env` forces
 a non-empty `PATH` and `is_env_protected` keeps it undroppable, but `extra_env`
 is merged afterwards and can override it — non-empty is not the same as
 trustworthy. Net risk is nil, since the step body is already arbitrary bash.
-Widening the fix to the `timeout` binary is out of scope here and tracked
-separately.
+Widening the fix to the `timeout` binary is out of scope here and tracked as
+[#145](https://github.com/rysweet/amplihack-recipe-runner/issues/145).
 
 ---
 
