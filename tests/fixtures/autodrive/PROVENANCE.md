@@ -28,7 +28,14 @@ preflight's contents beyond its emitting a `state_dir` field.
 the consuming step pipes through. `amplihack` is not a dependency of this
 repository and is not present in CI, and the test must not silently skip when
 it is absent. The shim is put first on `PATH` unconditionally, so the test
-behaves identically on a developer machine and in CI. It implements the same
-contract as the real subcommands: `extract-json --require-field NAME` prints
-the last JSON object in the input carrying `NAME` (or `{}`), and
-`extract-field --field NAME --default D` prints that field or `D`.
+behaves identically on a developer machine and in CI.
+
+It covers the real subcommands' contract only as far as this fixture uses it:
+`extract-json --require-field NAME` prints the input when it carries `NAME` and
+`{}` when it does not, and `extract-field --field NAME --default D` prints that
+field's string value or `D`. The preflight emits one flat object of string
+values, so `sed` reads it; the shim is not a JSON parser and must not be
+mistaken for one. The test asserts that the preflight's output reaches the
+consuming step's environment at all, which no extractor can fake: given an
+empty `CRUSTY_LOOP_PREFLIGHT` the shim yields nothing and the step's own guard
+refuses the run, exactly as in the field before the fix.

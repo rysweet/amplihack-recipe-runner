@@ -4,111 +4,61 @@
 # The consuming step in `autodrive-crusty-loop` pipes the preflight JSON
 # through these two subcommands. `amplihack` is not a dependency of this
 # repository and is absent in CI, and this test must not skip when it is
-# missing, so the fixture supplies them and is placed first on PATH. See
-# PROVENANCE.md.
+# missing, so the fixture supplies them and is placed first on PATH
+# unconditionally. See PROVENANCE.md.
+#
+# Scope: the preflight emits one flat JSON object whose values are strings, so
+# the shim reads exactly that shape, with sed. It is not a JSON parser and does
+# not try to be one. What the test asserts is that the preflight's output
+# reaches the consuming step's environment at all; how the step then takes it
+# apart is incidental, and an extractor that needed its own parser would be
+# more surface to get wrong than the behaviour under test.
 set -uo pipefail
 
-# The two subcommands below are implemented in Python. Say so by name if it is
-# absent, rather than failing as `python3: command not found` from inside a
-# shim the reader did not know was here.
-command -v python3 >/dev/null 2>&1 || {
-  echo "amplihack shim: python3 is required by tests/fixtures/autodrive/bin/amplihack; see that directory's PROVENANCE.md" >&2
+die() {
+  echo "amplihack shim: $1" >&2
   exit 2
 }
 
-if [ "${1:-}" != "orch" ] || [ "${2:-}" != "helper" ]; then
-  echo "amplihack shim: only 'orch helper ...' is implemented; got: $*" >&2
-  exit 2
-fi
+[ "${1:-}" = "orch" ] && [ "${2:-}" = "helper" ] ||
+  die "only 'orch helper ...' is implemented; got: $*"
 sub="${3:-}"
+[ -n "$sub" ] || die "no subcommand given"
 shift 3
+
+field=""
+default=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --require-field | --field)
+      field="${2:-}"
+      shift 2
+      ;;
+    --default)
+      default="${2:-}"
+      shift 2
+      ;;
+    *) shift ;;
+  esac
+done
+[ -n "$field" ] || die "$sub needs a field name"
+
+input="$(cat)"
 
 case "$sub" in
   extract-json)
-    field=""
-    while [ $# -gt 0 ]; do
-      case "$1" in
-        --require-field) field="${2:-}"; shift 2 ;;
-        *) shift ;;
-      esac
-    done
-    FIELD="$field" python3 -c '
-import json, os, sys
-
-text = sys.stdin.read()
-field = os.environ.get("FIELD", "")
-
-# Collect every balanced top-level {...} run that parses as JSON, in document
-# order, ignoring braces inside strings.
-objs = []
-depth = 0
-start = None
-in_str = False
-esc = False
-for i, ch in enumerate(text):
-    if in_str:
-        if esc:
-            esc = False
-        elif ch == "\\":
-            esc = True
-        elif ch == "\"":
-            in_str = False
-        continue
-    if ch == "\"":
-        in_str = True
-    elif ch == "{":
-        if depth == 0:
-            start = i
-        depth += 1
-    elif ch == "}" and depth > 0:
-        depth -= 1
-        if depth == 0 and start is not None:
-            try:
-                objs.append(json.loads(text[start:i + 1]))
-            except ValueError:
-                pass
-            start = None
-
-out = {}
-if field:
-    # Last object carrying the field wins, matching the real subcommand.
-    for o in objs:
-        if isinstance(o, dict) and field in o:
-            out = o
-elif objs:
-    out = objs[0]
-sys.stdout.write(json.dumps(out, separators=(",", ":")) + "\n")
-'
+    # Pass the object through when it carries the required field; the real
+    # subcommand emits `{}` when it does not.
+    if printf '%s' "$input" | grep -q "\"${field}\"[[:space:]]*:"; then
+      printf '%s\n' "$input"
+    else
+      printf '{}\n'
+    fi
     ;;
   extract-field)
-    field=""
-    default=""
-    while [ $# -gt 0 ]; do
-      case "$1" in
-        --field) field="${2:-}"; shift 2 ;;
-        --default) default="${2:-}"; shift 2 ;;
-        *) shift ;;
-      esac
-    done
-    FIELD="$field" DEFAULT="$default" python3 -c '
-import json, os, sys
-
-field = os.environ.get("FIELD", "")
-default = os.environ.get("DEFAULT", "")
-try:
-    data = json.loads(sys.stdin.read())
-except ValueError:
-    data = None
-if isinstance(data, dict) and field in data and data[field] is not None:
-    v = data[field]
-    v = v if isinstance(v, str) else json.dumps(v, separators=(",", ":"))
-else:
-    v = default
-sys.stdout.write(v + "\n")
-'
+    value="$(printf '%s' "$input" |
+      sed -n "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p")"
+    printf '%s\n' "${value:-$default}"
     ;;
-  *)
-    echo "amplihack shim: unsupported subcommand: $sub" >&2
-    exit 2
-    ;;
+  *) die "unsupported subcommand: $sub" ;;
 esac
