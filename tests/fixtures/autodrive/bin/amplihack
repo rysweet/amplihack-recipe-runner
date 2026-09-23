@@ -8,6 +8,14 @@
 # PROVENANCE.md.
 set -uo pipefail
 
+# The two subcommands below are implemented in Python. Say so by name if it is
+# absent, rather than failing as `python3: command not found` from inside a
+# shim the reader did not know was here.
+command -v python3 >/dev/null 2>&1 || {
+  echo "amplihack shim: python3 is required by tests/fixtures/autodrive/bin/amplihack; see that directory's PROVENANCE.md" >&2
+  exit 2
+}
+
 if [ "${1:-}" != "orch" ] || [ "${2:-}" != "helper" ]; then
   echo "amplihack shim: only 'orch helper ...' is implemented; got: $*" >&2
   exit 2
