@@ -218,6 +218,24 @@ cat "$AMPLIHACK_CONTEXT_FILE"
 task="$(jq -r '.task_description' "$AMPLIHACK_CONTEXT_FILE")"
 ```
 
+### What context contributes to the total
+
+Each top-level context value is exported under **two** names — the canonical
+`RECIPE_VAR_<key>` and, where the key is a suitable identifier, a plain
+upper-cased alias — so it counts against the budget roughly twice. This applies
+uniformly to every value, string or JSON; see
+[Step Outputs in the Environment](step-output-env.md).
+
+Two consequences follow, and both are intended:
+
+- A recipe carrying large JSON outputs reaches the file-first threshold sooner
+  than its raw context size suggests.
+- Above the threshold, the inline subset is keyed by the canonical
+  `RECIPE_VAR_` name only, so **no plain-name alias survives** — not even
+  `TASK_DESCRIPTION`. Consumers that
+  read an alias should guard it (`[ -n "$VAR" ]`) and fall back to
+  `$AMPLIHACK_CONTEXT_FILE`, which always holds the complete context.
+
 ---
 
 ## Configuration
@@ -289,3 +307,5 @@ child process or be triggered in production.
 - [CLI Reference](cli-reference.md) — invoking recipes that spawn subprocesses.
 - [`AMPLIHACK_BASH`](cli-reference.md#amplihack_bash) — choosing the interpreter
   those bash subprocesses run under.
+- [Step Outputs in the Environment](step-output-env.md) — the naming and
+  encoding rules for the context values this budget bounds.

@@ -213,6 +213,36 @@ failure a hard error that stops the recipe.
 | `false` (default)     | Step marked `degraded`, raw output stored, recipe continues |
 | `true`                | Step marked `failed`, recipe stops immediately |
 
+### Reading the Parsed Value
+
+A parsed object or array is stored in the context like any other output, and is
+exported to every later bash step as **compact JSON** under both
+`RECIPE_VAR_<output>` and the upper-cased `<OUTPUT>` alias — the same two names
+a plain string output gets.
+
+```yaml
+- id: preflight
+  command: printf '{"should_run":true,"state_dir":"/tmp/run-42"}\n'
+  output: my_preflight
+  parse_json: true
+
+- id: consume
+  command: |
+    echo "$MY_PREFLIGHT"
+    echo "$RECIPE_VAR_my_preflight"
+```
+
+```text
+{"should_run":true,"state_dir":"/tmp/run-42"}
+{"should_run":true,"state_dir":"/tmp/run-42"}
+```
+
+Individual fields of an object output are also available flattened, as
+`RECIPE_VAR_my_preflight__state_dir`. Reading the value from the environment is
+preferred over templating JSON into a script; see
+[Step Outputs in the Environment](step-output-env.md) for the naming rules, the
+size behaviour, and the reason.
+
 ---
 
 ## Sub-Recipe Recovery (`recovery_on_failure`)

@@ -667,3 +667,8 @@ from potentially noisy output using three strategies (tried in order):
 If all three fail, the runner optionally **retries** the agent step with a
 JSON-only reminder appended to the prompt, then re-applies the extraction
 pipeline.
+
+The extracted value is stored in the context under the step's `output:` name and
+is exported to later bash steps as compact JSON, under the same two names a
+string output gets. See
+[Step Outputs in the Environment](step-output-env.md).
