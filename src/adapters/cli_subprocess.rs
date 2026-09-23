@@ -1,6 +1,7 @@
 /// CLI subprocess adapter — executes agent steps by spawning `amplihack <agent>`
 /// subprocesses (configurable via `AMPLIHACK_AGENT_BINARY` env var, defaults to `claude`)
-/// and bash steps via `/bin/bash -c`.
+/// and bash steps via a bash interpreter resolved once in the parent process
+/// (`AMPLIHACK_BASH`, else the first `bash` on `PATH`, else `/bin/bash`).
 ///
 /// Agent steps use a temporary working directory to prevent file write races
 /// when running inside a nested Claude Code session (#2758). Session tree env
@@ -9,9 +10,10 @@ use crate::adapters::Adapter;
 use anyhow::Context;
 use std::collections::HashMap;
 use std::env;
+use std::ffi::OsString;
 use std::io::Read;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,6 +80,225 @@ pub(crate) fn is_env_protected(name: &str) -> bool {
     name.starts_with("AMPLIHACK_")
         || name.starts_with("RECIPE_VAR_")
         || PROTECTED_NAMES.contains(&name)
+}
+
+/// #143: last-resort bash interpreter. This MUST stay the only `/bin/bash`
+/// literal in the executable code of this file — everything else goes through
+/// `resolve_bash_interpreter`.
+pub(crate) const BASH_LAST_RESORT: &str = "/bin/bash";
+
+/// `None` if `path` is a regular file with at least one execute bit set, else
+/// the reason it is unusable as an interpreter.
+///
+/// The single executability predicate: both the `AMPLIHACK_BASH` check (which
+/// reports the reason) and the `PATH` scan (which only asks yes/no) go through
+/// here, so the two can never drift apart.
+///
+/// `metadata` follows symlinks deliberately: `/bin/bash` is itself a symlink on
+/// many distributions. This is a fail-fast diagnostic, not a security control —
+/// nothing stops the file changing between here and `execvp`. Its job is to turn
+/// a bare ENOENT at spawn into a message naming the cause.
+fn exec_file_rejection(path: &Path) -> Option<&'static str> {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        // EACCES anywhere in the path prefix must NOT be reported as a missing
+        // file: the file is sitting right there, and "not a regular file" sends
+        // the operator hunting for something that exists.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            Some("not accessible (permission denied)")
+        }
+        // A missing path and a dangling symlink are indistinguishable here, and
+        // both are "not a regular file" from the operator's point of view.
+        Err(_) => Some("not a regular file"),
+        Ok(m) if !m.is_file() => Some("not a regular file"),
+        Ok(m) if m.permissions().mode() & 0o111 == 0 => Some("not executable"),
+        Ok(_) => None,
+    }
+}
+
+/// Validate an operator-supplied `AMPLIHACK_BASH`, or reject it by name.
+///
+/// #143 requires failing loud rather than falling through: the operator named a
+/// specific interpreter, and quietly running a different one is worse than not
+/// running at all. The message echoes their value and the reason only — never
+/// `PATH` or the candidates tried, which routinely carry project and username
+/// identifiers in directory names.
+fn validate_amplihack_bash(raw: &str) -> anyhow::Result<PathBuf> {
+    let path = Path::new(raw);
+    // Absoluteness is the one rule that is hardening, not diagnosis: in the
+    // `timeout` arms the interpreter is an *argument* to `timeout`, so a leading
+    // `-` would be parsed as a `timeout` option. Requiring `/` makes that
+    // unrepresentable — and makes `execvp`'s PATH search vacuous everywhere.
+    let reason = if path.is_absolute() {
+        exec_file_rejection(path)
+    } else {
+        Some("not an absolute path")
+    };
+    match reason {
+        None => Ok(path.to_path_buf()),
+        Some(reason) => anyhow::bail!(
+            "AMPLIHACK_BASH is set to {raw:?} but {reason}. Unset AMPLIHACK_BASH \
+             to resolve bash from PATH, or point it at an absolute path to an \
+             executable bash."
+        ),
+    }
+}
+
+/// #143: pick the bash interpreter, as a pure function of the two env values.
+///
+/// Returns the resolved ABSOLUTE path and the rule that decided it, one of
+/// `"AMPLIHACK_BASH"`, `"PATH"` or `"default"`. Order:
+///
+/// 1. `AMPLIHACK_BASH`, if set and non-empty — validated, never bypassed.
+/// 2. Otherwise the first executable `bash` under an absolute `PATH` entry,
+///    in `PATH` order.
+/// 3. Otherwise [`BASH_LAST_RESORT`], preserving the pre-#143 behaviour.
+///
+/// There is deliberately no version probing: `PATH` order is the operator's
+/// stated preference, and `AMPLIHACK_BASH` covers the override case.
+pub(crate) fn resolve_bash_interpreter_from(
+    amplihack_bash: Option<&str>,
+    path: Option<&str>,
+) -> anyhow::Result<(PathBuf, &'static str)> {
+    // An empty value reads as unset. No trimming: whitespace is a path, and a
+    // trimmed typo would silently become a different interpreter.
+    if let Some(raw) = amplihack_bash
+        && !raw.is_empty()
+    {
+        return Ok((validate_amplihack_bash(raw)?, "AMPLIHACK_BASH"));
+    }
+
+    for entry in path.unwrap_or("").split(':') {
+        // Empty and relative entries are skipped. POSIX reads an empty entry as
+        // the current directory, and a bash step's current directory is the
+        // recipe's `working_dir` — recipe-controlled data must not be able to
+        // choose the interpreter.
+        let dir = Path::new(entry);
+        if !dir.is_absolute() {
+            continue;
+        }
+        let candidate = dir.join("bash");
+        if exec_file_rejection(&candidate).is_none() {
+            return Ok((candidate, "PATH"));
+        }
+    }
+
+    Ok((PathBuf::from(BASH_LAST_RESORT), "default"))
+}
+
+/// Resolve the bash interpreter from the PARENT process environment and log the
+/// decision.
+///
+/// Reading the parent env is the point: `Command` installs the child env before
+/// `execvp`, so a bare program name would be searched against the `env_clear`ed,
+/// `bounded_env`-filtered child `PATH` — and a `timeout`-wrapped step would
+/// search a second time, by a second mechanism. An absolute path resolved up
+/// here makes both questions vacuous.
+///
+/// `pub` because `tests/integration.rs` is an external crate and its bash
+/// fixture must resolve identically to production.
+pub fn resolve_bash_interpreter() -> anyhow::Result<PathBuf> {
+    // NOT `.ok()`: that conflates `NotUnicode` with `NotPresent`, so a pin the
+    // operator actually SET would silently downgrade to a PATH search — the
+    // precise fail-open that rule 1 forbids. A set-but-unreadable value is a
+    // rejection, not an absence.
+    let amplihack_bash = match env::var("AMPLIHACK_BASH") {
+        Ok(raw) => Some(raw),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(raw)) => anyhow::bail!(
+            "AMPLIHACK_BASH is set to {raw:?} but is not valid UTF-8. Unset \
+             AMPLIHACK_BASH to resolve bash from PATH, or point it at an \
+             absolute path to an executable bash."
+        ),
+    };
+    let path = env::var("PATH").ok();
+    let (resolved, rule) =
+        resolve_bash_interpreter_from(amplihack_bash.as_deref(), path.as_deref())?;
+
+    // Path and rule only — never `PATH` itself, whose directory names routinely
+    // carry project, customer and username identifiers.
+    log::info!("bash interpreter: {} (source: {rule})", resolved.display());
+    Ok(resolved)
+}
+
+/// What bash should execute for one step.
+#[derive(Clone, Copy)]
+pub(crate) enum BashInvocation<'a> {
+    /// A script spilled to a tempfile, past `BASH_INLINE_LIMIT`.
+    File(&'a Path),
+    /// The command passed inline via `-c`.
+    Inline(&'a str),
+}
+
+/// #143: the complete argv for one bash step; `argv[0]` is the program.
+///
+/// One builder for all four shapes is what makes "every arm runs the same
+/// interpreter" structural rather than merely asserted — there is exactly one
+/// place the interpreter can enter the vector.
+///
+/// `OsString` rather than `&str`: a script path that is not valid UTF-8 passes
+/// through intact instead of being lossily collapsed to an empty argument.
+pub(crate) fn bash_command_argv(
+    bash: &Path,
+    inv: BashInvocation<'_>,
+    timeout: Option<u64>,
+) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = Vec::with_capacity(5);
+    if let Some(secs) = timeout {
+        argv.push(OsString::from("timeout"));
+        argv.push(OsString::from(secs.to_string()));
+    }
+    argv.push(bash.as_os_str().to_os_string());
+    match inv {
+        BashInvocation::File(script) => argv.push(script.as_os_str().to_os_string()),
+        BashInvocation::Inline(command) => {
+            argv.push(OsString::from("-c"));
+            argv.push(OsString::from(command));
+        }
+    }
+    argv
+}
+
+/// The spawn-failure `with_context` message for this arm, preserved verbatim
+/// from the four pre-#143 match arms so operator-facing text does not regress.
+pub(crate) fn bash_spawn_context(inv: &BashInvocation<'_>, timeout: Option<u64>) -> &'static str {
+    match (inv, timeout) {
+        (BashInvocation::File(_), Some(_)) => {
+            "Failed to execute file-backed bash step with timeout"
+        }
+        (BashInvocation::File(_), None) => "Failed to execute file-backed bash step",
+        (BashInvocation::Inline(_), Some(_)) => "Failed to execute bash step with timeout",
+        (BashInvocation::Inline(_), None) => "Failed to execute bash step",
+    }
+}
+
+/// Captured child output as a trimmed `String`, reusing the capture buffer.
+///
+/// Equivalent to `String::from_utf8_lossy(&bytes).to_string().trim().to_string()`
+/// (verified identical for valid UTF-8, invalid UTF-8, leading/trailing/interior
+/// whitespace, all-whitespace and empty input) but without its two full copies
+/// of the output:
+///
+/// * `String::from_utf8` MOVES the capture buffer when it is already valid UTF-8
+///   — the overwhelmingly common case — instead of allocating a second copy.
+///   Invalid input still takes the lossy path, which must allocate to insert
+///   replacement characters.
+/// * Trimming is done in place: `truncate` is O(1), and the leading `drain` is a
+///   no-op memmove in the normal case where output has no leading whitespace.
+///
+/// This matters because a step's stdout is unbounded — the >64 KiB spill path
+/// exists precisely because steps aggregate multi-MB payloads. At 4 MiB the old
+/// form cost ~12.5 ms per step against a ~5 ms process spawn, i.e. the copies
+/// dominated the step; this form is ~1.7 ms.
+fn into_trimmed_string(bytes: Vec<u8>) -> String {
+    let mut s = match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(&e.into_bytes()).into_owned(),
+    };
+    s.truncate(s.trim_end().len());
+    let leading = s.len() - s.trim_start().len();
+    s.drain(..leading);
+    s
 }
 
 /// Byte cost of a single `key=value\0` environment entry, matching the kernel's
@@ -1017,6 +1238,13 @@ impl Adapter for CLISubprocessAdapter {
             working_dir,
             timeout
         );
+        // #143: resolve the interpreter FIRST, from the PARENT environment.
+        // `build_child_env` below merges `extra_env` (step `env:` blocks and
+        // `RECIPE_VAR_*`) over the top, so resolving above that merge is what
+        // makes it impossible for recipe YAML to choose the interpreter. It also
+        // means a misconfigured AMPLIHACK_BASH aborts before any env-budget work
+        // and before the >64 KiB tempfile spill — nothing to clean up.
+        let bash = resolve_bash_interpreter()?;
         let mut child_env = Self::build_child_env();
         // Propagate agent binary preference so scripts spawning nested agents
         // use the same binary as the parent (mirrors execute_agent_step_impl).
@@ -1059,48 +1287,33 @@ impl Adapter for CLISubprocessAdapter {
             None
         };
 
-        let output = match (&script_file, timeout) {
-            (Some(tf), Some(secs)) => Command::new("timeout")
-                .args([
-                    secs.to_string().as_str(),
-                    "/bin/bash",
-                    tf.path().to_str().unwrap_or(""),
-                ])
-                .current_dir(effective_dir)
-                .env_clear()
-                .envs(bounded.iter().map(|(k, v)| (k, v)))
-                .output()
-                .with_context(|| "Failed to execute file-backed bash step with timeout")?,
-            (Some(tf), None) => Command::new("/bin/bash")
-                .arg(tf.path())
-                .current_dir(effective_dir)
-                .env_clear()
-                .envs(bounded.iter().map(|(k, v)| (k, v)))
-                .output()
-                .with_context(|| "Failed to execute file-backed bash step")?,
-            (None, Some(secs)) => Command::new("timeout")
-                .args([&secs.to_string(), "/bin/bash", "-c", command])
-                .current_dir(effective_dir)
-                .env_clear()
-                .envs(bounded.iter().map(|(k, v)| (k, v)))
-                .output()
-                .with_context(|| "Failed to execute bash step with timeout")?,
-            (None, None) => Command::new("/bin/bash")
-                .args(["-c", command])
-                .current_dir(effective_dir)
-                .env_clear()
-                .envs(bounded.iter().map(|(k, v)| (k, v)))
-                .output()
-                .with_context(|| "Failed to execute bash step")?,
+        // #143: one spawn site for all four shapes. Previously the two `timeout`
+        // arms handed the interpreter to `timeout`'s own `execvp` while the two
+        // bare arms let Rust's `Command` resolve it — two mechanisms against two
+        // different `PATH`s, so a timed and an untimed step in the same recipe
+        // could run different interpreters. One builder, one absolute path.
+        let invocation = match &script_file {
+            Some(tf) => BashInvocation::File(tf.path()),
+            None => BashInvocation::Inline(command),
         };
+        let argv = bash_command_argv(&bash, invocation, timeout);
+        let output = Command::new(&argv[0])
+            .args(&argv[1..])
+            .current_dir(effective_dir)
+            .env_clear()
+            .envs(bounded.iter().map(|(k, v)| (k, v)))
+            .output()
+            .with_context(|| bash_spawn_context(&invocation, timeout))?;
 
         // Drop the tempfile (auto-cleans on drop) only AFTER bash completed.
         drop(script_file);
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
+        // Decode stderr ONLY on the failure path that reads it. Previously both
+        // streams were decoded unconditionally, so every successful step paid a
+        // full copy of a stderr it then discarded — and progress-chatty tools
+        // (cargo, npm, git) routinely put megabytes there.
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!(
                 "Command failed (exit {}): {}",
                 output.status.code().unwrap_or(-1),
@@ -1108,7 +1321,7 @@ impl Adapter for CLISubprocessAdapter {
             );
         }
 
-        Ok(stdout.trim().to_string())
+        Ok(into_trimmed_string(output.stdout))
     }
 
     fn is_available(&self) -> bool {
@@ -3050,5 +3263,633 @@ mod tests {
             "oversized inherited env must not cause E2BIG (os error 7): {result:?}"
         );
         assert_eq!(result.unwrap(), "ok");
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // #143: bash interpreter resolution
+    // ══════════════════════════════════════════════════════════════════
+    //
+    // NOTE: not one test below mutates the process environment, and exactly
+    // one — `test_resolve_bash_interpreter_wrapper_returns_absolute_path` —
+    // READS it. That one therefore asserts nothing an ambient `AMPLIHACK_BASH`
+    // could falsify: a developer with a bad value exported is supposed to get a
+    // rejection, and failing the test for it would name the wrong culprit.
+    //
+    // Under edition 2024 `std::env::set_var` is `unsafe` and unsound alongside
+    // Cargo's multi-threaded test runner; splitting the env read into a thin
+    // wrapper is what makes these plain function calls. The wrapper's env read
+    // is covered instead by `tests/bash_interpreter_tests.rs`, which sets the
+    // variable on a CHILD process — including the non-UTF-8 case, which is
+    // unrepresentable in this module's `Option<&str>` calls by construction.
+
+    use std::ffi::{OsStr, OsString};
+    use std::path::PathBuf;
+
+    /// Create `<dir>/<name>` with `mode` and return its absolute path.
+    fn write_fake_bash(dir: &Path, name: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\nexec /bin/sh \"$@\"\n").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(mode);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    /// Unwrap the `Err` arm and return its full chain, lowercased. Lowercasing
+    /// keeps the assertions pinned to the *semantics* of each rejection reason
+    /// without freezing capitalization.
+    fn resolve_err<T: std::fmt::Debug>(r: anyhow::Result<T>) -> String {
+        match r {
+            Ok(v) => panic!("expected a loud failure, got Ok({v:?})"),
+            Err(e) => format!("{e:#}").to_lowercase(),
+        }
+    }
+
+    fn os(v: &str) -> OsString {
+        OsString::from(v)
+    }
+
+    // ── Rule 1: AMPLIHACK_BASH ────────────────────────────────────────
+
+    /// (a) Set and executable: returned verbatim, tagged as the env rule.
+    /// Verbatim matters — no `canonicalize`, so a symlinked `/tmp` (macOS) or a
+    /// deliberately chosen symlink is not silently rewritten under the operator.
+    #[test]
+    fn test_resolve_bash_amplihack_bash_set_and_executable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = write_fake_bash(&tmp.path().join("bin"), "bash", 0o755);
+
+        let (resolved, rule) =
+            resolve_bash_interpreter_from(Some(fake.to_str().unwrap()), None).unwrap();
+
+        assert_eq!(resolved, fake, "AMPLIHACK_BASH must be returned unchanged");
+        assert_eq!(rule, "AMPLIHACK_BASH");
+        assert!(resolved.is_absolute());
+    }
+
+    /// (k) A valid AMPLIHACK_BASH wins over a perfectly good bash on PATH.
+    /// Pins the ORDER, which (a) alone cannot: with `path: None` the env rule
+    /// would also "win" by default.
+    #[test]
+    fn test_resolve_bash_amplihack_bash_outranks_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let chosen = write_fake_bash(&tmp.path().join("chosen"), "bash", 0o755);
+        let path_dir = tmp.path().join("onpath");
+        write_fake_bash(&path_dir, "bash", 0o755);
+
+        let (resolved, rule) = resolve_bash_interpreter_from(
+            Some(chosen.to_str().unwrap()),
+            Some(path_dir.to_str().unwrap()),
+        )
+        .unwrap();
+
+        assert_eq!(resolved, chosen);
+        assert_eq!(rule, "AMPLIHACK_BASH");
+    }
+
+    /// (b) Set but nonexistent: MUST fail loud naming both the variable and the
+    /// rejected path. This is the core of #143's "fail loud" requirement — the
+    /// operator named an interpreter, so silently running a different one is
+    /// worse than stopping.
+    #[test]
+    fn test_resolve_bash_amplihack_bash_missing_fails_loud_without_fallback() {
+        let err = resolve_err(resolve_bash_interpreter_from(
+            Some("/nonexistent/definitely/not/here/bash"),
+            Some("/usr/bin:/bin"),
+        ));
+
+        assert!(
+            err.contains("amplihack_bash"),
+            "error must name the variable so the operator knows what to fix: {err}"
+        );
+        assert!(
+            err.contains("/nonexistent/definitely/not/here/bash"),
+            "error must name the rejected path: {err}"
+        );
+    }
+
+    /// (c) Set, present, but the execute bit is clear: reject, do not fall back.
+    /// This is the overwhelmingly common misconfiguration (a wrapper script that
+    /// was never `chmod +x`); today it surfaces as a bare ENOENT at spawn.
+    #[test]
+    fn test_resolve_bash_amplihack_bash_not_executable_fails_loud() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = write_fake_bash(&tmp.path().join("nox"), "bash", 0o644);
+
+        let err = resolve_err(resolve_bash_interpreter_from(
+            Some(fake.to_str().unwrap()),
+            Some("/usr/bin:/bin"),
+        ));
+
+        assert!(
+            err.contains("not executable"),
+            "error must say the file is not executable: {err}"
+        );
+        assert!(err.contains("amplihack_bash"), "{err}");
+    }
+
+    /// (d) Set to a directory: reject. `metadata().is_file()` is what catches
+    /// this; a directory is "executable" by mode bits alone.
+    #[test]
+    fn test_resolve_bash_amplihack_bash_directory_fails_loud() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let err = resolve_err(resolve_bash_interpreter_from(
+            Some(tmp.path().to_str().unwrap()),
+            None,
+        ));
+
+        assert!(
+            err.contains("not a regular file"),
+            "a directory must be rejected as not a regular file: {err}"
+        );
+    }
+
+    /// (i) Set to a bare name: reject. R1 requires an ABSOLUTE path at all four
+    /// spawn arms; accepting `bash` here would reintroduce exactly the
+    /// child-PATH-vs-parent-PATH ambiguity #143 exists to remove.
+    #[test]
+    fn test_resolve_bash_amplihack_bash_relative_is_rejected() {
+        for raw in ["bash", "./tools/bash", "~/bin/bash"] {
+            let err = resolve_err(resolve_bash_interpreter_from(
+                Some(raw),
+                Some("/usr/bin:/bin"),
+            ));
+
+            assert!(
+                err.contains("absolute"),
+                "a non-absolute AMPLIHACK_BASH ({raw:?}) must be rejected as \
+                 not absolute, and must NOT fall through to PATH: {err}"
+            );
+        }
+    }
+
+    /// A symlink pointing at a valid interpreter must pass: resolution uses
+    /// `metadata` (which follows links), not `symlink_metadata`. `/bin/bash` is
+    /// itself a symlink on many distributions.
+    #[test]
+    fn test_resolve_bash_amplihack_bash_symlink_to_executable_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = write_fake_bash(&tmp.path().join("real"), "bash", 0o755);
+        let link = tmp.path().join("bash-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let (resolved, rule) =
+            resolve_bash_interpreter_from(Some(link.to_str().unwrap()), None).unwrap();
+
+        assert_eq!(
+            resolved, link,
+            "the symlink itself is returned, not its target — no canonicalization"
+        );
+        assert_eq!(rule, "AMPLIHACK_BASH");
+    }
+
+    /// (e) Empty string is treated as unset and falls through to PATH. The
+    /// `"PATH"` tag is what proves PATH actually decided rather than the empty
+    /// value being coincidentally resolvable.
+    #[test]
+    fn test_resolve_bash_empty_amplihack_bash_falls_through_to_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        let expected = write_fake_bash(&bin, "bash", 0o755);
+
+        let (resolved, rule) =
+            resolve_bash_interpreter_from(Some(""), Some(bin.to_str().unwrap())).unwrap();
+
+        assert_eq!(resolved, expected);
+        assert_eq!(rule, "PATH");
+    }
+
+    /// Whitespace-only is NOT empty and is NOT trimmed: it is a (relative) path
+    /// and must fail loud. Trimming would quietly turn an operator typo into a
+    /// different interpreter.
+    #[test]
+    fn test_resolve_bash_whitespace_amplihack_bash_is_not_trimmed() {
+        let err = resolve_err(resolve_bash_interpreter_from(Some("   "), None));
+
+        assert!(
+            err.contains("absolute"),
+            "whitespace must be treated as a path, not as unset: {err}"
+        );
+    }
+
+    // ── Rule 2: PATH ──────────────────────────────────────────────────
+
+    /// (f) PATH order is honoured and non-executable candidates are skipped.
+    #[test]
+    fn test_resolve_bash_path_skips_non_executable_and_honours_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nox = tmp.path().join("nox");
+        let bin = tmp.path().join("bin");
+        write_fake_bash(&nox, "bash", 0o644);
+        let expected = write_fake_bash(&bin, "bash", 0o755);
+
+        let path = format!("{}:{}", nox.display(), bin.display());
+        let (resolved, rule) = resolve_bash_interpreter_from(None, Some(&path)).unwrap();
+
+        assert_eq!(resolved, expected);
+        assert_eq!(rule, "PATH");
+    }
+
+    /// The FIRST executable match wins. #143 is explicit: PATH order is the
+    /// operator's stated preference, so no version probing may reorder it.
+    #[test]
+    fn test_resolve_bash_path_first_executable_match_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        let expected = write_fake_bash(&first, "bash", 0o755);
+        write_fake_bash(&second, "bash", 0o755);
+
+        let path = format!("{}:{}", first.display(), second.display());
+        let (resolved, rule) = resolve_bash_interpreter_from(None, Some(&path)).unwrap();
+
+        assert_eq!(
+            resolved, expected,
+            "first match on PATH wins; no bash-version preference is permitted"
+        );
+        assert_eq!(rule, "PATH");
+    }
+
+    /// (g) Empty and relative PATH entries are skipped. POSIX reads an empty
+    /// entry as the current directory; honouring it would make the interpreter
+    /// depend on the step's working directory — a trivial hijack.
+    #[test]
+    fn test_resolve_bash_path_skips_empty_and_relative_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        let expected = write_fake_bash(&bin, "bash", 0o755);
+
+        let path = format!(":relative/bin:.:{}", bin.display());
+        let (resolved, rule) = resolve_bash_interpreter_from(None, Some(&path)).unwrap();
+
+        assert_eq!(resolved, expected);
+        assert_eq!(rule, "PATH");
+    }
+
+    /// A PATH entry that is a directory named `bash` must not be selected.
+    #[test]
+    fn test_resolve_bash_path_skips_directory_named_bash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let decoy = tmp.path().join("decoy");
+        std::fs::create_dir_all(decoy.join("bash")).unwrap();
+        let bin = tmp.path().join("bin");
+        let expected = write_fake_bash(&bin, "bash", 0o755);
+
+        let path = format!("{}:{}", decoy.display(), bin.display());
+        let (resolved, _) = resolve_bash_interpreter_from(None, Some(&path)).unwrap();
+
+        assert_eq!(resolved, expected);
+    }
+
+    // ── Rule 3: last resort ───────────────────────────────────────────
+
+    /// (h) Nothing set at all: the last resort, asserted as the CONSTANT. Never
+    /// assert via filesystem existence — that would make the test pass or fail
+    /// on the host's layout, which is the very coupling #143 is removing.
+    #[test]
+    fn test_resolve_bash_last_resort_when_nothing_is_set() {
+        let (resolved, rule) = resolve_bash_interpreter_from(None, None).unwrap();
+
+        assert_eq!(resolved, PathBuf::from(BASH_LAST_RESORT));
+        assert_eq!(resolved, PathBuf::from("/bin/bash"));
+        assert_eq!(rule, "default");
+    }
+
+    /// (j) PATH is set but contains no usable bash: exhausting PATH is not an
+    /// error, it falls to the last resort — today's behaviour, preserved.
+    #[test]
+    fn test_resolve_bash_exhausted_path_falls_back_to_last_resort() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nox = tmp.path().join("nox");
+        write_fake_bash(&nox, "bash", 0o644);
+
+        let (resolved, rule) =
+            resolve_bash_interpreter_from(None, Some(nox.to_str().unwrap())).unwrap();
+
+        assert_eq!(resolved, PathBuf::from(BASH_LAST_RESORT));
+        assert_eq!(rule, "default");
+    }
+
+    // ── The env-reading wrapper ───────────────────────────────────────
+
+    /// The public wrapper must always hand back an ABSOLUTE path. §4: `execvp`
+    /// never searches PATH for an argument containing `/`, so absoluteness is
+    /// precisely what makes the child-PATH question vacuous at all four arms.
+    ///
+    /// This is the only test here that reads the ambient environment, so it
+    /// asserts on the `Ok` arm ONLY. A developer or CI runner with a bad
+    /// `AMPLIHACK_BASH` exported is supposed to get an error — failing this
+    /// test for it would name the wrong culprit for a correct rejection.
+    #[test]
+    fn test_resolve_bash_interpreter_wrapper_returns_absolute_path() {
+        if let Ok(resolved) = resolve_bash_interpreter() {
+            assert!(
+                resolved.is_absolute(),
+                "resolved interpreter must be absolute, got {resolved:?}"
+            );
+        }
+    }
+
+    /// EACCES must be diagnosed as itself. A regular, executable bash under a
+    /// parent the process cannot traverse is present — reporting it as "not a
+    /// regular file" sends the operator looking for a missing file that is
+    /// sitting right there, which is the opposite of this predicate's job.
+    #[test]
+    fn test_unreadable_parent_is_reported_as_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let locked = tmp.path().join("locked");
+        let bash = write_fake_bash(&locked, "bash", 0o755);
+
+        let restore = std::fs::metadata(&locked).unwrap().permissions();
+        let mut sealed = restore.clone();
+        sealed.set_mode(0o000);
+        std::fs::set_permissions(&locked, sealed).unwrap();
+
+        // root ignores mode bits, so the EACCES under test never occurs.
+        let skip = std::fs::metadata(&bash).is_ok();
+        let result = if skip {
+            None
+        } else {
+            Some(resolve_bash_interpreter_from(
+                Some(bash.to_str().unwrap()),
+                None,
+            ))
+        };
+
+        // Restore before asserting: a panic here must not leave an
+        // undeletable directory behind for the tempdir drop.
+        std::fs::set_permissions(&locked, restore).unwrap();
+
+        let Some(result) = result else { return };
+        let err = result.expect_err("an untraversable interpreter must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("permission denied"),
+            "must name the real cause, got: {msg}"
+        );
+        assert!(
+            !msg.contains("not a regular file"),
+            "must not claim the file is missing, got: {msg}"
+        );
+    }
+
+    // ── Argv construction (R10) ───────────────────────────────────────
+
+    /// All four legacy arms, argv-identical to today when the interpreter is
+    /// `/bin/bash`. If this passes, the four-arm collapse is a pure refactor
+    /// for every input that works today.
+    #[test]
+    fn test_bash_command_argv_matches_legacy_four_arms() {
+        let bash = Path::new("/bin/bash");
+        let script = Path::new("/tmp/recipe-bash-step-abc.sh");
+
+        assert_eq!(
+            bash_command_argv(bash, BashInvocation::File(script), Some(30)),
+            vec![
+                os("timeout"),
+                os("30"),
+                os("/bin/bash"),
+                os("/tmp/recipe-bash-step-abc.sh")
+            ],
+            "(Some(tf), Some(secs)) arm"
+        );
+        assert_eq!(
+            bash_command_argv(bash, BashInvocation::File(script), None),
+            vec![os("/bin/bash"), os("/tmp/recipe-bash-step-abc.sh")],
+            "(Some(tf), None) arm"
+        );
+        assert_eq!(
+            bash_command_argv(bash, BashInvocation::Inline("echo hi"), Some(30)),
+            vec![
+                os("timeout"),
+                os("30"),
+                os("/bin/bash"),
+                os("-c"),
+                os("echo hi")
+            ],
+            "(None, Some(secs)) arm"
+        );
+        assert_eq!(
+            bash_command_argv(bash, BashInvocation::Inline("echo hi"), None),
+            vec![os("/bin/bash"), os("-c"), os("echo hi")],
+            "(None, None) arm"
+        );
+    }
+
+    /// `into_trimmed_string` is an allocation optimisation, so its whole
+    /// contract is that it is INDISTINGUISHABLE from the form it replaced.
+    /// Assert that against the original expression rather than against
+    /// hand-written expectations, so the two can never drift.
+    #[test]
+    fn into_trimmed_string_matches_the_lossy_form_it_replaced() {
+        let cases: Vec<Vec<u8>> = vec![
+            b"hello".to_vec(),
+            b"hello\n".to_vec(),
+            b"  \n\t leading and trailing \r\n ".to_vec(),
+            b"keeps   interior   spacing".to_vec(),
+            b"   \n\t  ".to_vec(),         // all whitespace -> empty
+            Vec::new(),                    // empty
+            vec![0xff, 0xfe],              // wholly invalid UTF-8
+            vec![b' ', 0xff, b'a', b'\n'], // invalid, needs trimming too
+            "unicode: \u{4f60}\u{597d} \u{1f600}\n".as_bytes().to_vec(),
+            // U+00A0 carries the `White_Space` property, so `str::trim` DOES
+            // strip it while a naive ASCII byte trim would not. Pin the
+            // multi-byte case so the replacement keeps following `str::trim`.
+            "\u{a0}nbsp\u{a0}".as_bytes().to_vec(),
+        ];
+        for bytes in cases {
+            let expected = String::from_utf8_lossy(&bytes)
+                .to_string()
+                .trim()
+                .to_string();
+            assert_eq!(
+                into_trimmed_string(bytes.clone()),
+                expected,
+                "diverged from the replaced form for {bytes:?}"
+            );
+        }
+    }
+
+    /// Extract the interpreter element: `argv[2]` under `timeout`, else
+    /// `argv[0]`. Also asserts the `timeout` wrapping shape itself.
+    fn interpreter_element(argv: &[OsString], timeout: Option<u64>) -> &OsStr {
+        if timeout.is_some() {
+            assert_eq!(
+                argv[0],
+                os("timeout"),
+                "timed arms must still be wrapped in `timeout`"
+            );
+            &argv[2]
+        } else {
+            &argv[0]
+        }
+    }
+
+    /// **R10, the regression gate for #143.** All four execution arms must
+    /// receive the SAME resolved absolute interpreter. Today they do not agree
+    /// on a mechanism: arms 2 and 4 resolve through Rust's `Command` against the
+    /// child env, arms 1 and 3 through `timeout`'s own `execvp` — two rules on
+    /// two PATHs. One resolved absolute path at every arm is what retires that.
+    #[test]
+    fn test_all_four_arms_receive_the_same_resolved_interpreter() {
+        let resolved = PathBuf::from("/opt/homebrew/bin/bash");
+        let script = Path::new("/tmp/recipe-bash-step-xyz.sh");
+
+        let arms: Vec<(&str, Vec<OsString>, Option<u64>)> = vec![
+            (
+                "file+timeout",
+                bash_command_argv(&resolved, BashInvocation::File(script), Some(30)),
+                Some(30),
+            ),
+            (
+                "file",
+                bash_command_argv(&resolved, BashInvocation::File(script), None),
+                None,
+            ),
+            (
+                "inline+timeout",
+                bash_command_argv(&resolved, BashInvocation::Inline("echo hi"), Some(30)),
+                Some(30),
+            ),
+            (
+                "inline",
+                bash_command_argv(&resolved, BashInvocation::Inline("echo hi"), None),
+                None,
+            ),
+        ];
+
+        for (name, argv, timeout) in &arms {
+            let interp = interpreter_element(argv, *timeout);
+            assert_eq!(
+                interp,
+                resolved.as_os_str(),
+                "arm {name} must carry the resolved interpreter, got {interp:?}"
+            );
+            assert!(
+                Path::new(interp).is_absolute(),
+                "arm {name} must carry an ABSOLUTE interpreter"
+            );
+        }
+    }
+
+    /// The timeout value is rendered as seconds in `argv[1]`, unchanged from the
+    /// legacy `secs.to_string()` at both timed arms.
+    #[test]
+    fn test_bash_command_argv_renders_timeout_seconds() {
+        let bash = Path::new("/bin/bash");
+        let argv = bash_command_argv(bash, BashInvocation::Inline("true"), Some(1));
+        assert_eq!(argv[1], os("1"));
+
+        let argv = bash_command_argv(bash, BashInvocation::Inline("true"), Some(3600));
+        assert_eq!(argv[1], os("3600"));
+    }
+
+    /// A non-UTF-8 script path must arrive as the path, not as an empty string.
+    /// Pins the `tf.path().to_str().unwrap_or("")` defect at the old line 1067,
+    /// where a non-UTF-8 temp dir silently turned into `bash ""`.
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_command_argv_preserves_non_utf8_script_path() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let raw = OsStr::from_bytes(b"/tmp/\xff\xfe/recipe-bash-step.sh");
+        let script = Path::new(raw);
+        let bash = Path::new("/bin/bash");
+
+        let argv = bash_command_argv(bash, BashInvocation::File(script), None);
+        assert_eq!(argv, vec![os("/bin/bash"), raw.to_os_string()]);
+        assert_ne!(
+            argv[1],
+            os(""),
+            "non-UTF-8 path must not become an empty arg"
+        );
+
+        let argv = bash_command_argv(bash, BashInvocation::File(script), Some(30));
+        assert_eq!(argv[3], raw.to_os_string());
+    }
+
+    /// An inline command containing shell metacharacters is passed as ONE argv
+    /// element after `-c`; no quoting, splitting or escaping is applied.
+    #[test]
+    fn test_bash_command_argv_passes_inline_command_verbatim() {
+        let bash = Path::new("/bin/bash");
+        let cmd = "echo 'a b'; echo \"$HOME\" | cat # trailing";
+
+        let argv = bash_command_argv(bash, BashInvocation::Inline(cmd), None);
+        assert_eq!(argv, vec![os("/bin/bash"), os("-c"), os(cmd)]);
+        assert_eq!(argv.len(), 3, "the command must stay a single argv element");
+    }
+
+    /// An empty inline command still produces the `-c ""` form (today's
+    /// `test_execute_bash_step_empty_command` depends on this succeeding).
+    #[test]
+    fn test_bash_command_argv_empty_inline_command() {
+        let bash = Path::new("/bin/bash");
+        let argv = bash_command_argv(bash, BashInvocation::Inline(""), None);
+        assert_eq!(argv, vec![os("/bin/bash"), os("-c"), os("")]);
+    }
+
+    // ── Spawn-failure context strings ─────────────────────────────────
+
+    /// All four operator-facing `with_context` strings preserved verbatim, so
+    /// spawn-failure text does not regress with the refactor.
+    #[test]
+    fn test_bash_spawn_context_preserves_all_four_messages() {
+        let script = Path::new("/tmp/s.sh");
+
+        assert_eq!(
+            bash_spawn_context(&BashInvocation::File(script), Some(30)),
+            "Failed to execute file-backed bash step with timeout"
+        );
+        assert_eq!(
+            bash_spawn_context(&BashInvocation::File(script), None),
+            "Failed to execute file-backed bash step"
+        );
+        assert_eq!(
+            bash_spawn_context(&BashInvocation::Inline("echo hi"), Some(30)),
+            "Failed to execute bash step with timeout"
+        );
+        assert_eq!(
+            bash_spawn_context(&BashInvocation::Inline("echo hi"), None),
+            "Failed to execute bash step"
+        );
+    }
+
+    // ── Property: the invariant §4 depends on ─────────────────────────
+
+    mod bash_resolution_proptests {
+        use super::super::resolve_bash_interpreter_from;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// For ANY PATH string, resolution either fails loud or yields an
+            /// absolute path. There is no third outcome, and in particular no
+            /// relative interpreter can ever reach argv — that is the invariant
+            /// the whole fix rests on.
+            #[test]
+            fn resolution_is_absolute_or_error(path in ".{0,200}") {
+                if let Ok((resolved, _rule)) = resolve_bash_interpreter_from(None, Some(&path)) {
+                    prop_assert!(
+                        resolved.is_absolute(),
+                        "PATH {path:?} produced a non-absolute interpreter {resolved:?}"
+                    );
+                }
+            }
+
+            /// Same invariant across the AMPLIHACK_BASH arm: an arbitrary value
+            /// either errors or resolves absolutely. Never a silent fallback to
+            /// a different interpreter than the one named.
+            #[test]
+            fn amplihack_bash_is_absolute_or_error(v in ".{0,200}") {
+                if let Ok((resolved, _rule)) = resolve_bash_interpreter_from(Some(&v), None) {
+                    prop_assert!(resolved.is_absolute());
+                }
+            }
+        }
     }
 }

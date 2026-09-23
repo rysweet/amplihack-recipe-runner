@@ -14,7 +14,7 @@ Complete schema reference for amplihack recipe runner YAML files.
 | `context`     | map              | no       | `{}`    | Default variable values for templates    |
 | `extends`     | string           | no       | —       | Parent recipe name (for inheritance). Note: only single-level inheritance is supported; extended recipes cannot themselves use `extends`. |
 | `recursion`   | RecursionConfig  | no       | see below | Sub-recipe recursion limits           |
-| `hooks`       | RecipeHooks      | no       | —       | Lifecycle hooks                          |
+| `hooks`       | RecipeHooks      | no       | —       | Lifecycle hooks — bash commands, run by the resolved [bash interpreter](cli-reference.md#amplihack_bash) |
 | `steps`       | list of Step     | **yes**  | —       | Ordered list of steps to execute         |
 
 ### RecursionConfig
@@ -36,7 +36,11 @@ Shell commands executed at lifecycle boundaries.
 | `post_step` | string | Shell command to run after each step   |
 | `on_error`  | string | Shell command to run on step failure   |
 
-Hook commands receive context variables via template substitution.
+Hook commands receive context variables via template substitution. Each runs as
+a bash step with a fixed 30-second timeout, under the same
+[resolved bash interpreter](cli-reference.md#amplihack_bash) as ordinary
+`command:` steps. A failing hook is logged as a warning and does not fail the
+step.
 
 ---
 
@@ -46,7 +50,7 @@ Hook commands receive context variables via template substitution.
 |---------------------|-----------------|----------|---------|----------------------------------------------------------|
 | `id`                | string          | **yes**  | —       | Unique step identifier                                   |
 | `type`              | string          | no       | inferred | `"bash"`, `"agent"`, or `"recipe"` (see inference rules) |
-| `command`           | string          | no       | —       | Shell command (bash steps)                               |
+| `command`           | string          | no       | —       | Shell command (bash steps), run by the resolved [bash interpreter](cli-reference.md#amplihack_bash) |
 | `agent`             | string          | no       | —       | Agent reference (agent steps)                            |
 | `prompt`            | string          | no       | —       | Prompt template (agent steps)                            |
 | `output`            | string          | no       | —       | Variable name to store step output in context            |

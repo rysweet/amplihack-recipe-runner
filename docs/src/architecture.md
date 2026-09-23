@@ -265,7 +265,12 @@ trait Adapter {
 
 The production adapter spawns subprocesses:
 
-- **Bash steps** — `/bin/bash -c <command>`, optionally wrapped with `timeout`.
+- **Bash steps** — `<bash> -c <command>`, or `<bash> <script-file>` when the
+  command exceeds 64 KiB, optionally wrapped with `timeout`. `<bash>` is a
+  single absolute path resolved in the parent process (see
+  [Bash interpreter resolution](#bash-interpreter-resolution)). Lifecycle hooks
+  (`pre_step`, `post_step`, `on_error`) take the same path, with a fixed 30 s
+  timeout.
 - **Agent steps** — `claude -p <prompt>` in an isolated temp directory. A
   `NON_INTERACTIVE_FOOTER` ("Proceed autonomously. Do not ask questions.") is
   appended to prevent the nested Claude session from hanging on prompts.
@@ -278,6 +283,102 @@ then escalates to `SIGKILL`.
 variables (`AMPLIHACK_SESSION_DEPTH`, `AMPLIHACK_TREE_ID`, `AMPLIHACK_MAX_DEPTH`,
 `AMPLIHACK_MAX_SESSIONS`) and strips `CLAUDECODE` to prevent nested session
 confusion.
+
+### Bash interpreter resolution
+
+Bash steps do not hardcode an interpreter. `resolve_bash_interpreter()` picks
+one **absolute** path at the top of `execute_bash_step`, before the step's child
+environment is built and before any temporary script file is created:
+
+1. `AMPLIHACK_BASH`, if set and non-empty — validated, never silently bypassed.
+2. Otherwise the first executable `bash` under an absolute `PATH` entry, in
+   `PATH` order.
+3. Otherwise `/bin/bash`.
+
+Validation is `metadata()` (symlinks followed) plus `is_file()` and the
+owner/group/other execute bits. A set-but-unusable `AMPLIHACK_BASH` — not valid
+UTF-8, relative, missing, a directory, unreadable, or not executable — aborts
+the step with a single error string naming the variable, the rejected value, a
+fixed reason, and the remedy. Note that "set" is decided on `NotPresent` alone:
+a value that is present but not decodable is a rejection, never an absence. It
+does **not** fall through to rules 2
+or 3; see [CLI Reference](cli-reference.md#amplihack_bash) for the operator-facing
+contract.
+
+The resolved path and the rule tag are logged once **per bash-step execution,
+including lifecycle hooks** — resolution is per-call and uncached, and hooks are
+themselves bash steps, so a recipe with both `pre_step` and `post_step` emits up
+to three lines per step. It is one line per bash-step execution, not one per
+process.
+The line is emitted at `info`. (`main.rs` calls `env_logger::init()` with no
+default filter, so it needs `RUST_LOG` set to be shown.) The line and the error text carry the
+resolved or rejected path plus the rule/reason and nothing else — never `PATH`,
+never the candidate list, which routinely carry project and username
+identifiers in directory names.
+
+There is deliberately no version probing. `PATH` order is the operator's stated
+preference, and `AMPLIHACK_BASH` covers the override case.
+
+#### Why it resolves first
+
+That ordering is load-bearing, not an optimisation. Resolution reads the
+**parent** process environment (`std::env::var`) and must never read the child
+map. `build_child_env()` runs further down and then merges `extra_env` —
+step `env:` blocks and `RECIPE_VAR_*` values — over the top, so a recipe *can*
+put `AMPLIHACK_BASH` and `PATH` into the child environment. Resolving above that
+merge makes it structurally impossible for recipe YAML to choose the interpreter.
+The cheap side benefits follow from the same placement: a misconfigured
+`AMPLIHACK_BASH` aborts before any env-budget computation and before the >64 KiB
+tempfile spill, so it costs nothing and leaves nothing behind, and the
+interpreter log line lands next to the step-entry line an operator is reading.
+
+The validation predicate is a **fail-fast diagnostic, not a security control**.
+Nothing prevents the file from changing between `metadata()` and `execvp`; the
+check exists to turn a confusing exec failure into a message that names the
+cause. Absoluteness is the one rule that *is* a hardening measure: in the
+`timeout` arms the interpreter is `argv[2]`, an argument to `timeout`, so a
+leading `-` would be parsed as a `timeout` option. Requiring `/` makes that
+unrepresentable. There is no lexical or metacharacter validation beyond that —
+`Command` execs a real argv vector with no shell in between, so `;`, spaces and
+`$(…)` in a path are inert bytes, and a whitelist would reject legitimate paths
+(Nix store hashes, spaces) while adding nothing.
+
+#### Why the parent resolves it
+
+Rust's `Command` installs the child environment into `environ` *before* calling
+`execvp`, so a bare program name would be searched against the **child's**
+`PATH` — the `env_clear()`ed, `bounded_env`-filtered one. A `timeout`-wrapped
+step is worse still: `timeout` runs its own `execvp` on its first argument, a
+second search mechanism against a second `PATH`. Resolving to an absolute path
+in the parent makes the question vacuous, because `execvp` never searches
+`PATH` for an argument containing `/`.
+
+That guarantee only holds if there is exactly one place the interpreter can
+enter the argument vector, so all four shapes are produced by one pure builder
+and spawned from one call site:
+
+| Script file | Timeout | argv |
+|---|---|---|
+| no  | no  | `[<bash>, -c, <command>]` |
+| no  | yes | `[timeout, <secs>, <bash>, -c, <command>]` |
+| yes | no  | `[<bash>, <script-file>]` |
+| yes | yes | `[timeout, <secs>, <bash>, <script-file>]` |
+
+argv is built as `OsString`s, so a script path that is not valid UTF-8 is passed
+through intact rather than being lossily collapsed.
+
+Resolution runs per step, not once per process: a handful of `stat` calls is
+noise next to `fork`/`exec`, and caching would make `AMPLIHACK_BASH` read-once
+in a way that is harder to operate and to test.
+
+`timeout` itself is still located by name against the child's `PATH`. The
+absolute-interpreter guarantee therefore describes **what argv contains, not
+necessarily what executes**, in the two `timeout` arms. `build_child_env` forces
+a non-empty `PATH` and `is_env_protected` keeps it undroppable, but `extra_env`
+is merged afterwards and can override it — non-empty is not the same as
+trustworthy. Net risk is nil, since the step body is already arbitrary bash.
+Widening the fix to the `timeout` binary is out of scope here and tracked as
+[#145](https://github.com/rysweet/amplihack-recipe-runner/issues/145).
 
 ---
 

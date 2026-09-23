@@ -3,6 +3,7 @@
 /// Tests cross-module interactions: parsing → context → runner → adapters.
 /// Validates parity with the Python recipe runner behavior.
 use recipe_runner_rs::adapters::Adapter;
+use recipe_runner_rs::adapters::cli_subprocess::resolve_bash_interpreter;
 use recipe_runner_rs::agent_resolver::AgentResolver;
 use recipe_runner_rs::context::RecipeContext;
 use recipe_runner_rs::discovery;
@@ -668,7 +669,11 @@ impl Adapter for RealBashAdapter {
         _timeout: Option<u64>,
         extra_env: &std::collections::HashMap<String, String>,
     ) -> Result<String, anyhow::Error> {
-        let output = std::process::Command::new("/bin/bash")
+        // #143: resolve the interpreter the same way the real adapter does,
+        // instead of pinning /bin/bash — on a host whose /bin/bash predates 4.0
+        // this fixture would otherwise disagree with production.
+        let bash = resolve_bash_interpreter()?;
+        let output = std::process::Command::new(&bash)
             .args(["-c", command])
             .current_dir(working_dir)
             .envs(extra_env)
