@@ -376,7 +376,7 @@ impl RecipeContext {
                 Value::Null => String::new(),
                 v => v.to_string(),
             };
-            env.insert(env_key.clone(), env_val.clone());
+            env.insert(env_key, env_val.clone());
 
             // Legacy alias: plain uppercase, for every top-level key whose
             // name is a usable shell identifier (#1468).

@@ -10,28 +10,15 @@
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Once;
 use tempfile::TempDir;
 
-static BUILD_ONCE: Once = Once::new();
-
-fn ensure_built() {
-    BUILD_ONCE.call_once(|| {
-        let status = Command::new("cargo")
-            .args(["build", "--quiet"])
-            .current_dir(project_root())
-            .status()
-            .expect("failed to run cargo build");
-        assert!(status.success(), "cargo build failed");
-    });
-}
+/// Cargo builds the binary before an integration test runs and hands over its
+/// path, so the test neither shells out to `cargo build` nor assumes a
+/// `target/debug` layout that `--release` or `CARGO_TARGET_DIR` would move.
+const BINARY: &str = env!("CARGO_BIN_EXE_recipe-runner-rs");
 
 fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-fn binary_path() -> PathBuf {
-    project_root().join("target/debug/recipe-runner-rs")
 }
 
 fn autodrive_fixture() -> PathBuf {
@@ -53,8 +40,7 @@ fn run_json_in(
     cwd: &Path,
     envs: &[(&str, &str)],
 ) -> (i32, Value, String) {
-    ensure_built();
-    let mut cmd = Command::new(binary_path());
+    let mut cmd = Command::new(BINARY);
     cmd.arg(recipe_path)
         .args(["--output-format", "json"])
         .args(extra_args)
