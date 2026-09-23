@@ -5,6 +5,7 @@
 # User Guide
 - [Quick Start](quickstart.md)
 - [YAML Recipe Format](yaml-format.md)
+- [Step Outputs in the Environment](step-output-env.md)
 - [CLI Reference](cli-reference.md)
 - [Condition Language](conditions.md)
 - [Rate-Limit Handling](rate-limit-handling.md)

@@ -339,19 +339,30 @@ impl RecipeContext {
     /// Return environment variables for all context values.
     /// Keys are prefixed with `RECIPE_VAR_` and dots replaced with `__`.
     ///
-    /// For top-level scalar keys (string/null/number/bool), an uppercase
-    /// alias is also exported (e.g. `task_description` → `TASK_DESCRIPTION`)
-    /// for compatibility with recipes inherited from the legacy Python runner,
-    /// which exported plain uppercase names. The alias is only added when:
+    /// For every top-level key an uppercase alias is also exported (e.g.
+    /// `task_description` → `TASK_DESCRIPTION`) for compatibility with recipes
+    /// inherited from the legacy Python runner, which exported plain uppercase
+    /// names. The alias is added when:
     ///   - the key contains only `[a-zA-Z0-9_]` (so it round-trips cleanly to
-    ///     a shell identifier),
-    ///   - the value is a scalar (Object / Array stay namespaced under the
-    ///     `RECIPE_VAR_` prefix to avoid clobbering useful shell vars), and
+    ///     a shell identifier), and
     ///   - the uppercase name does not collide with an existing reserved
     ///     environment variable likely already set by the parent process
     ///     (`PATH`, `HOME`, `PWD`, `USER`, `SHELL`, `TMPDIR`, `LANG`, `TERM`).
     ///
-    /// See rysweet/amplihack-recipe-runner#95.
+    /// The alias carries exactly what `{{key}}` renders: a string verbatim, a
+    /// null as the empty string, and anything else — including an Object or an
+    /// Array from a `parse_json` step output — as its compact serialised JSON.
+    /// Objects are *additionally* flattened under `RECIPE_VAR_<key>__<field>`;
+    /// the alias does not replace that, it sits alongside it.
+    ///
+    /// Objects and Arrays used to be denied the alias, on the reasoning that
+    /// keeping them namespaced avoided clobbering useful shell vars. That is
+    /// what rysweet/amplihack-rs#1468 was: a `parse_json` output reached the
+    /// context but never the environment, so every consumer reading
+    /// `${SOME_PREFLIGHT:-}` saw an empty string. The reserved-name list below,
+    /// not the value's type, is what protects the shell's own variables.
+    ///
+    /// See rysweet/amplihack-recipe-runner#95 and rysweet/amplihack-rs#1468.
     pub fn shell_env_vars(&self) -> HashMap<String, String> {
         log::debug!(
             "RecipeContext::shell_env_vars: exporting {} context keys",
@@ -367,10 +378,9 @@ impl RecipeContext {
             };
             env.insert(env_key.clone(), env_val.clone());
 
-            // Legacy alias: plain uppercase for top-level scalars.
-            if Self::is_scalar(value)
-                && let Some(alias) = Self::legacy_uppercase_alias(key)
-            {
+            // Legacy alias: plain uppercase, for every top-level key whose
+            // name is a usable shell identifier (#1468).
+            if let Some(alias) = Self::legacy_uppercase_alias(key) {
                 // Don't overwrite if a real context key happens to already
                 // produce that alias (extremely unlikely but be safe).
                 env.entry(alias).or_insert(env_val);
@@ -382,13 +392,6 @@ impl RecipeContext {
             }
         }
         env
-    }
-
-    fn is_scalar(value: &Value) -> bool {
-        matches!(
-            value,
-            Value::String(_) | Value::Null | Value::Number(_) | Value::Bool(_)
-        )
     }
 
     /// Return an uppercase shell-identifier alias for `key`, or None if the
@@ -631,8 +634,14 @@ mod tests {
         let env = c.shell_env_vars();
         assert_eq!(env.get("RECIPE_VAR_obj__status").unwrap(), "ok");
         assert_eq!(env.get("RECIPE_VAR_obj__count").unwrap(), "5");
-        // Object values should NOT get an uppercase alias (only scalars).
-        assert!(!env.contains_key("OBJ"));
+        // rysweet/amplihack-rs#1468 inverted this: an Object used to be denied
+        // the uppercase alias, which is exactly why a `parse_json` output never
+        // reached a later bash step. It now gets one, as its compact JSON,
+        // alongside the flattened members above.
+        assert_eq!(
+            env.get("OBJ").map(String::as_str),
+            Some(r#"{"count":5,"status":"ok"}"#)
+        );
     }
 
     #[test]
@@ -703,6 +712,151 @@ mod tests {
         // But the canonical RECIPE_VAR_* form replaces dashes/dots correctly.
         assert_eq!(env.get("RECIPE_VAR_with_dash").unwrap(), "a");
         assert_eq!(env.get("RECIPE_VAR_with__dot").unwrap(), "b");
+    }
+
+    // ── #1468: a JSON (Object/Array) output must reach a later bash step's
+    // environment under the same upper-cased name a string output gets ──────
+
+    #[test]
+    fn test_json_value_exports_uppercase_alias_as_compact_json() {
+        // rysweet/amplihack-rs#1468: a `parse_json` step output landed in the
+        // context as an Object, and Objects were excluded from the uppercase
+        // alias, so `${MY_PREFLIGHT:-}` was empty in every later bash step
+        // while `{{my_preflight}}` rendered fine.
+        let c = ctx(vec![
+            ("my_preflight", json!({"a": "x", "state_dir": "/tmp/sd"})),
+            ("rounds", json!([{"state_dir": "/tmp/sd"}, {"n": 2}])),
+            ("plain_out", json!("plain string output")),
+        ]);
+        let env = c.shell_env_vars();
+
+        assert_eq!(
+            env.get("MY_PREFLIGHT").map(String::as_str),
+            Some(r#"{"a":"x","state_dir":"/tmp/sd"}"#),
+            "an object output must be exported as its compact serialised JSON"
+        );
+        assert_eq!(
+            env.get("ROUNDS").map(String::as_str),
+            Some(r#"[{"state_dir":"/tmp/sd"},{"n":2}]"#),
+            "an array output must be exported too"
+        );
+        assert_eq!(
+            env.get("PLAIN_OUT").map(String::as_str),
+            Some("plain string output"),
+            "a string output must still be exported"
+        );
+
+        // The canonical RECIPE_VAR_* form and the alias must never disagree.
+        for (key, alias) in [
+            ("RECIPE_VAR_my_preflight", "MY_PREFLIGHT"),
+            ("RECIPE_VAR_rounds", "ROUNDS"),
+            ("RECIPE_VAR_plain_out", "PLAIN_OUT"),
+        ] {
+            assert_eq!(env.get(key), env.get(alias), "{key} and {alias} differ");
+        }
+
+        // Nested flattening for objects is unaffected.
+        assert_eq!(
+            env.get("RECIPE_VAR_my_preflight__state_dir").unwrap(),
+            "/tmp/sd"
+        );
+    }
+
+    #[test]
+    fn test_json_value_alias_matches_template_substitution() {
+        // The issue notes `{{template}}` already worked for both kinds of
+        // output. After the fix the environment must render byte for byte the
+        // same thing, so a recipe can move between the two without a surprise.
+        let c = ctx(vec![
+            ("obj", json!({"b": 2, "a": "x"})),
+            ("arr", json!(["x", 1, true])),
+            ("num", json!(7)),
+            ("flag", json!(false)),
+            ("nul", json!(null)),
+            ("str", json!("hello")),
+        ]);
+        let env = c.shell_env_vars();
+        for key in ["obj", "arr", "num", "flag", "nul", "str"] {
+            assert_eq!(
+                env.get(&key.to_ascii_uppercase()).map(String::as_str),
+                Some(c.render(&format!("{{{{{key}}}}}")).as_str()),
+                "env alias for {key} must equal its template rendering"
+            );
+        }
+    }
+
+    #[test]
+    fn test_json_value_alias_obeys_the_same_naming_rules_as_a_scalar() {
+        // Widening the alias to Objects/Arrays must not widen *which* keys get
+        // one: reserved shell names and non-identifier keys stay excluded.
+        let c = ctx(vec![
+            ("path", json!({"clobber": true})),
+            ("lang", json!(["c"])),
+            ("with-dash", json!({"a": 1})),
+            ("9leading", json!([1])),
+        ]);
+        let env = c.shell_env_vars();
+        assert!(!env.contains_key("PATH"), "must not clobber PATH");
+        assert!(!env.contains_key("LANG"), "must not clobber LANG");
+        assert!(!env.contains_key("WITH-DASH"));
+        assert!(!env.contains_key("9LEADING"));
+        // Canonical form still present for all of them.
+        assert_eq!(env.get("RECIPE_VAR_path").unwrap(), r#"{"clobber":true}"#);
+        assert_eq!(env.get("RECIPE_VAR_with_dash").unwrap(), r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn test_json_and_string_outputs_are_sized_and_spilled_identically() {
+        // #1468 size decision: a JSON output gets the SAME treatment as a
+        // string output of the same serialised length — it counts toward the
+        // same measured budget, and when the budget is exceeded both vanish
+        // into the file-first context rather than risking E2BIG.
+        let payload = json!(vec!["x".repeat(200); 8]);
+        let serialised = payload.to_string();
+
+        let as_json = ctx(vec![("payload", payload.clone())]);
+        let as_string = ctx(vec![("payload", json!(serialised.clone()))]);
+
+        assert_eq!(
+            as_json.env_vars_size(),
+            as_string.env_vars_size(),
+            "a JSON output and the string of its serialisation must cost \
+             the same number of environment bytes"
+        );
+
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+
+        // Generous budget: both export the alias.
+        set_env_byte_budget_for_test(1024 * 1024);
+        for c in [&as_json, &as_string] {
+            let (env, temp) = c.shell_env_for_step();
+            assert_eq!(
+                env.get("PAYLOAD").map(String::as_str),
+                Some(serialised.as_str())
+            );
+            assert!(temp.is_none(), "no spill expected under a generous budget");
+        }
+
+        // Budget one byte under what the pair costs: both spill, and neither
+        // leaves the alias behind. Failing loud in the consumer's own
+        // `[ -n "$DIR" ]` guard is the intended, consistent outcome.
+        set_env_byte_budget_for_test(as_json.env_vars_size() - 1);
+        for c in [&as_json, &as_string] {
+            let (env, temp) = c.shell_env_for_step();
+            assert!(
+                env.contains_key("AMPLIHACK_CONTEXT_FILE"),
+                "over budget, both kinds must fall back to the context file"
+            );
+            assert!(
+                !env.contains_key("PAYLOAD"),
+                "the alias must not survive the spill"
+            );
+            if let Some(p) = temp {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+
+        clear_env_byte_budget_for_test();
     }
 
     #[test]
