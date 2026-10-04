@@ -331,7 +331,14 @@ fn group_live(group: i32) -> anyhow::Result<bool> {
         }
         let stat = match std::fs::read_to_string(entry.path().join("stat")) {
             Ok(stat) => stat,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            // A process can disappear after read_dir or after opening stat.
+            // Linux reports either ENOENT or ESRCH for those races.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                continue;
+            }
             Err(error) => return Err(error).context("Failed to inspect process state"),
         };
         // comm is parenthesized and may itself contain spaces or parentheses.

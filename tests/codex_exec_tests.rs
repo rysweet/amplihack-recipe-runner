@@ -249,6 +249,7 @@ failure_case!(blocked_stdin_respects_timeout, "blocked");
 #[test]
 fn exact_existing_output_limit_is_verbatim() {
     let (_, result, _) = run("limit", "task", None, "codex");
+    assert!(result.get("ok").is_some(), "{result}");
     assert_eq!(result["ok"].as_str().unwrap().len(), 10_000_000);
 }
 
@@ -284,7 +285,7 @@ fn concurrent_attempts_have_distinct_private_paths() {
     let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     let mut paths = std::collections::HashSet::new();
     for (_, result, record) in &results {
-        assert!(result.get("ok").is_some());
+        assert!(result.get("ok").is_some(), "{result}");
         assert!(paths.insert(record["final"].as_str().expect("final path")));
         assert_eq!(record["directory_mode"], 0o700);
     }
