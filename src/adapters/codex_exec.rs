@@ -140,8 +140,8 @@ fn execute_with_readers(
                 }
             }
             if heartbeat.elapsed() >= Duration::from_secs(30) {
-                log::info!(
-                    "Codex exec still running ({} seconds)",
+                eprintln!(
+                    "Codex exec still running ({} seconds, PID {group})",
                     started.elapsed().as_secs()
                 );
                 heartbeat = Instant::now();
@@ -168,13 +168,7 @@ fn execute_with_readers(
     shutdown(
         |value| signal(value).context("Failed to signal Codex process group"),
         || group_live(group),
-        || {
-            let kill = child.kill();
-            let wait = child.wait().context("Failed to reap Codex launcher");
-            // kill can fail for an already reaped launcher; wait is authoritative.
-            let _ = kill;
-            wait.map(|_| ())
-        },
+        || reap_launcher(&mut child, |child| child.kill(), Duration::from_secs(2)),
         &mut failures,
     );
     stop.store(true, std::sync::atomic::Ordering::Release);
@@ -232,12 +226,28 @@ fn drain_diagnostics<R: std::io::Read + std::os::fd::AsRawFd + Send + 'static>(
             }
             let mut stored = Vec::with_capacity(64 * 1024);
             let mut buffer = [0; 8192];
+            let mut completion = None;
+            let mut completion_bytes = 0;
             loop {
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    let deadline = completion
+                        .get_or_insert_with(|| Instant::now() + Duration::from_millis(50));
+                    // Preserve queued terminal messages even if this reader was
+                    // first scheduled after shutdown. Detached writers cannot
+                    // extend completion indefinitely, even with continuous data.
+                    if Instant::now() >= *deadline || completion_bytes >= 1024 * 1024 {
+                        return Ok(stored);
+                    }
+                }
                 match pipe.read(&mut buffer) {
                     Ok(0) => return Ok(stored),
                     Ok(count) => {
-                        let retain = count.min(64 * 1024 - stored.len());
-                        stored.extend_from_slice(&buffer[..retain]);
+                        if completion.is_some() {
+                            completion_bytes += count;
+                        }
+                        let excess = (stored.len() + count).saturating_sub(64 * 1024);
+                        stored.drain(..excess);
+                        stored.extend_from_slice(&buffer[..count]);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -265,6 +275,39 @@ pub(super) fn finish_resources(
         (result, Ok(())) => result,
         (Ok(_), Err(error)) => Err(error),
         (Err(error), Err(cleanup)) => Err(anyhow::anyhow!("{error:#}; cleanup: {cleanup:#}")),
+    }
+}
+
+/// Reap the direct launcher without an unbounded wait after a failed signal.
+#[cfg(unix)]
+fn reap_launcher(
+    child: &mut std::process::Child,
+    kill: impl FnOnce(&mut std::process::Child) -> std::io::Result<()>,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    if child
+        .try_wait()
+        .context("Failed to inspect Codex launcher before reaping")?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let kill_error = kill(child).err();
+    let deadline = Instant::now() + timeout;
+    loop {
+        let failure = match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            Ok(None) => "Timed out reaping Codex launcher".to_owned(),
+            Err(error) => format!("Failed to reap Codex launcher: {error}"),
+        };
+        return Err(match kill_error {
+            Some(error) => anyhow::anyhow!("Failed to kill Codex launcher: {error}; {failure}"),
+            None => anyhow::anyhow!(failure),
+        });
     }
 }
 
@@ -467,6 +510,39 @@ mod tests {
     use std::cell::RefCell;
 
     #[test]
+    fn launcher_kill_failure_has_bounded_reaping() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let started = Instant::now();
+        let result = reap_launcher(
+            &mut child,
+            |_| Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+            Duration::from_millis(30),
+        );
+        let elapsed = started.elapsed();
+        // Always clean up the fixture before asserting the injected failure.
+        let still_live = child.try_wait().unwrap().is_none();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let error = result.unwrap_err().to_string();
+        assert!(still_live);
+        assert!(elapsed < Duration::from_secs(1));
+        assert!(error.contains("Failed to kill Codex launcher"));
+        assert!(error.contains("Timed out reaping Codex launcher"));
+    }
+
+    #[test]
+    fn already_exited_launcher_does_not_require_kill() {
+        let mut child = Command::new("true").spawn().unwrap();
+        child.wait().unwrap();
+        reap_launcher(
+            &mut child,
+            |_| panic!("must not kill reaped child"),
+            Duration::ZERO,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn signal_and_observation_errors_do_not_skip_cleanup() {
         let operations = RefCell::new(Vec::new());
         let mut failures = vec!["original execution failure".into()];
@@ -511,8 +587,14 @@ mod tests {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handle = drain_diagnostics(reader, stop.clone());
         writer.write_all(&vec![b'x'; 1024 * 1024]).unwrap();
+        writer
+            .write_all(b"authentication failed: SECRET_CANARY")
+            .unwrap();
         drop(writer);
-        assert_eq!(handle.join().unwrap().unwrap().len(), 64 * 1024);
+        let tail = handle.join().unwrap().unwrap();
+        assert_eq!(tail.len(), 64 * 1024);
+        assert!(tail.ends_with(b"authentication failed: SECRET_CANARY"));
+        assert!(classify_failure(&String::from_utf8_lossy(&tail), false).contains("auth"));
 
         struct Broken(std::fs::File);
         impl std::os::fd::AsRawFd for Broken {
@@ -532,6 +614,74 @@ mod tests {
                 .unwrap()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn continuously_readable_diagnostics_observe_stop() {
+        struct Continuous {
+            file: std::fs::File,
+            stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            reads: usize,
+        }
+        impl std::os::fd::AsRawFd for Continuous {
+            fn as_raw_fd(&self) -> i32 {
+                self.file.as_raw_fd()
+            }
+        }
+        impl std::io::Read for Continuous {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                assert!(self.reads <= 228, "reader ignored bounded completion");
+                buffer.fill(b'x');
+                if self.reads == 100 {
+                    self.stop.store(true, std::sync::atomic::Ordering::Release);
+                }
+                Ok(buffer.len())
+            }
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pipe = Continuous {
+            file: tempfile::tempfile().unwrap(),
+            stop: stop.clone(),
+            reads: 0,
+        };
+        assert_eq!(
+            drain_diagnostics(pipe, stop).join().unwrap().unwrap().len(),
+            64 * 1024
+        );
+    }
+
+    #[test]
+    fn delayed_stderr_reader_preserves_terminal_rate_limit() {
+        let resources = tempfile::tempdir().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "cat >/dev/null; echo 'rate limit' >&2; exit 1"]);
+        let error = execute_with_readers(
+            command,
+            resources.path(),
+            resources.path(),
+            &[("PATH".into(), "/usr/bin:/bin".into())],
+            "task",
+            Some(5),
+            |stdout, stderr, stop| {
+                let stdout = drain_diagnostics(stdout, stop.clone());
+                let stderr = std::thread::spawn(move || {
+                    // Force the scheduling order that previously lost queued bytes.
+                    while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    drain_diagnostics(stderr, stop).join().unwrap()
+                });
+                (stdout, stderr)
+            },
+        )
+        .unwrap_err();
+        let failure = error.downcast_ref::<ExitFailure>().unwrap();
+        assert!(
+            failure.rate_limited,
+            "terminal diagnostic must enable retries"
+        );
+        assert!(failure.classification.contains("rate limit"));
     }
 
     #[test]
