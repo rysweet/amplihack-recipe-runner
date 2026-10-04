@@ -7,6 +7,7 @@ Complete reference for the `recipe-runner-rs` command-line interface.
 ```
 recipe-runner-rs [OPTIONS] [RECIPE] [COMMAND]
 recipe-runner-rs list [OPTIONS]
+recipe-runner-rs --capabilities
 ```
 
 ## Subcommands
@@ -22,6 +23,29 @@ recipe-runner-rs list --recipe-dir ./team-recipes --recipe-dir ./personal-recipe
 ```
 
 ## Global Options
+
+### `--capabilities`
+
+Standalone compatibility probe. Emits one JSON object with `schema_version: 1`,
+the compiled package `version`, and `capabilities: ["codex_exec"]`, then exits zero.
+It performs no update, cache-write, network, or agent-startup work. Do not combine
+it with other arguments. See the [capability API](codex-exec.md#compatibility-probe-api).
+
+### `--agent-binary <PROVIDER>`
+
+Select the agent provider, for example `claude`, `copilot`, or `codex`. Takes
+precedence over `AMPLIHACK_AGENT_BINARY`; the default is `claude`.
+
+```bash
+recipe-runner-rs review.yaml --agent-binary codex
+```
+
+Codex uses noninteractive exec with complete stdin instructions and private
+final-message capture. See [Codex agent steps](codex-exec.md) for configuration,
+model, timeout, and result behavior. Codex exit zero alone is insufficient:
+stdin delivery, lifecycle cleanup, and final-file validation must succeed.
+Successful final text is verbatim within `MAX_STEP_OUTPUT_BYTES`; oversized
+files fail instead of being truncated.
 
 ### `-C, --working-dir <DIR>`
 
@@ -497,8 +521,12 @@ exponential backoff. Tune the behavior with these variables (see
 | `AMPLIHACK_RATELIMIT_MAX_RETRIES` | `5` | Max retries after the initial attempt. |
 | `AMPLIHACK_RATELIMIT_BASE_DELAY_SECS` | `60` | Base backoff window; `0` = instant. |
 | `AMPLIHACK_RATELIMIT_MAX_DELAY_SECS` | `600` | Cap on any single backoff delay. |
-| `AMPLIHACK_RATELIMIT_FALLBACK_AUTO_MODEL` | _unset_ | Force `--model auto` on the final retry. |
+| `AMPLIHACK_RATELIMIT_FALLBACK_AUTO_MODEL` | _unset_ | Force `--model auto` on the final Claude/Copilot retry; excludes Codex. |
 | `AMPLIHACK_LAUNCHER_BINARY` | `amplihack` | Test-only launcher override. |
+
+Each attempt receives its own step timeout. Backoff and repeated attempts
+increase total duration, and retries may repeat side effects. Codex retains
+its explicit model or native selection on every attempt.
 
 ## Usage Examples
 

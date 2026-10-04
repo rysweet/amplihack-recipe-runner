@@ -35,6 +35,10 @@ mod exit_codes {
     about = "Execute amplihack YAML recipes"
 )]
 struct Cli {
+    /// Report supported execution contracts without update or network activity.
+    #[arg(long)]
+    capabilities: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 
@@ -148,6 +152,20 @@ fn parse_context_pair(pair: &str) -> Option<(String, Value)> {
 }
 
 fn main() {
+    let args: Vec<_> = std::env::args_os().collect();
+    if args.iter().skip(1).any(|arg| arg == "--capabilities") {
+        if args.len() != 2 {
+            eprintln!("--capabilities must be used alone");
+            std::process::exit(2);
+        }
+        use std::io::Write;
+        let report = serde_json::json!({"schema_version":1,"version":env!("CARGO_PKG_VERSION"),"capabilities":["codex_exec"]});
+        if let Err(error) = writeln!(std::io::stdout().lock(), "{report}") {
+            eprintln!("Failed to write capability report: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     env_logger::init();
     std::process::exit(run());
 }

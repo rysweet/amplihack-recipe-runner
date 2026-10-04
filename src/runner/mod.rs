@@ -587,6 +587,20 @@ impl<A: Adapter> RecipeRunner<A> {
         // Execute the step
         let output = match self.dispatch_step(step, ctx) {
             Ok(o) => {
+                if o.len() > MAX_STEP_OUTPUT_BYTES
+                    && self.adapter.name() == "codex"
+                    && step.effective_type() == StepType::Agent
+                {
+                    return StepResult {
+                        step_id: step.id.clone(),
+                        status: StepStatus::Failed,
+                        output: String::new(),
+                        error: format!(
+                            "Codex final output exceeds {MAX_STEP_OUTPUT_BYTES}-byte limit"
+                        ),
+                        duration: Some(step_start.elapsed()),
+                    };
+                }
                 if o.len() > MAX_STEP_OUTPUT_BYTES {
                     warn!(
                         "Step '{}' output truncated from {} to {} bytes",
@@ -1089,16 +1103,23 @@ impl<A: Adapter> RecipeRunner<A> {
             original_prompt
         );
 
-        let working_dir = step.working_dir.as_deref().unwrap_or(&self.working_dir);
-        match self.adapter.execute_agent_step(
-            &ctx.render(&retry_prompt),
-            None,
-            None,
-            None,
-            working_dir,
-            None,
-            None, // timeout
-        ) {
+        let mut repair_step = step.clone();
+        repair_step.prompt = Some(retry_prompt);
+        let result = if self.adapter.name() == "codex" {
+            self.dispatch_step(&repair_step, ctx)
+                .map_err(anyhow::Error::new)
+        } else {
+            self.adapter.execute_agent_step(
+                &ctx.render(repair_step.prompt.as_deref().unwrap_or("")),
+                None,
+                None,
+                None,
+                step.working_dir.as_deref().unwrap_or(&self.working_dir),
+                None,
+                None,
+            )
+        };
+        match result {
             Ok(output) => Some(output),
             Err(e) => {
                 warn!("Retry for step '{}' failed: {}", step.id, e);

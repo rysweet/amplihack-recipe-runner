@@ -45,6 +45,7 @@ graph TD
     runner --> adapters[adapters/mod.rs — Adapter trait]
 
     cli_sub --> adapters
+    cli_sub --> codex_exec[codex_exec.rs — private attempt lifecycle]
 
     parser --> models[models.rs]
     runner --> models
@@ -67,7 +68,8 @@ graph TD
 | `agent_resolver.rs`  | Agent reference → markdown file resolution             |
 | `discovery.rs`       | Multi-directory recipe discovery and manifest sync     |
 | `adapters/mod.rs`    | `Adapter` trait definition                             |
-| `adapters/cli_subprocess.rs` | Subprocess execution for bash and agent steps |
+| `adapters/cli_subprocess.rs` | Provider dispatch, subprocess execution and rate-limit retries |
+| `adapters/codex_exec.rs` | Private Codex stdin, output resources, process/IO lifecycle and final validation |
 
 ---
 
@@ -106,6 +108,13 @@ graph TD
    ├── context: final variable state
    └── duration: wall-clock time
 ```
+
+### Early Capability Dispatch
+
+`main.rs` handles exact standalone `--capabilities` before logger initialization
+and update checks. It emits the frozen schema/version/capability JSON; mixed
+invocations fail before execution or update effects. See the
+[probe contract](codex-exec.md#compatibility-probe-api).
 
 ### Parse Phase
 
@@ -244,17 +253,25 @@ become booleans, numeric strings become numbers, everything else stays a string.
 The `Adapter` trait decouples the runner from any specific execution backend:
 
 ```rust
-trait Adapter {
+pub trait Adapter: Sync {
     fn execute_agent_step(
-        &self, prompt: &str, agent_name: &str,
-        system_prompt: Option<&str>, mode: Option<&str>,
-        working_dir: Option<&str>, model: Option<&str>,
-    ) -> Result<String>;
+        &self,
+        prompt: &str,
+        agent_name: Option<&str>,
+        system_prompt: Option<&str>,
+        mode: Option<&str>,
+        working_dir: &str,
+        model: Option<&str>,
+        timeout: Option<u64>,
+    ) -> Result<String, anyhow::Error>;
 
     fn execute_bash_step(
-        &self, command: &str, working_dir: Option<&str>,
+        &self,
+        command: &str,
+        working_dir: &str,
         timeout: Option<u64>,
-    ) -> Result<String>;
+        extra_env: &std::collections::HashMap<String, String>,
+    ) -> Result<String, anyhow::Error>;
 
     fn is_available(&self) -> bool;
     fn name(&self) -> &str;
@@ -271,13 +288,29 @@ The production adapter spawns subprocesses:
   [Bash interpreter resolution](#bash-interpreter-resolution)). Lifecycle hooks
   (`pre_step`, `post_step`, `on_error`) take the same path, with a fixed 30 s
   timeout.
-- **Agent steps** — `claude -p <prompt>` in an isolated temp directory. A
-  `NON_INTERACTIVE_FOOTER` ("Proceed autonomously. Do not ask questions.") is
-  appended to prevent the nested Claude session from hanging on prompts.
+- **Agent steps** — dispatch by selected provider through `amplihack`.
+  Claude/Copilot retain their existing transport and result contracts. Codex uses
+  `amplihack codex -- exec --output-last-message UNIQUE_FINAL_PATH
+  [--model EXPLICIT_MODEL] -` in the effective workspace, without implicit
+  `--add-dir` or model selection. Full system/persona, leaf/no-reentry, task and
+  autonomy instructions are delivered through stdin for every prompt size.
 
-**Timeout enforcement**: A background heartbeat thread monitors the deadline.
-It logs progress every 2 seconds. On expiry it sends `SIGTERM`, waits 5 seconds,
-then escalates to `SIGKILL`.
+The private `adapters/codex_exec.rs` module owns each Codex attempt: portable
+private temporary resources, an absent-before-launch final pathname, bounded
+progress diagnostics, stdin completion, process-group/deadline handling, final
+validation and cleanup. Only a regular, safe, readable UTF-8 final file within
+`MAX_STEP_OUTPUT_BYTES` becomes the result, preserved verbatim including empty
+content. Exit zero alone does not establish success. Oversized output fails
+instead of being truncated; stdout/stderr never replace missing final output.
+
+**Timeout enforcement**: Codex's deadline covers stdin delivery and execution
+per attempt. Timeout terminates and reaps the owned process tree and completes
+I/O cleanup before returning; deliberately detached sessions are outside Unix
+process-group containment. Timed execution without equivalent platform tree
+cleanup fails explicitly. Backoff and repeated attempts extend total duration
+and may repeat side effects. Rate-limit and JSON repair retries retain the full
+execution context and use fresh output resources; Codex is excluded from
+implicit `--model auto` fallback. See [Codex agent steps](codex-exec.md).
 
 **Environment propagation**: `build_child_env()` forwards session-tracking
 variables (`AMPLIHACK_SESSION_DEPTH`, `AMPLIHACK_TREE_ID`, `AMPLIHACK_MAX_DEPTH`,
@@ -389,6 +422,8 @@ Widening the fix to the `timeout` binary is out of scope here and tracked as
 ```
 CLI args
   │
+  ├─ standalone --capabilities ──► frozen JSON probe ──► exit
+  │   (before logging, updates, cache writes, network or agent startup)
   ├─ --validate-only ──► parse + validate ──► print warnings ──► exit
   ├─ --explain ─────────► parse ──► print step plan ──► exit
   │
@@ -544,7 +579,9 @@ attacks.
 
 ### Subprocess Isolation (cli_subprocess.rs)
 
-- Agent steps execute in a fresh temporary directory that is cleaned up on drop.
+- Codex executes in the effective workspace; its private per-attempt output
+  directory is owned through execution, extraction and explicit cleanup.
+  Claude/Copilot retain their existing temporary-resource behavior.
 - `CLAUDECODE` is stripped from the child environment to prevent the nested
   Claude process from attaching to the parent's session.
 - Session depth tracking (`AMPLIHACK_SESSION_DEPTH`) prevents runaway recursive

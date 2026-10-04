@@ -768,6 +768,16 @@ impl CLISubprocessAdapter {
         // The `amplihack <agent>` subcommand requires `--` to separate its own
         // flags from passthrough args (#4342).
         cmd.arg("--");
+        if self.cli == "codex" {
+            cmd.arg("exec")
+                .arg("--output-last-message")
+                .arg(output_dir.join("final-message"));
+            if let Some(model) = model {
+                cmd.arg("--model").arg(model);
+            }
+            cmd.arg("-");
+            return Ok(cmd);
+        }
         // Copilot CLI requires --allow-all-tools for non-interactive use; without it,
         // nested copilot agents prompt for tool approval and hang/exit 1 (#88).
         // Opt out by setting AMPLIHACK_NO_ALLOW_ALL_TOOLS to any non-empty value.
@@ -879,6 +889,63 @@ impl CLISubprocessAdapter {
                  Check that step-04 created the worktree successfully.",
                 resolved_cwd.display()
             );
+        }
+
+        if self.cli == "codex" {
+            let mut child_env = Self::build_child_env();
+            child_env.insert("AMPLIHACK_AGENT_BINARY".into(), self.cli.clone());
+            let child_env = bounded_env(&child_env)?;
+            let envelope = format!(
+                "# System instructions\n{}\n\n# Task instructions\n{}{}",
+                Self::build_effective_system_prompt(system_prompt),
+                prompt,
+                NON_INTERACTIVE_FOOTER
+            );
+            let config = RateLimitConfig::from_env();
+            for attempt in 0..=config.max_retries {
+                let resources =
+                    tempfile::tempdir().context("Failed to allocate private Codex resources")?;
+                let command = self.build_agent_command(
+                    resources.path(),
+                    &resolved_cwd,
+                    prompt,
+                    system_prompt,
+                    model,
+                )?;
+                let result = super::codex_exec::execute(
+                    command,
+                    resources.path(),
+                    &resolved_cwd,
+                    &child_env,
+                    &envelope,
+                    timeout,
+                );
+                let cleanup = resources.close().context("Failed to clean Codex resources");
+                let result = match (result, cleanup) {
+                    (result, Ok(())) => result,
+                    (Ok(_), Err(error)) => return Err(error),
+                    (Err(error), Err(cleanup)) => {
+                        return Err(anyhow::anyhow!("{error:#}; {cleanup:#}"));
+                    }
+                };
+                match result {
+                    Err(error)
+                        if error
+                            .downcast_ref::<super::codex_exec::ExitFailure>()
+                            .is_some_and(|e| e.rate_limited)
+                            && attempt < config.max_retries =>
+                    {
+                        log::warn!("Codex rate limit; retrying attempt {}", attempt + 1);
+                        std::thread::sleep(backoff_delay(
+                            attempt + 1,
+                            config.base_delay_secs,
+                            config.max_delay_secs,
+                        ));
+                    }
+                    result => return result,
+                }
+            }
+            unreachable!("bounded retry loop always returns");
         }
 
         // Create a temp directory for the output log file only.
@@ -2411,12 +2478,13 @@ mod tests {
                 "second arg must be '--' separator for {binary}"
             );
 
-            // `-p` must come after the separator
+            // Provider invocation must come after the separator
             let separator_pos = args.iter().position(|a| a == "--").unwrap();
-            let p_pos = args.iter().position(|a| a == "-p").unwrap();
+            let invocation = if *binary == "codex" { "exec" } else { "-p" };
+            let p_pos = args.iter().position(|a| a == invocation).unwrap();
             assert!(
                 p_pos > separator_pos,
-                "-p must come after -- separator for {binary}"
+                "{invocation} must come after -- separator for {binary}"
             );
         }
     }
@@ -3890,6 +3958,37 @@ mod tests {
                     prop_assert!(resolved.is_absolute());
                 }
             }
+        }
+    }
+}
+
+// Step 7 contract tests use the existing private command boundary, without
+// creating the planned lifecycle module before its implementation phase.
+#[cfg(test)]
+mod codex_exec_contract_tests {
+    use super::*;
+
+    #[test]
+    fn codex_command_selects_exec_stdin_and_owned_final_output() {
+        let resources = tempfile::tempdir().unwrap();
+        let adapter = CLISubprocessAdapter::new().with_binary("codex");
+        let cmd = adapter
+            .build_agent_command(
+                resources.path(),
+                resources.path(),
+                "TASK_SENTINEL",
+                Some("PERSONA_SENTINEL"),
+                None,
+            )
+            .unwrap();
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args[0], "codex");
+        assert_eq!(args[1], "--");
+        assert_eq!(args[2], "exec");
+        assert_eq!(args.last().unwrap(), &&OsString::from("-"));
+        assert!(args.iter().any(|arg| *arg == "--output-last-message"));
+        for forbidden in ["-p", "TASK_SENTINEL", "--model", "--add-dir"] {
+            assert!(!args.iter().any(|arg| *arg == forbidden));
         }
     }
 }

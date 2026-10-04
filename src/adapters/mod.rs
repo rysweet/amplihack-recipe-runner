@@ -2,6 +2,7 @@
 ///
 ///
 pub mod cli_subprocess;
+mod codex_exec;
 
 /// Trait that all recipe execution adapters must implement.
 ///

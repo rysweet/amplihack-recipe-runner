@@ -16,14 +16,16 @@ same step with bounded exponential backoff before giving up with a clear error.
 
 > **Scope.** Rate-limit handling applies only to **agent steps**
 > (`amplihack <agent>` subprocesses). Bash steps (`execute_bash_step`) are
-> unaffected. The existing per-step timeout and output-capture/truncation behavior
-> are preserved unchanged.
+> unaffected. Claude/Copilot retain their existing output-capture/truncation behavior.
+> Codex requires a validated final-message file and preserves successful output
+> verbatim within `MAX_STEP_OUTPUT_BYTES`; oversize output fails.
 
 ## How it works
 
 1. **Run the step.** The agent subprocess is spawned, monitored against the
-   per-step timeout, and its `stdout`/`stderr` are captured (and truncated) exactly
-   as before.
+   per-attempt timeout. Claude/Copilot retain their existing stdout/stderr
+   capture. Codex captures bounded diagnostics separately and validates its
+   private final-message file; progress output never becomes the result.
 2. **Inspect failures.** On a **non-zero exit**, the runner checks the captured
    output for rate-limit signals (case-insensitive substring match):
    - `hit your rate limit`
@@ -40,7 +42,11 @@ same step with bounded exponential backoff before giving up with a clear error.
 4. **Bound the work.** After the configured number of retries is exhausted, the
    runner stops and **fails explicitly** — it never loops forever.
 
-Total agent executions for a single step are bounded to `1 + max_retries`.
+Rate-limit handling bounds executions to `1 + max_retries` per adapter call;
+recipe JSON repair can invoke the adapter again. The timeout applies separately
+to each attempt, not to the entire retry loop. Backoff and repeated attempts
+increase total step duration. Retries can repeat tool calls and other side
+effects; use idempotent operations where possible.
 
 ## Backoff policy
 
@@ -100,7 +106,9 @@ or AMPLIHACK_RATELIMIT_BASE_DELAY_SECS, or retry later.
 ## Optional `--model auto` fallback
 
 The provider message suggests switching to the auto model to keep working. The
-runner can apply this automatically as a last resort. When
+runner can apply this automatically for Claude/Copilot as a last resort. Codex
+is excluded: it preserves the explicit model or native model selection on every
+attempt, even when this variable is enabled. When
 `AMPLIHACK_RATELIMIT_FALLBACK_AUTO_MODEL` is set to a non-empty value, the **final**
 retry attempt is run with `--model auto` appended, overriding any explicit `model`
 configured for that step. This behavior is **off by default** so that normal runs
@@ -118,7 +126,7 @@ exactly these keys and apply exactly these defaults.
 | `AMPLIHACK_RATELIMIT_MAX_RETRIES` | `5` | Maximum retries **after** the initial attempt. Total executions are `1 + this`. Clamped to a hard ceiling of `100` to bound the worst-case budget. |
 | `AMPLIHACK_RATELIMIT_BASE_DELAY_SECS` | `60` | Base backoff window in seconds. `0` makes all waits instant (used by tests). |
 | `AMPLIHACK_RATELIMIT_MAX_DELAY_SECS` | `600` | Upper cap on any single backoff delay. Enforced to be `≥ base_delay`. |
-| `AMPLIHACK_RATELIMIT_FALLBACK_AUTO_MODEL` | _unset_ | When non-empty, force `--model auto` on the final retry attempt. |
+| `AMPLIHACK_RATELIMIT_FALLBACK_AUTO_MODEL` | _unset_ | When non-empty, force `--model auto` on the final Claude/Copilot retry; Codex is excluded. |
 | `AMPLIHACK_LAUNCHER_BINARY` | `amplihack` | Override the launcher executable. Test-only override for injecting a fake agent binary; production behavior is identical when unset. |
 
 ### Examples
@@ -133,7 +141,7 @@ recipe-runner-rs build.yaml
 AMPLIHACK_RATELIMIT_MAX_DELAY_SECS=120 \
 recipe-runner-rs deploy.yaml
 
-# Let the runner fall back to --model auto on the last attempt
+# Let Claude/Copilot fall back to --model auto on the last attempt
 AMPLIHACK_RATELIMIT_FALLBACK_AUTO_MODEL=1 \
 recipe-runner-rs long-task.yaml
 
@@ -146,17 +154,20 @@ recipe-runner-rs smoke.yaml
 
 | Situation | Outcome |
 |---|---|
-| Agent exits `0` | Step succeeds (no change from prior behavior). |
+| Claude/Copilot exits `0` | Existing success and output-capture behavior. |
+| Codex exits `0` | Succeeds only after complete stdin delivery, lifecycle cleanup, and final-file validation. Empty final files succeed; missing, unsafe, unreadable, invalid UTF-8, or oversized files fail. |
 | Non-zero exit, **no** rate-limit signal | **Fail fast** with `amplihack <cli> failed (exit N)`. |
 | Non-zero exit **with** rate-limit signal, retries remain | Loud banner → backoff sleep → retry the same step. |
 | Rate-limit signal, retries exhausted | Explicit "rate limit persisted after N retries" error. |
-| Per-step timeout exceeded | Unchanged — handled by the existing timeout path. |
+| Per-attempt timeout exceeded | Attempt fails; Codex terminates/reaps its owned process tree and completes I/O cleanup. |
 | Bash step | Unaffected; no rate-limit handling applied. |
 
 ## FAQ
 
 **Does this retry every failing step?**
-No. Only failures whose captured output matches a rate-limit signal are retried.
+No. Only nonzero-exit failures whose captured diagnostics match a rate-limit
+signal are eligible. Codex stdin, final-file, decoding, and cleanup failures
+are not retried merely because diagnostics contain rate-limit text.
 All other non-zero exits fail immediately, exactly as before.
 
 **Can it loop forever?**
@@ -168,5 +179,6 @@ No. The message only hints "under a minute," so the runner uses the configured
 `base_delay` with exponential backoff instead of fragile text parsing.
 
 **Will it change my model without asking?**
-Only if you opt in with `AMPLIHACK_RATELIMIT_FALLBACK_AUTO_MODEL`, and only on the
-final retry attempt.
+Only for Claude/Copilot if you opt in with
+`AMPLIHACK_RATELIMIT_FALLBACK_AUTO_MODEL`, and only on the final retry attempt.
+Codex never receives an implicit `auto` model.
