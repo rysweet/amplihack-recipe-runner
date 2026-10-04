@@ -1103,14 +1103,14 @@ impl<A: Adapter> RecipeRunner<A> {
             original_prompt
         );
 
-        let mut repair_step = step.clone();
-        repair_step.prompt = Some(retry_prompt);
         let result = if self.adapter.name() == "codex" {
+            let mut repair_step = step.clone();
+            repair_step.prompt = Some(retry_prompt);
             self.dispatch_step(&repair_step, ctx)
                 .map_err(anyhow::Error::new)
         } else {
             self.adapter.execute_agent_step(
-                &ctx.render(repair_step.prompt.as_deref().unwrap_or("")),
+                &ctx.render(&retry_prompt),
                 None,
                 None,
                 None,

@@ -26,14 +26,32 @@ fn adapter_worker() {
             Some("autonomous"),
             &root,
             std::env::var("TEST_MODEL").ok().as_deref(),
-            Some(
-                if std::env::var("TEST_SCENARIO").as_deref() == Ok("zero_timeout") {
-                    0
-                } else {
-                    1
-                },
-            ),
+            if std::env::var("TEST_SCENARIO").as_deref() == Ok("flood") {
+                None
+            } else {
+                Some(
+                    if std::env::var("TEST_SCENARIO").as_deref() == Ok("zero_timeout") {
+                        0
+                    } else {
+                        1
+                    },
+                )
+            },
         );
+    if let Ok(pid) = fs::read_to_string(format!("{root}/descendant.pid")) {
+        let state = fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+            .map(|stat| {
+                stat.rsplit_once(')')
+                    .unwrap()
+                    .1
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .unwrap_or_else(|_| "absent".into());
+        fs::write(format!("{root}/return-state"), state).unwrap();
+    }
     let value = match result {
         Ok(s) => json!({"ok":s}),
         Err(e) => json!({"error":format!("{e:#}")}),
@@ -42,7 +60,7 @@ fn adapter_worker() {
 }
 
 const LAUNCHER: &str = r#"#!/usr/bin/python3
-import sys, os, json, pathlib, time, stat, subprocess
+import sys, os, json, pathlib, time, stat, subprocess, threading
 root = pathlib.Path(os.environ['CODEX_TEST_ROOT'])
 args = sys.argv[1:]
 mode = os.environ['TEST_SCENARIO']
@@ -52,9 +70,15 @@ record = {'args':args, 'final':str(final) if final else None, 'absent':not final
 (root/'record.json').write_text(json.dumps(record))
 with (root/'attempts.jsonl').open('a') as log: log.write(json.dumps(record)+'\n')
 if mode in ('tree_timeout', 'tree_success'):
-    descendant = subprocess.Popen(['/usr/bin/python3', '-c', 'import time; time.sleep(30)'])
+    descendant = subprocess.Popen(['/usr/bin/python3', '-c', 'import time, signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); print("ready", flush=True); time.sleep(30)'], stdout=subprocess.PIPE)
+    descendant.stdout.readline()
     (root/'descendant.pid').write_text(str(descendant.pid))
     if mode == 'tree_timeout': time.sleep(30)
+if mode == 'writer':
+    code = 'import sys, time, signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); f=open(sys.argv[1], "wb", buffering=0); print("ready", flush=True)\nwhile True: f.write(b"x"); time.sleep(0.001)'
+    descendant = subprocess.Popen(['/usr/bin/python3', '-c', code, str(final)], stdout=subprocess.PIPE)
+    descendant.stdout.readline()
+    (root/'descendant.pid').write_text(str(descendant.pid))
 if mode == 'blocked': time.sleep(30)
 if mode == 'partial':
     if final: final.write_text('false success')
@@ -62,10 +86,16 @@ if mode == 'partial':
 data = sys.stdin.buffer.read() if final else b''
 (root/'stdin').write_bytes(data)
 print('PROGRESS_ONLY')
+if mode == 'flood':
+    def flood(fd):
+        for _ in range(512): os.write(fd, b'x'*8192)
+    threads = [threading.Thread(target=flood, args=(fd,)) for fd in (1,2)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
 if mode == 'retry' and len((root/'attempts.jsonl').read_text().splitlines()) == 1:
     print('rate limit', file=sys.stderr); sys.exit(1)
 if final:
-    if mode == 'missing': pass
+    if mode in ('missing', 'writer'): pass
     elif mode == 'directory': final.mkdir()
     elif mode == 'symlink':
         (root/'foreign').write_text('foreign'); final.symlink_to(root/'foreign')
@@ -134,11 +164,10 @@ fn run(
     }
     let result =
         serde_json::from_slice(&fs::read(root.path().join("result.json")).unwrap()).unwrap();
-    let record = serde_json::from_slice(
-        &fs::read(root.path().join("record.json"))
-            .unwrap_or_else(|e| panic!("fixture did not execute: {e}; adapter result: {result}")),
-    )
-    .unwrap();
+    let record = fs::read(root.path().join("record.json"))
+        .ok()
+        .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+        .unwrap_or(Value::Null);
     (root, result, record)
 }
 
@@ -291,29 +320,17 @@ fn assert_tree_cleanup(scenario: &str) {
         .unwrap()
         .parse()
         .unwrap();
-    // Linux zombies have exited and cannot retain stdin or write output.
-    let is_running = || {
-        fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .is_some_and(|stat| {
-                !stat
-                    .split_whitespace()
-                    .nth(2)
-                    .is_some_and(|state| state == "Z")
-            })
-    };
-    let deadline = Instant::now() + Duration::from_millis(500);
-    while is_running() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let leaked = is_running();
-    // Clean our fixture even when the baseline fails this assertion.
+    let state = fs::read_to_string(root.path().join("return-state")).unwrap();
+    let leaked = !matches!(state.as_str(), "Z" | "X" | "absent");
     if leaked {
         unsafe {
             libc::kill(pid, libc::SIGKILL);
         }
     }
-    assert!(!leaked, "{scenario}: descendant survived adapter return");
+    assert!(
+        !leaked,
+        "{scenario}: descendant alive at adapter return: {state}"
+    );
     assert_eq!(result.get("error").is_some(), scenario == "tree_timeout");
 }
 #[test]
@@ -333,4 +350,25 @@ fn failure_diagnostics_are_actionable_and_redacted() {
     assert!(error.contains("check Codex login"));
     assert!(!error.contains("SECRET_TOKEN"));
     assert!(!error.contains("PRIVATE_PROMPT"));
+}
+
+#[test]
+fn zero_timeout_fails_even_before_launcher_executes() {
+    let (_, result, _) = run("zero_timeout", "task", None, "codex");
+    assert!(result["error"].as_str().unwrap().contains("timed out"));
+}
+#[test]
+fn both_diagnostic_streams_are_drained_without_timeout() {
+    let (_, result, _) = run("flood", "task", None, "codex");
+    assert_eq!(result["ok"], "  FINAL\n\0Unicode: λ\n\n");
+}
+
+#[test]
+fn writing_descendant_stops_before_final_extraction() {
+    let (root, result, _) = run("writer", "task", None, "codex");
+    let state = fs::read_to_string(root.path().join("return-state")).unwrap();
+    assert!(matches!(state.as_str(), "Z" | "X" | "absent"), "{state}");
+    let output = result["ok"].as_str().unwrap();
+    assert!(!output.is_empty());
+    assert!(output.bytes().all(|byte| byte == b'x'));
 }

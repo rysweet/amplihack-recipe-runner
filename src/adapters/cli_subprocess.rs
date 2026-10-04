@@ -902,7 +902,8 @@ impl CLISubprocessAdapter {
                 NON_INTERACTIVE_FOOTER
             );
             let config = RateLimitConfig::from_env();
-            for attempt in 0..=config.max_retries {
+            let mut attempt = 0;
+            loop {
                 let resources =
                     tempfile::tempdir().context("Failed to allocate private Codex resources")?;
                 let command = self.build_agent_command(
@@ -921,13 +922,7 @@ impl CLISubprocessAdapter {
                     timeout,
                 );
                 let cleanup = resources.close().context("Failed to clean Codex resources");
-                let result = match (result, cleanup) {
-                    (result, Ok(())) => result,
-                    (Ok(_), Err(error)) => return Err(error),
-                    (Err(error), Err(cleanup)) => {
-                        return Err(anyhow::anyhow!("{error:#}; {cleanup:#}"));
-                    }
-                };
+                let result = super::codex_exec::finish_resources(result, cleanup);
                 match result {
                     Err(error)
                         if error
@@ -935,9 +930,10 @@ impl CLISubprocessAdapter {
                             .is_some_and(|e| e.rate_limited)
                             && attempt < config.max_retries =>
                     {
-                        log::warn!("Codex rate limit; retrying attempt {}", attempt + 1);
+                        attempt += 1;
+                        log::warn!("Codex rate limit; retrying attempt {attempt}");
                         std::thread::sleep(backoff_delay(
-                            attempt + 1,
+                            attempt,
                             config.base_delay_secs,
                             config.max_delay_secs,
                         ));
@@ -945,7 +941,6 @@ impl CLISubprocessAdapter {
                     result => return result,
                 }
             }
-            unreachable!("bounded retry loop always returns");
         }
 
         // Create a temp directory for the output log file only.
