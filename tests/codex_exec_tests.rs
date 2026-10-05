@@ -416,14 +416,24 @@ fn assert_runner_cancellation(signal: i32, variant: &str) {
         "parallel" => format!(
             "{agent}    continue_on_error: true\n    parallel_group: group\n{marker}    parallel_group: group\n  - id: later-agent\n    type: agent\n    prompt: must never run\n"
         ),
-        "nested" => {
+        "nested" | "nested_recovery" | "recovery_cancel" => {
             fs::write(
                 root.path().join("child.yaml"),
-                format!("name: child\nsteps:\n{agent}    fatal: false\n{marker}"),
+                if variant == "recovery_cancel" {
+                    "name: child\nsteps:\n  - id: fail\n    type: bash\n    command: exit 1\n"
+                        .to_string()
+                } else {
+                    format!("name: child\nsteps:\n{agent}    fatal: false\n{marker}")
+                },
             )
             .unwrap();
+            let recovery = if matches!(variant, "nested_recovery" | "recovery_cancel") {
+                "    recovery_on_failure: true\n"
+            } else {
+                ""
+            };
             format!(
-                "  - id: child\n    type: recipe\n    recipe: child\n    continue_on_error: true\n{marker}"
+                "  - id: child\n    type: recipe\n    recipe: child\n    continue_on_error: true\n{recovery}{marker}"
             )
         }
         _ => agent.to_string(),
@@ -543,7 +553,14 @@ fn assert_runner_cancellation(signal: i32, variant: &str) {
 #[cfg(target_os = "linux")]
 fn runner_sigint_cleans_owned_group_and_resources() {
     for variant in [
-        "fatal", "continue", "nonfatal", "nested", "parallel", "json",
+        "fatal",
+        "continue",
+        "nonfatal",
+        "nested",
+        "nested_recovery",
+        "recovery_cancel",
+        "parallel",
+        "json",
     ] {
         assert_runner_cancellation(libc::SIGINT, variant);
     }
@@ -552,7 +569,14 @@ fn runner_sigint_cleans_owned_group_and_resources() {
 #[cfg(target_os = "linux")]
 fn runner_sigterm_cleans_owned_group_and_resources() {
     for variant in [
-        "fatal", "continue", "nonfatal", "nested", "parallel", "json",
+        "fatal",
+        "continue",
+        "nonfatal",
+        "nested",
+        "nested_recovery",
+        "recovery_cancel",
+        "parallel",
+        "json",
     ] {
         assert_runner_cancellation(libc::SIGTERM, variant);
     }

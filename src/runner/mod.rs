@@ -879,7 +879,7 @@ impl<A: Adapter> RecipeRunner<A> {
 
         if !sub_result.success {
             let failure_summary = self.describe_sub_recipe_failure(&sub_result);
-            if step.recovery_on_failure {
+            if step.recovery_on_failure && self.interruption.borrow().is_none() {
                 let working_dir = step.working_dir.as_deref().unwrap_or(&self.working_dir);
                 let recovery_prompt = format!(
                     "Sub-recipe '{}' failed.\n{}\n\n\
@@ -904,13 +904,25 @@ impl<A: Adapter> RecipeRunner<A> {
                         info!("Sub-recipe '{}' recovered via agent", recipe_name);
                         return Ok(output);
                     }
-                    _ => {
+                    result => {
+                        if let Err(ref error) = result
+                            && error
+                                .downcast_ref::<crate::adapters::Interruption>()
+                                .is_some()
+                        {
+                            self.interruption.replace(Some(format!("{error:#}")));
+                        }
+                        let mut message = format!(
+                            "Sub-recipe '{}' failed and agentic recovery was unsuccessful.\n{}",
+                            recipe_name, failure_summary
+                        );
+                        if let Some(diagnostic) = self.interruption.borrow().as_ref() {
+                            message.push('\n');
+                            message.push_str(diagnostic);
+                        }
                         return Err(StepExecutionError {
                             step_id: step.id.clone(),
-                            message: format!(
-                                "Sub-recipe '{}' failed and agentic recovery was unsuccessful.\n{}",
-                                recipe_name, failure_summary
-                            ),
+                            message,
                         });
                     }
                 }
@@ -1512,6 +1524,9 @@ mod tests {
             _model: Option<&str>,
             _timeout: Option<u64>,
         ) -> Result<String, anyhow::Error> {
+            if prompt.starts_with("Sub-recipe '") {
+                return Ok("STATUS: COMPLETE".to_string());
+            }
             if prompt == "ordinary failure" {
                 anyhow::bail!("Codex exec cancelled by signal 15 (ordinary diagnostic text)");
             }
@@ -1537,6 +1552,26 @@ mod tests {
         fn name(&self) -> &str {
             "mock"
         }
+    }
+
+    #[test]
+    fn ordinary_nested_failure_still_runs_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("child.yaml"),
+            "name: child\nsteps:\n  - id: fail\n    type: agent\n    prompt: ordinary failure\n",
+        )
+        .unwrap();
+        let recipe = RecipeParser::new()
+            .parse("name: parent\nsteps:\n  - id: child\n    type: recipe\n    recipe: child\n    recovery_on_failure: true\n  - id: after\n    type: bash\n    command: echo continued\n")
+            .unwrap();
+        let runner = RecipeRunner::new(MockAdapter)
+            .with_working_dir(root.path().to_str().unwrap())
+            .with_auto_stage(false);
+        let result = runner.execute(&recipe, None);
+        assert!(result.success, "{result:?}");
+        assert_eq!(result.step_results.len(), 2);
+        assert_eq!(result.step_results[0].output, "STATUS: COMPLETE");
     }
 
     #[test]
