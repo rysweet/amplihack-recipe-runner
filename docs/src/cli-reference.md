@@ -27,7 +27,8 @@ recipe-runner-rs list --recipe-dir ./team-recipes --recipe-dir ./personal-recipe
 ### `--capabilities`
 
 Standalone compatibility probe. Emits one JSON object with `schema_version: 1`,
-the compiled package `version`, and `capabilities: ["codex_exec"]`, then exits zero.
+the compiled package `version`, and `capabilities: ["codex_exec"]` on Unix
+(an empty capability list on non-Unix), then exits zero.
 It performs no update, cache-write, network, or agent-startup work. Do not combine
 it with other arguments. See the [capability API](codex-exec.md#compatibility-probe-api).
 

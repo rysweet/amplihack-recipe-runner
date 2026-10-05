@@ -20,11 +20,11 @@ Source: [recipes/testing/](https://github.com/rysweet/amplihack-recipe-runner/tr
 | [large-context](https://github.com/rysweet/amplihack-recipe-runner/blob/main/recipes/testing/large-context.yaml) | Many context variables and long values to test template rendering at scale |
 | [empty-and-edge-cases](https://github.com/rysweet/amplihack-recipe-runner/blob/main/recipes/testing/empty-and-edge-cases.yaml) | Empty strings, missing variables, whitespace-only values, special characters |
 
-## Planned Codex verification
+## Codex verification
 
 The [Codex agent-step contract](codex-exec.md) requires both deterministic
-regression tests and later production integration evidence. These checks are
-planned acceptance guidance, not a claim that the baseline implements the feature.
+regression tests and production integration evidence. The following checks guide
+acceptance; deterministic fixtures alone do not establish production completion.
 
 Use an isolated fake launcher via `AMPLIHACK_LAUNCHER_BINARY` for deterministic
 coverage. Have it record argv, stdin and cwd, emit distinct progress diagnostics,
@@ -40,7 +40,7 @@ and write controlled final files. Keep fixtures and output under a private
 | Retries | Fresh output resources, no stale-file reuse, complete context/model/timeout preservation for rate-limit and JSON repair attempts, bounded backoff, Codex excluded from auto-model fallback, and local delivery/file/decoding/cleanup failures not retried based on diagnostic text. |
 | Runner integration | Verbatim bounded raw output survives storage in step results/context; explicit JSON extraction still transforms output; existing failure/continue-on-error policies and Claude/Copilot regressions pass. |
 
-Planned test locations are `tests/codex_capabilities_tests.rs`,
+Test locations are `tests/codex_capabilities_tests.rs`,
 `tests/codex_exec_tests.rs`, private lifecycle unit tests in
 `src/adapters/codex_exec.rs`, and existing adapter/runner regression suites.
 No model API call is needed for deterministic checks.

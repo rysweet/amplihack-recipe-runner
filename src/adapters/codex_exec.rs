@@ -102,8 +102,17 @@ impl Drop for Cancellation {
 #[cfg(unix)]
 pub(super) fn check_cancellation() -> anyhow::Result<()> {
     let signal = CANCELLED.load(std::sync::atomic::Ordering::Acquire);
-    anyhow::ensure!(signal == 0, "Codex exec cancelled by signal {signal}");
+    if signal != 0 {
+        return Err(Interruption { signal }.into());
+    }
     Ok(())
+}
+
+/// Terminal user interruption, retained through contextual cleanup errors.
+#[derive(Debug, thiserror::Error)]
+#[error("Codex exec cancelled by signal {signal}")]
+pub(crate) struct Interruption {
+    pub(crate) signal: i32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -377,7 +386,14 @@ pub(super) fn finish_resources(
     match (result, cleanup) {
         (result, Ok(())) => result,
         (Ok(_), Err(error)) => Err(error),
-        (Err(error), Err(cleanup)) => Err(anyhow::anyhow!("{error:#}; cleanup: {cleanup:#}")),
+        (Err(error), Err(cleanup)) => {
+            if cleanup.downcast_ref::<Interruption>().is_some() {
+                Err(cleanup.context(format!("execution: {error:#}")))
+            } else {
+                let detail = format!("{error:#}; cleanup: {cleanup:#}");
+                Err(error.context(detail))
+            }
+        }
     }
 }
 
@@ -816,6 +832,26 @@ mod tests {
         assert!(format!("{error:#}").contains("diagnostic reader failed"));
         if let Ok(pid) = std::fs::read_to_string(resources.path().join("launcher.pid")) {
             assert!(!group_live(pid.trim().parse().unwrap()).unwrap());
+        }
+    }
+
+    #[test]
+    fn cleanup_aggregation_preserves_typed_interruption() {
+        for (execution, cleanup) in [
+            (
+                Err(Interruption { signal: 15 }.into()),
+                Err(anyhow::anyhow!("delete failed")),
+            ),
+            (
+                Err(anyhow::anyhow!("execution failed")),
+                Err(Interruption { signal: 2 }.into()),
+            ),
+        ] {
+            let error = finish_resources(execution, cleanup).unwrap_err();
+            assert!(error.downcast_ref::<Interruption>().is_some());
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains("cancelled by signal"));
+            assert!(diagnostic.contains("failed"));
         }
     }
 

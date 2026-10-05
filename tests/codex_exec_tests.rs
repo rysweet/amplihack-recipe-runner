@@ -88,6 +88,12 @@ record = {'args':args, 'final':str(final) if final else None, 'absent':not final
           'directory_mode':stat.S_IMODE(final.parent.stat().st_mode) if final else None}
 (root/'record.json').write_text(json.dumps(record))
 with (root/'attempts.jsonl').open('a') as log: log.write(json.dumps(record)+'\n')
+if mode == 'cancel_json':
+    if len((root/'attempts.jsonl').read_text().splitlines()) == 1:
+        sys.stdin.read()
+        final.write_text('invalid JSON')
+        sys.exit(0)
+    mode = 'cancel'
 if mode in ('tree_timeout', 'tree_success', 'cancel'):
     descendant = subprocess.Popen(['/usr/bin/python3', '-c', 'import time, signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); print("ready", flush=True); time.sleep(30)'], stdout=subprocess.PIPE)
     descendant.stdout.readline()
@@ -395,27 +401,51 @@ fn writing_descendant_stops_before_final_extraction() {
 }
 
 #[cfg(target_os = "linux")]
-fn assert_runner_cancellation(signal: i32) {
+fn assert_runner_cancellation(signal: i32, variant: &str) {
     let root = tempfile::tempdir().unwrap();
     let launcher = root.path().join("launcher");
     fs::write(&launcher, LAUNCHER).unwrap();
     fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
     let recipe = root.path().join("recipe.yaml");
-    fs::write(
-        &recipe,
-        "name: cancellation\nsteps:\n  - id: agent\n    type: agent\n    prompt: safe fixture\n",
-    )
-    .unwrap();
+    let agent = "  - id: agent\n    type: agent\n    prompt: safe fixture\n";
+    let marker = "  - id: after\n    type: bash\n    command: touch continued\n";
+    let steps = match variant {
+        "json" => format!("{agent}    parse_json: true\n    continue_on_error: true\n{marker}"),
+        "nonfatal" => format!("{agent}    fatal: false\n{marker}"),
+        "continue" => format!("{agent}    continue_on_error: true\n{marker}"),
+        "parallel" => format!(
+            "{agent}    continue_on_error: true\n    parallel_group: group\n{marker}    parallel_group: group\n  - id: later-agent\n    type: agent\n    prompt: must never run\n"
+        ),
+        "nested" => {
+            fs::write(
+                root.path().join("child.yaml"),
+                format!("name: child\nsteps:\n{agent}    fatal: false\n{marker}"),
+            )
+            .unwrap();
+            format!(
+                "  - id: child\n    type: recipe\n    recipe: child\n    continue_on_error: true\n{marker}"
+            )
+        }
+        _ => agent.to_string(),
+    };
+    fs::write(&recipe, format!("name: cancellation\nsteps:\n{steps}")).unwrap();
     let mut runner = Command::new(env!("CARGO_BIN_EXE_recipe-runner-rs"))
         .arg(&recipe)
         .args(["--agent-binary", "codex", "--working-dir"])
         .arg(root.path())
         .env("CODEX_TEST_ROOT", root.path())
-        .env("TEST_SCENARIO", "cancel")
+        .env(
+            "TEST_SCENARIO",
+            if variant == "json" {
+                "cancel_json"
+            } else {
+                "cancel"
+            },
+        )
         .env("AMPLIHACK_LAUNCHER_BINARY", launcher)
         .env("AMPLIHACK_SESSION_DEPTH", "0")
         .env("RECIPE_RUNNER_NO_UPDATE_CHECK", "1")
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
@@ -451,8 +481,25 @@ fn assert_runner_cancellation(signal: i32) {
         std::thread::sleep(Duration::from_millis(10));
     }
     let output = runner.wait_with_output().unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("cancelled by signal"));
+    assert!(
+        !output.status.success(),
+        "{variant}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !root.path().join("continued").exists(),
+        "{variant} continued"
+    );
+    assert!(
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .contains("cancelled by signal"),
+        "{variant}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     for file in ["launcher.pid", "descendant.pid"] {
         let pid = fs::read_to_string(root.path().join(file)).unwrap();
         let live = fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
@@ -488,17 +535,25 @@ fn assert_runner_cancellation(signal: i32) {
             .unwrap()
             .lines()
             .count(),
-        1
+        if variant == "json" { 2 } else { 1 }
     );
 }
 
 #[test]
 #[cfg(target_os = "linux")]
 fn runner_sigint_cleans_owned_group_and_resources() {
-    assert_runner_cancellation(libc::SIGINT);
+    for variant in [
+        "fatal", "continue", "nonfatal", "nested", "parallel", "json",
+    ] {
+        assert_runner_cancellation(libc::SIGINT, variant);
+    }
 }
 #[test]
 #[cfg(target_os = "linux")]
 fn runner_sigterm_cleans_owned_group_and_resources() {
-    assert_runner_cancellation(libc::SIGTERM);
+    for variant in [
+        "fatal", "continue", "nonfatal", "nested", "parallel", "json",
+    ] {
+        assert_runner_cancellation(libc::SIGTERM, variant);
+    }
 }

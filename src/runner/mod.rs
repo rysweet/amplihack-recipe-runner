@@ -18,7 +18,7 @@ use crate::models::{
 use crate::parser::{RecipeParser, resolve_extends};
 use log::{error, info, warn};
 use serde_json::Value;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -42,6 +42,7 @@ pub struct RecipeRunner<A: Adapter> {
     working_dir: String,
     dry_run: bool,
     auto_stage: bool,
+    interruption: RefCell<Option<String>>,
     depth: Cell<u32>,
     total_steps: Cell<u32>,
     max_depth: Cell<u32>,
@@ -71,6 +72,7 @@ impl<A: Adapter> RecipeRunner<A> {
             working_dir: ".".to_string(),
             dry_run: false,
             auto_stage: true,
+            interruption: RefCell::new(None),
             depth: Cell::new(0),
             total_steps: Cell::new(0),
             max_depth: Cell::new(DEFAULT_MAX_DEPTH),
@@ -180,6 +182,7 @@ impl<A: Adapter> RecipeRunner<A> {
         recipe: &Recipe,
         user_context: Option<HashMap<String, Value>>,
     ) -> RecipeResult {
+        self.interruption.replace(None);
         info!(
             "RecipeRunner::execute: recipe='{}', dry_run={}",
             recipe.name, self.dry_run
@@ -343,7 +346,7 @@ impl<A: Adapter> RecipeRunner<A> {
                         ctx.set(output_key, value);
                     }
 
-                    if failed && !gs.is_nonfatal() {
+                    if self.interruption.borrow().is_some() || (failed && !gs.is_nonfatal()) {
                         group_failed = true;
                     }
 
@@ -446,7 +449,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     }
                 }
 
-                if failed && !step.is_nonfatal() {
+                if self.interruption.borrow().is_some() || (failed && !step.is_nonfatal()) {
                     step_results.push(result);
                     success = false;
                     break;
@@ -648,6 +651,16 @@ impl<A: Adapter> RecipeRunner<A> {
                         })
                     });
 
+                    if let Some(diagnostic) = self.interruption.borrow().as_ref() {
+                        return StepResult {
+                            step_id: step.id.clone(),
+                            status: StepStatus::Failed,
+                            output: String::new(),
+                            error: diagnostic.clone(),
+                            duration: Some(step_start.elapsed()),
+                        };
+                    }
+
                     match retry_result {
                         Some(parsed_output) => {
                             (parsed_output, StepStatus::Completed, String::new())
@@ -771,9 +784,14 @@ impl<A: Adapter> RecipeRunner<A> {
                         step.model.as_deref(),
                         step.timeout,
                     )
-                    .map_err(|e| StepExecutionError {
-                        step_id: step.id.clone(),
-                        message: format!("agent step failed: {:#}", e),
+                    .map_err(|e| {
+                        if e.downcast_ref::<crate::adapters::Interruption>().is_some() {
+                            self.interruption.replace(Some(format!("{e:#}")));
+                        }
+                        StepExecutionError {
+                            step_id: step.id.clone(),
+                            message: format!("agent step failed: {:#}", e),
+                        }
                     })
             }
         }
@@ -1122,6 +1140,9 @@ impl<A: Adapter> RecipeRunner<A> {
         match result {
             Ok(output) => Some(output),
             Err(e) => {
+                if e.downcast_ref::<crate::adapters::Interruption>().is_some() {
+                    self.interruption.replace(Some(format!("{e:#}")));
+                }
                 warn!("Retry for step '{}' failed: {}", step.id, e);
                 None
             }
@@ -1175,6 +1196,9 @@ impl<A: Adapter> RecipeRunner<A> {
             let mut handles = Vec::new();
 
             for (idx, step) in steps.iter().enumerate() {
+                if self.interruption.borrow().is_some() {
+                    break;
+                }
                 if self.should_skip_by_tags(step) {
                     results[idx] = Some(StepResult {
                         step_id: step.id.clone(),
@@ -1488,6 +1512,9 @@ mod tests {
             _model: Option<&str>,
             _timeout: Option<u64>,
         ) -> Result<String, anyhow::Error> {
+            if prompt == "ordinary failure" {
+                anyhow::bail!("Codex exec cancelled by signal 15 (ordinary diagnostic text)");
+            }
             Ok(format!(
                 "Agent response for: {}",
                 &prompt[..prompt.len().min(50)]
@@ -1509,6 +1536,20 @@ mod tests {
         }
         fn name(&self) -> &str {
             "mock"
+        }
+    }
+
+    #[test]
+    fn ordinary_nonfatal_errors_still_continue_without_matching_diagnostic_text() {
+        for policy in ["continue_on_error: true", "fatal: false"] {
+            let recipe = RecipeParser::new().parse(&format!(
+                "name: ordinary\nsteps:\n  - id: fail\n    type: agent\n    prompt: ordinary failure\n    {policy}\n  - id: after\n    type: bash\n    command: echo continued\n"
+            )).unwrap();
+            let runner = RecipeRunner::new(MockAdapter).with_auto_stage(false);
+            let result = runner.execute(&recipe, None);
+            assert!(result.success);
+            assert_eq!(result.step_results.len(), 2);
+            assert_eq!(result.step_results[1].status, StepStatus::Completed);
         }
     }
 

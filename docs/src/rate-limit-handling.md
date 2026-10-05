@@ -156,9 +156,9 @@ recipe-runner-rs smoke.yaml
 |---|---|
 | Claude/Copilot exits `0` | Existing success and output-capture behavior. |
 | Codex exits `0` | Succeeds only after complete stdin delivery, lifecycle cleanup, and final-file validation. Empty final files succeed; missing, unsafe, unreadable, invalid UTF-8, or oversized files fail. |
-| Non-zero exit, **no** rate-limit signal | **Fail fast** with `amplihack <cli> failed (exit N)`. |
-| Non-zero exit **with** rate-limit signal, retries remain | Loud banner → backoff sleep → retry the same step. |
-| Rate-limit signal, retries exhausted | Explicit "rate limit persisted after N retries" error. |
+| Non-zero exit, **no** rate-limit signal | Fail fast; Codex reports exit status and a fixed, credential-safe failure classification. Claude/Copilot retain `amplihack <cli> failed (exit N)`. |
+| Non-zero exit **with** rate-limit signal, retries remain | Backoff and retry the same step; Codex logs an attempt warning, while Claude/Copilot retain their existing banner. |
+| Rate-limit signal, retries exhausted | Codex reports the final exit status and rate-limit classification; Claude/Copilot retain the explicit "rate limit persisted after N retries" error. |
 | Per-attempt timeout exceeded | Attempt fails; Codex terminates/reaps its owned process tree and completes I/O cleanup. |
 | Bash step | Unaffected; no rate-limit handling applied. |
 
