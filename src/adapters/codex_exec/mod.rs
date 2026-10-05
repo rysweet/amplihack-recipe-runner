@@ -69,37 +69,68 @@ fn execute_with_readers(
     process.shutdown(&mut failures);
     stop.store(true, std::sync::atomic::Ordering::Release);
     let diagnostic = join_readers(stdout, stderr, &mut failures);
-    // Cancellation dominates ordinary execution/cleanup failures, retaining its type.
+    // Classify the drained diagnostic before adding cleanup errors, so a
+    // nonzero child status remains discoverable even when teardown fails.
+    let execution = execution.and_then(|status| {
+        if status.success() {
+            Ok(())
+        } else {
+            let diagnostic = String::from_utf8_lossy(&diagnostic);
+            let rate_limited = super::cli_subprocess::is_rate_limit(&diagnostic);
+            Err(ExitFailure {
+                status,
+                rate_limited,
+                classification: classify_failure(&diagnostic, rate_limited),
+            }
+            .into())
+        }
+    });
     let execution = combine_result(execution, check_cancellation());
     let cleanup = if failures.is_empty() {
         Ok(())
     } else {
         Err(anyhow::anyhow!(failures.join("; cleanup: ")))
     };
-    let status = combine_result(execution, cleanup)?;
-    if !status.success() {
-        let diagnostic = String::from_utf8_lossy(&diagnostic);
-        let rate_limited = super::cli_subprocess::is_rate_limit(&diagnostic);
-        return Err(ExitFailure {
-            status,
-            rate_limited,
-            classification: classify_failure(&diagnostic, rate_limited),
-        }
-        .into());
-    }
+    combine_result(execution, cleanup)?;
     read_final_output(&resources.join("final-message"))
+}
+
+/// Context marker: preserves the primary error while making failed cleanup terminal.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(super) struct CleanupFailure(String);
+
+pub(super) fn retryable(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Interruption>().is_none()
+        && error.downcast_ref::<CleanupFailure>().is_none()
+        && error
+            .downcast_ref::<ExitFailure>()
+            .is_some_and(|e| e.rate_limited)
 }
 
 fn combine_result<T>(result: anyhow::Result<T>, cleanup: anyhow::Result<()>) -> anyhow::Result<T> {
     match (result, cleanup) {
         (result, Ok(())) => result,
-        (Ok(_), Err(error)) => Err(error),
+        (Ok(_), Err(error)) => {
+            if error.downcast_ref::<Interruption>().is_some() {
+                Err(error)
+            } else {
+                let detail = format!("{error:#}");
+                Err(error.context(CleanupFailure(detail)))
+            }
+        }
         (Err(error), Err(cleanup)) => {
             if cleanup.downcast_ref::<Interruption>().is_some() {
-                Err(cleanup.context(format!("execution: {error:#}")))
+                let detail = format!("execution: {error:#}");
+                let interrupted = cleanup.context(detail.clone());
+                if error.downcast_ref::<CleanupFailure>().is_some() {
+                    Err(interrupted.context(CleanupFailure(detail)))
+                } else {
+                    Err(interrupted)
+                }
             } else {
                 let detail = format!("{error:#}; cleanup: {cleanup:#}");
-                Err(error.context(detail))
+                Err(error.context(CleanupFailure(detail)))
             }
         }
     }

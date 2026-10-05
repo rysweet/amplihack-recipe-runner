@@ -113,7 +113,12 @@ pub(super) fn join_readers(
                     diagnostic = bytes;
                 }
             }
-            _ => failures.push(format!("Failed to drain Codex {name} diagnostics")),
+            Ok(Err(error)) => {
+                failures.push(format!("Failed to drain Codex {name} diagnostics: {error}"))
+            }
+            Err(_) => failures.push(format!(
+                "Failed to drain Codex {name} diagnostics: reader panicked"
+            )),
         }
     }
     diagnostic

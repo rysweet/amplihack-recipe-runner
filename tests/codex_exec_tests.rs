@@ -118,6 +118,11 @@ if mode == 'flood':
     threads = [threading.Thread(target=flood, args=(fd,)) for fd in (1,2)]
     for thread in threads: thread.start()
     for thread in threads: thread.join()
+if mode == 'cleanup_failure':
+    final.parent.rmdir()
+    final.parent.write_text('injected resource obstruction')
+    print('rate limit SECRET', file=sys.stderr)
+    sys.exit(7)
 if mode == 'retry' and len((root/'attempts.jsonl').read_text().splitlines()) == 1:
     print('rate limit', file=sys.stderr); sys.exit(1)
 if final:
@@ -162,7 +167,11 @@ fn run(
         .env("TEST_PROVIDER", provider)
         .env(
             "AMPLIHACK_RATELIMIT_MAX_RETRIES",
-            if scenario == "retry" { "1" } else { "0" },
+            if matches!(scenario, "retry" | "cleanup_failure") {
+                "1"
+            } else {
+                "0"
+            },
         )
         .env("AMPLIHACK_RATELIMIT_BASE_DELAY_SECS", "0")
         .env("AMPLIHACK_RATELIMIT_MAX_DELAY_SECS", "0")
@@ -580,4 +589,30 @@ fn runner_sigterm_cleans_owned_group_and_resources() {
     ] {
         assert_runner_cancellation(libc::SIGTERM, variant);
     }
+}
+
+#[test]
+fn resource_deletion_failure_prevents_rate_limit_retry() {
+    let (root, result, record) = run("cleanup_failure", "task", None, "codex");
+    let obstruction = std::path::Path::new(record["final"].as_str().unwrap())
+        .parent()
+        .unwrap();
+    fs::remove_file(obstruction).unwrap();
+    assert_eq!(
+        fs::read_to_string(root.path().join("attempts.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(result.get("ok").is_none());
+    let error = result["error"].as_str().unwrap();
+    for detail in [
+        "exit status: 7",
+        "rate limit",
+        "Failed to clean Codex resources",
+    ] {
+        assert!(error.contains(detail), "missing {detail}: {error}");
+    }
+    assert!(!error.contains("SECRET"));
 }

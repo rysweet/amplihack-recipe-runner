@@ -933,9 +933,7 @@ impl CLISubprocessAdapter {
                     );
                     match result {
                         Err(error)
-                            if error
-                                .downcast_ref::<super::codex_exec::ExitFailure>()
-                                .is_some_and(|e| e.rate_limited)
+                            if super::codex_exec::retryable(&error)
                                 && attempt < config.max_retries =>
                         {
                             attempt += 1;
