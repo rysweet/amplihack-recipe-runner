@@ -42,7 +42,7 @@ and write controlled final files. Keep fixtures and output under a private
 
 Test locations are `tests/codex_capabilities_tests.rs`,
 `tests/codex_exec_tests.rs`, private lifecycle unit tests in
-`src/adapters/codex_exec.rs`, and existing adapter/runner regression suites.
+`src/adapters/codex_exec/tests/`, and existing adapter/runner regression suites.
 No model API call is needed for deterministic checks.
 
 Later production verification must use the updated production Amplihack launcher
