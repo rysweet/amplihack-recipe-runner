@@ -1,3 +1,7 @@
+---
+document_type: explanation
+---
+
 # Architecture — amplihack-recipe-runner
 
 Rust implementation of the amplihack recipe runner. Parses YAML recipe files,
@@ -45,7 +49,7 @@ graph TD
     runner --> adapters[adapters/mod.rs — Adapter trait]
 
     cli_sub --> adapters
-    cli_sub --> codex_exec[codex_exec.rs — private attempt lifecycle]
+    cli_sub --> codex_exec[codex_exec/mod.rs — private attempt coordinator]
 
     parser --> models[models.rs]
     runner --> models
@@ -69,7 +73,11 @@ graph TD
 | `discovery.rs`       | Multi-directory recipe discovery and manifest sync     |
 | `adapters/mod.rs`    | `Adapter` trait definition                             |
 | `adapters/cli_subprocess.rs` | Provider dispatch, subprocess execution and rate-limit retries |
-| `adapters/codex_exec.rs` | Private Codex stdin, output resources, process/IO lifecycle and final validation |
+| `adapters/codex_exec/mod.rs` | Private attempt coordination and typed error composition |
+| `adapters/codex_exec/cancellation.rs` | Scoped signal registration, cancellation state and disposition restoration |
+| `adapters/codex_exec/process.rs` | Owned child/group, complete stdin delivery, deadline and bounded shutdown |
+| `adapters/codex_exec/diagnostics.rs` | Bounded pipe readers and secret-safe exit classification |
+| `adapters/codex_exec/final_output.rs` | Descriptor validation and exact bounded UTF-8 final-message reads |
 
 ---
 
@@ -295,13 +303,55 @@ The production adapter spawns subprocesses:
   `--add-dir` or model selection. Full system/persona, leaf/no-reentry, task and
   autonomy instructions are delivered through stdin for every prompt size.
 
-The private `adapters/codex_exec.rs` module owns each Codex attempt: portable
-private temporary resources, an absent-before-launch final pathname, bounded
-progress diagnostics, stdin completion, process-group/deadline handling, final
-validation and cleanup. Only a regular, safe, readable UTF-8 final file within
-`MAX_STEP_OUTPUT_BYTES` becomes the result, preserved verbatim including empty
-content. Exit zero alone does not establish success. Oversized output fails
-instead of being truncated; stdout/stderr never replace missing final output.
+### Private Codex execution ownership
+
+`cli_subprocess.rs` constructs the full stdin envelope and typed command arguments,
+allocates a fresh private temporary directory for each attempt, and owns retry
+policy and resource removal. Temporary resources use the platform temporary
+location, honoring `TMPDIR`; the directory is private and the final pathname is
+absent before launch. There is no additional public adapter API.
+
+The private `adapters/codex_exec/` modules divide the attempt by responsibility:
+
+- `mod.rs` coordinates spawn, delivery/wait, teardown and result classification.
+  It composes primary and cleanup errors while retaining downcastable
+  `Interruption` identity.
+- `cancellation.rs` owns reference-counted SIGINT/SIGTERM registration. The first
+  active owner installs handlers; the last restores prior dispositions. Handlers
+  only record atomic signal state. Concurrent owners do not clear an existing
+  cancellation. Registration rollback and explicit restoration failures are
+  observable. The scope spans retries and backoff.
+- `process.rs` owns the child and its Unix process group, nonblocking complete
+  stdin delivery, one per-attempt deadline, shutdown confirmation and reaping.
+  Shutdown uses a 100 ms TERM grace period, then KILL, with two-second bounds
+  for confirmation and launcher reaping.
+- `diagnostics.rs` drains both pipes concurrently, retaining 64 KiB tails.
+  Stopped readers finish within a 50 ms or 1 MiB additional-read bound. Exit
+  classification uses fixed actionable categories, including late stderr
+  rate-limit evidence, without exposing raw provider output or credentials.
+- `final_output.rs` validates the opened descriptor using no-follow and
+  nonblocking flags, regular-file type, ownership and permissions. Metadata
+  checks and a limit-plus-one read enforce the 10,000,000-byte output bound
+  before unbounded allocation. Strict UTF-8 decoding preserves all content,
+  including an empty message and whitespace.
+
+After spawn, every outcome closes stdin, shuts down and reaps the owned process
+group, then stops and joins both diagnostic readers. Cleanup continues after
+an earlier failure so errors can be aggregated. Final-file extraction requires
+complete stdin delivery, successful process exit and successful lifecycle
+cleanup. The adapter removes temporary resources before returning. Exit zero or
+an existing final file alone cannot establish success; progress output never
+substitutes for a missing final message, and oversized output fails rather than
+being truncated.
+
+Typed cancellation takes precedence over ordinary execution and cleanup errors.
+It stops the enclosing recipe despite `continue_on_error` or `fatal: false`,
+including nested execution, parallel scheduling and JSON repair. Recorded
+interruption prevents agentic recovery from starting; interruption during
+recovery aborts the enclosing recipe. No rate-limit retry, automatic model
+fallback or JSON repair runs after cancellation. Already running parallel Bash
+steps retain their existing join behavior. Ordinary failures retain the
+established recovery and nonfatal policies.
 
 **Timeout enforcement**: Codex's deadline covers stdin delivery and execution
 per attempt. Timeout terminates and reaps the owned process tree and completes
