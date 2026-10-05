@@ -1,6 +1,21 @@
+---
+title: Codex agent steps
+description: Codex execution, configuration, results, and terminal failure contracts.
+doc_type: reference
+---
+
 # Codex agent steps
 
 The runner executes Codex agent steps through Amplihack using modern noninteractive `codex exec`. Claude remains the default provider; selecting Codex leaves Claude and Copilot invocation and result contracts unchanged.
+
+## Contents
+
+- [Run a recipe](#run-a-recipe)
+- [Provider and configuration](#provider-and-configuration)
+- [Instructions, results, and failures](#instructions-results-and-failures)
+- [Terminal cleanup failures](#terminal-cleanup-failures)
+- [Compatibility probe API](#compatibility-probe-api)
+- [Rust adapter API](#rust-adapter-api)
 
 ## Run a recipe
 
@@ -73,6 +88,49 @@ Bounded rate-limit retries and JSON repair retries retain the effective instruct
 
 The runner has no generic Codex argument passthrough API. Use recipe fields for task, model, working directory, and timeout.
 
+## Terminal cleanup failures
+
+Cleanup failure stops the entire recipe, even without SIGINT or SIGTERM. Process
+shutdown, diagnostic-reader completion, and owned-resource deletion failures
+remain terminal through agent calls, Bash calls, lifecycle hooks, nested recipes,
+recovery, parallel execution, and JSON repair.
+
+| Boundary or setting | Behavior after cleanup failure |
+|---|---|
+| `continue_on_error: true` or `fatal: false` | The step and recipe fail; later steps do not run. |
+| Nested recipes with `recovery_on_failure: true` | Child failure propagates through every enclosing recipe; recovery and later steps do not run. |
+| Recovery already in progress | Cleanup failure in recovery stops enclosing recovery and continuation. |
+| `parse_json: true` | Cleanup failure in the primary call prevents JSON repair. Cleanup failure during repair prevents further repair or raw-output fallback, whether `parse_json_required` is `true` or `false`. |
+| `pre_step` hook | Cleanup failure blocks the primary step and subsequent hooks. |
+| `post_step` hook | Cleanup failure makes the step and recipe fail, including after the last primary step succeeds. |
+| `on_error` hook | Cleanup failure stops further hooks, recovery, and continuation. |
+| Parallel group | A worker publishes terminal failure when it classifies the error, before joins. Pending agent, Bash, recipe, hook, recovery, and repair dispatch stops; all workers already started are joined before return. |
+
+Already admitted work may finish. A parallel failure remains associated with its
+original step, and successful siblings cannot turn the recipe into success.
+Step results, listener notifications, audit entries, and checkpoints reflect the
+effective failure, including failure in a final post-hook. Terminal state persists
+through nesting and aggregation and resets only for an independent top-level
+execution using the runner again.
+
+Ordinary errors retain their existing policies: nonfatal continuation, nested
+recovery, optional JSON degradation, and warning-only hook failures still apply.
+Terminality comes from typed errors, not diagnostic text containing words such as
+"cleanup" or "interrupted". There is no configuration switch to bypass it.
+
+For example, a nested Codex step whose final message is valid but whose owned
+resource deletion fails causes its parent recipe to fail. Setting
+`recovery_on_failure: true` and `continue_on_error: true` on the parent step does
+not launch recovery or the next step. An ordinary child error remains eligible
+for the configured recovery policy.
+
+Failure diagnostics retain the unsuccessful child exit status, safe failure
+classification, and cleanup details. If interruption and cleanup failure occur
+together, interruption takes precedence while cleanup diagnostics remain visible.
+A cleanup error does not establish that every owned resource was removed.
+See [Codex verification](testing-recipes.md#codex-verification) for regression
+coverage of these boundaries.
+
 ## Compatibility probe API
 
 ```bash
@@ -95,6 +153,10 @@ A stale runner that rejects the probe is incompatible. Managed Amplihack install
 
 The public `Adapter: Sync` interface and `StepResult` types are unchanged. `execute_agent_step` accepts prompt, optional agent name, effective system prompt, mode, working directory, optional model, and optional timeout, returning `Result<String, anyhow::Error>`.
 
-For a Codex `CLISubprocessAdapter`, `Ok(String)` contains the verbatim final message within the output bound, including `Ok(String::new())` for an intentionally empty file. Execution/resource failures return contextual `Err`; ordinary failures follow existing failure and `continue_on_error` policies. SIGINT/SIGTERM cancellation is terminal and stops the recipe regardless of those policies, including cancellation during nested recovery. Optional JSON parsing happens after successful raw extraction. No new public error enum, output-path parameter, or JSONL protocol is required.
+For a Codex `CLISubprocessAdapter`, `Ok(String)` contains the verbatim final message within the output bound, including `Ok(String::new())` for an intentionally empty file. Execution/resource failures return contextual `Err`; ordinary failures follow existing failure and `continue_on_error` policies. SIGINT/SIGTERM cancellation and cleanup failure are terminal and stop the recipe regardless of those policies, including during nested recovery. Optional JSON parsing happens after successful raw extraction. No new public error enum, output-path parameter, or JSONL protocol is required.
 
-Cleanup failures are terminal, including process shutdown, diagnostic readers, and resource deletion. When a child exits unsuccessfully and cleanup also fails, the error retains its exit status, safe failure classification, and cleanup details. Such attempts never enter rate-limit retries; typed cancellation still takes precedence.
+The runner classifies private typed `CleanupFailure` and `Interruption` markers
+in the error chain before converting an error to text. Classification survives
+execution boundaries without changing the public result schema. Cleanup failures
+never enter rate-limit retries; the [terminal cleanup contract](#terminal-cleanup-failures)
+also governs recovery, nonfatal policies, hooks, and JSON repair.

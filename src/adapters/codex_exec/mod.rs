@@ -98,7 +98,7 @@ fn execute_with_readers(
 /// Context marker: preserves the primary error while making failed cleanup terminal.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
-pub(super) struct CleanupFailure(String);
+pub(crate) struct CleanupFailure(String);
 
 pub(super) fn retryable(error: &anyhow::Error) -> bool {
     error.downcast_ref::<Interruption>().is_none()
