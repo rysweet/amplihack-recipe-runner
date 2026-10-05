@@ -901,46 +901,68 @@ impl CLISubprocessAdapter {
                 prompt,
                 NON_INTERACTIVE_FOOTER
             );
-            let config = RateLimitConfig::from_env();
-            let mut attempt = 0;
-            loop {
-                let resources =
-                    tempfile::tempdir().context("Failed to allocate private Codex resources")?;
-                let command = self.build_agent_command(
-                    resources.path(),
-                    &resolved_cwd,
-                    prompt,
-                    system_prompt,
-                    model,
-                )?;
-                let result = super::codex_exec::execute(
-                    command,
-                    resources.path(),
-                    &resolved_cwd,
-                    &child_env,
-                    &envelope,
-                    timeout,
-                );
-                let cleanup = resources.close().context("Failed to clean Codex resources");
-                let result = super::codex_exec::finish_resources(result, cleanup);
-                match result {
-                    Err(error)
-                        if error
-                            .downcast_ref::<super::codex_exec::ExitFailure>()
-                            .is_some_and(|e| e.rate_limited)
-                            && attempt < config.max_retries =>
-                    {
-                        attempt += 1;
-                        log::warn!("Codex rate limit; retrying attempt {attempt}");
-                        std::thread::sleep(backoff_delay(
-                            attempt,
-                            config.base_delay_secs,
-                            config.max_delay_secs,
-                        ));
+            #[cfg(unix)]
+            let cancellation = super::codex_exec::Cancellation::install()?;
+            let result = (|| {
+                let config = RateLimitConfig::from_env();
+                let mut attempt = 0;
+                loop {
+                    let resources = tempfile::tempdir()
+                        .context("Failed to allocate private Codex resources")?;
+                    let command = self.build_agent_command(
+                        resources.path(),
+                        &resolved_cwd,
+                        prompt,
+                        system_prompt,
+                        model,
+                    )?;
+                    let result = super::codex_exec::execute(
+                        command,
+                        resources.path(),
+                        &resolved_cwd,
+                        &child_env,
+                        &envelope,
+                        timeout,
+                    );
+                    let cleanup = resources.close().context("Failed to clean Codex resources");
+                    let result = super::codex_exec::finish_resources(result, cleanup);
+                    #[cfg(unix)]
+                    let result = super::codex_exec::finish_resources(
+                        result,
+                        super::codex_exec::check_cancellation(),
+                    );
+                    match result {
+                        Err(error)
+                            if error
+                                .downcast_ref::<super::codex_exec::ExitFailure>()
+                                .is_some_and(|e| e.rate_limited)
+                                && attempt < config.max_retries =>
+                        {
+                            attempt += 1;
+                            log::warn!("Codex rate limit; retrying attempt {attempt}");
+                            let delay = backoff_delay(
+                                attempt,
+                                config.base_delay_secs,
+                                config.max_delay_secs,
+                            );
+                            let started = Instant::now();
+                            while started.elapsed() < delay {
+                                #[cfg(unix)]
+                                super::codex_exec::check_cancellation()?;
+                                std::thread::sleep(
+                                    delay
+                                        .saturating_sub(started.elapsed())
+                                        .min(Duration::from_millis(10)),
+                                );
+                            }
+                        }
+                        result => return result,
                     }
-                    result => return result,
                 }
-            }
+            })();
+            #[cfg(unix)]
+            let result = super::codex_exec::finish_resources(result, cancellation.close());
+            return result;
         }
 
         // Create a temp directory for the output log file only.

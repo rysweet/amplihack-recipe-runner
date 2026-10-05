@@ -29,7 +29,7 @@ fn standalone_probe_is_exact_and_has_no_update_side_effects() {
         serde_json::from_slice(&out.stdout).expect("exactly one JSON object");
     assert_eq!(
         value,
-        json!({"schema_version":1,"version":env!("CARGO_PKG_VERSION"),"capabilities":["codex_exec"]})
+        json!({"schema_version":1,"version":env!("CARGO_PKG_VERSION"),"capabilities":if cfg!(unix) { vec!["codex_exec"] } else { vec![] }})
     );
     assert_eq!(std::fs::read_to_string(cache).unwrap(), sentinel);
 }

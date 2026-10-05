@@ -159,7 +159,8 @@ fn main() {
             std::process::exit(2);
         }
         use std::io::Write;
-        let report = serde_json::json!({"schema_version":1,"version":env!("CARGO_PKG_VERSION"),"capabilities":["codex_exec"]});
+        let capabilities: &[&str] = if cfg!(unix) { &["codex_exec"] } else { &[] };
+        let report = serde_json::json!({"schema_version":1,"version":env!("CARGO_PKG_VERSION"),"capabilities":capabilities});
         if let Err(error) = writeln!(std::io::stdout().lock(), "{report}") {
             eprintln!("Failed to write capability report: {error}");
             std::process::exit(1);

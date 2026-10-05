@@ -16,6 +16,20 @@ fn adapter_worker() {
     let Ok(root) = std::env::var("CODEX_TEST_ROOT") else {
         return;
     };
+    fn dispositions() -> [(usize, i32); 2] {
+        [libc::SIGINT, libc::SIGTERM].map(|signal| unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            assert_eq!(libc::sigaction(signal, std::ptr::null(), &mut action), 0);
+            // Linux libc adds its internal SA_RESTORER trampoline on install;
+            // compare caller-visible disposition flags, not that ABI detail.
+            #[cfg(target_os = "linux")]
+            let flags = action.sa_flags & !0x04000000;
+            #[cfg(not(target_os = "linux"))]
+            let flags = action.sa_flags;
+            (action.sa_sigaction, flags)
+        })
+    }
+    let prior = dispositions();
     let prompt = fs::read_to_string(format!("{root}/prompt")).unwrap();
     let result = CLISubprocessAdapter::new()
         .with_binary(&std::env::var("TEST_PROVIDER").unwrap())
@@ -38,6 +52,11 @@ fn adapter_worker() {
                 )
             },
         );
+    assert_eq!(
+        dispositions(),
+        prior,
+        "signal dispositions must be restored"
+    );
     if let Ok(pid) = fs::read_to_string(format!("{root}/descendant.pid")) {
         let state = fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
             .map(|stat| {
@@ -69,11 +88,12 @@ record = {'args':args, 'final':str(final) if final else None, 'absent':not final
           'directory_mode':stat.S_IMODE(final.parent.stat().st_mode) if final else None}
 (root/'record.json').write_text(json.dumps(record))
 with (root/'attempts.jsonl').open('a') as log: log.write(json.dumps(record)+'\n')
-if mode in ('tree_timeout', 'tree_success'):
+if mode in ('tree_timeout', 'tree_success', 'cancel'):
     descendant = subprocess.Popen(['/usr/bin/python3', '-c', 'import time, signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); print("ready", flush=True); time.sleep(30)'], stdout=subprocess.PIPE)
     descendant.stdout.readline()
     (root/'descendant.pid').write_text(str(descendant.pid))
-    if mode == 'tree_timeout': time.sleep(30)
+    (root/'launcher.pid').write_text(str(os.getpid()))
+    if mode in ('tree_timeout', 'cancel'): time.sleep(30)
 if mode == 'writer':
     code = 'import sys, time, signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); f=open(sys.argv[1], "wb", buffering=0); print("ready", flush=True)\nwhile True: f.write(b"x"); time.sleep(0.001)'
     descendant = subprocess.Popen(['/usr/bin/python3', '-c', code, str(final)], stdout=subprocess.PIPE)
@@ -372,4 +392,113 @@ fn writing_descendant_stops_before_final_extraction() {
     let output = result["ok"].as_str().unwrap();
     assert!(!output.is_empty());
     assert!(output.bytes().all(|byte| byte == b'x'));
+}
+
+#[cfg(target_os = "linux")]
+fn assert_runner_cancellation(signal: i32) {
+    let root = tempfile::tempdir().unwrap();
+    let launcher = root.path().join("launcher");
+    fs::write(&launcher, LAUNCHER).unwrap();
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+    let recipe = root.path().join("recipe.yaml");
+    fs::write(
+        &recipe,
+        "name: cancellation\nsteps:\n  - id: agent\n    type: agent\n    prompt: safe fixture\n",
+    )
+    .unwrap();
+    let mut runner = Command::new(env!("CARGO_BIN_EXE_recipe-runner-rs"))
+        .arg(&recipe)
+        .args(["--agent-binary", "codex", "--working-dir"])
+        .arg(root.path())
+        .env("CODEX_TEST_ROOT", root.path())
+        .env("TEST_SCENARIO", "cancel")
+        .env("AMPLIHACK_LAUNCHER_BINARY", launcher)
+        .env("AMPLIHACK_SESSION_DEPTH", "0")
+        .env("RECIPE_RUNNER_NO_UPDATE_CHECK", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !root.path().join("launcher.pid").exists() {
+        if start.elapsed() > Duration::from_secs(5) {
+            runner.kill().unwrap();
+            let output = runner.wait_with_output().unwrap();
+            panic!(
+                "fixture failed to start: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let launcher: i32 = fs::read_to_string(root.path().join("launcher.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(unsafe { libc::getpgid(launcher) }, launcher);
+    assert_ne!(unsafe { libc::getpgid(runner.id() as i32) }, launcher);
+    assert_eq!(unsafe { libc::kill(runner.id() as i32, signal) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while runner.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            unsafe {
+                libc::kill(-launcher, libc::SIGKILL);
+            }
+            runner.kill().unwrap();
+            runner.wait().unwrap();
+            panic!("cancellation exceeded cleanup bounds");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = runner.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cancelled by signal"));
+    for file in ["launcher.pid", "descendant.pid"] {
+        let pid = fs::read_to_string(root.path().join(file)).unwrap();
+        let live = fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+            .map(|stat| {
+                !matches!(
+                    stat.rsplit_once(')')
+                        .unwrap()
+                        .1
+                        .split_whitespace()
+                        .next()
+                        .unwrap(),
+                    "Z" | "X"
+                )
+            })
+            .unwrap_or(false);
+        if live {
+            unsafe {
+                libc::kill(-launcher, libc::SIGKILL);
+            }
+        }
+        assert!(!live, "{file} alive at runner return");
+    }
+    let record: Value =
+        serde_json::from_slice(&fs::read(root.path().join("record.json")).unwrap()).unwrap();
+    assert!(
+        !std::path::Path::new(record["final"].as_str().unwrap())
+            .parent()
+            .unwrap()
+            .exists()
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("attempts.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn runner_sigint_cleans_owned_group_and_resources() {
+    assert_runner_cancellation(libc::SIGINT);
+}
+#[test]
+#[cfg(target_os = "linux")]
+fn runner_sigterm_cleans_owned_group_and_resources() {
+    assert_runner_cancellation(libc::SIGTERM);
 }
