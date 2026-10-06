@@ -183,8 +183,33 @@ fn worker_admission(early: bool, excess_bash: bool) {
         "started worker not joined: {events:?}"
     );
     assert!(result.step_results.iter().any(|r| r.step_id == "held"));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| *e == "finished-held-worker")
+            .count(),
+        1,
+        "held worker must finish exactly once"
+    );
+    assert_eq!(events.iter().filter(|e| *e == "agent:fence").count(), 1);
+    let mut expected_ids = vec!["held".to_string(), "fence".to_string()];
     if early {
         assert!(events.contains(&"observed-worker-conversion".into()));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| *e == "bash:notified-cleanup")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| *e == "observed-worker-conversion")
+                .count(),
+            1
+        );
+        expected_ids.push("worker-cleanup".into());
     }
     if excess_bash {
         assert_eq!(
@@ -203,6 +228,50 @@ fn worker_admission(early: bool, excess_bash: bool) {
             48,
             "all admitted workers must be joined and retained"
         );
+        for n in 0..48 {
+            let id = format!("admitted-{n}");
+            let finished = format!("finished:{id}");
+            assert_eq!(
+                events.iter().filter(|e| **e == finished).count(),
+                1,
+                "missing or duplicate completion for {id}: {events:?}"
+            );
+            expected_ids.push(id);
+        }
+    }
+    assert_eq!(
+        events.iter().filter(|e| e.starts_with("finished")).count(),
+        1 + if excess_bash { 48 } else { 0 },
+        "unexpected worker completion: {events:?}"
+    );
+    assert_eq!(
+        result.step_results.len(),
+        expected_ids.len(),
+        "unexpected result: {result:?}"
+    );
+    for id in expected_ids {
+        let matching: Vec<_> = result
+            .step_results
+            .iter()
+            .filter(|r| r.step_id == id)
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "missing or duplicate result for {id}: {result:?}"
+        );
+        if id == "held" || id.starts_with("admitted-") {
+            let completed = matching[0];
+            assert_eq!(completed.status, crate::models::StepStatus::Completed);
+            assert_eq!(
+                completed.output,
+                if id == "held" {
+                    "joined"
+                } else {
+                    "STATUS: COMPLETE"
+                }
+            );
+        }
     }
     assert_terminal(&result, &state, 1);
     let failed_id = if early { "worker-cleanup" } else { "fence" };
