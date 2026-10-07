@@ -20,4 +20,5 @@
 
 # Reference
 - [Architecture](architecture.md)
+- [Codex Lifecycle](codex-lifecycle.md)
 - [Environment Budget & Safe Spawning](env-budget.md)

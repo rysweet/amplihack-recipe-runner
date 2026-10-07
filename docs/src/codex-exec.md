@@ -2,6 +2,7 @@
 title: Codex agent steps
 description: Codex execution, configuration, results, and terminal failure contracts.
 doc_type: reference
+last_updated: 2026-10-07
 ---
 
 # Codex agent steps
@@ -13,6 +14,7 @@ The runner executes Codex agent steps through Amplihack using modern noninteract
 - [Run a recipe](#run-a-recipe)
 - [Provider and configuration](#provider-and-configuration)
 - [Instructions, results, and failures](#instructions-results-and-failures)
+- [Cancellation and ownership](#cancellation-and-ownership)
 - [Terminal cleanup failures](#terminal-cleanup-failures)
 - [Compatibility probe API](#compatibility-probe-api)
 - [Rust adapter API](#rust-adapter-api)
@@ -43,7 +45,8 @@ Validate, then run in the repository you want Codex to inspect:
 
 ```bash
 recipe-runner-rs codex-summary.yaml --validate-only
-recipe-runner-rs codex-summary.yaml --agent-binary codex -C /path/to/repository --progress
+# Output: ✓ Recipe 'codex-summary' is valid (1 steps)
+recipe-runner-rs codex-summary.yaml --agent-binary codex -C . --progress
 ```
 
 The final response is stored in `summary`. `--output-format json` serializes the recipe result; it does not enable Codex JSON streaming. Progress and diagnostics are separate from the stored response.
@@ -67,10 +70,12 @@ Omitting the recipe step's `model` leaves model selection to native Codex config
 Temporary resources use portable tempfile handling and the platform's temporary-directory configuration, including `TMPDIR` on Unix. To use a chosen writable runtime directory:
 
 ```bash
-TMPDIR=/path/to/private-runtime recipe-runner-rs codex-summary.yaml --agent-binary codex
+runtime_dir=$(mktemp -d)
+TMPDIR="$runtime_dir" recipe-runner-rs codex-summary.yaml --agent-binary codex
+rmdir "$runtime_dir"
 ```
 
-Create that directory before running. Production has no hardcoded `/d0` path. Each attempt owns a unique private directory and a final pathname that is absent before launch. On Unix, attempt directories are owner-only (`0700`), with owner-only final-file access (`0600`). Resources remain owned through process completion and extraction, then are removed. Allocation and cleanup failures are reported.
+The command creates an owner-only runtime directory and removes it after successful attempt-resource cleanup. Each attempt owns a unique private directory and a final pathname that is absent before launch. On Unix, attempt directories are owner-only (`0700`), with owner-only final-file access (`0600`). Resources remain owned through process completion and extraction, then are removed. Allocation and cleanup failures are reported.
 
 ## Instructions, results, and failures
 
@@ -82,11 +87,25 @@ The existing `MAX_STEP_OUTPUT_BYTES` limit is 10,000,000 bytes. Codex final outp
 
 Spawn errors, incomplete or failed stdin writes, timeout, nonzero exit, missing or nonregular final files, symlinks, unsafe permissions, read failures, invalid UTF-8, and cleanup failures fail the attempt. A final file does not turn a nonzero exit or incomplete instruction delivery into success. Stdout and stderr are drained concurrently, retaining the latest 64 KiB per stream in memory while continuing to drain. After shutdown, each reader drains queued bytes until EOF or the pipe would block, bounded by 1 MiB of additional reads or 50 ms, so detached writers cannot prevent completion. No diagnostic spool files are created. Reader failures fail the attempt.
 
-A step's `timeout` applies separately to each attempt and covers stdin delivery and execution. `timeout: 0` expires immediately; omission means no execution deadline. Timeout cleanup terminates and reaps the owned launcher/Codex process tree and finishes I/O cleanup before returning. Cleanup attempts TERM, observes a bounded 100 ms grace period, attempts KILL, confirms shutdown within two seconds, polls launcher reaping for at most two additional seconds (including direct-kill fallback), and joins diagnostic readers before extraction. A failed direct kill followed by an unreaped launcher reports both errors rather than waiting indefinitely. Failures are aggregated and prevent extraction. Linux process metadata distinguishes zombies from live members; other Unix platforms require group absence. Unix process groups contain ordinary inherited descendants; deliberately detached sessions are outside that containment. Codex execution is supported only on Unix; all non-Unix execution fails explicitly. SIGINT and SIGTERM during active Codex work stop stdin delivery and use the same bounded process, I/O and resource cleanup before returning a nonretryable cancellation error. Cancellation stops the entire recipe, including nested recipes and pending parallel-group steps, even when `continue_on_error: true` or `fatal: false` is set. JSON-repair cancellation also fails the recipe rather than accepting degraded output. Already running parallel bash steps are joined under their existing execution contract. Prior signal dispositions are restored after active Codex calls finish.
+A step's `timeout` applies separately to each attempt. Its absolute deadline starts immediately after successful launcher spawn and covers group-anchor establishment, reader setup, stdin delivery and execution. `timeout: 0` expires immediately; omission removes the execution deadline while retaining bounded helper startup and cleanup. Synchronous OS spawn is outside this polling deadline.
+
+Cleanup stops stdin delivery, retires the owned launcher within two seconds, and terminates the original group while a private anchor retains its identity. Group TERM has at most 100 ms grace; the final group KILL is attempted even after TERM or probe errors when authority remains valid. Signaling is then sealed. Helper retirement and observational confirmation share a two-second deadline measured from completion of that KILL attempt. Process polling uses at most 4.1 seconds, plus the existing reader and resource cleanup bounds. Failed signals or reaping remain errors even after eventual absence. See the [lifecycle reference](codex-lifecycle.md) for startup, ownership assumptions and failure paths.
+
+Linux process metadata distinguishes zombies from live members; other Unix platforms require group absence. A proven transient pre-reap zombie-only observation resolved by bounded successful reaping and final absence does not add a false terminal cleanup error. EPERM or final absence alone cannot establish that condition. Genuine permission, signal, probe, reap, reader, resource and surviving-descendant failures remain terminal. Unix process groups contain ordinary inherited descendants; deliberately detached sessions are outside that containment. Codex execution is Unix-only; non-Unix execution fails explicitly. Unix capability advertisement does not establish native runtime validation on every Unix platform.
 
 Bounded rate-limit retries and JSON repair retries retain the effective instructions, task, persona, no-reentry context, provenance, working directory, explicit model, and timeout. A JSON repair attempt adds repair instructions. Every attempt gets fresh private output resources. Backoff waits and repeated attempts increase total step duration beyond a single timeout. Retries can repeat tool calls and other side effects; use idempotent operations where possible. Stdin, file, decoding, and cleanup errors are not made retryable merely by rate-limit text in diagnostics.
 
 The runner has no generic Codex argument passthrough API. Use recipe fields for task, model, working directory, and timeout.
+
+## Cancellation and ownership
+
+SIGINT and SIGTERM observed during active Codex ownership stop stdin delivery and use bounded process, reader and resource cleanup. Cancellation remains effective during last-owner signal restoration, including SIGTERM delivered while its product handler remains installed after SIGINT restoration. The adapter captures the immutable interruption and restoration result under the ownership mutex before an independent owner can begin a new epoch.
+
+Concurrent calls share signal ownership and the same observation baseline. Closing a nonlast owner samples cancellation without restoring handlers. The last owner attempts restoration of both complete prior dispositions. Registration, rollback or restoration failures retain diagnostics and pending restoration metadata; a later installation reconciles them within bounds or refuses before spawning.
+
+The guarantee starts at the handler's observable atomic entry publication. A published event remains observable even if that handler is still in flight. Persistent per-signal observations are never reset. A kernel-selected handler that has not reached publication at the retirement snapshot lies outside this guarantee; atomics, the mutex and `sigaction` do not establish a universal kernel dispatch fence.
+
+Cancellation stops the entire recipe, including nested recovery and pending parallel steps, even with `continue_on_error: true` or `fatal: false`. JSON repair cannot accept degraded success after cancellation. Already admitted work is joined under its existing execution contract. Ordinary Claude/Copilot failures retain their existing policies. No recipe field configures the private anchor, observation counters, handler retirement or cleanup budgets.
 
 ## Terminal cleanup failures
 
@@ -127,6 +146,8 @@ for the configured recovery policy.
 Failure diagnostics retain the unsuccessful child exit status, safe failure
 classification, and cleanup details. If interruption and cleanup failure occur
 together, interruption takes precedence while cleanup diagnostics remain visible.
+Both `Interruption` and `CleanupFailure` remain discoverable through typed error
+composition, together with the primary ordinary error or unsuccessful exit status.
 A cleanup error does not establish that every owned resource was removed.
 See [Codex verification](testing-recipes.md#codex-verification) for regression
 coverage of these boundaries.
@@ -137,10 +158,10 @@ coverage of these boundaries.
 recipe-runner-rs --capabilities
 ```
 
-The standalone probe exits zero and writes exactly one JSON object, optionally followed by a newline, with empty stderr:
+The standalone probe exits zero and writes exactly one JSON object, optionally followed by a newline, with empty stderr. For a Unix build with package version 0.4.1:
 
 ```json
-{"schema_version":1,"version":"<package_version>","capabilities":["codex_exec"]}
+{"capabilities":["codex_exec"],"schema_version":1,"version":"0.4.1"}
 ```
 
 `version` is the compiled Cargo package version. The producer emits exactly these three keys. Unix builds advertise `codex_exec`; non-Unix builds emit an empty capability list because execution is unsupported. The probe runs before logging initialization, update checks, update-cache writes, network access, or agent startup, regardless of ambient logging/update settings. Mixed recipe/subcommand/option invocations with `--capabilities` are rejected before execution or update effects. Failed stdout writes report failure.

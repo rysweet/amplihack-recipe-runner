@@ -1,5 +1,13 @@
 //! Owned launcher/group lifecycle and bounded stdin delivery.
-use super::check_cancellation;
+#[cfg(test)]
+pub(super) use super::group_cleanup::shutdown;
+use super::group_cleanup::shutdown_bounded;
+#[cfg(test)]
+pub(super) use super::launcher_cleanup::reap_launcher;
+use super::{
+    check_cancellation,
+    group_anchor::{GroupAnchor, validate_reaper},
+};
 use anyhow::Context;
 use std::{
     path::Path,
@@ -9,15 +17,49 @@ use std::{
 
 pub(super) struct OwnedProcess {
     pub(super) child: std::process::Child,
+    anchor: GroupAnchor,
+    started: Instant,
+    deadline: Option<Instant>,
+    closed: bool,
 }
 impl OwnedProcess {
+    #[cfg(test)]
     pub(super) fn spawn(
-        mut command: Command,
+        command: Command,
         resources: &Path,
         cwd: &Path,
         environment: &[(String, String)],
     ) -> anyhow::Result<Self> {
+        Self::spawn_with_timeout(command, resources, cwd, environment, None)
+    }
+    pub(super) fn spawn_with_timeout(
+        mut command: Command,
+        resources: &Path,
+        cwd: &Path,
+        environment: &[(String, String)],
+        timeout: Option<u64>,
+    ) -> anyhow::Result<Self> {
         use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        anyhow::ensure!(
+            timeout != Some(0),
+            "Codex exec timed out before launcher setup"
+        );
+        // Reject unrepresentable budgets before any launcher can create descendants.
+        let lifetime = timeout
+            .map(|seconds| {
+                seconds
+                    .checked_mul(1000)
+                    .and_then(|ms| ms.checked_add(4100))
+                    .context("Codex anchor lifetime overflow")
+            })
+            .transpose()?;
+        timeout
+            .map(|seconds| {
+                Instant::now()
+                    .checked_add(Duration::from_secs(seconds))
+                    .context("Codex attempt deadline overflow")
+            })
+            .transpose()?;
         std::fs::set_permissions(resources, std::fs::Permissions::from_mode(0o700))
             .context("Failed to secure Codex resources")?;
         command
@@ -37,11 +79,36 @@ impl OwnedProcess {
                 Ok(())
             });
         }
+        super::combine_result(Ok(()), validate_reaper())?;
         check_cancellation()?;
-        let child = command
+        let mut child = command
             .spawn()
             .context("Failed to spawn Codex exec launcher")?;
-        Ok(Self { child })
+        let started = Instant::now();
+        let deadline = timeout
+            .map(|seconds| {
+                started
+                    .checked_add(Duration::from_secs(seconds))
+                    .context("Codex attempt deadline overflow")
+            })
+            .transpose();
+        let deadline = match deadline {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                return Err(super::group_anchor::startup_failure(&mut child, error));
+            }
+        };
+        let startup = deadline.map_or(started + Duration::from_millis(100), |d| {
+            d.min(started + Duration::from_millis(100))
+        });
+        let anchor = GroupAnchor::establish(&mut child, startup, lifetime)?;
+        Ok(Self {
+            child,
+            anchor,
+            started,
+            deadline,
+            closed: false,
+        })
     }
     pub(super) fn deliver_and_wait(
         &mut self,
@@ -50,7 +117,16 @@ impl OwnedProcess {
         stop: &std::sync::atomic::AtomicBool,
     ) -> anyhow::Result<std::process::ExitStatus> {
         use std::{io::Write, os::fd::AsRawFd};
-        let started = Instant::now();
+        let started = self.started;
+        if self.deadline.is_none() {
+            self.deadline = timeout
+                .map(|seconds| {
+                    started
+                        .checked_add(Duration::from_secs(seconds))
+                        .context("Codex attempt deadline overflow")
+                })
+                .transpose()?;
+        }
         let group = self.child.id() as i32;
         let mut stdin = self.child.stdin.take();
         let fd = stdin.as_ref().context("Missing Codex stdin")?.as_raw_fd();
@@ -65,10 +141,14 @@ impl OwnedProcess {
         let mut heartbeat = Instant::now();
         loop {
             check_cancellation()?;
+            self.anchor.inspect()?;
             if stop.load(std::sync::atomic::Ordering::Acquire) {
                 anyhow::bail!("Codex diagnostic reader failed");
             }
-            if timeout.is_some_and(|seconds| started.elapsed() >= Duration::from_secs(seconds)) {
+            if self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
                 anyhow::bail!(
                     "Codex exec timed out while delivering stdin or waiting for completion"
                 );
@@ -122,113 +202,35 @@ impl OwnedProcess {
         }
     }
     pub(super) fn shutdown(&mut self, failures: &mut Vec<String>) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        self.child.stdin.take();
+        if let Err(error) = super::launcher_cleanup::retire_launcher(
+            &mut self.child,
+            Instant::now() + Duration::from_secs(2),
+        ) {
+            failures.push(format!("{error:#}"));
+        }
         let group = self.child.id() as i32;
-        shutdown(
-            |value| {
-                if unsafe { libc::kill(-group, value) } != 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::ESRCH) {
-                        return Err(error).context("Failed to signal Codex process group");
-                    }
-                }
-                Ok(())
-            },
+        shutdown_bounded(
+            |signal, deadline| self.anchor.signal(signal, deadline),
             || group_live(group),
-            || {
-                reap_launcher(
-                    &mut self.child,
-                    |child| child.kill(),
-                    Duration::from_secs(2),
-                )
-            },
+            || Ok(()),
             failures,
         );
     }
 }
-/// Reap the direct launcher without an unbounded wait after a failed signal.
-#[cfg(unix)]
-pub(super) fn reap_launcher(
-    child: &mut std::process::Child,
-    kill: impl FnOnce(&mut std::process::Child) -> std::io::Result<()>,
-    timeout: Duration,
-) -> anyhow::Result<()> {
-    if child
-        .try_wait()
-        .context("Failed to inspect Codex launcher before reaping")?
-        .is_some()
-    {
-        return Ok(());
-    }
-    let kill_error = kill(child).err();
-    let deadline = Instant::now() + timeout;
-    loop {
-        let failure = match child.try_wait() {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(5));
-                continue;
-            }
-            Ok(None) => "Timed out reaping Codex launcher".to_owned(),
-            Err(error) => format!("Failed to reap Codex launcher: {error}"),
-        };
-        return Err(match kill_error {
-            Some(error) => anyhow::anyhow!("Failed to kill Codex launcher: {error}; {failure}"),
-            None => anyhow::anyhow!(failure),
-        });
-    }
-}
-
-#[cfg(unix)]
-pub(super) fn shutdown(
-    mut signal: impl FnMut(i32) -> anyhow::Result<()>,
-    mut live: impl FnMut() -> anyhow::Result<bool>,
-    mut reap: impl FnMut() -> anyhow::Result<()>,
-    failures: &mut Vec<String>,
-) {
-    if let Err(error) = signal(libc::SIGTERM) {
-        failures.push(format!("{error:#}"));
-    }
-    let grace = Instant::now() + Duration::from_millis(100);
-    loop {
-        match live() {
-            Ok(false) => break,
-            Ok(true) if Instant::now() < grace => std::thread::sleep(Duration::from_millis(5)),
-            Ok(true) => break,
-            Err(error) => {
-                failures.push(format!("Failed to observe Codex process group: {error:#}"));
-                break;
+impl Drop for OwnedProcess {
+    fn drop(&mut self) {
+        if !self.closed {
+            let mut failures = Vec::new();
+            self.shutdown(&mut failures);
+            for failure in failures {
+                log::error!("{failure}");
             }
         }
-    }
-    // Always attempt KILL even after a TERM or observation failure.
-    if let Err(error) = signal(libc::SIGKILL) {
-        failures.push(format!("{error:#}"));
-    }
-    // A failed group signal must not leave a live launcher blocking wait forever.
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match live() {
-            Ok(false) => break,
-            Ok(true) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
-            Ok(true) => {
-                failures.push("Codex process group termination was not confirmed".into());
-                break;
-            }
-            Err(error) => {
-                failures.push(format!("Failed to confirm Codex termination: {error:#}"));
-                break;
-            }
-        }
-    }
-    if let Err(error) = reap() {
-        failures.push(format!("{error:#}"));
-    }
-    match live() {
-        Ok(false) => {}
-        Ok(true) => failures.push("Codex process group remains live after launcher reaping".into()),
-        Err(error) => failures.push(format!(
-            "Failed to confirm Codex termination after reaping: {error:#}"
-        )),
     }
 }
 

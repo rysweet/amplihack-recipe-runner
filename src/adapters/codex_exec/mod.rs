@@ -1,11 +1,23 @@
 //! Owned noninteractive Codex attempts. Progress is diagnostic, never a result.
 use std::{path::Path, process::Command};
+#[cfg(unix)]
+mod anchor_child;
+#[cfg(unix)]
+mod anchor_io;
 mod cancellation;
 mod diagnostics;
 #[cfg(unix)]
 mod final_output;
 #[cfg(unix)]
+mod group_anchor;
+#[cfg(unix)]
+mod group_cleanup;
+#[cfg(unix)]
+mod launcher_cleanup;
+#[cfg(unix)]
 mod process;
+#[cfg(unix)]
+mod signal_observations;
 pub(crate) use cancellation::Interruption;
 #[cfg(unix)]
 pub(super) use cancellation::{Cancellation, check_cancellation};
@@ -57,7 +69,8 @@ fn execute_with_readers(
         std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> (DiagnosticReader, DiagnosticReader),
 ) -> anyhow::Result<String> {
-    let mut process = OwnedProcess::spawn(command, resources, cwd, environment)?;
+    let mut process =
+        OwnedProcess::spawn_with_timeout(command, resources, cwd, environment, timeout)?;
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (stdout, stderr) = readers(
         process.child.stdout.take().unwrap(),
@@ -121,9 +134,22 @@ fn combine_result<T>(result: anyhow::Result<T>, cleanup: anyhow::Result<()>) -> 
         }
         (Err(error), Err(cleanup)) => {
             if cleanup.downcast_ref::<Interruption>().is_some() {
+                if error.downcast_ref::<Interruption>().is_some() {
+                    let failed = error.downcast_ref::<CleanupFailure>().is_some()
+                        || cleanup.downcast_ref::<CleanupFailure>().is_some();
+                    let detail = format!("{error:#}; cleanup: {cleanup:#}");
+                    let primary = error.context(detail.clone());
+                    return Err(if failed {
+                        primary.context(CleanupFailure(detail))
+                    } else {
+                        primary
+                    });
+                }
                 let detail = format!("execution: {error:#}");
                 let interrupted = cleanup.context(detail.clone());
-                if error.downcast_ref::<CleanupFailure>().is_some() {
+                if error.downcast_ref::<CleanupFailure>().is_some()
+                    || interrupted.downcast_ref::<CleanupFailure>().is_some()
+                {
                     Err(interrupted.context(CleanupFailure(detail)))
                 } else {
                     Err(interrupted)
