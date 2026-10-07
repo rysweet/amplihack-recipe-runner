@@ -141,7 +141,8 @@ impl OwnedProcess {
         let mut heartbeat = Instant::now();
         loop {
             check_cancellation()?;
-            self.anchor.inspect()?;
+            // Owned inspection faults are terminal even if later shutdown succeeds.
+            super::combine_result(Ok(()), self.anchor.inspect())?;
             if stop.load(std::sync::atomic::Ordering::Acquire) {
                 anyhow::bail!("Codex diagnostic reader failed");
             }
@@ -156,7 +157,10 @@ impl OwnedProcess {
             if let Some(status) = self
                 .child
                 .try_wait()
-                .context("Failed to wait for Codex exec")?
+                .context("Failed to wait for Codex exec")
+                .context(super::CleanupFailure(
+                    "Codex owned launcher inspection failed".into(),
+                ))?
             {
                 if offset != envelope.len() {
                     anyhow::bail!(
@@ -214,10 +218,12 @@ impl OwnedProcess {
             failures.push(format!("{error:#}"));
         }
         let group = self.child.id() as i32;
+        let anchor = &mut self.anchor;
+        let child = &mut self.child;
         shutdown_bounded(
-            |signal, deadline| self.anchor.signal(signal, deadline),
+            |signal, deadline| anchor.signal(signal, deadline),
             || group_live(group),
-            || Ok(()),
+            |deadline| super::launcher_cleanup::observe_launcher(child, deadline),
             failures,
         );
     }

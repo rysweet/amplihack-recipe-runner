@@ -2,18 +2,6 @@
 use super::super::process::OwnedProcess;
 use std::{fs, os::fd::AsRawFd, process::Command, sync::atomic::AtomicBool};
 
-fn members(group: i32) -> Vec<i32> {
-    fs::read_dir("/proc")
-        .unwrap()
-        .filter_map(|entry| {
-            let path = entry.ok()?.path();
-            let pid = path.file_name()?.to_str()?.parse().ok()?;
-            let stat = fs::read_to_string(path.join("stat")).ok()?;
-            let fields: Vec<_> = stat.rsplit_once(')')?.1.split_whitespace().collect();
-            (fields.get(2)?.parse::<i32>().ok()? == group).then_some(pid)
-        })
-        .collect()
-}
 pub(super) fn worker() {
     super::retirement_fixtures::arm(0, 0, 0, 0, 0);
     let root = tempfile::tempdir().unwrap();
@@ -30,15 +18,14 @@ pub(super) fn worker() {
     .collect();
     let mut second =
         OwnedProcess::spawn(Command::new("/bin/cat"), root.path(), root.path(), &[]).unwrap();
-    let helpers: Vec<_> = members(second.child.id() as i32)
+    let helpers: Vec<_> = super::inspection::members(second.child.id() as i32)
+        .unwrap()
         .into_iter()
         .filter(|pid| *pid != second.child.id() as i32)
         .collect();
     let mut leaked = Vec::new();
     for pid in &helpers {
-        for entry in fs::read_dir(format!("/proc/{pid}/fd")).unwrap() {
-            let entry = entry.unwrap();
-            let path = fs::read_link(entry.path()).unwrap();
+        for path in super::inspection::descriptors(*pid).unwrap() {
             if pipes.contains(&path) {
                 leaked.push((pid, path));
             }

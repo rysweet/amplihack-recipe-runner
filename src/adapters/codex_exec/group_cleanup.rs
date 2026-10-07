@@ -4,15 +4,15 @@ use std::time::{Duration, Instant};
 pub(super) fn shutdown(
     mut signal: impl FnMut(i32) -> anyhow::Result<()>,
     live: impl FnMut() -> anyhow::Result<bool>,
-    reap: impl FnMut() -> anyhow::Result<()>,
+    mut reap: impl FnMut() -> anyhow::Result<()>,
     failures: &mut Vec<String>,
 ) {
-    shutdown_bounded(|value, _| signal(value), live, reap, failures);
+    shutdown_bounded(|value, _| signal(value), live, |_| reap(), failures);
 }
 pub(super) fn shutdown_bounded(
     mut signal: impl FnMut(i32, Instant) -> anyhow::Result<()>,
     mut live: impl FnMut() -> anyhow::Result<bool>,
-    mut reap: impl FnMut() -> anyhow::Result<()>,
+    mut reap: impl FnMut(Instant) -> anyhow::Result<()>,
     failures: &mut Vec<String>,
 ) {
     if let Err(error) = signal(libc::SIGTERM, Instant::now()) {
@@ -50,7 +50,7 @@ pub(super) fn shutdown_bounded(
             }
         }
     }
-    if let Err(error) = reap() {
+    if let Err(error) = reap(deadline) {
         failures.push(format!("{error:#}"));
     }
     match live() {

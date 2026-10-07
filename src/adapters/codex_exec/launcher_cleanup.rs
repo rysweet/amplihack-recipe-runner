@@ -4,6 +4,23 @@ use std::{
     process::Child,
     time::{Duration, Instant},
 };
+
+/// Consume a late launcher exit without signaling or renewing the cleanup budget.
+pub(super) fn observe_launcher(child: &mut Child, deadline: Instant) -> anyhow::Result<()> {
+    loop {
+        // Even an exhausted deadline permits one consuming nonblocking observation.
+        if child
+            .try_wait()
+            .context("Failed to reap Codex launcher")?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        anyhow::ensure!(!remaining.is_zero(), "Timed out reaping Codex launcher");
+        std::thread::sleep(remaining.min(Duration::from_millis(5)));
+    }
+}
 pub(super) fn reap_launcher(
     child: &mut Child,
     kill: impl FnOnce(&mut Child) -> std::io::Result<()>,

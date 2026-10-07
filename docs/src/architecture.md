@@ -326,8 +326,8 @@ The production adapter spawns subprocesses:
 
 ### Private Codex execution ownership
 
-**[PLANNED — Implementation pending]** The lifecycle changes below specify the
-intended ownership and retirement contract.
+The private lifecycle modules implement the ownership and retirement contract
+described below.
 
 `cli_subprocess.rs` constructs the full stdin envelope and typed command arguments,
 allocates a fresh private temporary directory for each attempt, and owns retry
@@ -357,6 +357,9 @@ The private `adapters/codex_exec/` modules divide the attempt by responsibility:
 - `process.rs` owns the launcher, nonblocking complete stdin delivery and one
   absolute attempt deadline computed immediately after successful spawn. Anchor
   and reader setup, delivery and execution consume that same deadline.
+  Owned anchor and launcher inspection errors immediately acquire typed
+  `CleanupFailure` context, retaining their original error chains. Successful
+  later cleanup cannot make these failures nonfatal or admit pending work.
 - `group_anchor.rs`, `anchor_io.rs` and `anchor_child.rs` establish private retained
   membership in the original Unix group before any launcher polling can reap it.
   Readiness requires descriptor isolation and child-local signal policy. The
@@ -367,10 +370,13 @@ The private `adapters/codex_exec/` modules divide the attempt by responsibility:
   still owned/live and PID-specific reap share cleanup start plus two seconds.
   Group TERM has at most 100 ms grace; TERM/probe errors do not skip the final
   KILL while authority remains. That KILL attempt seals destructive group access,
-  including on failure. Helper fallback/reap and final observational confirmation
-  share KILL-attempt completion plus two seconds. The helper is reaped before
-  confirmation; exhausted budgets still permit a final observation without a new
-  wait window. EINTR, fallback and Drop never renew these deadlines.
+  including on failure. Helper fallback/reap, consuming launcher observation and
+  final group confirmation share the deadline computed immediately before the
+  KILL attempt (plus two seconds). After helper retirement, PID-specific launcher
+  polling consumes any exit caused by late group termination and retains earlier
+  direct-signal or timeout errors. Exhausted budgets still permit one nonblocking
+  consuming observation without a new wait window. This observation never signals.
+  EINTR, fallback and Drop never renew these deadlines.
 - `diagnostics.rs` drains both pipes concurrently, retaining 64 KiB tails.
   Stopped readers finish within a 50 ms or 1 MiB additional-read bound. Exit
   classification uses fixed actionable categories, including late stderr
@@ -383,7 +389,8 @@ The private `adapters/codex_exec/` modules divide the attempt by responsibility:
 
 After spawn, every outcome attempts bounded cleanup: close stdin, retire the
 launcher, tear down the original group while authority remains, seal signaling,
-retire/reap the helper, observe the group, then stop and join diagnostic readers.
+retire/reap the helper, observe the group and consume launcher status within the
+same final deadline, then stop and join diagnostic readers.
 Lost authority prohibits uncertain direct/group signals; cleanup continues for
 positively owned resources and aggregates genuine signal, probe, reap, reader
 and resource failures. Complete reaping and group absence are success conditions,

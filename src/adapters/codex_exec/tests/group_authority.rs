@@ -5,18 +5,6 @@ use super::super::{
 };
 use std::{fs, os::fd::AsRawFd, process::Command, sync::atomic::AtomicBool};
 
-fn members(group: i32) -> Vec<i32> {
-    fs::read_dir("/proc")
-        .unwrap()
-        .filter_map(|entry| {
-            let path = entry.ok()?.path();
-            let pid = path.file_name()?.to_str()?.parse::<i32>().ok()?;
-            let stat = fs::read_to_string(path.join("stat")).ok()?;
-            let fields: Vec<_> = stat.rsplit_once(')')?.1.split_whitespace().collect();
-            (fields.get(2)?.parse::<i32>().ok()? == group).then_some(pid)
-        })
-        .collect()
-}
 pub(super) fn worker(case: &str) {
     let root = tempfile::tempdir().unwrap();
     if case == "authority_unrelated" {
@@ -99,18 +87,13 @@ pub(super) fn worker(case: &str) {
     let mut process = OwnedProcess::spawn(command, root.path(), root.path(), &[]).unwrap();
     let group = process.child.id() as i32;
     let delivery = process.deliver_and_wait("safe task", Some(3), &AtomicBool::new(false));
-    let retained = members(group);
+    let retained = super::inspection::members(group).unwrap();
     let leaked: Vec<_> = retained
         .iter()
         .filter(|pid| {
-            fs::read_dir(format!("/proc/{pid}/fd"))
+            super::inspection::descriptors(**pid)
                 .unwrap()
-                .any(|entry| {
-                    entry
-                        .ok()
-                        .and_then(|e| fs::read_link(e.path()).ok())
-                        .is_some_and(|p| p == unrelated)
-                })
+                .contains(&unrelated)
         })
         .copied()
         .collect();

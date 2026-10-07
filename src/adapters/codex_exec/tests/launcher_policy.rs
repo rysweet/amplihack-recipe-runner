@@ -4,6 +4,65 @@ use std::{
     process::Command,
     time::{Duration, Instant},
 };
+
+#[test]
+fn exhausted_observational_budget_still_consumes_waitable_launcher() {
+    let mut child = Command::new("/bin/true").spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    child.id() as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            },
+            0
+        );
+        if unsafe { info.si_pid() } != 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "fixture never became waitable");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    super::super::launcher_cleanup::observe_launcher(&mut child, Instant::now()).unwrap();
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+}
+
+#[test]
+fn exhausted_observational_budget_does_not_signal_or_extend_wait() {
+    let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    let started = Instant::now();
+    let result = super::super::launcher_cleanup::observe_launcher(&mut child, started);
+    let elapsed = started.elapsed();
+    let live = child.try_wait().unwrap().is_none();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(live, "observational reaping signaled the child");
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "renewed expired budget"
+    );
+    assert!(format!("{:#}", result.unwrap_err()).contains("Timed out reaping"));
+}
 #[test]
 fn direct_term_failure_survives_successful_retirement() {
     let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();

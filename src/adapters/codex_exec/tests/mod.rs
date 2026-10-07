@@ -33,3 +33,7 @@ mod launcher_policy;
 
 #[cfg(target_os = "linux")]
 mod first_launcher_fault;
+#[cfg(target_os = "linux")]
+mod inspection;
+#[cfg(target_os = "linux")]
+mod owned_faults;

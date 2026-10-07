@@ -12,9 +12,12 @@
 #include <time.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <sys/wait.h>
 static ssize_t (*real_write)(int, const void *, size_t);
 static pid_t owner_pid;
 static int fork_calls;
+static pid_t launcher_pid, anchor_pid;
+static int anchor_probes, wait_faulted, owned_forks;
 static int armed, delivered, selected_signal, boundary, restore_fault, register_fault;
 static int group_mode, int_restored, inflight, reset_race;
 static atomic_int retiring, attempting;
@@ -149,6 +152,12 @@ static int zombie_only(pid_t group) {
 int kill(pid_t pid, int sig) {
     if (!real_kill) real_kill = dlsym(RTLD_NEXT, "kill");
     if (!real_kill) _exit(123);
+    if (armed && getpid() == owner_pid && group_mode == 16 && pid == launcher_pid &&
+        (sig == SIGTERM || sig == SIGKILL)) {
+        event("direct_signal_denied", sig); errno = EPERM; return -1;
+    }
+    if (armed && getpid() == owner_pid && group_mode >= 14 && pid == -launcher_pid)
+        event("group_signal_forwarded", sig);
     if (!armed || !group_mode || pid >= -1) return real_kill(pid, sig);
     if (group_mode == 1 && zombie_only(-pid)) {
         event("proven_zombie_only_EPERM", sig); errno = EPERM; return -1;
@@ -180,7 +189,40 @@ pid_t fork(void) {
     if (!next_fork) _exit(135);
     if (armed && group_mode == 12 && fork_calls++ == 0) { event("launcher_fault_fork", EAGAIN); errno = EAGAIN; return -1; }
     if (armed && group_mode == 5 && fork_calls++ > 0) { event("anchor_fault_fork", EAGAIN); errno = EAGAIN; return -1; }
-    return next_fork();
+    pid_t child = next_fork();
+    if (armed && getpid() == owner_pid && group_mode >= 14 && child > 0) {
+        if (owned_forks++ % 2 == 0) { launcher_pid = child; event("owned_launcher", child); }
+        else { anchor_pid = child; event("owned_anchor", child); }
+    }
+    return child;
+}
+/* Gates match positively captured child identities, not global syscall counts. */
+int waitid(idtype_t type, id_t id, siginfo_t *info, int options) {
+    static int (*next)(idtype_t, id_t, siginfo_t *, int);
+    if (!next) next = dlsym(RTLD_NEXT, "waitid");
+    if (!next) _exit(140);
+    if (armed && getpid() == owner_pid && group_mode >= 14 && type == P_PID &&
+        id == (id_t)anchor_pid && options == (WEXITED | WNOHANG | WNOWAIT)) {
+        if (++anchor_probes == 2 && group_mode == 14) {
+            event("delivery_anchor_EIO", id); errno = EIO; return -1;
+        }
+        event("anchor_wait_forwarded", id);
+    }
+    return next(type, id, info, options);
+}
+pid_t waitpid(pid_t pid, int *status, int options) {
+    static pid_t (*next)(pid_t, int *, int);
+    if (!next) next = dlsym(RTLD_NEXT, "waitpid");
+    if (!next) _exit(141);
+    if (armed && getpid() == owner_pid && pid == launcher_pid && options == WNOHANG) {
+        if (group_mode == 15 && anchor_probes >= 2 && !wait_faulted++) {
+            event("delivery_launcher_EIO", pid); errno = EIO; return -1;
+        }
+        pid_t result = next(pid, status, options); int saved = errno;
+        if (result == pid) event("launcher_reaped", pid);
+        errno = saved; return result;
+    }
+    return next(pid, status, options);
 }
 int setpgid(pid_t pid, pid_t group) {
     if (!next_group) next_group = dlsym(RTLD_NEXT, "setpgid");

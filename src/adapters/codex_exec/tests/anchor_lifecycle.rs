@@ -6,18 +6,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn group_members(group: i32) -> Vec<i32> {
-    fs::read_dir("/proc")
-        .unwrap()
-        .filter_map(|entry| {
-            let path = entry.ok()?.path();
-            let pid = path.file_name()?.to_str()?.parse().ok()?;
-            let stat = fs::read_to_string(path.join("stat")).ok()?;
-            let fields: Vec<_> = stat.rsplit_once(')')?.1.split_whitespace().collect();
-            (fields.get(2)?.parse::<i32>().ok()? == group).then_some(pid)
-        })
-        .collect()
-}
 pub(super) fn worker(case: &str) {
     let root = tempfile::tempdir().unwrap();
     let mode = match case {
@@ -57,7 +45,8 @@ pub(super) fn worker(case: &str) {
     } else {
         let mut process = spawned.unwrap();
         let group = process.child.id() as i32;
-        let helpers: Vec<_> = group_members(group)
+        let helpers: Vec<_> = super::inspection::members(group)
+            .unwrap()
             .into_iter()
             .filter(|pid| *pid != group)
             .collect();
@@ -85,7 +74,7 @@ pub(super) fn worker(case: &str) {
         );
         assert!(format!("{error:#}").contains("primary ordinary failure"));
         assert!(
-            group_members(group).is_empty(),
+            super::inspection::members(group).unwrap().is_empty(),
             "owned member not reaped at return"
         );
     }
