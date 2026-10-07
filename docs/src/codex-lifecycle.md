@@ -1,6 +1,6 @@
 ---
 title: Codex lifecycle reference
-description: Private group authority, cleanup budgets and observable signal retirement contracts.
+description: Private FIFO permissions, group authority, cleanup budgets and observable signal retirement contracts.
 doc_type: reference
 last_updated: 2026-10-07
 ---
@@ -17,6 +17,7 @@ These lifecycle interfaces are private and add no recipe settings.
 - [Private interfaces](#private-interfaces)
 - [Group authority](#group-authority)
 - [Helper protocol and isolation](#helper-protocol-and-isolation)
+- [Portable FIFO permissions](#portable-fifo-permissions)
 - [Deadlines and cleanup order](#deadlines-and-cleanup-order)
 - [Failure classification](#failure-classification)
 - [Signal observation and retirement](#signal-observation-and-retirement)
@@ -88,8 +89,9 @@ every child and endpoint throughout unwind. The helper performs no model work.
 
 Every endpoint is created close-on-exec, so a concurrent launcher cannot retain
 private protocol handles across exec. Linux uses `pipe2(O_CLOEXEC | O_NONBLOCK)`.
-Other Unix targets use a directional FIFO in a new owned 0700 directory: create
-with mode 0600, open read first and write second with `O_CLOEXEC | O_NONBLOCK |
+Other Unix targets use a directional FIFO. Its intended directory creation
+contract is specified in [portable FIFO permissions](#portable-fifo-permissions).
+Create the FIFO with mode 0600, open read first and write second with `O_CLOEXEC | O_NONBLOCK |
 O_NOFOLLOW`, and verify type, owner, mode and descriptor identity. The constructor
 unlinks the FIFO, explicitly closes the directory descriptor and removes the
 directory before returning. Partial construction closes every acquired endpoint
@@ -132,6 +134,62 @@ Untimed attempts retain bounded establishment/retirement and parent-loss control
 EOF; they have no fixed execution-duration ceiling. Expiry or EOF outside
 intentional retirement is a typed fault when detected.
 The inherited parent memory is not a memory sandbox.
+
+## Portable FIFO permissions
+
+> **[PLANNED - Implementation Pending]**: This section specifies the intended
+> permission-at-creation contract and its required integration checks.
+
+The private `anchor_fifo::new() -> anyhow::Result<Pipe>` factory will configure
+`tempfile::Builder::permissions(Permissions::from_mode(0o700))` before `tempdir()`.
+Both fixture roots passed to `construct()` must use the same permission request
+before `tempdir_in()`. Directory privacy must hold at creation, without a later
+chmod repair. Construction must never change the process umask.
+
+The selected temporary parent follows Unix `TMPDIR` configuration, as described
+in the [temporary-resource usage reference](codex-exec.md#provider-and-configuration).
+The parent must be trusted and writable. Mode 0700 does not isolate malicious
+same-UID or privileged processes or establish hostile-TMPDIR protection.
+There is no recipe option, public FIFO API or provider-policy change. Ordinary
+Linux endpoint selection retains `pipe2`; Linux mechanism controls explicitly
+exercise the shared portable constructor.
+
+Umask can remove requested permission bits but cannot add permissions. The
+required behavior is:
+
+| Child umask | Directory / FIFO contract |
+|---|---|
+| `000` | Exact 0700 / 0600; construction succeeds. |
+| `002` | Exact 0700 / 0600; construction succeeds. |
+| `022` | Exact 0700 / 0600; construction succeeds. |
+| `077` | Exact 0700 / 0600; construction succeeds. |
+| `0100`, `0200` | Owner bits are removed; construction refuses safely, retaining primary and genuine cleanup diagnostics. |
+
+Exact directory/FIFO modes, types and effective-UID ownership remain mandatory,
+including for effective root. Owner-bit-restricted objects are rejected rather
+than widened. Other owner-bit-removing masks have no universal success guarantee.
+Each opened endpoint must match the FIFO device/inode observed through
+`AT_SYMLINK_NOFOLLOW`; directional, NONBLOCK, CLOEXEC and nofollow gates remain
+mandatory. The private `construct(root, opened)` callback observes endpoint-open
+boundaries; production supplies a no-op and performs filesystem work before fork.
+
+Successful construction checks unlink, directory-descriptor close and directory
+removal before returning endpoints. Failure closes acquired endpoints and retains
+cleanup errors alongside the original diagnostic. A privacy refusal with clean
+teardown preserves its primary error; genuine cleanup failures remain typed
+`CleanupFailure`. Failure after launcher creation still invokes bounded owned
+startup unwind. Cancellation combined with cleanup retains both terminal causes.
+
+Verification requires independent production-factory and fixture observations
+under all four common masks in disposable children, leaving the parent mask
+unchanged. Observations must record requested and actual creation modes, ownership
+and identity before names disappear. Controls must preserve readiness delivery,
+both partial-open boundaries, unlink-error composition, concurrent-exec isolation
+and actual parent-SIGKILL EOF
+on an untimed attempt. Internal integration covers FIFO-to-anchor-to-launcher
+ownership, natural helper exit/reaping, unrelated-launcher survival and final group
+absence. These contracts do not assert completed runtime or platform acceptance;
+see [verification requirements](testing-recipes.md#lifecycle-discrimination-and-evidence).
 
 ## Deadlines and cleanup order
 

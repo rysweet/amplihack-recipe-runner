@@ -5,13 +5,16 @@ use std::{
     ffi::CString,
     os::{
         fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
-        unix::ffi::OsStrExt,
+        unix::{ffi::OsStrExt, fs::PermissionsExt},
     },
 };
 
 pub(super) fn new() -> anyhow::Result<Pipe> {
     construct(
-        tempfile::Builder::new().prefix("codex-anchor-").tempdir()?,
+        tempfile::Builder::new()
+            .prefix("codex-anchor-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?,
         |_| Ok(()),
     )
 }
@@ -162,4 +165,4 @@ fn construct(
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "tests/anchor_fifo.rs"]
-mod tests;
+pub(super) mod tests;

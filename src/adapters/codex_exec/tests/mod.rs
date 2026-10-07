@@ -44,3 +44,8 @@ mod owned_faults;
 mod endpoint_parent_loss;
 #[cfg(target_os = "linux")]
 mod fixture_evidence;
+
+#[cfg(target_os = "linux")]
+mod anchor_fifo_adapter;
+#[cfg(target_os = "linux")]
+mod anchor_fifo_integration;

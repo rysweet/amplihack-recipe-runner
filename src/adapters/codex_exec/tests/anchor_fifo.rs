@@ -2,7 +2,10 @@
 use super::{construct, stat};
 use std::{
     fs,
-    os::{fd::AsRawFd, unix::process::CommandExt},
+    os::{
+        fd::AsRawFd,
+        unix::{fs::PermissionsExt, process::CommandExt},
+    },
     process::{Child, Command},
     time::{Duration, Instant},
 };
@@ -85,6 +88,7 @@ fn concurrent_exec_at_each_open_cannot_retain_fifo_or_mask_eof() {
     let parent = tempfile::tempdir().unwrap();
     let root = tempfile::Builder::new()
         .prefix("fifo-")
+        .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in(parent.path())
         .unwrap();
     let removed = root.path().to_owned();
@@ -145,7 +149,10 @@ fn partial_construction_closes_each_endpoint_and_removes_paths() {
     }
     for boundary in [1, 2] {
         let parent = tempfile::tempdir().unwrap();
-        let root = tempfile::Builder::new().tempdir_in(parent.path()).unwrap();
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in(parent.path())
+            .unwrap();
         let path = root.path().to_owned();
         let mut seen = Vec::new();
         let mut calls = 0;
@@ -183,3 +190,6 @@ fn partial_construction_closes_each_endpoint_and_removes_paths() {
         }
     }
 }
+
+#[path = "anchor_fifo_masks.rs"]
+pub(in crate::adapters::codex_exec) mod masks;
