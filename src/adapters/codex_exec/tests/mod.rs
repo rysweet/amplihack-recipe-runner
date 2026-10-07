@@ -32,6 +32,8 @@ pub(super) mod extended_fixtures;
 mod launcher_policy;
 
 #[cfg(target_os = "linux")]
+mod capacity_contracts;
+#[cfg(target_os = "linux")]
 mod first_launcher_fault;
 #[cfg(target_os = "linux")]
 mod inspection;

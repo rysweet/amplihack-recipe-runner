@@ -70,18 +70,42 @@ pub(super) fn worker(case: &str) {
     }
     let unrelated = root.path().join("unrelated-private-handle");
     let handle = fs::File::create(&unrelated).unwrap();
-    let high = unsafe { libc::fcntl(handle.as_raw_fd(), libc::F_DUPFD, 65536) };
-    assert!(high >= 65536);
     let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
     assert_eq!(
         unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
         0
     );
     let original = limit;
+    // This isolated worker may raise its soft limit within its inherited hard
+    // capacity. FD 65536 requires a ceiling strictly greater than 65536.
+    assert!(limit.rlim_max > 65536, "hard limit cannot admit FD 65536");
+    if limit.rlim_cur <= 65536 {
+        limit.rlim_cur = 65537;
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) },
+            0,
+            "cannot establish high-descriptor fixture capacity"
+        );
+    }
+    let high = unsafe { libc::fcntl(handle.as_raw_fd(), libc::F_DUPFD, 65536) };
+    assert!(high >= 65536);
+    let flags = unsafe { libc::fcntl(high, libc::F_GETFD) };
+    assert!(flags >= 0, "high descriptor is not open");
+    assert_eq!(flags & libc::FD_CLOEXEC, 0, "descriptor is not inheritable");
     if case == "authority_fd_lowered_limit" {
         limit.rlim_cur = 4096;
         assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        assert!(high as libc::rlim_t >= limit.rlim_cur);
+        assert_eq!(
+            unsafe { libc::fcntl(high, libc::F_GETFD) },
+            flags,
+            "lowering the limit closed or changed the inherited descriptor"
+        );
     }
+    println!(
+        "authority_capacity original_soft={} hard={} spawn_soft={} high={} inheritable=true",
+        original.rlim_cur, original.rlim_max, limit.rlim_cur, high
+    );
     let mut command = Command::new("/bin/sh");
     command.args(["-c", "cat >/dev/null"]);
     let mut process = OwnedProcess::spawn(command, root.path(), root.path(), &[]).unwrap();

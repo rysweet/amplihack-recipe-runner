@@ -49,7 +49,7 @@ pub(super) extern "C" fn publish(signal: libc::c_int) {
     } else {
         &TERMINATE
     };
-    let _ = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+    let _ = counter.try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
         Some(value.saturating_add(1))
     });
     #[cfg(all(test, target_os = "linux"))]
