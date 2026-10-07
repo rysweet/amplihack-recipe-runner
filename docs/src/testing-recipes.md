@@ -132,6 +132,34 @@ terminal publication occurs before pending work and joins; already admitted
 workers finish and are joined. Ordinary-error controls retain Claude/Copilot,
 recovery, hook and JSON policies.
 
+#### Descriptor capacity and endpoint privacy
+
+The authority fixture chooses `min(actual_hard_capacity, 65537) - 1`, requires
+that descriptor to exceed the deliberately lowered 4096 limit, and raises only
+its isolated worker's soft capacity when needed. It verifies the descriptor is
+open and inheritable before spawn and unchanged after lowering the soft limit.
+Both authority contracts run under child-only initial soft 65536 and under
+child-only soft/hard 65536; parent limits remain identical. Capable hosts retain
+FD 65536 stress; hard 65536 uses FD 65535. Allocation/capacity failures are test
+failures, never skips. Isolation, retained membership after launcher reap,
+successful delivery/cleanup and final group absence remain required in both.
+
+Portable-endpoint controls exec a real concurrent launcher after each open,
+verify private descriptor identities do not survive exec, and observe EOF while
+that launcher remains alive. A separate actual parent-SIGKILL control requires
+an untimed helper to exit through EOF and verifies the unrelated launcher
+survives; owned orphans are adopted and reaped. Partial construction must close
+all descriptors and remove temporary paths. Linux execution of this constructor
+is mechanism evidence; native Darwin remains a separate validation obligation.
+
+Fixture stdout/stderr and case-required events must exist and decode as UTF-8.
+Only explicitly optional files may be missing (`NotFound`), with absence printed
+separately from empty contents. Other read/hash/decode errors include operation
+and path and fail visibly alongside the worker exit. When evidence preservation
+is requested, keep and identify the directory before reading, hashing or
+reporting failures. Invalid UTF-8 and directory-as-file controls verify this
+without relying on permission errors that disappear under root.
+
 #### Evidence bindings
 
 Each oracle records the actual command, allowlisted nonsecret environment,

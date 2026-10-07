@@ -68,29 +68,23 @@ pub(in crate::adapters::codex_exec) fn run_case(case: &str, worker: &str) {
         if Instant::now() > deadline {
             child.kill().unwrap();
             child.wait().unwrap();
-            panic!("{case}: subprocess watchdog expired (not semantic RED)");
+            let evidence = super::fixture_evidence::observe(
+                root,
+                case,
+                "watchdog-killed/reaped",
+                std::env::var_os("LIFECYCLE_ARTIFACT_ROOT").is_some(),
+            );
+            panic!("{case}: subprocess watchdog expired (not semantic RED); evidence={evidence:?}");
         }
         std::thread::sleep(Duration::from_millis(5));
     };
-    let out = fs::read_to_string(root.path().join("stdout")).unwrap();
-    let err = fs::read_to_string(root.path().join("stderr")).unwrap();
-    let observations = fs::read_to_string(events).unwrap_or_default();
-    println!("case={case} worker_exit={status}\n{out}\n{err}\n{observations}");
-    if std::env::var_os("LIFECYCLE_ARTIFACT_ROOT").is_some() {
-        use sha2::Digest;
-        for file in ["events", "stdout", "stderr", "launcher"] {
-            let path = root.path().join(file);
-            if let Ok(bytes) = fs::read(&path) {
-                println!(
-                    "fixture path={} bytes={} sha256={:x}",
-                    path.display(),
-                    bytes.len(),
-                    sha2::Sha256::digest(&bytes)
-                );
-            }
-        }
-        println!("preserved_fixture={}", root.keep().display());
-    }
+    let out = super::fixture_evidence::observe(
+        root,
+        case,
+        status,
+        std::env::var_os("LIFECYCLE_ARTIFACT_ROOT").is_some(),
+    )
+    .unwrap_or_else(|error| panic!("{error:#}"));
     assert!(out.contains("running 1 test"), "worker was not selected");
     assert!(status.success(), "{case}: semantic worker assertion failed");
 }

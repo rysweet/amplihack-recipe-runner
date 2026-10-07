@@ -28,7 +28,7 @@ These lifecycle interfaces are private and add no recipe settings.
 |---|---|
 | `OwnedProcess` in `process.rs` | Owns the launcher, attempt deadline and anchor. Establishes authority before polling can reap the launcher; stops delivery on cancellation or authority loss. |
 | `GroupAnchor` in `group_anchor.rs` | Non-cloneable authority for the original group, held through the final destructive operation. |
-| `anchor_io.rs` | Owns preallocated readiness/control endpoints and validates bounded acknowledgments. |
+| `anchor_io.rs` / `anchor_fifo.rs` | Own preallocated, atomically close-on-exec readiness/control endpoints and validate bounded acknowledgments. |
 | `anchor_child.rs` | Joins the original group, isolates descriptors and signals, enforces helper lifetime and exits through raw `_exit`. |
 | `group_cleanup.rs` | One bounded TERM/KILL/probe driver, including the preserved closure seam. |
 | `launcher_cleanup.rs` | Bounded direct-launcher retirement preserving every signal and reap error. |
@@ -38,6 +38,8 @@ These lifecycle interfaces are private and add no recipe settings.
 | `finish_resources(result, cancellation.close())` | Composes retirement with execution and cleanup while retaining typed terminal causes and primary diagnostics. |
 
 Explicit close reports failures; close and Drop release each owner exactly once.
+Emergency Drop cannot return an error and logs retirement failures; ordinary
+completion explicitly closes resources and composes failures into the result.
 The public `Adapter: Sync`, result types, capability schema and provider/model
 policies follow the [existing adapter contract](codex-exec.md#rust-adapter-api).
 
@@ -83,6 +85,27 @@ Readiness and control descriptors are allocated before fork. A fixed bounded
 acknowledgment confirms group join, descriptor isolation, child-local signal
 policy and lifetime setup before launcher polling or reap. Startup guards own
 every child and endpoint throughout unwind. The helper performs no model work.
+
+Every endpoint is created close-on-exec, so a concurrent launcher cannot retain
+private protocol handles across exec. Linux uses `pipe2(O_CLOEXEC | O_NONBLOCK)`.
+Other Unix targets use a directional FIFO in a new owned 0700 directory: create
+with mode 0600, open read first and write second with `O_CLOEXEC | O_NONBLOCK |
+O_NOFOLLOW`, and verify type, owner, mode and descriptor identity. The constructor
+unlinks the FIFO, explicitly closes the directory descriptor and removes the
+directory before returning. Partial construction closes every acquired endpoint
+and composes filesystem/close failures with the original error. No keeper writer
+or read/write endpoint masks EOF on parent loss. Filesystem work finishes before
+fork; the helper still performs only raw operations afterward.
+
+Apple's [open semantics](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/man/man2/open.2)
+and [FIFO implementation](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/miscfs/fifofs/fifo_vnops.c)
+support this construction. It uses `mkfifo`, rather than `mkfifoat`, which Apple's
+[SDK declarations](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/sys/stat.h)
+restrict to macOS 13+. The other directory-relative operations are available
+within Rust's macOS deployment floors (10.12 x86, 11.0 ARM); native SDK linking
+and runtime remain unverified. Linux exercises the identical FIFO constructor,
+including exec during construction and actual parent death on an untimed attempt.
+Those controls do not establish native Darwin behavior.
 
 Only the two protocol endpoints remain open in the helper. Every other inherited
 descriptor is closed before readiness, including concurrent attempts' pipe

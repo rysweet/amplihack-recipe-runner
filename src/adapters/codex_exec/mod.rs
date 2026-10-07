@@ -2,6 +2,8 @@
 use std::{path::Path, process::Command};
 #[cfg(unix)]
 mod anchor_child;
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
+mod anchor_fifo;
 #[cfg(unix)]
 mod anchor_io;
 mod cancellation;

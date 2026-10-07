@@ -360,7 +360,7 @@ The private `adapters/codex_exec/` modules divide the attempt by responsibility:
   Owned anchor and launcher inspection errors immediately acquire typed
   `CleanupFailure` context, retaining their original error chains. Successful
   later cleanup cannot make these failures nonfatal or admit pending work.
-- `group_anchor.rs`, `anchor_io.rs` and `anchor_child.rs` establish private retained
+- `group_anchor.rs`, `anchor_io.rs`, `anchor_fifo.rs` and `anchor_child.rs` establish private retained
   membership in the original Unix group before any launcher polling can reap it.
   Readiness requires descriptor isolation and child-local signal policy. The
   non-cloneable anchor holds group authority through the final destructive call;

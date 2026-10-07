@@ -39,3 +39,8 @@ mod first_launcher_fault;
 mod inspection;
 #[cfg(target_os = "linux")]
 mod owned_faults;
+
+#[cfg(target_os = "linux")]
+mod endpoint_parent_loss;
+#[cfg(target_os = "linux")]
+mod fixture_evidence;

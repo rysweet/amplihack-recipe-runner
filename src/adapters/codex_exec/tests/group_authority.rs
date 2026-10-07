@@ -76,19 +76,28 @@ pub(super) fn worker(case: &str) {
         0
     );
     let original = limit;
-    // This isolated worker may raise its soft limit within its inherited hard
-    // capacity. FD 65536 requires a ceiling strictly greater than 65536.
-    assert!(limit.rlim_max > 65536, "hard limit cannot admit FD 65536");
-    if limit.rlim_cur <= 65536 {
-        limit.rlim_cur = 65537;
+    // Preserve FD 65536 stress when capacity permits; bounded hosts still
+    // exercise an inheritable descriptor above the deliberately lowered limit.
+    let target = limit.rlim_max.min(65537).checked_sub(1).unwrap();
+    let target = i32::try_from(target).expect("fixture descriptor target exceeds c_int");
+    assert!(
+        target > 4096,
+        "hard capacity cannot exercise the lowered-limit boundary"
+    );
+    if limit.rlim_cur <= target as libc::rlim_t {
+        limit.rlim_cur = (target as libc::rlim_t).checked_add(1).unwrap();
         assert_eq!(
             unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) },
             0,
             "cannot establish high-descriptor fixture capacity"
         );
     }
-    let high = unsafe { libc::fcntl(handle.as_raw_fd(), libc::F_DUPFD, 65536) };
-    assert!(high >= 65536);
+    let high = unsafe { libc::fcntl(handle.as_raw_fd(), libc::F_DUPFD, target) };
+    assert!(
+        high >= target,
+        "high descriptor allocation failed: {}",
+        std::io::Error::last_os_error()
+    );
     let flags = unsafe { libc::fcntl(high, libc::F_GETFD) };
     assert!(flags >= 0, "high descriptor is not open");
     assert_eq!(flags & libc::FD_CLOEXEC, 0, "descriptor is not inheritable");
@@ -103,8 +112,8 @@ pub(super) fn worker(case: &str) {
         );
     }
     println!(
-        "authority_capacity original_soft={} hard={} spawn_soft={} high={} inheritable=true",
-        original.rlim_cur, original.rlim_max, limit.rlim_cur, high
+        "authority_capacity original_soft={} hard={} target={} spawn_soft={} high={} inheritable=true",
+        original.rlim_cur, original.rlim_max, target, limit.rlim_cur, high
     );
     let mut command = Command::new("/bin/sh");
     command.args(["-c", "cat >/dev/null"]);
