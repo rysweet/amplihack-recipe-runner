@@ -248,6 +248,7 @@ fn should_skip_update_check(args: &[OsString]) -> bool {
             | Some("--help")
             | Some("-V")
             | Some("--version")
+            | Some("--capabilities")
     )
 }
 

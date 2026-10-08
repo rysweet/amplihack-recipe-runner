@@ -6,6 +6,7 @@
 - [Quick Start](quickstart.md)
 - [YAML Recipe Format](yaml-format.md)
 - [CLI Reference](cli-reference.md)
+- [Codex Agent Steps](codex-exec.md)
 - [Condition Language](conditions.md)
 - [Rate-Limit Handling](rate-limit-handling.md)
 
@@ -19,4 +20,5 @@
 
 # Reference
 - [Architecture](architecture.md)
+- [Codex Lifecycle](codex-lifecycle.md)
 - [Environment Budget & Safe Spawning](env-budget.md)

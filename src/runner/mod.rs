@@ -7,6 +7,11 @@ pub mod audit;
 pub mod json_parser;
 pub mod listeners;
 pub mod sub_recipe_paths;
+mod terminal;
+use terminal::{ParallelOutcome, TerminalFailure, TerminalState};
+
+#[cfg(test)]
+pub(crate) mod cleanup_test_observer;
 
 use crate::adapters::Adapter;
 use crate::agent_resolver::{AgentResolveError, AgentResolver};
@@ -42,6 +47,7 @@ pub struct RecipeRunner<A: Adapter> {
     working_dir: String,
     dry_run: bool,
     auto_stage: bool,
+    terminal: TerminalState,
     depth: Cell<u32>,
     total_steps: Cell<u32>,
     max_depth: Cell<u32>,
@@ -71,6 +77,7 @@ impl<A: Adapter> RecipeRunner<A> {
             working_dir: ".".to_string(),
             dry_run: false,
             auto_stage: true,
+            terminal: TerminalState::default(),
             depth: Cell::new(0),
             total_steps: Cell::new(0),
             max_depth: Cell::new(DEFAULT_MAX_DEPTH),
@@ -180,6 +187,7 @@ impl<A: Adapter> RecipeRunner<A> {
         recipe: &Recipe,
         user_context: Option<HashMap<String, Value>>,
     ) -> RecipeResult {
+        self.terminal.reset();
         info!(
             "RecipeRunner::execute: recipe='{}', dry_run={}",
             recipe.name, self.dry_run
@@ -313,25 +321,41 @@ impl<A: Adapter> RecipeRunner<A> {
                     break;
                 }
 
-                for gs in &group_steps {
+                let mut pre_hook_failure = None;
+                for (idx, gs) in group_steps.iter().enumerate() {
                     self.listener.on_step_start(&gs.id, gs.effective_type());
                     self.run_hook(&recipe.hooks.pre_step, "pre_step", &gs.id, &ctx);
+                    if self.terminal.is_terminal() {
+                        pre_hook_failure = Some(idx);
+                        break;
+                    }
                 }
 
-                let group_results =
-                    self.execute_parallel_group(&group_steps, recipe, &ctx, &*self.listener);
+                let group_results = if let Some(idx) = pre_hook_failure {
+                    vec![(idx, self.execute_step(group_steps[idx], &mut ctx))]
+                } else {
+                    self.execute_parallel_group(&group_steps, recipe, &ctx, &*self.listener)
+                };
 
                 let mut group_failed = false;
-                for (gs, result) in group_steps.iter().zip(group_results) {
+                for (idx, mut result) in group_results {
+                    let gs = group_steps[idx];
                     self.total_steps.set(self.total_steps.get() + 1);
                     let failed = result.status == StepStatus::Failed;
 
+                    let terminal_before_hook = self.terminal.is_terminal();
                     if failed {
                         self.run_hook(&recipe.hooks.on_error, "on_error", &gs.id, &ctx);
                     } else {
                         self.run_hook(&recipe.hooks.post_step, "post_step", &gs.id, &ctx);
                     }
 
+                    // Retain outcomes of siblings that completed before terminal
+                    // observation. A newly terminal hook belongs to this step.
+                    if !terminal_before_hook {
+                        self.terminal.apply(&mut result);
+                    }
+                    let failed = result.status == StepStatus::Failed;
                     self.listener.on_step_complete(&result);
                     self.write_audit_entry(&audit_file, &result);
 
@@ -343,11 +367,11 @@ impl<A: Adapter> RecipeRunner<A> {
                         ctx.set(output_key, value);
                     }
 
-                    if failed && !gs.is_nonfatal() {
+                    if self.terminal.is_terminal() || (failed && !gs.is_nonfatal()) {
                         group_failed = true;
                     }
 
-                    if failed && gs.is_nonfatal() {
+                    if failed && gs.is_nonfatal() && !self.terminal.is_terminal() {
                         warn!(
                             "Step '{}' failed but continue_on_error is set, continuing",
                             gs.id
@@ -413,7 +437,7 @@ impl<A: Adapter> RecipeRunner<A> {
                 self.listener.on_step_start(&step.id, step.effective_type());
                 self.run_hook(&recipe.hooks.pre_step, "pre_step", &step.id, &ctx);
 
-                let result = self.execute_step(step, &mut ctx);
+                let mut result = self.execute_step(step, &mut ctx);
                 self.total_steps.set(self.total_steps.get() + 1);
 
                 let failed = result.status == StepStatus::Failed;
@@ -424,6 +448,8 @@ impl<A: Adapter> RecipeRunner<A> {
                     self.run_hook(&recipe.hooks.post_step, "post_step", &step.id, &ctx);
                 }
 
+                self.terminal.apply(&mut result);
+                let failed = result.status == StepStatus::Failed;
                 self.listener.on_step_complete(&result);
                 self.write_audit_entry(&audit_file, &result);
 
@@ -446,13 +472,13 @@ impl<A: Adapter> RecipeRunner<A> {
                     }
                 }
 
-                if failed && !step.is_nonfatal() {
+                if self.terminal.is_terminal() || (failed && !step.is_nonfatal()) {
                     step_results.push(result);
                     success = false;
                     break;
                 }
 
-                if failed && step.is_nonfatal() {
+                if failed && step.is_nonfatal() && !self.terminal.is_terminal() {
                     warn!(
                         "Step '{}' failed but continue_on_error is set, continuing",
                         step.id
@@ -466,7 +492,7 @@ impl<A: Adapter> RecipeRunner<A> {
 
         RecipeResult {
             recipe_name: recipe.name.clone(),
-            success,
+            success: success && !self.terminal.is_terminal(),
             step_results,
             context: ctx.to_map(),
             duration: Some(start.elapsed()),
@@ -498,6 +524,9 @@ impl<A: Adapter> RecipeRunner<A> {
     }
 
     fn run_hook(&self, hook: &Option<String>, hook_name: &str, step_id: &str, ctx: &RecipeContext) {
+        if self.terminal.is_terminal() {
+            return;
+        }
         if let Some(cmd) = hook {
             let rendered = ctx.render_shell(cmd);
             let (env_vars, context_file) = ctx.shell_env_for_step();
@@ -506,6 +535,7 @@ impl<A: Adapter> RecipeRunner<A> {
                 self.adapter
                     .execute_bash_step(&rendered, &self.working_dir, Some(30), &env_vars)
             {
+                self.terminal.observe(&e);
                 warn!("{} hook failed for step '{}': {}", hook_name, step_id, e);
             }
             if let Some(path) = context_file
@@ -533,6 +563,15 @@ impl<A: Adapter> RecipeRunner<A> {
 
     fn execute_step(&self, step: &Step, ctx: &mut RecipeContext) -> StepResult {
         let step_start = Instant::now();
+        if let Some(error) = self.terminal.diagnostic() {
+            return StepResult {
+                step_id: step.id.clone(),
+                status: StepStatus::Failed,
+                output: String::new(),
+                error,
+                duration: Some(step_start.elapsed()),
+            };
+        }
 
         if self.dry_run {
             info!("DRY RUN: would execute step '{}'", step.id);
@@ -587,6 +626,20 @@ impl<A: Adapter> RecipeRunner<A> {
         // Execute the step
         let output = match self.dispatch_step(step, ctx) {
             Ok(o) => {
+                if o.len() > MAX_STEP_OUTPUT_BYTES
+                    && self.adapter.name() == "codex"
+                    && step.effective_type() == StepType::Agent
+                {
+                    return StepResult {
+                        step_id: step.id.clone(),
+                        status: StepStatus::Failed,
+                        output: String::new(),
+                        error: format!(
+                            "Codex final output exceeds {MAX_STEP_OUTPUT_BYTES}-byte limit"
+                        ),
+                        duration: Some(step_start.elapsed()),
+                    };
+                }
                 if o.len() > MAX_STEP_OUTPUT_BYTES {
                     warn!(
                         "Step '{}' output truncated from {} to {} bytes",
@@ -611,6 +664,17 @@ impl<A: Adapter> RecipeRunner<A> {
             }
         };
 
+        // A worker may publish terminality during this admitted primary call.
+        if let Some(error) = self.terminal.diagnostic() {
+            return StepResult {
+                step_id: step.id.clone(),
+                status: StepStatus::Failed,
+                output: String::new(),
+                error,
+                duration: Some(step_start.elapsed()),
+            };
+        }
+
         // Parse JSON if requested — retry once on failure.
         // When parse_json fails, respect continue_on_error: if set, complete
         // with raw output instead of failing the recipe (#2954).
@@ -633,6 +697,16 @@ impl<A: Adapter> RecipeRunner<A> {
                             serde_json::to_string(&parsed).unwrap_or(retry_output)
                         })
                     });
+
+                    if let Some(diagnostic) = self.terminal.diagnostic().as_ref() {
+                        return StepResult {
+                            step_id: step.id.clone(),
+                            status: StepStatus::Failed,
+                            output: String::new(),
+                            error: diagnostic.clone(),
+                            duration: Some(step_start.elapsed()),
+                        };
+                    }
 
                     match retry_result {
                         Some(parsed_output) => {
@@ -700,6 +774,12 @@ impl<A: Adapter> RecipeRunner<A> {
             step.id,
             step.effective_type()
         );
+        if let Some(message) = self.terminal.diagnostic() {
+            return Err(StepExecutionError {
+                step_id: step.id.clone(),
+                message,
+            });
+        }
         // Render working_dir through template engine so {{worktree_setup.worktree_path}} resolves
         let raw_working_dir = step.working_dir.as_deref().unwrap_or(&self.working_dir);
         let working_dir_rendered = ctx.render(raw_working_dir);
@@ -715,9 +795,12 @@ impl<A: Adapter> RecipeRunner<A> {
                     .adapter
                     .execute_bash_step(&rendered, working_dir, step.timeout, &env_vars)
                     .map(|output| output.trim_end().to_string())
-                    .map_err(|e| StepExecutionError {
-                        step_id: step.id.clone(),
-                        message: format!("bash step failed: {:#}", e),
+                    .map_err(|e| {
+                        self.terminal.observe(&e);
+                        StepExecutionError {
+                            step_id: step.id.clone(),
+                            message: format!("bash step failed: {:#}", e),
+                        }
                     });
                 // Clean up temp context file after step completes
                 if let Some(path) = context_file
@@ -757,9 +840,12 @@ impl<A: Adapter> RecipeRunner<A> {
                         step.model.as_deref(),
                         step.timeout,
                     )
-                    .map_err(|e| StepExecutionError {
-                        step_id: step.id.clone(),
-                        message: format!("agent step failed: {:#}", e),
+                    .map_err(|e| {
+                        self.terminal.observe(&e);
+                        StepExecutionError {
+                            step_id: step.id.clone(),
+                            message: format!("agent step failed: {:#}", e),
+                        }
                     })
             }
         }
@@ -847,7 +933,7 @@ impl<A: Adapter> RecipeRunner<A> {
 
         if !sub_result.success {
             let failure_summary = self.describe_sub_recipe_failure(&sub_result);
-            if step.recovery_on_failure {
+            if step.recovery_on_failure && !self.terminal.is_terminal() {
                 let working_dir = step.working_dir.as_deref().unwrap_or(&self.working_dir);
                 let recovery_prompt = format!(
                     "Sub-recipe '{}' failed.\n{}\n\n\
@@ -856,7 +942,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     recipe_name, failure_summary
                 );
 
-                match self.adapter.execute_agent_step(
+                let recovery = self.adapter.execute_agent_step(
                     &recovery_prompt,
                     None,
                     None,
@@ -864,21 +950,31 @@ impl<A: Adapter> RecipeRunner<A> {
                     working_dir,
                     None,
                     None, // timeout
-                ) {
+                );
+                if let Err(ref error) = recovery {
+                    self.terminal.observe(error);
+                }
+                match recovery {
                     Ok(output)
-                        if output.to_lowercase().contains("status: complete")
-                            || output.to_lowercase().contains("recovered") =>
+                        if !self.terminal.is_terminal()
+                            && (output.to_lowercase().contains("status: complete")
+                                || output.to_lowercase().contains("recovered")) =>
                     {
                         info!("Sub-recipe '{}' recovered via agent", recipe_name);
                         return Ok(output);
                     }
                     _ => {
+                        let mut message = format!(
+                            "Sub-recipe '{}' failed and agentic recovery was unsuccessful.\n{}",
+                            recipe_name, failure_summary
+                        );
+                        if let Some(diagnostic) = self.terminal.diagnostic().as_ref() {
+                            message.push('\n');
+                            message.push_str(diagnostic);
+                        }
                         return Err(StepExecutionError {
                             step_id: step.id.clone(),
-                            message: format!(
-                                "Sub-recipe '{}' failed and agentic recovery was unsuccessful.\n{}",
-                                recipe_name, failure_summary
-                            ),
+                            message,
                         });
                     }
                 }
@@ -1077,8 +1173,8 @@ impl<A: Adapter> RecipeRunner<A> {
     /// Retry an agent step with an explicit JSON-only instruction.
     fn retry_for_json(&self, step: &Step, ctx: &mut RecipeContext) -> Option<String> {
         log::debug!("retry_for_json: step='{}'", step.id);
-        if step.effective_type() != StepType::Agent {
-            return None; // Can't retry bash steps with different prompts
+        if self.terminal.is_terminal() || step.effective_type() != StepType::Agent {
+            return None; // No pending repair after terminal observation
         }
 
         let original_prompt = step.prompt.as_deref().unwrap_or("");
@@ -1089,18 +1185,26 @@ impl<A: Adapter> RecipeRunner<A> {
             original_prompt
         );
 
-        let working_dir = step.working_dir.as_deref().unwrap_or(&self.working_dir);
-        match self.adapter.execute_agent_step(
-            &ctx.render(&retry_prompt),
-            None,
-            None,
-            None,
-            working_dir,
-            None,
-            None, // timeout
-        ) {
+        let result = if self.adapter.name() == "codex" {
+            let mut repair_step = step.clone();
+            repair_step.prompt = Some(retry_prompt);
+            self.dispatch_step(&repair_step, ctx)
+                .map_err(anyhow::Error::new)
+        } else {
+            self.adapter.execute_agent_step(
+                &ctx.render(&retry_prompt),
+                None,
+                None,
+                None,
+                step.working_dir.as_deref().unwrap_or(&self.working_dir),
+                None,
+                None,
+            )
+        };
+        match result {
             Ok(output) => Some(output),
             Err(e) => {
+                self.terminal.observe(&e);
                 warn!("Retry for step '{}' failed: {}", step.id, e);
                 None
             }
@@ -1136,7 +1240,7 @@ impl<A: Adapter> RecipeRunner<A> {
         _recipe: &Recipe,
         ctx: &RecipeContext,
         _listener: &dyn ExecutionListener,
-    ) -> Vec<StepResult> {
+    ) -> Vec<(usize, StepResult)> {
         log::debug!("execute_parallel_group: {} steps", steps.len());
         if steps.len() > MAX_PARALLEL_STEPS {
             warn!(
@@ -1149,11 +1253,19 @@ impl<A: Adapter> RecipeRunner<A> {
         let default_wd = self.working_dir.as_str();
         let dry_run = self.dry_run;
         let mut results: Vec<Option<StepResult>> = vec![None; steps.len()];
+        if self.terminal.is_terminal() {
+            let mut ctx_clone = ctx.clone();
+            return vec![(0, self.execute_step(steps[0], &mut ctx_clone))];
+        }
+        let terminal = &self.terminal;
 
         std::thread::scope(|s| {
             let mut handles = Vec::new();
 
             for (idx, step) in steps.iter().enumerate() {
+                if self.terminal.is_terminal() {
+                    break;
+                }
                 if self.should_skip_by_tags(step) {
                     results[idx] = Some(StepResult {
                         step_id: step.id.clone(),
@@ -1169,7 +1281,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     let ctx_clone = ctx.clone();
                     let handle = s.spawn(move || {
                         Self::execute_bash_step_parallel(
-                            step, &ctx_clone, adapter, default_wd, dry_run,
+                            step, &ctx_clone, adapter, default_wd, dry_run, terminal,
                         )
                     });
                     handles.push((idx, handle));
@@ -1183,7 +1295,10 @@ impl<A: Adapter> RecipeRunner<A> {
 
             for (idx, handle) in handles {
                 match handle.join() {
-                    Ok(result) => results[idx] = Some(result),
+                    Ok(outcome) => {
+                        self.terminal.merge(outcome.terminal);
+                        results[idx] = Some(outcome.result);
+                    }
                     Err(panic_info) => {
                         let panic_msg = if let Some(s) = panic_info.downcast_ref::<String>() {
                             s.clone()
@@ -1212,7 +1327,11 @@ impl<A: Adapter> RecipeRunner<A> {
             }
         });
 
-        results.into_iter().flatten().collect()
+        results
+            .into_iter()
+            .enumerate()
+            .filter_map(|(idx, result)| result.map(|result| (idx, result)))
+            .collect()
     }
 
     /// Execute a single bash step in a parallel context without `&mut RecipeContext`.
@@ -1222,7 +1341,8 @@ impl<A: Adapter> RecipeRunner<A> {
         adapter: &A,
         default_working_dir: &str,
         dry_run: bool,
-    ) -> StepResult {
+        terminal: &TerminalState,
+    ) -> ParallelOutcome {
         log::debug!(
             "execute_bash_step_parallel: step='{}', dry_run={}",
             step.id,
@@ -1237,7 +1357,8 @@ impl<A: Adapter> RecipeRunner<A> {
                 output: "(dry-run)".to_string(),
                 error: String::new(),
                 duration: Some(step_start.elapsed()),
-            };
+            }
+            .into();
         }
 
         if let Some(ref condition) = step.condition {
@@ -1250,7 +1371,8 @@ impl<A: Adapter> RecipeRunner<A> {
                         output: String::new(),
                         error: String::new(),
                         duration: Some(step_start.elapsed()),
-                    };
+                    }
+                    .into();
                 }
                 Err(e) => {
                     return StepResult {
@@ -1259,7 +1381,8 @@ impl<A: Adapter> RecipeRunner<A> {
                         output: String::new(),
                         error: format!("Condition error: {}", e),
                         duration: Some(step_start.elapsed()),
-                    };
+                    }
+                    .into();
                 }
             }
         }
@@ -1268,6 +1391,7 @@ impl<A: Adapter> RecipeRunner<A> {
         let (env_vars, context_file) = ctx.shell_env_for_step();
         let working_dir = step.working_dir.as_deref().unwrap_or(default_working_dir);
 
+        let mut failure = None;
         let result = match adapter.execute_bash_step(
             &rendered,
             working_dir,
@@ -1294,7 +1418,8 @@ impl<A: Adapter> RecipeRunner<A> {
                                     error: "parse_json failed: output is not valid JSON"
                                         .to_string(),
                                     duration: Some(step_start.elapsed()),
-                                };
+                                }
+                                .into();
                             }
                             warn!(
                                 "Step '{}': parse_json failed on bash step, using raw output (degraded)",
@@ -1314,13 +1439,21 @@ impl<A: Adapter> RecipeRunner<A> {
                     duration: Some(step_start.elapsed()),
                 }
             }
-            Err(e) => StepResult {
-                step_id: step.id.clone(),
-                status: StepStatus::Failed,
-                output: String::new(),
-                error: e.to_string(),
-                duration: Some(step_start.elapsed()),
-            },
+            Err(e) => {
+                failure = TerminalFailure::classify(&e);
+                terminal.merge(failure.clone());
+                // Test-only acknowledgment at the actual worker error conversion.
+                // Publication precedes this acknowledgment and owner joins.
+                #[cfg(test)]
+                cleanup_test_observer::converted();
+                StepResult {
+                    step_id: step.id.clone(),
+                    status: StepStatus::Failed,
+                    output: String::new(),
+                    error: format!("{e:#}"),
+                    duration: Some(step_start.elapsed()),
+                }
+            }
         };
         // Clean up temp context file
         if let Some(path) = context_file
@@ -1328,7 +1461,10 @@ impl<A: Adapter> RecipeRunner<A> {
         {
             log::debug!("Failed to clean up context file {}: {}", path.display(), e);
         }
-        result
+        ParallelOutcome {
+            result,
+            terminal: failure,
+        }
     }
 }
 
@@ -1467,6 +1603,12 @@ mod tests {
             _model: Option<&str>,
             _timeout: Option<u64>,
         ) -> Result<String, anyhow::Error> {
+            if prompt.starts_with("Sub-recipe '") {
+                return Ok("STATUS: COMPLETE".to_string());
+            }
+            if prompt == "ordinary failure" {
+                anyhow::bail!("Codex exec cancelled by signal 15 (ordinary diagnostic text)");
+            }
             Ok(format!(
                 "Agent response for: {}",
                 &prompt[..prompt.len().min(50)]
@@ -1488,6 +1630,40 @@ mod tests {
         }
         fn name(&self) -> &str {
             "mock"
+        }
+    }
+
+    #[test]
+    fn ordinary_nested_failure_still_runs_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("child.yaml"),
+            "name: child\nsteps:\n  - id: fail\n    type: agent\n    prompt: ordinary failure\n",
+        )
+        .unwrap();
+        let recipe = RecipeParser::new()
+            .parse("name: parent\nsteps:\n  - id: child\n    type: recipe\n    recipe: child\n    recovery_on_failure: true\n  - id: after\n    type: bash\n    command: echo continued\n")
+            .unwrap();
+        let runner = RecipeRunner::new(MockAdapter)
+            .with_working_dir(root.path().to_str().unwrap())
+            .with_auto_stage(false);
+        let result = runner.execute(&recipe, None);
+        assert!(result.success, "{result:?}");
+        assert_eq!(result.step_results.len(), 2);
+        assert_eq!(result.step_results[0].output, "STATUS: COMPLETE");
+    }
+
+    #[test]
+    fn ordinary_nonfatal_errors_still_continue_without_matching_diagnostic_text() {
+        for policy in ["continue_on_error: true", "fatal: false"] {
+            let recipe = RecipeParser::new().parse(&format!(
+                "name: ordinary\nsteps:\n  - id: fail\n    type: agent\n    prompt: ordinary failure\n    {policy}\n  - id: after\n    type: bash\n    command: echo continued\n"
+            )).unwrap();
+            let runner = RecipeRunner::new(MockAdapter).with_auto_stage(false);
+            let result = runner.execute(&recipe, None);
+            assert!(result.success);
+            assert_eq!(result.step_results.len(), 2);
+            assert_eq!(result.step_results[1].status, StepStatus::Completed);
         }
     }
 

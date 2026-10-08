@@ -1,9 +1,30 @@
+---
+title: Recipe runner architecture
+description: Module boundaries, execution flow and subprocess ownership.
+doc_type: explanation
+last_updated: 2026-10-07
+---
+
 # Architecture — amplihack-recipe-runner
 
 Rust implementation of the amplihack recipe runner. Parses YAML recipe files,
 evaluates conditions in a sandboxed expression language, and executes steps
 (bash commands, AI agent prompts, or nested sub-recipes) through a pluggable
 adapter layer.
+
+## Contents
+
+- [Module dependency diagram](#module-dependency-diagram)
+- [Data flow](#data-flow)
+- [Core types](#core-types-modelsrs)
+- [CLI interface](#cli-interface-mainrs)
+- [Adapter pattern](#adapter-pattern)
+- [Execution flow](#execution-flow)
+- [Safety model](#safety-model)
+- [Interior mutability](#interior-mutability-pattern)
+- [Recipe discovery](#recipe-discovery-discoveryrs)
+- [JSONL audit log](#jsonl-audit-log)
+- [JSON output extraction](#json-output-extraction)
 
 ---
 
@@ -45,6 +66,7 @@ graph TD
     runner --> adapters[adapters/mod.rs — Adapter trait]
 
     cli_sub --> adapters
+    cli_sub --> codex_exec[codex_exec/mod.rs — private attempt coordinator]
 
     parser --> models[models.rs]
     runner --> models
@@ -67,7 +89,16 @@ graph TD
 | `agent_resolver.rs`  | Agent reference → markdown file resolution             |
 | `discovery.rs`       | Multi-directory recipe discovery and manifest sync     |
 | `adapters/mod.rs`    | `Adapter` trait definition                             |
-| `adapters/cli_subprocess.rs` | Subprocess execution for bash and agent steps |
+| `adapters/cli_subprocess.rs` | Provider dispatch, subprocess execution and rate-limit retries |
+| `adapters/codex_exec/mod.rs` | Private attempt coordination and typed error composition |
+| `adapters/codex_exec/cancellation.rs` | Shared signal epochs, full disposition restoration and cancellation snapshot before ownership unlock |
+| `adapters/codex_exec/signal_observations.rs` | Persistent per-signal observable-entry publication without epoch resets |
+| `adapters/codex_exec/process.rs` | Owned child/group, complete stdin delivery, deadline and bounded shutdown |
+| `adapters/codex_exec/group_anchor.rs` | Non-cloneable retained group authority through final destructive access |
+| `adapters/codex_exec/anchor_io.rs` / `anchor_child.rs` | Bounded private helper readiness, descriptor isolation and lifetime |
+| `adapters/codex_exec/launcher_cleanup.rs` | Direct-launcher retirement within shared absolute cleanup deadlines |
+| `adapters/codex_exec/diagnostics.rs` | Bounded pipe readers and secret-safe exit classification |
+| `adapters/codex_exec/final_output.rs` | Descriptor validation and exact bounded UTF-8 final-message reads |
 
 ---
 
@@ -106,6 +137,13 @@ graph TD
    ├── context: final variable state
    └── duration: wall-clock time
 ```
+
+### Early Capability Dispatch
+
+`main.rs` handles exact standalone `--capabilities` before logger initialization
+and update checks. It emits the frozen schema/version/capability JSON; mixed
+invocations fail before execution or update effects. See the
+[probe contract](codex-exec.md#compatibility-probe-api).
 
 ### Parse Phase
 
@@ -244,17 +282,25 @@ become booleans, numeric strings become numbers, everything else stays a string.
 The `Adapter` trait decouples the runner from any specific execution backend:
 
 ```rust
-trait Adapter {
+pub trait Adapter: Sync {
     fn execute_agent_step(
-        &self, prompt: &str, agent_name: &str,
-        system_prompt: Option<&str>, mode: Option<&str>,
-        working_dir: Option<&str>, model: Option<&str>,
-    ) -> Result<String>;
+        &self,
+        prompt: &str,
+        agent_name: Option<&str>,
+        system_prompt: Option<&str>,
+        mode: Option<&str>,
+        working_dir: &str,
+        model: Option<&str>,
+        timeout: Option<u64>,
+    ) -> Result<String, anyhow::Error>;
 
     fn execute_bash_step(
-        &self, command: &str, working_dir: Option<&str>,
+        &self,
+        command: &str,
+        working_dir: &str,
         timeout: Option<u64>,
-    ) -> Result<String>;
+        extra_env: &std::collections::HashMap<String, String>,
+    ) -> Result<String, anyhow::Error>;
 
     fn is_available(&self) -> bool;
     fn name(&self) -> &str;
@@ -271,13 +317,117 @@ The production adapter spawns subprocesses:
   [Bash interpreter resolution](#bash-interpreter-resolution)). Lifecycle hooks
   (`pre_step`, `post_step`, `on_error`) take the same path, with a fixed 30 s
   timeout.
-- **Agent steps** — `claude -p <prompt>` in an isolated temp directory. A
-  `NON_INTERACTIVE_FOOTER` ("Proceed autonomously. Do not ask questions.") is
-  appended to prevent the nested Claude session from hanging on prompts.
+- **Agent steps** — dispatch by selected provider through `amplihack`.
+  Claude/Copilot retain their existing transport and result contracts. Codex uses
+  `amplihack codex -- exec --output-last-message UNIQUE_FINAL_PATH
+  [--model EXPLICIT_MODEL] -` in the effective workspace, without implicit
+  `--add-dir` or model selection. Full system/persona, leaf/no-reentry, task and
+  autonomy instructions are delivered through stdin for every prompt size.
 
-**Timeout enforcement**: A background heartbeat thread monitors the deadline.
-It logs progress every 2 seconds. On expiry it sends `SIGTERM`, waits 5 seconds,
-then escalates to `SIGKILL`.
+### Private Codex execution ownership
+
+The private lifecycle modules implement the ownership and retirement contract
+described below.
+
+`cli_subprocess.rs` constructs the full stdin envelope and typed command arguments,
+allocates a fresh private temporary directory for each attempt, and owns retry
+policy and resource removal. Temporary resources use the platform temporary
+location, honoring `TMPDIR`; the directory is private and the final pathname is
+absent before launch. There is no additional public adapter API.
+
+The private `adapters/codex_exec/` modules divide the attempt by responsibility:
+
+- `mod.rs` coordinates spawn, delivery/wait, teardown and result classification.
+  It composes primary, cleanup and immutable cancellation-retirement results,
+  retaining both downcastable `Interruption` and `CleanupFailure` markers.
+- `cancellation.rs` owns reference-counted SIGINT/SIGTERM registration. The first
+  active owner saves full prior dispositions and captures a baseline before
+  installation; concurrent owners share it. Nonlast close snapshots under the
+  ownership mutex. Last close
+  attempts both restorations and constructs an immutable observation/restoration
+  result before unlocking. Failed restoration retains original actions and pending
+  metadata for bounded reconciliation or refusal before a later spawn. The scope
+  spans retries and backoff.
+- `signal_observations.rs` publishes observable handler entry through persistent,
+  target-proven lock-free per-signal saturating sequences, never reset between
+  owners. Handlers perform no blocking, allocation or epoch-dependent later writes.
+  Published entered/in-flight events during restoration are covered; a
+  kernel-selected old handler first publishing after the retirement snapshot is
+  outside demonstrated epoch attribution. Saturation is a typed terminal fault.
+- `process.rs` owns the launcher, nonblocking complete stdin delivery and one
+  absolute attempt deadline computed immediately after successful spawn. Anchor
+  and reader setup, delivery and execution consume that same deadline.
+  Owned anchor and launcher inspection errors immediately acquire typed
+  `CleanupFailure` context, retaining their original error chains. Successful
+  later cleanup cannot make these failures nonfatal or admit pending work.
+- `group_anchor.rs`, `anchor_io.rs`, `anchor_fifo.rs` and `anchor_child.rs` establish private retained
+  membership in the original Unix group before any launcher polling can reap it.
+  Readiness requires descriptor isolation and child-local signal policy. The
+  non-cloneable anchor holds group authority through the final destructive call;
+  a numeric PGID alone never authorizes signaling.
+- `launcher_cleanup.rs` retires the direct launcher before anchored group TERM
+  and KILL. Initial reap, direct TERM with at most 100 ms grace, direct KILL if
+  still owned/live and PID-specific reap share cleanup start plus two seconds.
+  Group TERM has at most 100 ms grace; TERM/probe errors do not skip the final
+  KILL while authority remains. That KILL attempt seals destructive group access,
+  including on failure. Helper fallback/reap, consuming launcher observation and
+  final group confirmation share the deadline computed immediately before the
+  KILL attempt (plus two seconds). After helper retirement, PID-specific launcher
+  polling consumes any exit caused by late group termination and retains earlier
+  direct-signal or timeout errors. Exhausted budgets still permit one nonblocking
+  consuming observation without a new wait window. This observation never signals.
+  EINTR, fallback and Drop never renew these deadlines.
+- `diagnostics.rs` drains both pipes concurrently, retaining 64 KiB tails.
+  Stopped readers finish within a 50 ms or 1 MiB additional-read bound. Exit
+  classification uses fixed actionable categories, including late stderr
+  rate-limit evidence, without exposing raw provider output or credentials.
+- `final_output.rs` validates the opened descriptor using no-follow and
+  nonblocking flags, regular-file type, ownership and permissions. Metadata
+  checks and a limit-plus-one read enforce the 10,000,000-byte output bound
+  before unbounded allocation. Strict UTF-8 decoding preserves all content,
+  including an empty message and whitespace.
+
+After spawn, every outcome attempts bounded cleanup: close stdin, retire the
+launcher, tear down the original group while authority remains, seal signaling,
+retire/reap the helper, observe the group and consume launcher status within the
+same final deadline, then stop and join diagnostic readers.
+Lost authority prohibits uncertain direct/group signals; cleanup continues for
+positively owned resources and aggregates genuine signal, probe, reap, reader
+and resource failures. Complete reaping and group absence are success conditions,
+not guarantees after cleanup failure. Later absence cannot erase an earlier
+genuine failure. Final-file extraction requires complete stdin delivery,
+successful process exit and successful lifecycle cleanup. The adapter explicitly
+closes temporary resources before returning; removal failure is terminal. Exit zero or
+an existing final file alone cannot establish success; progress output never
+substitutes for a missing final message, and oversized output fails rather than
+being truncated.
+
+Typed cancellation takes precedence while retaining both terminal markers and
+primary diagnostics when cleanup also fails. Cancellation and genuine cleanup
+failure stop pending dispatch before joins; already admitted work is joined.
+Both stop the enclosing recipe despite `continue_on_error` or `fatal: false`,
+including nested execution, parallel scheduling and JSON repair. Recorded
+interruption prevents agentic recovery from starting; interruption during
+recovery aborts the enclosing recipe. No rate-limit retry, automatic model
+fallback or JSON repair runs after cancellation. Already running parallel Bash
+steps retain their existing join behavior. Ordinary failures retain the
+established recovery and nonfatal policies.
+
+**Timeout enforcement**: Codex's per-attempt deadline includes anchor and reader
+setup, stdin delivery and execution. Establishment is capped at 100 ms and the
+remaining attempt time. Cleanup uses shared absolute deadlines with at most
+4.1 seconds of process polling plus existing reader/resource bounds; synchronous
+spawn, syscall scheduling and resource I/O have no hard real-time guarantee.
+Timeout attempts owned-group and I/O cleanup before returning; authority loss or
+incomplete cleanup remains typed `CleanupFailure`. Deliberately detached sessions
+are outside Unix process-group containment. Timed execution without equivalent
+platform tree cleanup fails explicitly. Backoff and repeated attempts extend
+total duration and may repeat side effects. Rate-limit and JSON repair retries retain the full
+execution context and use fresh output resources; Codex is excluded from
+implicit `--model auto` fallback. Genuine cleanup failures permit no retry, JSON
+repair, recovery or nonfatal continuation. See [Codex agent steps](codex-exec.md)
+and the [lifecycle reference](codex-lifecycle.md) for helper isolation, reaper
+assumptions and the unverified Darwin/other Unix scope.
 
 **Environment propagation**: `build_child_env()` forwards session-tracking
 variables (`AMPLIHACK_SESSION_DEPTH`, `AMPLIHACK_TREE_ID`, `AMPLIHACK_MAX_DEPTH`,
@@ -389,6 +539,8 @@ Widening the fix to the `timeout` binary is out of scope here and tracked as
 ```
 CLI args
   │
+  ├─ standalone --capabilities ──► frozen JSON probe ──► exit
+  │   (before logging, updates, cache writes, network or agent startup)
   ├─ --validate-only ──► parse + validate ──► print warnings ──► exit
   ├─ --explain ─────────► parse ──► print step plan ──► exit
   │
@@ -544,11 +696,32 @@ attacks.
 
 ### Subprocess Isolation (cli_subprocess.rs)
 
-- Agent steps execute in a fresh temporary directory that is cleaned up on drop.
+- Codex executes in the effective workspace; its private per-attempt output
+  directory is owned through execution, extraction and explicit cleanup.
+  Claude/Copilot retain their existing temporary-resource behavior.
 - `CLAUDECODE` is stripped from the child environment to prevent the nested
   Claude process from attaching to the parent's session.
 - Session depth tracking (`AMPLIHACK_SESSION_DEPTH`) prevents runaway recursive
   spawning.
+
+Codex holds concrete original-group identity through a private anchor before
+launcher reaping can release it. Teardown retires the launcher, terminates the
+anchored group, seals signaling, then reaps the helper before observational
+confirmation. This ordering avoids launcher-only zombie observations while
+preventing destructive access to an unrelated reused PGID. Genuine cleanup
+failures remain terminal even when the group eventually disappears.
+
+Cancellation ownership and group authority are separate lifetimes. Persistent
+signal-entry publications survive shared-owner retirement; the last owner
+composes its immutable interruption/restoration result before unlocking. This
+covers observable entered handlers during restoration, with an explicit limit
+for kernel-selected handlers that have not published entry. Both typed terminal
+causes survive adapter composition, so worker classification stops pending
+dispatch before joins while ordinary provider failures keep existing policies.
+
+The [lifecycle reference](codex-lifecycle.md) defines deadlines, helper isolation,
+reaper assumptions and platform limitations; [verification contracts](testing-recipes.md#lifecycle-discrimination-and-evidence)
+define the discriminating evidence for those boundaries.
 
 ---
 
