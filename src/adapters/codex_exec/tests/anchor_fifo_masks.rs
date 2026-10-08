@@ -1,13 +1,30 @@
 //! Child-only common-mask contracts at existing production and fixture boundaries.
 use std::{
     fs,
-    os::{fd::AsRawFd, unix::process::CommandExt},
-    path::Path,
+    os::{
+        fd::AsRawFd,
+        unix::{fs::OpenOptionsExt, process::CommandExt},
+    },
     process::Command,
     time::{Duration, Instant},
 };
 
+#[path = "anchor_fifo_observer.rs"]
+mod observer;
+use observer::{compile, verify_creation};
+
 pub(in crate::adapters::codex_exec) fn run(mask: u32, selector: &str, case: &str) {
+    if let Err(path) = run_observed(mask, selector, case, None) {
+        panic!("mask {mask:03o} contract failed: evidence={path:?}");
+    }
+}
+
+fn run_observed(
+    mask: u32,
+    selector: &str,
+    case: &str,
+    fault: Option<&str>,
+) -> Result<std::path::PathBuf, std::path::PathBuf> {
     // Read Linux's published mask without ever changing the parent process mask.
     let parent_mask = || {
         fs::read_to_string("/proc/self/status")
@@ -40,6 +57,14 @@ pub(in crate::adapters::codex_exec) fn run(mask: u32, selector: &str, case: &str
         observer.display().to_string()
     };
     let creation_log = root.path().join("creation.tsv");
+    // The parent owns the log: an owner-write-removing child mask must only
+    // restrict the objects under observation, not subsequent log appends.
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&creation_log)
+        .unwrap();
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .args(["--exact", selector, "--nocapture", "--test-threads=1"])
@@ -54,6 +79,11 @@ pub(in crate::adapters::codex_exec) fn run(mask: u32, selector: &str, case: &str
         .env("LIFECYCLE_EVENTS", root.path().join("events"))
         .stdout(fs::File::create(root.path().join("stdout")).unwrap())
         .stderr(fs::File::create(root.path().join("stderr")).unwrap());
+    // Ambient instrumentation faults must never affect ordinary observations.
+    command.env_remove("FIFO_CREATION_FAULT");
+    if let Some(fault) = fault {
+        command.env("FIFO_CREATION_FAULT", fault);
+    }
     // This closure runs only after fork, immediately before the disposable exec.
     unsafe {
         command.pre_exec(move || {
@@ -78,89 +108,39 @@ pub(in crate::adapters::codex_exec) fn run(mask: u32, selector: &str, case: &str
     };
     let out = fs::read_to_string(root.path().join("stdout")).unwrap();
     let err = fs::read_to_string(root.path().join("stderr")).unwrap();
+    fs::write(root.path().join("exit-status"), status.to_string()).unwrap();
     println!(
         "child_mask={mask:03o} exit={:?}\n{out}\n{err}",
         status.code()
     );
-    assert_eq!(parent_mask(), before, "parent mask changed");
-    // Keep failure evidence as well as optional externally requested success evidence.
-    let preserve = !status.success() || std::env::var_os("FIFO_MASK_ARTIFACT_ROOT").is_some();
+    // Keep artifacts for every validation failure, including a marker with exit 0
+    // and otherwise valid rows. Existing semantic assertions stay in this gate.
+    let checked = std::panic::catch_unwind(|| {
+        assert_eq!(parent_mask(), before, "parent mask changed");
+        assert!(out.contains("running 1 test"), "zero worker selection");
+        assert!(status.success(), "child contract failed: {status}");
+        assert!(
+            !err.contains(observer::FAILURE_MARKER),
+            "creation observer failed"
+        );
+        if mask & 0o700 == 0 {
+            verify_creation(&creation_log);
+        }
+        assert_eq!(
+            fs::read_dir(tmp).unwrap().count(),
+            0,
+            "private paths leaked"
+        );
+    });
+    let preserve = checked.is_err()
+        || fault.is_some()
+        || std::env::var_os("FIFO_MASK_ARTIFACT_ROOT").is_some();
     let path = if preserve {
         root.keep()
     } else {
         root.path().to_owned()
     };
-    assert!(
-        out.contains("running 1 test"),
-        "zero worker selection: {path:?}"
-    );
-    assert!(
-        status.success(),
-        "mask {mask:03o} contract failed: {path:?}"
-    );
-    if mask & 0o700 == 0 {
-        verify_creation(&creation_log);
-    }
-    assert_eq!(
-        fs::read_dir(tmp).unwrap().count(),
-        0,
-        "private paths leaked"
-    );
-}
-
-fn compile(source: &str, name: &str, root: &Path) -> std::path::PathBuf {
-    let library = root.join(name);
-    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(source);
-    let mut command = Command::new("/usr/bin/cc");
-    command
-        .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror", "-o"])
-        .arg(&library)
-        .arg(source)
-        .arg("-ldl");
-    let output = command.output().unwrap();
-    fs::write(root.join(format!("{name}-compile.stdout")), &output.stdout).unwrap();
-    fs::write(root.join(format!("{name}-compile.stderr")), &output.stderr).unwrap();
-    println!(
-        "fixture_compile command={command:?} exit={:?}",
-        output.status.code()
-    );
-    assert!(output.status.success(), "fixture failed to compile");
-    library
-}
-
-fn verify_creation(log: &Path) {
-    let text = fs::read_to_string(log).expect("missing creation observations");
-    let rows: Vec<Vec<&str>> = text
-        .lines()
-        .map(|line| line.split('\t').collect())
-        .collect();
-    let fifos: Vec<_> = rows.iter().filter(|row| row[0] == "fifo").collect();
-    assert!(!fifos.is_empty(), "portable factory never created a FIFO");
-    for fifo in fifos {
-        assert_eq!(fifo.len(), 8);
-        assert_eq!(fifo[1].parse::<u32>().unwrap(), 0o600);
-        assert_eq!(fifo[2], "0", "FIFO observation failed");
-        let mode = fifo[3].parse::<u32>().unwrap();
-        assert_eq!(mode & libc::S_IFMT, libc::S_IFIFO);
-        assert_eq!(mode & 0o777, 0o600);
-        assert_eq!(fifo[4].parse::<u32>().unwrap(), unsafe { libc::geteuid() });
-        assert_ne!(fifo[6], "0", "missing FIFO inode identity");
-        let parent = Path::new(fifo[7]).parent().unwrap();
-        let directory = rows
-            .iter()
-            .find(|row| row[0] == "directory" && Path::new(row[7]) == parent)
-            .expect("missing permission-at-creation observation");
-        assert_eq!(directory[2], "0", "directory observation failed");
-        let mode = directory[3].parse::<u32>().unwrap();
-        assert_eq!(mode & libc::S_IFMT, libc::S_IFDIR);
-        assert_eq!(mode & 0o777, 0o700, "directory was public at creation");
-        assert_eq!(directory[4], fifo[4]);
-        assert_eq!(directory[5], fifo[5]);
-        assert_ne!(directory[6], "0");
-        assert!(!parent.exists(), "FIFO root not removed");
-    }
+    if checked.is_ok() { Ok(path) } else { Err(path) }
 }
 
 #[test]

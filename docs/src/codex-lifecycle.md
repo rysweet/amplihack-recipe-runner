@@ -137,14 +137,11 @@ The inherited parent memory is not a memory sandbox.
 
 ## Portable FIFO permissions
 
-> **[PLANNED - Implementation Pending]**: This section specifies the intended
-> permission-at-creation contract and its required integration checks.
-
-The private `anchor_fifo::new() -> anyhow::Result<Pipe>` factory will configure
+The private `anchor_fifo::new() -> anyhow::Result<Pipe>` factory configures
 `tempfile::Builder::permissions(Permissions::from_mode(0o700))` before `tempdir()`.
-Both fixture roots passed to `construct()` must use the same permission request
-before `tempdir_in()`. Directory privacy must hold at creation, without a later
-chmod repair. Construction must never change the process umask.
+Both fixture roots passed to `construct()` use the same permission request
+before `tempdir_in()`. Directory privacy holds at creation, without a later
+chmod repair. Construction does not change the process umask.
 
 The selected temporary parent follows Unix `TMPDIR` configuration, as described
 in the [temporary-resource usage reference](codex-exec.md#provider-and-configuration).
@@ -190,6 +187,9 @@ on an untimed attempt. Internal integration covers FIFO-to-anchor-to-launcher
 ownership, natural helper exit/reaping, unrelated-launcher survival and final group
 absence. These contracts do not assert completed runtime or platform acceptance;
 see [verification requirements](testing-recipes.md#lifecycle-discrimination-and-evidence).
+Step 13 acceptance, independent finding closure, current-head CI and publication
+remain pending. Native Darwin runtime and deployed-ABI verification remain
+unverified; Linux shared-constructor checks do not establish those guarantees.
 
 ## Deadlines and cleanup order
 
