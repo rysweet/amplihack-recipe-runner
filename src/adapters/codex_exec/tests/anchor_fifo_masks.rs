@@ -25,6 +25,28 @@ fn run_observed(
     case: &str,
     fault: Option<&str>,
 ) -> Result<std::path::PathBuf, std::path::PathBuf> {
+    run_observed_with_setup(mask, selector, case, fault, |root| {
+        let observer = std::env::var_os("FIFO_CREATION_OBSERVER")
+            .map(|path| Ok(std::path::PathBuf::from(path)))
+            .unwrap_or_else(|| compile("fifo_creation_observer.c", "observer.so", root))?;
+        if case.starts_with("adapter_") {
+            let interposer = std::env::var_os("LIFECYCLE_INTERPOSER")
+                .map(|path| Ok(std::path::PathBuf::from(path)))
+                .unwrap_or_else(|| compile("lifecycle_interpose.c", "lifecycle.so", root))?;
+            Ok(format!("{}:{}", observer.display(), interposer.display()))
+        } else {
+            Ok(observer.display().to_string())
+        }
+    })
+}
+
+fn run_observed_with_setup(
+    mask: u32,
+    selector: &str,
+    case: &str,
+    fault: Option<&str>,
+    setup: impl FnOnce(&std::path::Path) -> anyhow::Result<String>,
+) -> Result<std::path::PathBuf, std::path::PathBuf> {
     // Read Linux's published mask without ever changing the parent process mask.
     let parent_mask = || {
         fs::read_to_string("/proc/self/status")
@@ -45,16 +67,17 @@ fn run_observed(
     };
     let tmp = root.path().join("tmp");
     fs::create_dir(&tmp).unwrap();
-    let observer = std::env::var_os("FIFO_CREATION_OBSERVER")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| compile("fifo_creation_observer.c", "observer.so", root.path()));
-    let preload = if case.starts_with("adapter_") {
-        let interposer = std::env::var_os("LIFECYCLE_INTERPOSER")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| compile("lifecycle_interpose.c", "lifecycle.so", root.path()));
-        format!("{}:{}", observer.display(), interposer.display())
-    } else {
-        observer.display().to_string()
+    let preload = match setup(root.path()) {
+        Ok(preload) => preload,
+        Err(error) => {
+            let path = root.keep();
+            let diagnostic = format!("fixture setup failed: {error:#}");
+            eprintln!("{diagnostic}; evidence={path:?}");
+            if let Err(write_error) = fs::write(path.join("setup-error"), &diagnostic) {
+                eprintln!("could not save setup error: {write_error}; evidence={path:?}");
+            }
+            return Err(path);
+        }
     };
     let creation_log = root.path().join("creation.tsv");
     // The parent owns the log: an owner-write-removing child mask must only

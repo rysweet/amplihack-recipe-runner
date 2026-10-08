@@ -1,4 +1,5 @@
 //! Creation evidence checks and genuine observer failure controls.
+use anyhow::Context;
 use std::{fs, path::Path, process::Command};
 
 pub(super) const FAILURE_MARKER: &str = "FIFO_CREATION_OBSERVER_FAILURE";
@@ -122,7 +123,38 @@ unsafe extern "C" fn mkdir_at(path: *const libc::c_char, mode: libc::mode_t) -> 
     unsafe { libc::mkdirat(libc::AT_FDCWD, path, mode) }
 }
 
-pub(super) fn compile(source: &str, name: &str, root: &Path) -> std::path::PathBuf {
+#[test]
+fn compiler_failure_retains_diagnostics_before_worker_launch() {
+    for name in ["observer.so", "lifecycle.so"] {
+        let path =
+            super::run_observed_with_setup(0o022, WORKER, "fifo_compile_failure", None, |root| {
+                let source = root.join("invalid-fixture.c");
+                fs::write(&source, "#error FIFO_COMPILER_RETENTION_CONTROL\n")?;
+                Ok(compile(source.to_str().unwrap(), name, root)?
+                    .display()
+                    .to_string())
+            })
+            .expect_err("failed compiler was accepted as GREEN");
+        assert!(path.is_dir(), "failed setup root was deleted");
+        assert!(path.join(format!("{name}-compile.stdout")).is_file());
+        let stderr = fs::read_to_string(path.join(format!("{name}-compile.stderr"))).unwrap();
+        assert!(stderr.contains("FIFO_COMPILER_RETENTION_CONTROL"));
+        let diagnostic = fs::read_to_string(path.join("setup-error")).unwrap();
+        assert!(diagnostic.contains("fixture failed to compile"));
+        assert!(diagnostic.contains("FIFO_COMPILER_RETENTION_CONTROL"));
+        assert!(
+            !path.join("creation.tsv").exists(),
+            "worker setup continued after compiler failure"
+        );
+        assert!(
+            !path.join("stdout").exists(),
+            "worker launched after compiler failure"
+        );
+        println!("retained_failed_compile={name} evidence={path:?}");
+    }
+}
+
+pub(super) fn compile(source: &str, name: &str, root: &Path) -> anyhow::Result<std::path::PathBuf> {
     let library = root.join(name);
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -133,15 +165,34 @@ pub(super) fn compile(source: &str, name: &str, root: &Path) -> std::path::PathB
         .arg(&library)
         .arg(source)
         .arg("-ldl");
-    let output = command.output().unwrap();
-    fs::write(root.join(format!("{name}-compile.stdout")), &output.stdout).unwrap();
-    fs::write(root.join(format!("{name}-compile.stderr")), &output.stderr).unwrap();
+    let output = command
+        .output()
+        .with_context(|| format!("could not launch fixture compiler: {command:?}"))?;
+    fs::write(root.join(format!("{name}-compile.stdout")), &output.stdout)
+        .context("could not save compiler stdout")?;
+    fs::write(root.join(format!("{name}-compile.stderr")), &output.stderr)
+        .context("could not save compiler stderr")?;
+    fs::write(
+        root.join(format!("{name}-compile.command")),
+        format!("{command:?}"),
+    )
+    .context("could not save compiler command")?;
+    fs::write(
+        root.join(format!("{name}-compile.status")),
+        output.status.to_string(),
+    )
+    .context("could not save compiler status")?;
     println!(
         "fixture_compile command={command:?} exit={:?}",
         output.status.code()
     );
-    assert!(output.status.success(), "fixture failed to compile");
-    library
+    anyhow::ensure!(
+        output.status.success(),
+        "fixture failed to compile: {command:?}; status={}; stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(library)
 }
 
 pub(super) fn verify_creation(log: &Path) {
