@@ -201,8 +201,11 @@ The measured budget works together with the existing file-first context
 mechanism:
 
 - `RecipeContext::write_context_file()` serializes the full context to
-  `${TMPDIR}/amplihack-context-<pid>.json` with `0600` permissions and exports
-  `AMPLIHACK_CONTEXT_FILE` pointing at it.
+  a uniquely named `${TMPDIR}/amplihack-context-*.json` file and exports
+  `AMPLIHACK_CONTEXT_FILE` pointing at it. The file is created exclusively
+  with private temporary-file permissions (mode `0600` on Unix) before any
+  context bytes are written. It is retained only after writing and flushing
+  succeeds; failed writes remove the partial file.
 - `shell_env_for_step()` relocates large context to that file and keeps only a
   small subset of critical variables inline (each under 4 KiB), plus
   `AMPLIHACK_CONTEXT_FILE`.
@@ -271,14 +274,10 @@ child process or be triggered in production.
 
 ## Known limitations & follow-up
 
-- **Context temp-file TOCTOU (R7).** `write_context_file()` uses a predictable
-  path (`${TMPDIR}/amplihack-context-<pid>.json`) and creates it with `0600`
-  permissions. On a shared `TMPDIR` this leaves a small time-of-check /
-  time-of-use and symlink-following window between path selection and file
-  creation. The planned hardening is to create the file with `O_EXCL` (refusing
-  to follow an existing symlink) and/or a random suffix instead of the bare PID.
-  This does not affect the env-budget guarantees above; it is tracked as a
-  separate security follow-up.
+Context-file creation no longer uses a predictable PID path: the tempfile
+library creates a unique file without following a planted path, and the file is
+private before context bytes are written. The public `(PathBuf, env)` API and
+caller cleanup contract remain unchanged.
 
 ---
 
