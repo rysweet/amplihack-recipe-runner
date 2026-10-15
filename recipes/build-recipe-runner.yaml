@@ -32,7 +32,7 @@ steps:
     command: |
       cargo add serde --features derive && \
       cargo add serde_json && \
-      cargo add serde_yaml && \
+      cargo add serde_norway@0.9.42 --rename serde_yaml && \
       cargo add clap --features derive && \
       cargo add anyhow && \
       cargo add thiserror && \

@@ -29,7 +29,7 @@ fn project_root() -> PathBuf {
 }
 
 fn binary_path() -> PathBuf {
-    project_root().join("target/debug/recipe-runner-rs")
+    PathBuf::from(env!("CARGO_BIN_EXE_recipe-runner-rs"))
 }
 
 /// Write a YAML recipe file into the given directory and return its path.

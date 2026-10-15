@@ -30,6 +30,7 @@ recipe-runner-rs recipe.yaml -R ./recipes -R ../amplihack/amplifier-bundle/recip
 
 - **[Architecture](docs/src/architecture.md)** — Module design, data flow, adapter pattern
 - **[YAML Format Reference](docs/src/yaml-format.md)** — Complete recipe schema
+- **[Codex Agent Steps](docs/src/codex-exec.md)** — Noninteractive execution, configuration, results, and capability API
 - **[CLI Reference](docs/src/cli-reference.md)** — All commands, flags, exit codes
 - **[Condition Language](docs/src/conditions.md)** — Safe expression evaluator reference
 

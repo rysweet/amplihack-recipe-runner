@@ -236,7 +236,11 @@ original failure propagates.
 ## Model Override (`model`)
 
 Agent steps can override the default model using the `model` field. The value
-is passed to the adapter, which maps it to a specific model identifier.
+is passed to the selected provider adapter. For Codex, it is forwarded explicitly
+as `--model`; omission leaves selection to native Codex configuration. Codex
+never uses an implicit `auto` fallback. Choose a provider-supported identifier;
+the Claude examples below are not portable Codex model names. See
+[Codex agent steps](codex-exec.md).
 
 ```yaml
 - id: quick-check
