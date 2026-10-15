@@ -25,12 +25,10 @@ all-features = true
 # release cannot silently remain in Cargo.lock.
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-# Keep this exact unmaintained-only warning visible in cargo-audit while
-# allowing cargo-deny to pass: serde_yaml is the current recipe parser, and
-# replacing its archived unsafe-libyaml backend needs a parser migration.
-ignore = [
-    { id = "RUSTSEC-2024-0449", reason = "serde_yaml is the current recipe parser; replacing its archived backend requires a parser migration" },
-]
+# No advisories are currently ignored. If a transitive advisory ever needs a
+# temporary waiver, add it here with an explicit reason and a tracking issue,
+# e.g. { id = "RUSTSEC-XXXX-NNNN", reason = "...", }.
+ignore = []
 
 [licenses]
 # Allow-list of OSI/FSF-approved permissive (and permissive-data) licenses

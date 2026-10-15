@@ -20,5 +20,6 @@
 
 # Reference
 - [Architecture](architecture.md)
+- [Migration to 0.5.0](migration-v0.5.md)
 - [Codex Lifecycle](codex-lifecycle.md)
 - [Environment Budget & Safe Spawning](env-budget.md)

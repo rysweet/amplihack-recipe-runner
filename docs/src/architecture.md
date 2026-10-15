@@ -109,7 +109,7 @@ graph TD
       │
       ▼
  ┌──────────┐   file size check    ┌────────────┐
- │ parser.rs │ ──────────────────► │ serde_yaml  │
+ │ parser.rs │ ──────────────────► │ serde_norway │
  └──────────┘   MAX_YAML_SIZE 1MB  │ deserialize │
       │                            └─────┬──────┘
       │  validate: name, steps,          │
@@ -149,7 +149,7 @@ invocations fail before execution or update effects. See the
 
 1. `RecipeParser::parse_file` reads the file and rejects anything over 1 MB
    (YAML bomb protection).
-2. `serde_yaml` deserializes into `Recipe`. Step fields like `command`, `agent`,
+2. `serde_norway` (imported as `serde_yaml` for source compatibility) deserializes into `Recipe`. Step fields like `command`, `agent`,
    `prompt`, and `recipe` determine the implicit `StepType` via
    `Step::effective_type()`.
 3. Structural validation: name must be non-empty, at least one step required,
