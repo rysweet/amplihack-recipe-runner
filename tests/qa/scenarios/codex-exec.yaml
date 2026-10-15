@@ -1,0 +1,24 @@
+name: Codex exec CLI transport contract
+description: Run the published candidate through Codex exec and legacy-provider controls using an isolated fake launcher (Unix QA; requires bash, realpath, and Python 3).
+version: "1.0.0"
+config:
+  timeout: 180000
+  retries: 0
+  parallel: false
+environment:
+  requires: [RECIPE_RUNNER_QA_BINARY]
+agents:
+  - name: cli-agent
+    type: cli
+    config:
+      defaultTimeout: 180000
+steps:
+  - name: Candidate Codex transport and Claude/Copilot compatibility
+    agent: cli-agent
+    action: execute_command
+    target: bash tests/qa/codex-exec.sh
+    timeout: 180000
+assertions: []
+metadata:
+  tags: [recipe-runner, codex, transport, compatibility]
+  priority: critical

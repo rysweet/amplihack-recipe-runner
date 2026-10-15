@@ -14,11 +14,13 @@
 #include <stdatomic.h>
 #include <sys/wait.h>
 static ssize_t (*real_write)(int, const void *, size_t);
+static ssize_t (*real_read)(int, void *, size_t);
 static pid_t owner_pid;
 static int fork_calls;
 static pid_t launcher_pid, anchor_pid;
 static int anchor_probes, wait_faulted, owned_forks;
 static int armed, delivered, selected_signal, boundary, restore_fault, register_fault;
+static int require_anchor_ready, anchor_ready_observed;
 static int group_mode, int_restored, inflight, reset_race;
 static atomic_int retiring, attempting;
 static atomic_int entered, release_entry;
@@ -47,9 +49,13 @@ void lifecycle_arm(int signal, int at, int restoration, int registration, int gr
     if (!real_action || !real_kill) _exit(123);
     real_write = dlsym(RTLD_NEXT, "write");
     if (!real_write) _exit(138);
+    real_read = dlsym(RTLD_NEXT, "read");
+    if (!real_read) _exit(142);
     owner_pid = getpid(); fork_calls = 0;
     armed = 1; selected_signal = signal; inflight = at == 2; reset_race = at == 3; boundary = (inflight || reset_race) ? 0 : at;
     restore_fault = restoration; register_fault = registration; group_mode = group;
+    require_anchor_ready = getenv("LIFECYCLE_REQUIRE_ANCHOR_READY") != NULL;
+    anchor_ready_observed = 0;
 }
 int lifecycle_retiring(void) { return atomic_load_explicit(&retiring, memory_order_seq_cst); }
 int lifecycle_attempting_install(void) { atomic_store_explicit(&attempting, 1, memory_order_seq_cst); return 1; }
@@ -88,7 +94,9 @@ int sigaction(int sig, const struct sigaction *act, struct sigaction *old) {
     struct sigaction current;
     if (real_action(sig, NULL, &current)) _exit(124);
     if (product[index] && current.sa_handler == product[index]) {
-        if (!delivered && selected_signal && sig == (boundary ? SIGTERM : SIGINT)) {
+        if (!delivered && selected_signal &&
+            (!require_anchor_ready || anchor_ready_observed) &&
+            sig == (boundary ? SIGTERM : SIGINT)) {
             struct sigaction active;
             sigset_t blocked;
             int selected = selected_signal == SIGINT ? 0 : 1;
@@ -159,9 +167,6 @@ int kill(pid_t pid, int sig) {
     if (armed && getpid() == owner_pid && group_mode >= 14 && pid == -launcher_pid)
         event("group_signal_forwarded", sig);
     if (!armed || !group_mode || pid >= -1) return real_kill(pid, sig);
-    if (group_mode == 1 && zombie_only(-pid)) {
-        event("proven_zombie_only_EPERM", sig); errno = EPERM; return -1;
-    }
     if (group_mode == 13 && sig == SIGKILL) {
         if (real_kill(pid, SIGUSR1)) _exit(139);
         struct timespec pause = {0, 1000000};
@@ -169,11 +174,6 @@ int kill(pid_t pid, int sig) {
         event("helper_boundary_real_SIGUSR1", SIGUSR1);
     }
     int rc = real_kill(pid, sig), saved = errno;
-    if (group_mode == 1 && sig == SIGTERM && !rc) {
-        /* Only pace observation; preserve real TERM delivery and its result. */
-        struct timespec pause = {0, 1000000};
-        for (int i = 0; i < 100 && !zombie_only(-pid); ++i) nanosleep(&pause, NULL);
-    }
     if (group_mode == 2 && sig == SIGKILL) {
         event("genuine_KILL_EPERM_after_delivery", sig); errno = EPERM; return -1;
     }
@@ -241,8 +241,26 @@ ssize_t write(int fd, const void *buffer, size_t count) {
     if (!real_write) _exit(138);
     if (armed && getpid() != owner_pid && count == 1 && *(const unsigned char *)buffer == 0xA7) {
         if (group_mode == 8) { unsigned char wrong = 0x31; event("anchor_bad_ack", fd); return real_write(fd, &wrong, 1); }
-        if (group_mode == 9) { event("anchor_no_ack", fd); struct timespec pause = {0, 300000000}; nanosleep(&pause, NULL); return real_write(fd, buffer, count); }
+        if (group_mode == 9) { event("anchor_delayed_ack", fd); struct timespec pause = {0, 300000000}; nanosleep(&pause, NULL); return real_write(fd, buffer, count); }
+        if (group_mode == 10) { event("anchor_deadline_ack_delayed", fd); struct timespec pause = {2, 0}; nanosleep(&pause, NULL); return real_write(fd, buffer, count); }
         if (group_mode == 11) { event("anchor_failed_ack", fd); errno = EPIPE; return -1; }
+        if (group_mode == 18) {
+            event("anchor_cancel_signal_sent", fd);
+            if (real_kill(owner_pid, SIGINT)) _exit(143);
+            struct timespec pause = {0, 300000000}; nanosleep(&pause, NULL);
+            return real_write(fd, buffer, count);
+        }
     }
     return real_write(fd, buffer, count);
+}
+ssize_t read(int fd, void *buffer, size_t count) {
+    if (!real_read) real_read = dlsym(RTLD_NEXT, "read");
+    if (!real_read) _exit(142);
+    ssize_t result = real_read(fd, buffer, count);
+    if (armed && getpid() == owner_pid && require_anchor_ready && !anchor_ready_observed &&
+        result == 1 && count == 1 && *(const unsigned char *)buffer == 0xA7) {
+        anchor_ready_observed = 1;
+        event("anchor_readiness_observed", *(const unsigned char *)buffer);
+    }
+    return result;
 }

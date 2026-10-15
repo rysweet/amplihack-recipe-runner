@@ -1,4 +1,5 @@
 //! Preallocated private readiness/control endpoints and bounded parent I/O.
+use super::check_cancellation;
 use anyhow::Context;
 #[cfg(target_os = "linux")]
 use std::os::fd::FromRawFd;
@@ -40,12 +41,12 @@ impl Pipe {
         Ok(pipe)
     }
 }
-pub(super) fn acknowledge(fd: &OwnedFd, deadline: Instant) -> anyhow::Result<()> {
+pub(super) fn acknowledge(fd: &OwnedFd, deadline: Option<Instant>) -> anyhow::Result<()> {
     loop {
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "Timed out establishing Codex anchor readiness"
-        );
+        check_cancellation()?;
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            anyhow::bail!("Timed out establishing Codex anchor readiness");
+        }
         let mut byte = 0u8;
         let count = unsafe { libc::read(fd.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) };
         if count == 1 {

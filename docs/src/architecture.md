@@ -95,7 +95,7 @@ graph TD
 | `adapters/codex_exec/signal_observations.rs` | Persistent per-signal observable-entry publication without epoch resets |
 | `adapters/codex_exec/process.rs` | Owned child/group, complete stdin delivery, deadline and bounded shutdown |
 | `adapters/codex_exec/group_anchor.rs` | Non-cloneable retained group authority through final destructive access |
-| `adapters/codex_exec/anchor_io.rs` / `anchor_child.rs` | Bounded private helper readiness, descriptor isolation and lifetime |
+| `adapters/codex_exec/anchor_io.rs` / `anchor_child.rs` | Private helper readiness under the attempt deadline, cancellation polling, descriptor isolation and lifetime |
 | `adapters/codex_exec/launcher_cleanup.rs` | Direct-launcher retirement within shared absolute cleanup deadlines |
 | `adapters/codex_exec/diagnostics.rs` | Bounded pipe readers and secret-safe exit classification |
 | `adapters/codex_exec/final_output.rs` | Descriptor validation and exact bounded UTF-8 final-message reads |

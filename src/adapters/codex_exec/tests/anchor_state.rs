@@ -1,6 +1,8 @@
 //! Concrete private-helper protocol, reaping and sealed-authority contracts.
 use super::{GroupAnchor, validate_reaper};
-use crate::adapters::codex_exec::{CleanupFailure, process::OwnedProcess};
+use crate::adapters::codex_exec::{
+    CleanupFailure, Interruption, cancellation::Cancellation, process::OwnedProcess,
+};
 use std::os::unix::process::CommandExt;
 use std::{
     process::Command,
@@ -75,10 +77,13 @@ fn deny_close_range() {
     );
 }
 pub(in crate::adapters::codex_exec) fn worker(case: &str) {
-    if case.starts_with("protocol_") {
+    if matches!(
+        case,
+        "protocol_bad" | "protocol_timeout" | "protocol_pipe" | "protocol_enosys"
+    ) {
         let mode = match case {
             "protocol_bad" => 8,
-            "protocol_timeout" => 9,
+            "protocol_timeout" => 10,
             "protocol_pipe" => 11,
             "protocol_enosys" => 0,
             _ => panic!("unknown protocol case"),
@@ -91,13 +96,20 @@ pub(in crate::adapters::codex_exec) fn worker(case: &str) {
         let mut command = Command::new("/bin/sleep");
         command.arg("30");
         let started = Instant::now();
-        let error = match OwnedProcess::spawn(command, root.path(), root.path(), &[]) {
-            Err(error) => error,
-            Ok(mut child) => {
-                child.shutdown(&mut Vec::new());
-                panic!("invalid protocol succeeded");
-            }
+        let timeout = if case == "protocol_timeout" {
+            Some(1)
+        } else {
+            None
         };
+        let error =
+            match OwnedProcess::spawn_with_timeout(command, root.path(), root.path(), &[], timeout)
+            {
+                Err(error) => error,
+                Ok(mut child) => {
+                    child.shutdown(&mut Vec::new());
+                    panic!("invalid protocol succeeded");
+                }
+            };
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(error.downcast_ref::<CleanupFailure>().is_some());
         let diagnostic = format!("{error:#}");
@@ -107,7 +119,51 @@ pub(in crate::adapters::codex_exec) fn worker(case: &str) {
         }
         if case == "protocol_timeout" {
             assert!(diagnostic.contains("Timed out establishing"));
+            assert!(started.elapsed() >= Duration::from_secs(1));
         }
+        if case == "protocol_pipe" {
+            assert!(diagnostic.contains("exited before readiness"));
+        }
+        return;
+    }
+    if case == "protocol_delayed_ack" {
+        crate::adapters::codex_exec::tests::retirement_fixtures::arm(0, 0, 0, 0, 9);
+        let root = tempfile::tempdir().unwrap();
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let started = Instant::now();
+        let mut process =
+            OwnedProcess::spawn_with_timeout(command, root.path(), root.path(), &[], Some(10))
+                .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        let mut failures = Vec::new();
+        process.shutdown(&mut failures);
+        assert!(
+            failures.is_empty(),
+            "delayed ready helper cleanup: {failures:?}"
+        );
+        return;
+    }
+    if case == "protocol_cancel" {
+        crate::adapters::codex_exec::tests::retirement_fixtures::arm(0, 0, 0, 0, 18);
+        let cancellation = Cancellation::install().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let spawn = OwnedProcess::spawn_with_timeout(command, root.path(), root.path(), &[], None);
+        let error = match spawn {
+            Err(error) => error,
+            Ok(mut process) => {
+                process.shutdown(&mut Vec::new());
+                panic!("no-timeout startup ignored cancellation");
+            }
+        };
+        let error = super::super::combine_result(Err::<(), _>(error), cancellation.close())
+            .expect_err("cancellation must remain terminal");
+        assert!(error.downcast_ref::<Interruption>().is_some(), "{error:#}");
+        assert!(format!("{error:#}").contains("cancelled by signal 2"));
+        let events = std::fs::read_to_string(std::env::var("LIFECYCLE_EVENTS").unwrap()).unwrap();
+        assert!(events.contains("anchor_cancel_signal_sent"));
         return;
     }
     if case == "state_boundary" {
@@ -123,7 +179,7 @@ pub(in crate::adapters::codex_exec) fn worker(case: &str) {
     };
     let mut anchor = GroupAnchor::establish(
         &mut child,
-        Instant::now() + Duration::from_millis(100),
+        Some(Instant::now() + Duration::from_millis(100)),
         lifetime,
     )
     .unwrap();
@@ -229,6 +285,11 @@ macro_rules! isolated {
 isolated!(invalid_ack_refuses_and_unwinds, "protocol_bad");
 isolated!(withheld_ack_times_out_and_unwinds, "protocol_timeout");
 isolated!(failed_ack_refuses_and_unwinds, "protocol_pipe");
+isolated!(
+    delayed_ack_uses_configured_attempt_deadline,
+    "protocol_delayed_ack"
+);
+isolated!(no_timeout_ack_wait_observes_cancellation, "protocol_cancel");
 isolated!(
     unavailable_close_range_refuses_and_unwinds,
     "protocol_enosys"

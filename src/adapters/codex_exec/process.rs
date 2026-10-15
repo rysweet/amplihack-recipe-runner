@@ -98,10 +98,7 @@ impl OwnedProcess {
                 return Err(super::group_anchor::startup_failure(&mut child, error));
             }
         };
-        let startup = deadline.map_or(started + Duration::from_millis(100), |d| {
-            d.min(started + Duration::from_millis(100))
-        });
-        let anchor = GroupAnchor::establish(&mut child, startup, lifetime)?;
+        let anchor = GroupAnchor::establish(&mut child, deadline, lifetime)?;
         Ok(Self {
             child,
             anchor,

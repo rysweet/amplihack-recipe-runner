@@ -127,6 +127,12 @@ fn adapter_worker() {
         "owned signal used prior handler"
     );
     let events = fs::read_to_string(root.join("events")).unwrap();
+    assert_eq!(
+        std::env::var("LIFECYCLE_REQUIRE_ANCHOR_READY").as_deref(),
+        Ok("1"),
+        "full-adapter fixture must require observed helper readiness"
+    );
+    assert!(events.contains("anchor_readiness_observed"), "{events}");
     assert!(events.contains("verified_owned_unblocked"));
     assert!(events.contains("real_raise_return value=0"));
     if signal == libc::SIGTERM {

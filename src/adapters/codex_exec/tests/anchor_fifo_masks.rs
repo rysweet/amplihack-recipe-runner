@@ -102,6 +102,9 @@ fn run_observed_with_setup(
         .env("LIFECYCLE_EVENTS", root.path().join("events"))
         .stdout(fs::File::create(root.path().join("stdout")).unwrap())
         .stderr(fs::File::create(root.path().join("stderr")).unwrap());
+    if case.starts_with("adapter_") {
+        command.env("LIFECYCLE_REQUIRE_ANCHOR_READY", "1");
+    }
     // Ambient instrumentation faults must never affect ordinary observations.
     command.env_remove("FIFO_CREATION_FAULT");
     if let Some(fault) = fault {

@@ -46,7 +46,7 @@ pub(super) struct GroupAnchor {
 impl GroupAnchor {
     pub(super) fn establish(
         launcher: &mut Child,
-        deadline: Instant,
+        deadline: Option<Instant>,
         lifetime_ms: Option<u64>,
     ) -> anyhow::Result<Self> {
         let group = i32::try_from(launcher.id()).context("Invalid Codex launcher identity")?;
@@ -56,7 +56,11 @@ impl GroupAnchor {
             Err(error) => Err(startup_failure(launcher, error)),
         }
     }
-    fn start(group: i32, deadline: Instant, lifetime_ms: Option<u64>) -> anyhow::Result<Self> {
+    fn start(
+        group: i32,
+        deadline: Option<Instant>,
+        lifetime_ms: Option<u64>,
+    ) -> anyhow::Result<Self> {
         validate_reaper()?;
         anyhow::ensure!(
             group > 1 && group != unsafe { libc::getpgrp() },

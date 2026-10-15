@@ -10,7 +10,7 @@ use std::{
 
 pub(super) fn worker(case: &str) {
     let mode = match case {
-        "group_zombie" => 1,
+        "group_teardown" => 0,
         "group_kill" => 2,
         "group_term" => 3,
         _ => panic!("unknown group case"),
@@ -44,10 +44,10 @@ pub(super) fn worker(case: &str) {
     let error =
         finish_resources(Err(anyhow::anyhow!("primary ordinary timeout")), cleanup).unwrap_err();
     assert!(format!("{error:#}").contains("primary ordinary timeout"));
-    if mode == 1 {
+    if mode == 0 {
         assert!(
             error.downcast_ref::<CleanupFailure>().is_none(),
-            "resolved proven zombie-only state became terminal: {error:#}"
+            "ordinary successful group teardown became terminal: {error:#}"
         );
     } else {
         assert!(
@@ -59,8 +59,8 @@ pub(super) fn worker(case: &str) {
 }
 
 #[test]
-fn resolved_zombie_only_group_retains_ordinary_error() {
-    super::retirement_fixtures::run("group_zombie");
+fn ordinary_group_teardown_retains_primary_error() {
+    super::retirement_fixtures::run("group_teardown");
 }
 #[test]
 fn genuine_kill_permission_failure_survives_final_absence() {

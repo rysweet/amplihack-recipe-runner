@@ -36,7 +36,7 @@ fn optional(case: &str, file: &str) -> bool {
                 | "protocol_enosys"
                 | "descriptors_concurrent"
                 | "anchor_unexpected_exit"
-                | "group_zombie"
+                | "group_teardown"
         ),
         // Only adapter signal workers create this script in the outer fixture.
         "launcher" => !case.starts_with("adapter_"),
