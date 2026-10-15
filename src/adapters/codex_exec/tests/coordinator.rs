@@ -40,7 +40,11 @@ fn delayed_stderr_reader_preserves_terminal_rate_limit() {
 fn reader_failure_triggers_cleanup_without_execution_timeout() {
     let resources = tempfile::tempdir().unwrap();
     let mut command = Command::new("/bin/sh");
-    command.args(["-c", "echo $$ > launcher.pid; exec sleep 30"]);
+    command.args([
+        "-c",
+        "printf '%s\\n' \"$$\" > launcher.pid.tmp && /bin/mv launcher.pid.tmp launcher.pid && exec sleep 30",
+    ]);
+    let launcher_pid_path = resources.path().join("launcher.pid");
     let started = Instant::now();
     let error = execute_with_readers(
         command,
@@ -51,10 +55,37 @@ fn reader_failure_triggers_cleanup_without_execution_timeout() {
         None,
         |stdout, stderr, stop| {
             let failed = stop.clone();
+            let pid_path = launcher_pid_path.clone();
             let reader = std::thread::spawn(move || {
+                // Do not inject the reader failure while the launcher is still
+                // publishing its PID. Otherwise the test can observe an empty
+                // file created by shell redirection and fail before checking
+                // whether cleanup killed the owned process group.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let pid_published = loop {
+                    match std::fs::read_to_string(&pid_path) {
+                        Ok(contents) if contents.trim().parse::<i32>().is_ok() => break true,
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            drop(stdout);
+                            failed.store(true, std::sync::atomic::Ordering::Release);
+                            return Err(error);
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                };
                 drop(stdout);
                 failed.store(true, std::sync::atomic::Ordering::Release);
-                Err(std::io::Error::other("injected reader error"))
+                let reason = if pid_published {
+                    "injected reader error"
+                } else {
+                    "launcher PID publication timed out before injected reader error"
+                };
+                Err(std::io::Error::other(reason))
             });
             let stderr = drain_diagnostics(stderr, stop);
             (reader, stderr)
@@ -63,9 +94,15 @@ fn reader_failure_triggers_cleanup_without_execution_timeout() {
     .unwrap_err();
     assert!(started.elapsed() < Duration::from_secs(3));
     assert!(format!("{error:#}").contains("diagnostic reader failed"));
-    if let Ok(pid) = std::fs::read_to_string(resources.path().join("launcher.pid")) {
-        assert!(!group_live(pid.trim().parse().unwrap()).unwrap());
-    }
+    let pid = std::fs::read_to_string(&launcher_pid_path)
+        .expect("launcher must atomically publish its PID before reader failure")
+        .trim()
+        .parse::<i32>()
+        .expect("published launcher PID must be valid");
+    assert!(
+        !group_live(pid).unwrap(),
+        "reader failure cleanup must kill the published launcher group"
+    );
 }
 
 #[test]

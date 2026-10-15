@@ -1403,39 +1403,37 @@ impl<A: Adapter> RecipeRunner<A> {
                 // condition comparisons like `count != '1'` work correctly.
                 let output = raw_output.trim_end().to_string();
                 // Apply parse_json if requested
-                let (final_output, status) = if step.parse_json && !output.is_empty() {
+                let (final_output, status, error) = if step.parse_json && !output.is_empty() {
                     match parse_json_output(&output, &step.id) {
                         Some(parsed) => (
                             serde_json::to_string(&parsed).unwrap_or(output),
                             StepStatus::Completed,
+                            String::new(),
                         ),
                         None => {
                             if step.parse_json_required {
-                                return StepResult {
-                                    step_id: step.id.clone(),
-                                    status: StepStatus::Failed,
-                                    output: String::new(),
-                                    error: "parse_json failed: output is not valid JSON"
-                                        .to_string(),
-                                    duration: Some(step_start.elapsed()),
-                                }
-                                .into();
+                                (
+                                    String::new(),
+                                    StepStatus::Failed,
+                                    "parse_json failed: output is not valid JSON".to_string(),
+                                )
+                            } else {
+                                warn!(
+                                    "Step '{}': parse_json failed on bash step, using raw output (degraded)",
+                                    step.id
+                                );
+                                (output, StepStatus::Degraded, String::new())
                             }
-                            warn!(
-                                "Step '{}': parse_json failed on bash step, using raw output (degraded)",
-                                step.id
-                            );
-                            (output, StepStatus::Degraded)
                         }
                     }
                 } else {
-                    (output, StepStatus::Completed)
+                    (output, StepStatus::Completed, String::new())
                 };
                 StepResult {
                     step_id: step.id.clone(),
                     status,
                     output: final_output,
-                    error: String::new(),
+                    error,
                     duration: Some(step_start.elapsed()),
                 }
             }
@@ -1631,6 +1629,87 @@ mod tests {
         fn name(&self) -> &str {
             "mock"
         }
+    }
+
+    struct ContextFileCaptureAdapter(std::sync::Mutex<Option<std::path::PathBuf>>);
+
+    impl Adapter for ContextFileCaptureAdapter {
+        fn execute_agent_step(
+            &self,
+            _prompt: &str,
+            _agent_name: Option<&str>,
+            _system_prompt: Option<&str>,
+            _mode: Option<&str>,
+            _working_dir: &str,
+            _model: Option<&str>,
+            _timeout: Option<u64>,
+        ) -> Result<String, anyhow::Error> {
+            anyhow::bail!("agent execution is not used by this test")
+        }
+
+        fn execute_bash_step(
+            &self,
+            _command: &str,
+            _working_dir: &str,
+            _timeout: Option<u64>,
+            extra_env: &std::collections::HashMap<String, String>,
+        ) -> Result<String, anyhow::Error> {
+            *self.0.lock().unwrap() = extra_env
+                .get("AMPLIHACK_CONTEXT_FILE")
+                .map(std::path::PathBuf::from);
+            Ok("not-json".to_string())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "context-file-capture"
+        }
+    }
+
+    struct ResetEnvBudget;
+
+    impl Drop for ResetEnvBudget {
+        fn drop(&mut self) {
+            crate::context::clear_env_byte_budget_for_test();
+        }
+    }
+
+    #[test]
+    fn required_json_failure_still_removes_spilled_parallel_context_file() {
+        let _budget_lock = crate::context::ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        crate::context::set_env_byte_budget_for_test(1);
+        let _reset = ResetEnvBudget;
+        let recipe = RecipeParser::new()
+            .parse(
+                "name: invalid-json\nsteps:\n  - id: parse\n    type: bash\n    command: echo invalid\n    parse_json: true\n    parse_json_required: true\n    parallel_group: cleanup\n",
+            )
+            .unwrap();
+        let context = RecipeContext::new(HashMap::from([(
+            "large".to_string(),
+            Value::String("x".repeat(8192)),
+        )]));
+        let adapter = ContextFileCaptureAdapter(std::sync::Mutex::new(None));
+
+        let outcome = RecipeRunner::execute_bash_step_parallel(
+            &recipe.steps[0],
+            &context,
+            &adapter,
+            ".",
+            false,
+            &TerminalState::default(),
+        );
+
+        assert_eq!(outcome.result.status, StepStatus::Failed);
+        assert!(outcome.result.error.contains("parse_json failed"));
+        let path = adapter.0.lock().unwrap().clone().unwrap();
+        assert!(
+            !path.exists(),
+            "parallel JSON failure must clean up spilled context file {}",
+            path.display()
+        );
     }
 
     #[test]

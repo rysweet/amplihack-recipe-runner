@@ -7,6 +7,7 @@ use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 #[cfg(test)]
 use std::sync::Mutex;
@@ -441,18 +442,15 @@ impl RecipeContext {
     pub fn write_context_file(
         &self,
     ) -> std::io::Result<(std::path::PathBuf, HashMap<String, String>)> {
+        self.write_context_file_in(&std::env::temp_dir())
+    }
+
+    fn write_context_file_in(
+        &self,
+        directory: &Path,
+    ) -> std::io::Result<(PathBuf, HashMap<String, String>)> {
         let json = serde_json::to_string_pretty(&self.data).map_err(std::io::Error::other)?;
-        let path =
-            std::env::temp_dir().join(format!("amplihack-context-{}.json", std::process::id()));
-        let mut file = std::fs::File::create(&path)?;
-        file.write_all(json.as_bytes())?;
-        file.flush()?;
-        // Restrict permissions (owner-only read/write)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        let path = persist_private_context_file(directory, |file| file.write_all(json.as_bytes()))?;
         log::info!(
             "Context written to {} ({} bytes, {} keys)",
             path.display(),
@@ -574,6 +572,23 @@ impl RecipeContext {
         log::trace!("RecipeContext::to_map: cloning {} keys", self.data.len());
         self.data.clone()
     }
+}
+
+/// Persist sensitive context through a unique, owner-private temporary file.
+/// The tempfile is kept only after writing and flushing succeed; on every
+/// earlier error its drop removes the incomplete file.
+fn persist_private_context_file(
+    directory: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
+    let mut tempfile = tempfile::Builder::new()
+        .prefix("amplihack-context-")
+        .suffix(".json")
+        .tempfile_in(directory)?;
+    write(tempfile.as_file_mut())?;
+    tempfile.as_file_mut().flush()?;
+    let (_file, path) = tempfile.keep().map_err(|error| error.error)?;
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -1413,6 +1428,111 @@ mod tests {
             let _ = std::fs::remove_file(p);
         }
         clear_env_byte_budget_for_test();
+    }
+
+    #[test]
+    fn context_file_does_not_follow_or_truncate_planted_legacy_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("protected.json");
+        std::fs::write(&target, b"keep this content").unwrap();
+        let legacy = directory
+            .path()
+            .join(format!("amplihack-context-{}.json", std::process::id()));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &legacy).unwrap();
+        #[cfg(not(unix))]
+        std::fs::write(&legacy, b"pre-existing file").unwrap();
+
+        let context = ctx(vec![("secret", json!("private value"))]);
+        let (path, env) = context.write_context_file_in(directory.path()).unwrap();
+
+        assert_ne!(path, legacy);
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep this content");
+        #[cfg(unix)]
+        assert_eq!(std::fs::read_link(&legacy).unwrap(), target);
+        #[cfg(not(unix))]
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"pre-existing file");
+        let path_from_env = env.get("AMPLIHACK_CONTEXT_FILE").unwrap();
+        assert_eq!(path_from_env, &path.to_string_lossy());
+        let contents: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(contents["secret"], "private value");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_context_files_are_unique_private_and_keep_independent_payloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = ctx(vec![("payload", json!("first context"))]);
+        let second = ctx(vec![("payload", json!("second context"))]);
+        let first_dir = directory.path().to_path_buf();
+        let second_dir = directory.path().to_path_buf();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_start = std::sync::Arc::clone(&start);
+        let second_start = std::sync::Arc::clone(&start);
+
+        let first_thread = std::thread::spawn(move || {
+            first_start.wait();
+            first.write_context_file_in(&first_dir).unwrap().0
+        });
+        let second_thread = std::thread::spawn(move || {
+            second_start.wait();
+            second.write_context_file_in(&second_dir).unwrap().0
+        });
+        let first_path = first_thread.join().unwrap();
+        let second_path = second_thread.join().unwrap();
+
+        assert_ne!(first_path, second_path);
+        let first_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&first_path).unwrap()).unwrap();
+        let second_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&second_path).unwrap()).unwrap();
+        assert_eq!(first_json["payload"], "first context");
+        assert_eq!(second_json["payload"], "second context");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&first_path, &second_path] {
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn context_tempfile_is_private_before_first_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = persist_private_context_file(directory.path(), |file| {
+            assert_eq!(file.metadata()?.permissions().mode() & 0o777, 0o600);
+            file.write_all(b"private from creation")
+        })
+        .unwrap();
+
+        assert_eq!(std::fs::read(path).unwrap(), b"private from creation");
+    }
+
+    #[test]
+    fn failed_context_write_removes_partial_private_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let result = persist_private_context_file(directory.path(), |file| {
+            file.write_all(b"partial context")?;
+            Err(std::io::Error::other("injected write failure"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     // ── Property-based tests (PR4: audit/proptest-parser-template) ──────
