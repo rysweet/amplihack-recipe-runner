@@ -143,6 +143,8 @@ recipe-runner-rs refactor.yaml --no-auto-stage -C /path/to/repo
 
 Parse and validate the recipe, print any warnings, then exit. Does not execute any steps. More thorough than `--dry-run` as it focuses on surfacing validation warnings.
 
+Unknown step fields are listed once, in the same wording a normal run uses, and the command still exits `0` because they are warnings. A normal run reports the same unknown fields as parse-time warnings and keeps going (see [Unknown and retired step fields](yaml-format.md#unknown-and-retired-step-fields)). `--validate-only` doesn't repeat them as parse-time warnings.
+
 ```bash
 recipe-runner-rs deploy.yaml --validate-only
 
@@ -282,7 +284,7 @@ recipe-runner-rs deploy.yaml --output-format json --progress 2>/dev/null
 |------|---------|-------------|
 | `0` | Success | Recipe completed successfully; all steps passed |
 | `1` | Failure | Recipe failed; at least one step failed during execution |
-| `2` | Parse/validation error | Invalid YAML syntax, unknown fields, or other validation errors |
+| `2` | Parse/validation error | Invalid YAML syntax, missing required fields, or other parse errors. Unknown step fields are warnings, not errors. |
 
 ```bash
 # Check exit code in scripts

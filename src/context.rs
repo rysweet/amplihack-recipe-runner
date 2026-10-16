@@ -44,14 +44,15 @@ static HEREDOC_START_RE: LazyLock<Regex> = LazyLock::new(|| {
 // command path and argv (large argv/scripts are spilled to files elsewhere).
 //
 // The value is cached in a `OnceLock` and exposed through the single accessor
-// [`env_byte_budget`], which both the context layer
-// ([`RecipeContext::shell_env_for_step`]) and the subprocess layer
-// (`cli_subprocess::bounded_env`) consult so the two can never drift.
+// [`env_byte_budget`], which both the bash-step spill planner
+// (`env_spill::spill_for_bash`) and `cli_subprocess::bounded_env` consult so
+// the two can never drift.
 
 /// Conservative floor used only when `sysconf`/`getrlimit` are unavailable or
 /// when subtracting the argv reserve would leave a pathologically small (or
-/// underflowed) budget. 256 KiB comfortably exceeds a curated file-first env
-/// yet stays well under any real `ARG_MAX`.
+/// underflowed) budget. 256 KiB comfortably holds a typical curated env,
+/// with larger recipe values spilled to files, yet stays well under any real
+/// `ARG_MAX`.
 pub(crate) const ENV_BUDGET_FLOOR: usize = 256 * 1024;
 
 /// Headroom reserved for the command path plus argv, kept separate from the
@@ -428,17 +429,18 @@ impl RecipeContext {
     pub fn env_vars_size(&self) -> usize {
         self.shell_env_vars()
             .iter()
-            .map(|(k, v)| k.len() + v.len() + 1) // key=value\0
+            .map(|(k, v)| k.len() + 1 + v.len() + 1) // key=value\0
             .sum()
     }
 
-    /// Write full context as JSON to a temp file and return (path, minimal env).
+    /// Write full context as JSON to a private temp file and return
+    /// (path, env containing only `AMPLIHACK_CONTEXT_FILE`).
     ///
-    /// The returned `HashMap` contains only `AMPLIHACK_CONTEXT_FILE` pointing to
-    /// the temp file. Bash steps can read values with:
-    ///   `jq -r '.var_name' "$AMPLIHACK_CONTEXT_FILE"`
+    /// Not used by step execution: since #130 bash steps receive every
+    /// `RECIPE_VAR_*` value, with oversized values spilled to private files by
+    /// the adapter. Kept for library callers that want a JSON snapshot.
     ///
-    /// The caller is responsible for cleaning up the temp file after step execution.
+    /// The caller is responsible for removing the file.
     pub fn write_context_file(
         &self,
     ) -> std::io::Result<(std::path::PathBuf, HashMap<String, String>)> {
@@ -465,55 +467,16 @@ impl RecipeContext {
         Ok((path, env))
     }
 
-    /// Return env vars for a bash step, using file-based context when the total
-    /// env size exceeds the OS argument list limit (~2MB on Linux).
+    /// Return the env vars for a bash step: every `RECIPE_VAR_*` value plus
+    /// the legacy uppercase aliases, exactly [`Self::shell_env_vars`].
     ///
-    /// Returns (env_vars, Option<temp_file_path>). The caller must clean up
-    /// the temp file after the step completes.
-    pub fn shell_env_for_step(&self) -> (HashMap<String, String>, Option<std::path::PathBuf>) {
-        // Single source of truth: the runtime-MEASURED budget (replaces the old
-        // hardcoded `MAX_ENV_BYTES = 1_500_000` literal). Shared with
-        // `cli_subprocess::bounded_env` so the layers never disagree.
-        let max_env_bytes = env_byte_budget();
-        let env_vars = self.shell_env_vars();
-        let total_size: usize = env_vars.iter().map(|(k, v)| k.len() + v.len() + 1).sum();
-
-        if total_size > max_env_bytes {
-            log::warn!(
-                "Context env size ({} bytes) exceeds measured budget ({} bytes) — using file-based context",
-                total_size,
-                max_env_bytes,
-            );
-            match self.write_context_file() {
-                Ok((path, file_env)) => {
-                    // Include a small subset of critical vars directly in env
-                    // so basic scripts still work without jq
-                    let mut combined = file_env;
-                    for key in [
-                        "task_description",
-                        "repo_path",
-                        "task_type",
-                        "workstream_count",
-                    ] {
-                        if let Some(val) = env_vars.get(&Self::env_key(key)) {
-                            // Only include if the value is small
-                            if val.len() < 4096 {
-                                combined.insert(Self::env_key(key), val.clone());
-                            }
-                        }
-                    }
-                    return (combined, Some(path));
-                }
-                Err(e) => {
-                    log::error!(
-                        "Failed to write context file, falling back to env vars: {}",
-                        e
-                    );
-                    // Fall through to env vars — may still fail with E2BIG
-                }
-            }
-        }
-        (env_vars, None)
+    /// #130: this used to replace the whole set with `AMPLIHACK_CONTEXT_FILE`
+    /// plus four small vars when the total exceeded the budget, so scripts
+    /// silently read every other var as empty. The subprocess adapter now
+    /// spills individual oversized values to private files and reads them back
+    /// before the script runs, so nothing is dropped here.
+    pub fn shell_env_for_step(&self) -> HashMap<String, String> {
+        self.shell_env_vars()
     }
 
     /// Convert a template variable name to an env var key.
@@ -1402,32 +1365,31 @@ mod tests {
     }
 
     #[test]
-    fn test_shell_env_for_step_uses_shared_budget_accessor() {
-        // With the old 1_500_000 literal an 8 KiB env would NOT spill; forcing a
-        // tiny shared budget must make shell_env_for_step spill to a file-first
-        // context (AMPLIHACK_CONTEXT_FILE), proving it reads the single shared
-        // accessor rather than a hardcoded ceiling.
-        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
-        set_env_byte_budget_for_test(64);
-
+    fn shell_env_for_step_passes_every_var_regardless_of_budget() {
+        // #130: going over the shared budget used to replace the env with
+        // AMPLIHACK_CONTEXT_FILE plus four small vars, so every other var read
+        // as empty. The adapter now spills individual values to files, so the
+        // context layer must hand over every var regardless of the budget.
         let c = ctx(vec![
             ("task_description", json!("do the thing")),
             ("big", json!("x".repeat(8192))),
         ]);
-        let (env, temp) = c.shell_env_for_step();
+        let env = c.shell_env_for_step();
 
-        assert!(
-            env.contains_key("AMPLIHACK_CONTEXT_FILE"),
-            "tiny shared budget must trigger file-first spill (not the 1_500_000 literal)"
+        assert_eq!(env, c.shell_env_vars(), "every var must be passed through");
+        assert_eq!(
+            env.get("RECIPE_VAR_big").map(String::len),
+            Some(8192),
+            "large var must not be dropped"
+        );
+        assert_eq!(
+            env.get("RECIPE_VAR_task_description").map(String::as_str),
+            Some("do the thing")
         );
         assert!(
-            temp.is_some(),
-            "spill must return a temp file path for the caller to clean up"
+            !env.contains_key("AMPLIHACK_CONTEXT_FILE"),
+            "the lossy four-variable fallback must be gone"
         );
-        if let Some(p) = temp {
-            let _ = std::fs::remove_file(p);
-        }
-        clear_env_byte_budget_for_test();
     }
 
     #[test]
