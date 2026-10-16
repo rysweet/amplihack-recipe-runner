@@ -7,7 +7,9 @@
 /// when running inside a nested Claude Code session (#2758). Session tree env
 /// vars are propagated so child processes respect recursion depth limits.
 use crate::adapters::Adapter;
+use crate::adapters::env_spill::{self, PER_VALUE_ENV_CAP, env_pair_bytes};
 use anyhow::Context;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
@@ -66,8 +68,8 @@ pub(crate) fn read_capped(path: &Path, max_bytes: usize) -> std::io::Result<Stri
 /// silently break the child (broken `PATH`/`HOME`), sever the session tree
 /// (`AMPLIHACK_*`), or discard required recipe inputs (`RECIPE_VAR_*` and the
 /// critical scalars). Everything else is inherited convenience that MAY be
-/// dropped losslessly — its full value still lives in the file-first context
-/// referenced by `AMPLIHACK_CONTEXT_FILE`.
+/// dropped: recipe values reach bash steps via `RECIPE_VAR_*` (spilled to
+/// private files when too large, see `env_spill`), not via inherited vars.
 pub(crate) fn is_env_protected(name: &str) -> bool {
     const PROTECTED_NAMES: &[&str] = &[
         "PATH",
@@ -301,12 +303,6 @@ fn into_trimmed_string(bytes: Vec<u8>) -> String {
     s
 }
 
-/// Byte cost of a single `key=value\0` environment entry, matching the kernel's
-/// accounting for argv/envp copied during `execve`.
-fn env_pair_bytes(key: &str, value: &str) -> usize {
-    key.len() + value.len() + 1
-}
-
 /// #130: the env budget was exceeded by *protected* variables that cannot be
 /// dropped. Carries NAMES and SIZES only — never values — so it is safe to log,
 /// `Display`, and `Debug` without leaking secrets (R1).
@@ -334,9 +330,9 @@ impl std::fmt::Display for EnvBudgetError {
             f,
             "child environment exceeds the measured argument/env budget: protected \
              variable(s) {:?} require {} bytes but only {} bytes are available, and \
-             these variables cannot be dropped. Move large payloads out of the \
-             environment and into the file-first context referenced by \
-             AMPLIHACK_CONTEXT_FILE instead of passing them as env vars.",
+             these variables cannot be dropped. Recipe values are spilled to private \
+             files automatically; large inherited or protected variables must be \
+             moved out of the environment before running the recipe.",
             self.offending, self.protected_bytes, self.budget,
         )
     }
@@ -347,8 +343,9 @@ impl std::error::Error for EnvBudgetError {}
 /// #130: build a child environment guaranteed to fit inside the MEASURED byte
 /// budget ([`crate::context::env_byte_budget`]).
 ///
-/// Non-protected inherited variables are dropped largest-first (lossless — they
-/// remain recoverable from `AMPLIHACK_CONTEXT_FILE`) with a NAMES-only warning.
+/// Non-protected inherited variables are dropped largest-first with a
+/// NAMES-only warning. Bash steps spill recipe values to private files first
+/// (`env_spill`), so only ambient inherited variables are ever dropped here.
 /// If, after dropping every non-protected entry, the remaining *protected*
 /// variables still exceed the budget, this FAILS LOUD with an
 /// [`EnvBudgetError`] naming them — it never silently drops a protected value
@@ -371,14 +368,14 @@ pub(crate) fn bounded_env(
     let protected_bytes: usize = protected.iter().map(|(k, v)| env_pair_bytes(k, v)).sum();
 
     // Fail loud: protected variables alone cannot be made to fit. Naming them
-    // (names only) lets the operator relocate the payload into the file-first
-    // context rather than hitting an opaque E2BIG.
+    // (names only) lets the operator move the payload out of the environment
+    // rather than hitting an opaque E2BIG.
     if protected_bytes > budget {
         let offending: Vec<String> = protected.iter().map(|(k, _)| k.clone()).collect();
         log::error!(
             "bounded_env: protected env var(s) exceed measured budget ({} > {} bytes); \
-             refusing to spawn. Offending (names only): {:?}. Relocate large values to \
-             AMPLIHACK_CONTEXT_FILE.",
+             refusing to spawn. Offending (names only): {:?}. Move large inherited or \
+             protected values out of the environment.",
             protected_bytes,
             budget,
             offending,
@@ -535,6 +532,12 @@ pub struct CLISubprocessAdapter {
     working_dir: String,
 }
 
+/// #130: whether an inherited `KEY=value\0` string is too large to pass to
+/// any child (`env_pair_bytes > PER_VALUE_ENV_CAP`).
+fn inherited_env_entry_too_large(key: &str, value: &str) -> bool {
+    env_pair_bytes(key, value) > PER_VALUE_ENV_CAP
+}
+
 impl CLISubprocessAdapter {
     pub fn new() -> Self {
         // Use AMPLIHACK_AGENT_BINARY env var if set, otherwise default to "claude"
@@ -569,19 +572,19 @@ impl CLISubprocessAdapter {
     fn build_child_env() -> HashMap<String, String> {
         log::debug!("CLISubprocessAdapter::build_child_env: building child environment");
 
-        // #130 root-cause defense: a single inherited env value larger than the
-        // kernel's per-argument cap (`MAX_ARG_STRLEN`, 128 KiB) makes `execve`
-        // fail with `E2BIG` (`os error 7`) no matter how small our own vars are.
-        // Such an oversized *inherited* value is unusable by any child anyway,
-        // so we sanitize it out here (names only in the log). The variables we
-        // explicitly set below (session tree, PATH/HOME) are always small and
-        // are added after this filter, so they are never affected.
-        const MAX_SINGLE_ENV_VALUE_BYTES: usize = 128 * 1024;
+        // #130 root-cause defense: a single inherited `KEY=value\0` string
+        // longer than the kernel's per-string cap (`MAX_ARG_STRLEN`, 128 KiB)
+        // makes `execve` fail with `E2BIG` (`os error 7`) no matter how small
+        // our own vars are. Such an oversized *inherited* value is unusable by
+        // any child anyway, so we sanitize it out here (names only in the log).
+        // The variables we explicitly set below (session tree, PATH/HOME) are
+        // always small and are added after this filter, so they are never
+        // affected.
         let mut oversized: Vec<String> = Vec::new();
         let mut child_env: HashMap<String, String> = env::vars()
             .filter(|(k, _)| k != "CLAUDECODE")
             .filter(|(k, v)| {
-                if v.len() > MAX_SINGLE_ENV_VALUE_BYTES {
+                if inherited_env_entry_too_large(k, v) {
                     oversized.push(k.clone());
                     false
                 } else {
@@ -591,12 +594,11 @@ impl CLISubprocessAdapter {
             .collect();
         if !oversized.is_empty() {
             log::warn!(
-                "build_child_env: dropped {} oversized inherited env var(s) (> {} bytes each) \
-                 that would blow execve regardless of any other setting. Pass large payloads \
-                 to steps via the file-first context (AMPLIHACK_CONTEXT_FILE) instead of the \
-                 environment. Dropped (names only): {:?}",
+                "build_child_env: dropped {} oversized inherited env var(s) (KEY=value over \
+                 {} bytes each) that would blow execve regardless of any other setting. Move \
+                 large inherited payloads out of the environment. Dropped (names only): {:?}",
                 oversized.len(),
-                MAX_SINGLE_ENV_VALUE_BYTES,
+                PER_VALUE_ENV_CAP,
                 oversized,
             );
         }
@@ -981,7 +983,7 @@ impl CLISubprocessAdapter {
         // of surfacing a raw E2BIG.
         let bounded_child = bounded_env(&child_env).with_context(|| {
             "Refusing to spawn agent step: child environment exceeds the measured \
-             argument/env budget (see AMPLIHACK_CONTEXT_FILE for the file-first context)"
+             argument/env budget"
         })?;
 
         // Bounded rate-limit retry loop (#839). Total executions = 1 + max_retries.
@@ -1331,16 +1333,28 @@ impl Adapter for CLISubprocessAdapter {
         // Propagate agent binary preference so scripts spawning nested agents
         // use the same binary as the parent (mirrors execute_agent_step_impl).
         child_env.insert("AMPLIHACK_AGENT_BINARY".to_string(), self.cli.clone());
-        // Merge caller-supplied step vars (they override inherited/base values),
-        // then bound the whole set to the MEASURED env budget before spawning.
-        // `bounded_env` drops non-protected leftovers losslessly and FAILS LOUD
-        // (naming protected vars) rather than letting a raw E2BIG surface.
+        // Merge caller-supplied step vars (they override inherited/base values).
         for (k, v) in extra_env {
             child_env.insert(k.clone(), v.clone());
         }
+        // #130: move recipe values that can't travel as env strings (over the
+        // per-string cap, or needed to fit the total budget) into private
+        // files, and read them back with a preamble. The guard owns the files
+        // and removes them when this function returns, on every path.
+        let spill =
+            env_spill::spill_for_bash(&mut child_env, extra_env, crate::context::env_byte_budget())
+                .context("Failed to spill oversized env values for bash step")?;
+        let command: Cow<'_, str> = match &spill {
+            Some(spill) => Cow::Owned(format!("{}{command}", spill.preamble())),
+            None => Cow::Borrowed(command),
+        };
+        let command = command.as_ref();
+        // Bound the whole set to the MEASURED env budget before spawning.
+        // `bounded_env` drops non-protected leftovers and FAILS LOUD (naming
+        // protected vars) rather than letting a raw E2BIG surface.
         let bounded = bounded_env(&child_env).with_context(|| {
             "Refusing to spawn bash step: child environment exceeds the measured \
-             argument/env budget (see AMPLIHACK_CONTEXT_FILE for the file-first context)"
+             argument/env budget"
         })?;
         let effective_dir = if working_dir.is_empty() || working_dir == "." {
             &self.working_dir
@@ -1387,8 +1401,9 @@ impl Adapter for CLISubprocessAdapter {
             .output()
             .with_context(|| bash_spawn_context(&invocation, timeout))?;
 
-        // Drop the tempfile (auto-cleans on drop) only AFTER bash completed.
+        // Drop the tempfiles (auto-clean on drop) only AFTER bash completed.
         drop(script_file);
+        drop(spill);
 
         // Decode stderr ONLY on the failure path that reads it. Previously both
         // streams were decoded unconditionally, so every successful step paid a
@@ -3225,7 +3240,7 @@ mod tests {
             "oversized non-protected var must be dropped (lossless via file)"
         );
 
-        let total: usize = result.iter().map(|(k, v)| k.len() + v.len() + 1).sum();
+        let total: usize = result.iter().map(|(k, v)| env_pair_bytes(k, v)).sum();
         assert!(
             total <= env_byte_budget(),
             "resulting env {total} must fit the budget {}",
@@ -3275,10 +3290,11 @@ mod tests {
             !format!("{err:?}").contains(secret_value),
             "Debug must never contain a variable value"
         );
-        // Guidance must point the user at the file-first context for recovery.
+        // #130: AMPLIHACK_CONTEXT_FILE is no longer set by step execution, so
+        // the guidance must not send users looking for it.
         assert!(
-            shown.contains("AMPLIHACK_CONTEXT_FILE"),
-            "error must reference AMPLIHACK_CONTEXT_FILE for recovery"
+            !shown.contains("AMPLIHACK_CONTEXT_FILE"),
+            "error must not reference the removed AMPLIHACK_CONTEXT_FILE fallback"
         );
 
         clear_env_byte_budget_for_test();
@@ -3354,7 +3370,7 @@ mod tests {
     /// `RECIPE_VAR_*` value must still reach the script byte-for-byte.
     #[cfg(target_os = "linux")]
     #[test]
-    fn execve_rejects_single_env_string_over_max_arg_strlen() {
+    fn single_env_string_over_max_arg_strlen_reaches_script() {
         let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
         clear_env_byte_budget_for_test();
 
@@ -3378,6 +3394,286 @@ mod tests {
             panic!("a single >MAX_ARG_STRLEN recipe var must not fail execve: {e:#}")
         });
         assert_eq!(out.trim(), "133120");
+    }
+
+    // ── #130: per-value env spill through execute_bash_step ───────────
+
+    use crate::adapters::env_spill::SpillRootGuard;
+
+    fn sha256_hex(s: &str) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(s.as_bytes()))
+    }
+
+    /// Restores the measured budget even if the test panics.
+    struct BudgetReset;
+    impl Drop for BudgetReset {
+        fn drop(&mut self) {
+            clear_env_byte_budget_for_test();
+        }
+    }
+
+    /// Upper bound on the bytes of every protected var `execute_bash_step`
+    /// will put in the child env before any recipe var is added.
+    fn protected_inherited_bytes() -> usize {
+        let mut env = CLISubprocessAdapter::build_child_env();
+        env.insert("AMPLIHACK_AGENT_BINARY".into(), "claude".into());
+        env.iter()
+            .filter(|(k, _)| is_env_protected(k))
+            .map(|(k, v)| env_pair_bytes(k, v))
+            .sum::<usize>()
+            + 256
+    }
+
+    fn entries_in(dir: &Path) -> usize {
+        std::fs::read_dir(dir).unwrap().count()
+    }
+
+    /// Deterministic value of exactly `len` bytes.
+    fn patterned(tag: &str, len: usize) -> String {
+        let unit = format!("{tag}:0123456789abcdef|");
+        unit.repeat(len / unit.len() + 1)[..len].to_string()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn over_budget_recipe_env_keeps_every_var_readable() {
+        // T3: about 10 vars of 8–20 KiB, total far over a forced budget. Before
+        // the fix the context layer kept 4 vars; now every one is readable.
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        let _reset = BudgetReset;
+        set_env_byte_budget_for_test(protected_inherited_bytes() + 16 * 1024);
+
+        let mut extra = HashMap::new();
+        let mut script = String::new();
+        let mut expected = Vec::new();
+        for i in 0..10 {
+            let v = patterned(&format!("v{i}"), 8 * 1024 + i * 1300);
+            expected.push(sha256_hex(&v));
+            extra.insert(format!("RECIPE_VAR_v{i}"), v);
+            script.push_str(&format!(
+                "printf %s \"$RECIPE_VAR_v{i}\" | sha256sum | cut -c1-64\n"
+            ));
+        }
+        let total: usize = extra.iter().map(|(k, v)| env_pair_bytes(k, v)).sum();
+        assert!(
+            total > 16 * 1024 * 5,
+            "fixture must be well over the budget"
+        );
+
+        let out = CLISubprocessAdapter::new()
+            .execute_bash_step(&script, ".", None, &extra)
+            .unwrap_or_else(|e| panic!("over-budget step must still run: {e:#}"));
+        assert_eq!(out.lines().collect::<Vec<_>>(), expected);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spilled_values_are_byte_identical_including_trailing_newlines() {
+        // T4: oversized and budget-spilled values with awkward bytes.
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        let _reset = BudgetReset;
+        set_env_byte_budget_for_test(protected_inherited_bytes() + 512);
+
+        let tricky = "  lead\nembedded\\ 'single' \"double\" $(echo no) `echo no` * ; trail  \n\n";
+        let big = format!("{}{tricky}", patterned("big", 130 * 1024));
+        let mut extra = HashMap::new();
+        extra.insert("RECIPE_VAR_big".to_string(), big.clone());
+        extra.insert("BIG".to_string(), big.clone());
+        for i in 0..4 {
+            extra.insert(format!("RECIPE_VAR_s{i}"), format!("{i}{tricky}"));
+        }
+        let mut script = String::from(
+            "printf %s \"$RECIPE_VAR_big\" | sha256sum | cut -c1-64\n\
+             printf %s \"$BIG\" | sha256sum | cut -c1-64\n",
+        );
+        let mut expected = vec![sha256_hex(&big), sha256_hex(&big)];
+        for i in 0..4 {
+            script.push_str(&format!(
+                "printf %s \"$RECIPE_VAR_s{i}\" | sha256sum | cut -c1-64\n"
+            ));
+            expected.push(sha256_hex(&format!("{i}{tricky}")));
+        }
+
+        let out = CLISubprocessAdapter::new()
+            .execute_bash_step(&script, ".", None, &extra)
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(out.lines().collect::<Vec<_>>(), expected);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn injection_payload_in_a_spilled_value_is_data_not_code() {
+        // S1
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        clear_env_byte_budget_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("pwned");
+        let m = marker.display();
+        let value = format!(
+            "{}'; touch '{m}'; '$(touch '{m}')`touch '{m}'`\n",
+            patterned("inj", 130 * 1024)
+        );
+        let extra = map_of(&[("RECIPE_VAR_inj", value.as_str())]);
+        let out = CLISubprocessAdapter::new()
+            .execute_bash_step(
+                "printf %s \"$RECIPE_VAR_inj\" | sha256sum | cut -c1-64",
+                ".",
+                None,
+                &extra,
+            )
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(out, sha256_hex(&value));
+        assert!(!marker.exists(), "spilled value must never be evaluated");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spill_dir_exists_during_the_step_and_is_removed_after_success() {
+        // T6 (exit 0)
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        clear_env_byte_budget_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let _g = SpillRootGuard::set(root.path());
+        let big = patterned("big", 130 * 1024);
+        let extra = map_of(&[("RECIPE_VAR_big", big.as_str())]);
+        let cmd = format!("ls -A '{}' | wc -l", root.path().display());
+        let out = CLISubprocessAdapter::new()
+            .execute_bash_step(&cmd, ".", None, &extra)
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(out.trim(), "1", "exactly one spill dir during the step");
+        assert_eq!(entries_in(root.path()), 0, "spill dir must be removed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spill_dir_is_removed_after_a_failing_step() {
+        // T6 (exit 1)
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        clear_env_byte_budget_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let _g = SpillRootGuard::set(root.path());
+        let big = patterned("big", 130 * 1024);
+        let extra = map_of(&[("RECIPE_VAR_big", big.as_str())]);
+        let cmd = format!("ls -A '{}' | wc -l >&2; exit 1", root.path().display());
+        let err = CLISubprocessAdapter::new()
+            .execute_bash_step(&cmd, ".", None, &extra)
+            .expect_err("exit 1 must fail");
+        assert!(format!("{err:#}").contains("(exit 1): 1"), "{err:#}");
+        assert_eq!(entries_in(root.path()), 0, "spill dir must be removed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spill_dir_is_removed_after_a_timeout() {
+        // T6 (timeout)
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        clear_env_byte_budget_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let _g = SpillRootGuard::set(root.path());
+        let big = patterned("big", 130 * 1024);
+        let extra = map_of(&[("RECIPE_VAR_big", big.as_str())]);
+        let result = CLISubprocessAdapter::new().execute_bash_step("sleep 5", ".", Some(1), &extra);
+        assert!(result.is_err(), "timeout must fail: {result:?}");
+        assert_eq!(entries_in(root.path()), 0, "spill dir must be removed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spill_dir_is_removed_when_bounded_env_refuses_after_spilling() {
+        // S6/SR-8: protected inherited vars alone exceed the budget.
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        let _reset = BudgetReset;
+        set_env_byte_budget_for_test(16);
+        let root = tempfile::tempdir().unwrap();
+        let _g = SpillRootGuard::set(root.path());
+        let big = patterned("SENTINEL_SPILL_VALUE", 130 * 1024);
+        let extra = map_of(&[("RECIPE_VAR_big", big.as_str())]);
+        let err = CLISubprocessAdapter::new()
+            .execute_bash_step("echo never", ".", None, &extra)
+            .expect_err("protected env over budget must fail loud");
+        let shown = format!("{err:#} {err:?}");
+        assert!(
+            !shown.contains("SENTINEL_SPILL_VALUE"),
+            "no value bytes in errors"
+        );
+        assert!(!shown.contains("os error 7"), "{shown}");
+        assert_eq!(entries_in(root.path()), 0, "spill dir must be removed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn small_env_runs_the_script_unchanged_with_no_spill_dir() {
+        // T7: no preamble ($LINENO is 1) and nothing written.
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        clear_env_byte_budget_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let _g = SpillRootGuard::set(root.path());
+        let extra = map_of(&[("RECIPE_VAR_a", "a"), ("A", "a")]);
+        let cmd = format!(
+            "echo \"$LINENO\"; ls -A '{}' | wc -l; printf %s \"$RECIPE_VAR_a$A\"",
+            root.path().display()
+        );
+        let out = CLISubprocessAdapter::new()
+            .execute_bash_step(&cmd, ".", None, &extra)
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(out.lines().collect::<Vec<_>>(), vec!["1", "0", "aa"]);
+        assert_eq!(entries_in(root.path()), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_commands_still_run_after_reading_a_200_kib_value() {
+        // T8 / D1: spilled values are shell-local, so children don't hit E2BIG.
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        clear_env_byte_budget_for_test();
+        let big = "b".repeat(200 * 1024);
+        let extra = map_of(&[("RECIPE_VAR_BIG", big.as_str())]);
+        let out = CLISubprocessAdapter::new()
+            .execute_bash_step(
+                "test \"${#RECIPE_VAR_BIG}\" -eq 204800 && /usr/bin/env true && echo ok; \
+                 env | grep -c '^RECIPE_VAR_BIG=' || true",
+                ".",
+                None,
+                &extra,
+            )
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(out.lines().collect::<Vec<_>>(), vec!["ok", "0"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn over_cap_unreadable_name_is_dropped_and_the_step_still_runs() {
+        // T9
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        clear_env_byte_budget_for_test();
+        let big = "x".repeat(130 * 1024);
+        let extra = map_of(&[("BASH_FOO", big.as_str()), ("RECIPE_VAR_ok", "fine")]);
+        let out = CLISubprocessAdapter::new()
+            .execute_bash_step(
+                "echo \"${BASH_FOO:-unset}\"; echo \"$RECIPE_VAR_ok\"",
+                ".",
+                None,
+                &extra,
+            )
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(out.lines().collect::<Vec<_>>(), vec!["unset", "fine"]);
+    }
+
+    #[test]
+    fn inherited_filter_counts_the_whole_env_string() {
+        // T10 / D15: a value just under 128 KiB with a long key is still an
+        // env string over the cap and must not reach any child (agent steps
+        // get build_child_env verbatim).
+        let key = format!("ISSUE130_{}", "K".repeat(200));
+        let value = "v".repeat(128 * 1024 - 8);
+        assert!(value.len() <= 128 * 1024, "old value-only filter kept this");
+        assert!(inherited_env_entry_too_large(&key, &value));
+
+        let fits = "v".repeat(crate::adapters::env_spill::PER_VALUE_ENV_CAP - key.len() - 2);
+        assert!(!inherited_env_entry_too_large(&key, &fits));
+        assert!(inherited_env_entry_too_large(&key, &format!("{fits}v")));
+        assert!(!inherited_env_entry_too_large("PATH", "/usr/bin:/bin"));
     }
 
     // ══════════════════════════════════════════════════════════════════

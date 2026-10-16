@@ -3,6 +3,7 @@
 ///
 pub mod cli_subprocess;
 mod codex_exec;
+mod env_spill;
 pub(crate) use codex_exec::{CleanupFailure, Interruption};
 
 /// Trait that all recipe execution adapters must implement.
