@@ -1,0 +1,88 @@
+name: "autodrive-crusty-loop-preflight-fixture"
+description: |
+  Issue rysweet/amplihack-rs#1468 regression fixture.
+
+  Step 01 is `step-01-crusty-loop-preflight` from
+  `amplifier-bundle/recipes/autodrive-crusty-loop.yaml`, copied verbatim: a
+  `parse_json: true` bash step whose JSON carries `state_dir`.
+
+  Step 02 keeps the part of `step-02-crusty-loop` that this bug breaks, again
+  verbatim: the two reads of `${CRUSTY_LOOP_PREFLIGHT:-}`, the extraction
+  pipeline, and the guard that refuses to run an unrecorded loop. The rest of
+  that step — the loop-helper lookup and the `bash "$LOOP_HELPER"` invocation,
+  which would launch real agent rounds — is deliberately omitted; it is not
+  what #1468 is about and cannot run in a test. The step echoes the resolved
+  values instead, so the test can assert on them.
+
+  See PROVENANCE.md.
+version: "1.0.0"
+
+context:
+  repo_path: "."
+  pr_number: ""
+  pr_url: ""
+  task_description: ""
+  autodrive_state_dir: ""
+
+steps:
+  - id: "step-01-crusty-loop-preflight"
+    type: "bash"
+    parse_json: true
+    command: |
+      set -uo pipefail
+      cd "${REPO_PATH:-.}" 2>/dev/null || true
+      export GIT_PAGER=cat GH_PAGER=cat PAGER=cat LESS=FRX
+      STATE_HELPER="${AMPLIHACK_HOME:-${REPO_PATH:-$(pwd)}}/amplifier-bundle/tools/autodrive_state.sh"
+      [ -f "$STATE_HELPER" ] || STATE_HELPER="${REPO_PATH:-$(pwd)}/amplifier-bundle/tools/autodrive_state.sh"
+      [ -f "$STATE_HELPER" ] || STATE_HELPER="$(pwd)/amplifier-bundle/tools/autodrive_state.sh"
+      [ -f "$STATE_HELPER" ] || STATE_HELPER="${HOME:-/root}/.copilot/amplifier-bundle/tools/autodrive_state.sh"
+      [ -f "$STATE_HELPER" ] || STATE_HELPER="${HOME:-/root}/.amplihack/amplifier-bundle/tools/autodrive_state.sh"
+      [ -f "$STATE_HELPER" ] || { echo "ERROR: autodrive state helper not found (searched AMPLIHACK_HOME, REPO_PATH, cwd, ~/.copilot, ~/.amplihack): $STATE_HELPER; cwd=$(pwd)" >&2; exit 1; }
+      . "$STATE_HELPER"
+
+      PR="${PR_NUMBER:-}"
+      [ -n "$PR" ] || PR="$(gh pr view --json number --jq .number 2>/dev/null || printf '')"
+      case "$PR" in ''|*[!0-9]*) PR="" ;; esac
+      BRANCH="detached"
+      if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || printf 'detached')"
+      else
+        echo "[skip] not a git repo; the branch identity falls back to 'detached' rather than being assumed" >&2
+      fi
+      IDENT="${PR:-$BRANCH}"
+      DIR="${AUTODRIVE_STATE_DIR:-}"
+      [ -n "$DIR" ] || DIR="$(autodrive_state_dir "${REPO_PATH:-.}" "$IDENT")"
+      mkdir -p "$DIR"
+
+      # Resume: merged work is never redone, and a phase this workflow already
+      # completed is not repeated. Platform state wins over any local record.
+      RUN="true"; WHY="crusty loop not yet completed for this PR"
+      STATE="$(autodrive_pr_state "$PR")"
+      if [ "$STATE" = "MERGED" ]; then
+        RUN="false"; WHY="PR #${PR} is already merged; nothing to review"
+      elif autodrive_phase_done "$DIR" "crusty-loop"; then
+        RUN="false"; WHY="the crusty loop already completed for this PR in an earlier run"
+      fi
+      echo "INFO: crusty-loop preflight: pr=${PR:-<none>} pr_state=${STATE} run=${RUN} (${WHY}) state_dir=${DIR}" >&2
+      printf '{"should_run":"%s","pr":"%s","pr_state":"%s","state_dir":"%s","reason":"%s"}\n' \
+        "$RUN" "$PR" "$STATE" "$DIR" "$WHY"
+    output: "crusty_loop_preflight"
+
+  - id: "step-02-crusty-loop"
+    condition: "crusty_loop_preflight.should_run == 'true'"
+    type: "bash"
+    command: |
+      set -uo pipefail
+      cd "${REPO_PATH:-.}" 2>/dev/null || true
+      DIR="$(printf '%s' "${CRUSTY_LOOP_PREFLIGHT:-}" \
+        | amplihack orch helper extract-json --require-field state_dir \
+        | amplihack orch helper extract-field --field state_dir --default '')"
+      PR="$(printf '%s' "${CRUSTY_LOOP_PREFLIGHT:-}" \
+        | amplihack orch helper extract-json --require-field pr \
+        | amplihack orch helper extract-field --field pr --default '')"
+      [ -n "$DIR" ] || { echo "ERROR: preflight produced no state_dir; refusing to run an unrecorded loop." >&2; exit 1; }
+
+      # The real step launches the crusty loop here. The fixture stops and
+      # reports what the loop would have been given.
+      echo "RESOLVED_STATE_DIR=[${DIR}]"
+      echo "RESOLVED_PR=[${PR}]"

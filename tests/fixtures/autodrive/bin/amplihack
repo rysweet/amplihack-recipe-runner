@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Stand-in for `amplihack orch helper extract-json` / `extract-field`.
+#
+# The consuming step in `autodrive-crusty-loop` pipes the preflight JSON
+# through these two subcommands. `amplihack` is not a dependency of this
+# repository and is absent in CI, and this test must not skip when it is
+# missing, so the fixture supplies them and is placed first on PATH
+# unconditionally. See PROVENANCE.md.
+#
+# Scope: the preflight emits one flat JSON object whose values are strings, so
+# the shim reads exactly that shape, with sed. It is not a JSON parser and does
+# not try to be one. What the test asserts is that the preflight's output
+# reaches the consuming step's environment at all; how the step then takes it
+# apart is incidental, and an extractor that needed its own parser would be
+# more surface to get wrong than the behaviour under test.
+set -uo pipefail
+
+die() {
+  echo "amplihack shim: $1" >&2
+  exit 2
+}
+
+[ "${1:-}" = "orch" ] && [ "${2:-}" = "helper" ] ||
+  die "only 'orch helper ...' is implemented; got: $*"
+sub="${3:-}"
+[ -n "$sub" ] || die "no subcommand given"
+shift 3
+
+field=""
+default=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --require-field | --field)
+      field="${2:-}"
+      shift 2
+      ;;
+    --default)
+      default="${2:-}"
+      shift 2
+      ;;
+    *) shift ;;
+  esac
+done
+[ -n "$field" ] || die "$sub needs a field name"
+
+input="$(cat)"
+
+case "$sub" in
+  extract-json)
+    # Pass the object through when it carries the required field; the real
+    # subcommand emits `{}` when it does not.
+    if printf '%s' "$input" | grep -q "\"${field}\"[[:space:]]*:"; then
+      printf '%s\n' "$input"
+    else
+      printf '{}\n'
+    fi
+    ;;
+  extract-field)
+    value="$(printf '%s' "$input" |
+      sed -n "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p")"
+    printf '%s\n' "${value:-$default}"
+    ;;
+  *) die "unsupported subcommand: $sub" ;;
+esac
