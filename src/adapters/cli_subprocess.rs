@@ -2363,6 +2363,20 @@ mod tests {
     }
 
     #[test]
+    fn test_prompt_at_exact_inline_limit_stays_inline() {
+        // Exactly MAX bytes (prompt + system prompt combined) stays inline;
+        // one byte more switches to file-backed transport.
+        let adapter = CLISubprocessAdapter::new().with_binary("claude");
+        let system = "s".repeat(16);
+        let prompt = "x".repeat(MAX_INLINE_AGENT_PROMPT_BYTES - system.len());
+        assert_eq!(prompt.len() + system.len(), MAX_INLINE_AGENT_PROMPT_BYTES);
+        assert!(!adapter.should_use_file_backed_prompt_transport(&prompt, Some(&system)));
+        assert!(
+            adapter.should_use_file_backed_prompt_transport(&format!("{prompt}x"), Some(&system))
+        );
+    }
+
+    #[test]
     fn test_uses_file_backed_prompt_transport_for_copilot() {
         // Copilot now also uses file-backed transport for large prompts
         let adapter = CLISubprocessAdapter::new().with_binary("copilot");
