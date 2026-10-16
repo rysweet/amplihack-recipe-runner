@@ -529,7 +529,7 @@ impl<A: Adapter> RecipeRunner<A> {
         }
         if let Some(cmd) = hook {
             let rendered = ctx.render_shell(cmd);
-            let (env_vars, context_file) = ctx.shell_env_for_step();
+            let env_vars = ctx.shell_env_for_step();
             info!("Running {} hook for step '{}'", hook_name, step_id);
             if let Err(e) =
                 self.adapter
@@ -537,11 +537,6 @@ impl<A: Adapter> RecipeRunner<A> {
             {
                 self.terminal.observe(&e);
                 warn!("{} hook failed for step '{}': {}", hook_name, step_id, e);
-            }
-            if let Some(path) = context_file
-                && let Err(e) = std::fs::remove_file(&path)
-            {
-                log::debug!("Failed to clean up context file {}: {}", path.display(), e);
             }
         }
     }
@@ -790,9 +785,8 @@ impl<A: Adapter> RecipeRunner<A> {
             StepType::Recipe => self.execute_sub_recipe(step, ctx),
             StepType::Bash => {
                 let rendered = ctx.render_shell(step.command.as_deref().unwrap_or(""));
-                let (env_vars, context_file) = ctx.shell_env_for_step();
-                let result = self
-                    .adapter
+                let env_vars = ctx.shell_env_for_step();
+                self.adapter
                     .execute_bash_step(&rendered, working_dir, step.timeout, &env_vars)
                     .map(|output| output.trim_end().to_string())
                     .map_err(|e| {
@@ -801,14 +795,7 @@ impl<A: Adapter> RecipeRunner<A> {
                             step_id: step.id.clone(),
                             message: format!("bash step failed: {:#}", e),
                         }
-                    });
-                // Clean up temp context file after step completes
-                if let Some(path) = context_file
-                    && let Err(e) = std::fs::remove_file(&path)
-                {
-                    log::debug!("Failed to clean up context file {}: {}", path.display(), e);
-                }
-                result
+                    })
             }
             StepType::Agent => {
                 let rendered_prompt = ctx.render(step.prompt.as_deref().unwrap_or(""));
@@ -1388,7 +1375,7 @@ impl<A: Adapter> RecipeRunner<A> {
         }
 
         let rendered = ctx.render_shell(step.command.as_deref().unwrap_or(""));
-        let (env_vars, context_file) = ctx.shell_env_for_step();
+        let env_vars = ctx.shell_env_for_step();
         let working_dir = step.working_dir.as_deref().unwrap_or(default_working_dir);
 
         let mut failure = None;
@@ -1453,12 +1440,6 @@ impl<A: Adapter> RecipeRunner<A> {
                 }
             }
         };
-        // Clean up temp context file
-        if let Some(path) = context_file
-            && let Err(e) = std::fs::remove_file(&path)
-        {
-            log::debug!("Failed to clean up context file {}: {}", path.display(), e);
-        }
         ParallelOutcome {
             result,
             terminal: failure,
@@ -1631,9 +1612,9 @@ mod tests {
         }
     }
 
-    struct ContextFileCaptureAdapter(std::sync::Mutex<Option<std::path::PathBuf>>);
+    struct EnvCaptureAdapter(std::sync::Mutex<Option<HashMap<String, String>>>);
 
-    impl Adapter for ContextFileCaptureAdapter {
+    impl Adapter for EnvCaptureAdapter {
         fn execute_agent_step(
             &self,
             _prompt: &str,
@@ -1654,9 +1635,7 @@ mod tests {
             _timeout: Option<u64>,
             extra_env: &std::collections::HashMap<String, String>,
         ) -> Result<String, anyhow::Error> {
-            *self.0.lock().unwrap() = extra_env
-                .get("AMPLIHACK_CONTEXT_FILE")
-                .map(std::path::PathBuf::from);
+            *self.0.lock().unwrap() = Some(extra_env.clone());
             Ok("not-json".to_string())
         }
 
@@ -1665,7 +1644,7 @@ mod tests {
         }
 
         fn name(&self) -> &str {
-            "context-file-capture"
+            "env-capture"
         }
     }
 
@@ -1678,7 +1657,9 @@ mod tests {
     }
 
     #[test]
-    fn required_json_failure_still_removes_spilled_parallel_context_file() {
+    fn required_json_failure_with_tiny_budget_passes_full_env() {
+        // #130: a tiny budget no longer swaps the env for AMPLIHACK_CONTEXT_FILE;
+        // the adapter receives every var and handles oversize itself.
         let _budget_lock = crate::context::ENV_BUDGET_TEST_LOCK.lock().unwrap();
         crate::context::set_env_byte_budget_for_test(1);
         let _reset = ResetEnvBudget;
@@ -1691,7 +1672,7 @@ mod tests {
             "large".to_string(),
             Value::String("x".repeat(8192)),
         )]));
-        let adapter = ContextFileCaptureAdapter(std::sync::Mutex::new(None));
+        let adapter = EnvCaptureAdapter(std::sync::Mutex::new(None));
 
         let outcome = RecipeRunner::execute_bash_step_parallel(
             &recipe.steps[0],
@@ -1704,11 +1685,78 @@ mod tests {
 
         assert_eq!(outcome.result.status, StepStatus::Failed);
         assert!(outcome.result.error.contains("parse_json failed"));
-        let path = adapter.0.lock().unwrap().clone().unwrap();
-        assert!(
-            !path.exists(),
-            "parallel JSON failure must clean up spilled context file {}",
-            path.display()
+        let env = adapter.0.lock().unwrap().clone().unwrap();
+        assert!(!env.contains_key("AMPLIHACK_CONTEXT_FILE"));
+        assert_eq!(env.get("RECIPE_VAR_large").map(String::len), Some(8192));
+        assert_eq!(env.get("LARGE").map(String::len), Some(8192));
+    }
+
+    fn sha256_hex(s: &str) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(s.as_bytes()))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn large_step_output_reaches_the_next_bash_step_byte_for_byte() {
+        // T2 (#130): a 200 KiB step output followed by a bash step that reads
+        // it through RECIPE_VAR_<name> and its legacy alias. Before the fix the
+        // second step died with `Argument list too long (os error 7)`.
+        let _budget_lock = crate::context::ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        crate::context::clear_env_byte_budget_for_test();
+        let unit = "abcdefghijklmnopqrstuvwxyz0123456789\n";
+        let produced = unit.repeat(204_800 / unit.len() + 1)[..204_800].to_string();
+        // The runner trims captured step output.
+        let expected = sha256_hex(produced.trim());
+
+        let recipe = RecipeParser::new()
+            .parse(
+                "name: big-output\nsteps:\n  - id: gen\n    type: bash\n    command: \"yes abcdefghijklmnopqrstuvwxyz0123456789 | head -c 204800\"\n    output: gen\n  - id: read\n    type: bash\n    command: |\n      printf %s \"$RECIPE_VAR_gen\" | sha256sum | cut -c1-64\n      printf %s \"$GEN\" | sha256sum | cut -c1-64\n",
+            )
+            .unwrap();
+        let runner =
+            RecipeRunner::new(crate::adapters::cli_subprocess::CLISubprocessAdapter::new())
+                .with_auto_stage(false);
+        let result = runner.execute(&recipe, None);
+
+        assert!(result.success, "{:?}", result.step_results);
+        assert_eq!(result.step_results[0].output.len(), produced.trim().len());
+        assert_eq!(
+            result.step_results[1].output.lines().collect::<Vec<_>>(),
+            vec![expected.as_str(), expected.as_str()]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oversized_context_value_keeps_trailing_newlines_end_to_end() {
+        // #130: user-supplied context is not trimmed, so a spilled value must
+        // come back with its trailing newlines intact.
+        let _budget_lock = crate::context::ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        crate::context::clear_env_byte_budget_for_test();
+        let report = format!("{}\n  tail with spaces  \n\n", "r".repeat(130 * 1024));
+
+        let recipe = RecipeParser::new()
+            .parse(
+                "name: trailing\nsteps:\n  - id: read\n    type: bash\n    command: |\n      printf %s \"$RECIPE_VAR_report\" | sha256sum | cut -c1-64\n      printf %s \"$REPORT\" | sha256sum | cut -c1-64\n",
+            )
+            .unwrap();
+        let runner =
+            RecipeRunner::new(crate::adapters::cli_subprocess::CLISubprocessAdapter::new())
+                .with_auto_stage(false);
+        let result = runner.execute(
+            &recipe,
+            Some(HashMap::from([(
+                "report".to_string(),
+                Value::String(report.clone()),
+            )])),
+        );
+
+        assert!(result.success, "{:?}", result.step_results);
+        let expected = sha256_hex(&report);
+        assert_eq!(
+            result.step_results[0].output.lines().collect::<Vec<_>>(),
+            vec![expected.as_str(), expected.as_str()]
         );
     }
 
