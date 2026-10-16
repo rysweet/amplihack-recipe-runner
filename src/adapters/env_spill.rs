@@ -22,6 +22,10 @@ use anyhow::Context;
 pub(crate) const MAX_ARG_STRLEN: usize = 131_072;
 
 /// Largest `KEY=value\0` string kept inline in the child environment.
+///
+/// The 4096-byte margin is conservative headroom below the kernel's per-string
+/// limit, so that a value near the cap is spilled rather than kept inline at
+/// the edge of `MAX_ARG_STRLEN`.
 pub(crate) const PER_VALUE_ENV_CAP: usize = MAX_ARG_STRLEN - 4096;
 
 /// Byte cost of one `KEY=value\0` environment string, as the kernel counts it.

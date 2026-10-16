@@ -388,7 +388,7 @@ pub(crate) fn bounded_env(
     }
 
     // Greedily keep the smallest non-protected entries first to retain as many
-    // as possible; drop the rest (largest-first) losslessly.
+    // as possible; drop the rest (largest-first).
     droppable.sort_by_key(|(k, v)| env_pair_bytes(k, v));
     let mut result = protected;
     let mut used = protected_bytes;
@@ -1339,7 +1339,7 @@ impl Adapter for CLISubprocessAdapter {
         // `RECIPE_VAR_*`) over the top, so resolving above that merge is what
         // makes it impossible for recipe YAML to choose the interpreter. It also
         // means a misconfigured AMPLIHACK_BASH aborts before any env-budget work
-        // and before the >64 KiB tempfile spill — nothing to clean up.
+        // and before the >64 KiB script tempfile — nothing to clean up.
         let bash = resolve_bash_interpreter()?;
         let mut child_env = Self::build_child_env();
         // Propagate agent binary preference so scripts spawning nested agents
@@ -3249,7 +3249,7 @@ mod tests {
         );
         assert!(
             !keys.contains("BIG_NON_PROTECTED"),
-            "oversized non-protected var must be dropped (lossless via file)"
+            "oversized non-protected var must be dropped"
         );
 
         let total: usize = result.iter().map(|(k, v)| env_pair_bytes(k, v)).sum();
