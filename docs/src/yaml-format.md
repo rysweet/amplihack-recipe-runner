@@ -66,10 +66,68 @@ step.
 | `recovery_on_failure` | bool            | no       | `false` | Attempt agentic recovery if sub-recipe fails (see below) |
 | `context`           | map             | no       | —       | Context overrides passed to sub-recipe                   |
 | `continue_on_error` | bool            | no       | `false` | Continue execution if this step fails                    |
+| `fatal`             | bool            | no       | `true`  | `fatal: false` is shorthand for `continue_on_error: true` |
+| `nonfatal`          | bool            | no       | `false` | Alias for `continue_on_error`                            |
 | `when_tags`         | list of strings | no       | `[]`    | Step only runs when these tags match active tag filters  |
 | `parallel_group`    | string          | no       | —       | Group name for parallel execution                        |
 
 > **Note:** The `context` field provides step-specific variables that are passed as overrides to sub-recipes. In YAML you write `context:`.
+
+### Unknown and retired step fields
+
+A step key that isn't in the table above is **ignored, with a warning**. The
+recipe still parses and runs, so an existing recipe never breaks because of an
+unknown key, but a typo or an unsupported field can't silently do nothing.
+
+The runner prints one warning per unknown key when it parses the recipe:
+
+```text
+recipe 'deploy': step 'build' has unknown field 'comand' (ignored)
+```
+
+A field that used to mean something but is now retired gets a specific
+message that says what to do. The only retired field is `max_env_value_bytes`:
+
+```text
+recipe 'workflow-tdd': step 'checkpoint-3': field 'max_env_value_bytes' is retired and ignored — the runner now spills oversized env values to private files automatically; remove it from the recipe
+```
+
+`max_env_value_bytes` was a per-step setting to avoid `Argument list too long`
+errors. The runner now handles oversized values automatically without
+truncating them (see
+[Per-value env spill](env-budget.md#per-value-env-spill-bash-steps)), so you
+can remove the field.
+
+Details:
+
+- A step without an `id` is shown as `<index N>` (zero-based). A recipe
+  without a `name` is shown as `<unnamed>`. A non-string key is shown as
+  `<non-string key>`.
+- Recipe names, step ids and keys are escaped (`\n`, `\u{1b}`, ...) and cut
+  to 128 characters, so a warning is always a single line.
+- A recipe gives at most 100 field warnings, followed by
+  `… and N more unknown step fields`.
+- Warnings go through the logger at `warn` level when it's enabled (for
+  example `RUST_LOG=warn`). Otherwise they go to stderr prefixed with
+  `warning: `.
+- `--validate-only` lists the same messages in its own report and doesn't
+  print them twice. Unknown fields are warnings, so it still exits `0`. See
+  [`--validate-only`](cli-reference.md#--validate-only).
+
+Library users who parse recipes themselves can turn the parse-time warnings
+off:
+
+```rust
+use std::path::Path;
+use recipe_runner_rs::parser::RecipeParser;
+
+let parser = RecipeParser::new().without_field_warnings();
+let recipe = parser.parse_file(Path::new("recipes/deploy.yaml"))?;
+```
+
+`RecipeParser::new()` (and `RecipeParser::default()`) print the warnings.
+`RecipeParser` is a struct with a private field, so build it with `new()` or
+`default()`; the unit-struct expression `RecipeParser` doesn't compile.
 
 ---
 

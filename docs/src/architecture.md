@@ -154,8 +154,17 @@ invocations fail before execution or update effects. See the
    `Step::effective_type()`.
 3. Structural validation: name must be non-empty, at least one step required,
    step IDs must be unique.
-4. `validate_with_yaml` inspects raw YAML keys and reports unknown fields using
-   edit-distance typo detection (e.g., "comand" → did you mean "command"?).
+4. Unknown step fields are reported, never rejected. Once the size, anchor and
+   structural checks pass, `parse()` re-reads the YAML as a `serde_yaml::Value`
+   and checks each step's keys against `KNOWN_STEP_FIELDS`. It emits one
+   warning per unknown key (`recipe '<name>': step '<id>' has unknown field
+   '<field>' (ignored)`) and a specific "retired" message for
+   `max_env_value_bytes`. `validate_with_yaml` (used by `--validate-only`)
+   uses the same `step_field_warnings` helper, so both paths produce the same
+   text. `--validate-only` and
+   `lib::validate_recipe` build the parser with `without_field_warnings()`, so
+   nothing is reported twice. See
+   [Unknown and retired step fields](yaml-format.md#unknown-and-retired-step-fields).
 
 ### Execute Phase
 
@@ -433,6 +442,11 @@ assumptions and the unverified Darwin/other Unix scope.
 variables (`AMPLIHACK_SESSION_DEPTH`, `AMPLIHACK_TREE_ID`, `AMPLIHACK_MAX_DEPTH`,
 `AMPLIHACK_MAX_SESSIONS`) and strips `CLAUDECODE` to prevent nested session
 confusion.
+It also drops any inherited variable whose `KEY=value\0` string exceeds
+`PER_VALUE_ENV_CAP` (128 KiB minus 4 KiB). For bash steps,
+`env_spill::spill_for_bash()` then moves oversized and over-budget recipe
+values into private files and prepends a preamble that reads them back. See
+[Per-value env spill](env-budget.md#per-value-env-spill-bash-steps).
 
 ### Bash interpreter resolution
 
@@ -691,8 +705,8 @@ attacks.
   memory exhaustion.
 - **Structural validation**: Rejects empty names, zero-step recipes, and
   duplicate step IDs.
-- **Field typo detection**: Unknown top-level and step-level fields trigger
-  warnings. Edit-distance matching suggests corrections.
+- **Unknown field warnings**: Unknown top-level and step-level fields trigger
+  warnings and are otherwise ignored. No correction is suggested.
 
 ### Subprocess Isolation (cli_subprocess.rs)
 
