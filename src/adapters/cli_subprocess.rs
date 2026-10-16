@@ -2373,6 +2373,7 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "-p"));
         assert!(args.iter().any(|arg| arg == "--system-prompt"));
         assert!(!args.iter().any(|arg| arg == "--append-system-prompt"));
+        assert!(!args.iter().any(|arg| arg == "--append-system-prompt-file"));
     }
 
     #[test]
@@ -2401,7 +2402,9 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
 
-        assert!(args.iter().any(|arg| arg == "--append-system-prompt"));
+        // #159: the overflow file must go to the FILE flag, never the TEXT flag.
+        assert!(args.iter().any(|arg| arg == "--append-system-prompt-file"));
+        assert!(!args.iter().any(|arg| arg == "--append-system-prompt"));
         assert!(!args.iter().any(|arg| arg == "--system-prompt"));
 
         let prompt_arg_index = args.iter().position(|arg| arg == "-p").unwrap();
@@ -2412,8 +2415,8 @@ mod tests {
 
         let prompt_file_index = args
             .iter()
-            .position(|arg| arg == "--append-system-prompt")
-            .unwrap();
+            .position(|arg| arg == "--append-system-prompt-file")
+            .expect("--append-system-prompt-file must be present (#159)");
         let prompt_file = std::path::PathBuf::from(&args[prompt_file_index + 1]);
         let prompt_file_contents = std::fs::read_to_string(&prompt_file).unwrap();
         assert!(prompt_file_contents.contains("system"));
@@ -2463,12 +2466,292 @@ mod tests {
 
         let prompt_file_index = args
             .iter()
-            .position(|arg| arg == "--append-system-prompt")
-            .unwrap();
+            .position(|arg| arg == "--append-system-prompt-file")
+            .expect("--append-system-prompt-file must be present (#159)");
         let prompt_file = std::path::PathBuf::from(&args[prompt_file_index + 1]);
         let prompt_file_contents = std::fs::read_to_string(&prompt_file).unwrap();
         assert!(prompt_file_contents.starts_with(&large_system_prompt));
         assert!(prompt_file_contents.contains(RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT));
+    }
+
+    // ── #159: overflow prompt file must be passed via --append-system-prompt-file ──
+
+    fn args_of(cmd: &std::process::Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// (a) Claude-family CLIs pass the overflow file with the FILE flag, as its
+    /// own argv element, pointing at an existing absolute 0600 file — and never
+    /// pass anything to the TEXT flag `--append-system-prompt` (#159).
+    #[test]
+    fn test_claude_family_large_prompt_uses_append_system_prompt_file() {
+        for cli in ["claude", "launch", "RustyClawd"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let output_dir = tmp.path().join(".recipe-output");
+            std::fs::create_dir_all(&output_dir).unwrap();
+
+            let adapter = CLISubprocessAdapter::new().with_binary(cli);
+            let prompt = "y".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1);
+            let cmd = adapter
+                .build_agent_command(&output_dir, tmp.path(), &prompt, Some("system"), None)
+                .unwrap();
+            let args = args_of(&cmd);
+
+            assert!(
+                !args.iter().any(|arg| arg == "--append-system-prompt"),
+                "{cli}: --append-system-prompt takes TEXT; passing a path loses the overflow (#159): {:?}",
+                args.iter()
+                    .map(|a| &a[..a.len().min(80)])
+                    .collect::<Vec<_>>()
+            );
+            let flag_index = args
+                .iter()
+                .position(|arg| arg == "--append-system-prompt-file")
+                .unwrap_or_else(|| panic!("{cli}: --append-system-prompt-file missing"));
+            let prompt_file = std::path::PathBuf::from(
+                args.get(flag_index + 1)
+                    .unwrap_or_else(|| panic!("{cli}: flag has no value")),
+            );
+            assert!(prompt_file.is_absolute(), "{cli}: path must be absolute");
+            assert!(prompt_file.exists(), "{cli}: prompt file must exist");
+            assert_eq!(prompt_file, output_dir.join("agent-system-prompt.md"));
+            assert_eq!(
+                args.iter()
+                    .filter(|arg| *arg == "--append-system-prompt-file")
+                    .count(),
+                1,
+                "{cli}: flag must appear exactly once"
+            );
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&prompt_file)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o600, "{cli}: prompt file must be private");
+            }
+        }
+    }
+
+    /// (b) The prompt file holds effective system prompt + overflow byte-for-byte.
+    /// (Already green before the fix: the content was right, only the flag was wrong.)
+    #[test]
+    fn test_file_backed_prompt_file_is_byte_exact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adapter = CLISubprocessAdapter::new().with_binary("claude");
+        let prompt = format!(
+            "HEAD{}UNIQUE_OVERFLOW_TAIL_159",
+            "x".repeat(MAX_INLINE_AGENT_PROMPT_BYTES)
+        );
+        let effective = CLISubprocessAdapter::build_effective_system_prompt(Some("system"));
+
+        let (inline_prompt, prompt_file) = adapter
+            .build_file_backed_prompt_payload(tmp.path(), &prompt, Some(&effective))
+            .unwrap();
+        let prompt_file = prompt_file.expect("overflow must produce a prompt file");
+
+        let boundary =
+            CLISubprocessAdapter::clamp_char_boundary(&prompt, FILE_BACKED_INLINE_PROMPT_BYTES);
+        assert_eq!(boundary, FILE_BACKED_INLINE_PROMPT_BYTES);
+        let expected = format!(
+            "{}\n\n# Continued task instructions\n\n{}",
+            effective,
+            &prompt[boundary..]
+        );
+        let contents = std::fs::read_to_string(&prompt_file).unwrap();
+        assert_eq!(contents, expected);
+        assert!(contents.contains(RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT));
+        assert!(contents.ends_with("UNIQUE_OVERFLOW_TAIL_159"));
+        assert_eq!(
+            inline_prompt,
+            format!(
+                "{}{}",
+                &prompt[..boundary],
+                FILE_BACKED_PROMPT_CONTINUATION_NOTE
+            )
+        );
+    }
+
+    /// (b') A multibyte char straddling the 8 KiB boundary is split on a char
+    /// boundary (no panic), and inline head + file overflow == original prompt.
+    #[test]
+    fn test_file_backed_prompt_file_is_byte_exact_multibyte_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adapter = CLISubprocessAdapter::new().with_binary("claude");
+        let prompt = format!(
+            "{}🦀{}",
+            "a".repeat(FILE_BACKED_INLINE_PROMPT_BYTES - 1),
+            "x".repeat(MAX_INLINE_AGENT_PROMPT_BYTES)
+        );
+        let effective = CLISubprocessAdapter::build_effective_system_prompt(Some("system"));
+
+        let boundary =
+            CLISubprocessAdapter::clamp_char_boundary(&prompt, FILE_BACKED_INLINE_PROMPT_BYTES);
+        assert_eq!(boundary, FILE_BACKED_INLINE_PROMPT_BYTES - 1);
+
+        let (inline_prompt, prompt_file) = adapter
+            .build_file_backed_prompt_payload(tmp.path(), &prompt, Some(&effective))
+            .unwrap();
+        let contents = std::fs::read_to_string(prompt_file.unwrap()).unwrap();
+        let header = format!("{effective}\n\n# Continued task instructions\n\n");
+        assert!(contents.starts_with(&header));
+        let overflow = &contents[header.len()..];
+        assert!(overflow.starts_with('🦀'));
+
+        let inline_head = inline_prompt
+            .strip_suffix(FILE_BACKED_PROMPT_CONTINUATION_NOTE)
+            .expect("claude inline prompt must end with the continuation note");
+        assert_eq!(format!("{inline_head}{overflow}"), prompt);
+    }
+
+    /// (c) End-to-end: a fake `claude` launcher recording its argv receives the
+    /// overflow via `--append-system-prompt-file`, and the file it reads during
+    /// the run contains the overflow tail and the no-reentry guard (#159).
+    #[cfg(unix)]
+    #[test]
+    fn test_fake_claude_receives_overflow_via_file_flag() {
+        let script_dir = tempfile::tempdir().unwrap();
+        let capture_dir = tempfile::tempdir().unwrap();
+        let work_dir = tempfile::tempdir().unwrap();
+        let launcher = script_dir.path().join("fake-launcher.sh");
+        let counter_file = capture_dir.path().join("count");
+        let argv_capture = capture_dir.path().join("argv.bin");
+        let file_capture = capture_dir.path().join("prompt-file.txt");
+
+        // argv is recorded NUL-separated because the -p value contains newlines.
+        // The prompt file is copied while the child runs: the step's tempdir
+        // (and the file) is removed once execute_agent_step_impl returns.
+        write_fake_launcher(
+            &launcher,
+            &format!(
+                ": > '{argv}'\n\
+                 prev=''\n\
+                 for a in \"$@\"; do\n\
+                 printf '%s\\0' \"$a\" >> '{argv}'\n\
+                 if [ \"$prev\" = \"--append-system-prompt-file\" ]; then cat -- \"$a\" > '{file}'; fi\n\
+                 prev=\"$a\"\n\
+                 done\n\
+                 echo AGENT_OK\n\
+                 exit 0",
+                argv = argv_capture.display(),
+                file = file_capture.display(),
+            ),
+        );
+
+        let prompt = format!("HEAD{}UNIQUE_OVERFLOW_TAIL_159", "x".repeat(40 * 1024));
+        // Run with env overridden, then release the env guards and ENV_MUTEX
+        // BEFORE asserting, so a failure here can't poison the mutex for the
+        // other env-mutating tests.
+        let result = {
+            let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let _g_launcher = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
+            let _g_counter = EnvGuard::new("AMPLIHACK_TEST_RL_COUNTER");
+            let _g_agent = EnvGuard::new("AMPLIHACK_AGENT_BINARY");
+            let _g_retries = EnvGuard::new("AMPLIHACK_RATELIMIT_MAX_RETRIES");
+            // SAFETY: test holds ENV_MUTEX to serialize env var access
+            unsafe {
+                env::set_var("AMPLIHACK_LAUNCHER_BINARY", launcher.to_str().unwrap());
+                env::set_var("AMPLIHACK_TEST_RL_COUNTER", counter_file.to_str().unwrap());
+                env::set_var("AMPLIHACK_AGENT_BINARY", "claude");
+                env::set_var("AMPLIHACK_RATELIMIT_MAX_RETRIES", "0");
+            }
+            CLISubprocessAdapter::new().execute_agent_step_impl(
+                &prompt,
+                Some("system"),
+                None,
+                work_dir.path().to_str().unwrap(),
+                Some(60),
+            )
+        };
+        assert!(result.is_ok(), "fake claude step must succeed: {result:?}");
+
+        let raw = std::fs::read(&argv_capture).expect("fake launcher must record argv");
+        let argv: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        assert!(
+            !argv.iter().any(|a| a == "--append-system-prompt"),
+            "child must never get the overflow path as system-prompt TEXT (#159)"
+        );
+        let flag_index = argv
+            .iter()
+            .position(|a| a == "--append-system-prompt-file")
+            .expect("child argv must contain --append-system-prompt-file (#159)");
+        assert!(
+            argv.get(flag_index + 1)
+                .is_some_and(|p| p.ends_with("agent-system-prompt.md")),
+            "flag must be followed by the prompt file path"
+        );
+
+        let delivered = std::fs::read_to_string(&file_capture)
+            .expect("child must have been able to read the prompt file during the run");
+        assert!(delivered.contains("UNIQUE_OVERFLOW_TAIL_159"));
+        assert!(delivered.contains(RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT));
+        assert!(delivered.contains("system"));
+        assert!(delivered.contains(NON_INTERACTIVE_FOOTER));
+    }
+
+    /// (d) Non-Claude CLIs can't take a system-prompt file, so the inline note
+    /// must name the overflow file's absolute path instead of pointing at an
+    /// "appended system prompt" the CLI never receives (#159).
+    #[test]
+    fn test_copilot_large_prompt_note_names_prompt_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_dir = tmp.path().join(".recipe-output");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let adapter = CLISubprocessAdapter::new().with_binary("copilot");
+        let prompt = format!(
+            "Task: copilot overflow.\n{}",
+            "z".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1)
+        );
+        let cmd = adapter
+            .build_agent_command(&output_dir, tmp.path(), &prompt, Some("system"), None)
+            .unwrap();
+        let args = args_of(&cmd);
+
+        let prompt_file = output_dir.join("agent-system-prompt.md");
+        assert!(prompt_file.is_absolute());
+        assert!(prompt_file.exists());
+
+        let p_index = args.iter().position(|arg| arg == "-p").unwrap();
+        let inline_prompt = &args[p_index + 1];
+        assert!(inline_prompt.starts_with("Task: copilot overflow."));
+        assert!(
+            inline_prompt.contains(&prompt_file.display().to_string()),
+            "copilot note must name the prompt file path"
+        );
+        assert!(
+            !inline_prompt.contains("appended system prompt"),
+            "copilot never receives an appended system prompt"
+        );
+        assert!(!inline_prompt.contains(FILE_BACKED_PROMPT_CONTINUATION_NOTE));
+        assert!(inline_prompt.ends_with(&format!(
+            "\n\nIMPORTANT: Additional task instructions, output requirements, and context \
+             continue in the file {}. Read that file and treat its content as part of this \
+             same request and follow it fully.",
+            prompt_file.display()
+        )));
+
+        let output_dir_str = output_dir.to_string_lossy().into_owned();
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--add-dir" && w[1] == output_dir_str),
+            "copilot must get --add-dir <output_dir>"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("--append-system-prompt")),
+            "copilot must not receive any --append-system-prompt* flag"
+        );
     }
 
     #[test]
