@@ -667,7 +667,7 @@ impl CLISubprocessAdapter {
     fn write_private_prompt_file(
         prompt_file: &std::path::Path,
         content: &str,
-    ) -> Result<std::path::PathBuf, anyhow::Error> {
+    ) -> Result<(), anyhow::Error> {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
         #[cfg(unix)]
@@ -696,7 +696,7 @@ impl CLISubprocessAdapter {
                 })?;
         }
 
-        Ok(prompt_file.to_path_buf())
+        Ok(())
     }
 
     fn clamp_char_boundary(text: &str, max_bytes: usize) -> usize {
@@ -757,10 +757,8 @@ impl CLISubprocessAdapter {
         let prompt_file = if appended_prompt.is_empty() {
             None
         } else {
-            Some(Self::write_private_prompt_file(
-                &prompt_file_path,
-                &appended_prompt,
-            )?)
+            Self::write_private_prompt_file(&prompt_file_path, &appended_prompt)?;
+            Some(prompt_file_path)
         };
 
         Ok((inline_prompt, prompt_file))
