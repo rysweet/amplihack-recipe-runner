@@ -641,7 +641,7 @@ impl CLISubprocessAdapter {
     }
 
     fn supports_file_backed_prompt_transport(&self) -> bool {
-        // Claude-family CLIs support --append-system-prompt for overflow.
+        // Claude-family CLIs support --append-system-prompt-file for overflow.
         // Copilot CLI does not, but we still need to avoid E2BIG.
         // For Copilot: truncate -p and write overflow to a prompt file
         // in the working dir that the agent can read via --add-dir.
@@ -665,11 +665,21 @@ impl CLISubprocessAdapter {
     }
 
     fn write_private_prompt_file(
-        output_dir: &std::path::Path,
+        prompt_file: &std::path::Path,
         content: &str,
     ) -> Result<std::path::PathBuf, anyhow::Error> {
-        let prompt_file = output_dir.join("agent-system-prompt.md");
-        let mut file = std::fs::File::create(&prompt_file)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            // Create private from the start; set_permissions below also
+            // covers a file left over from an earlier attempt.
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(prompt_file)
             .with_context(|| format!("Failed to create prompt file {}", prompt_file.display()))?;
         file.write_all(content.as_bytes())
             .with_context(|| format!("Failed to write prompt file {}", prompt_file.display()))?;
@@ -680,13 +690,13 @@ impl CLISubprocessAdapter {
         {
             use std::os::unix::fs::PermissionsExt;
 
-            std::fs::set_permissions(&prompt_file, std::fs::Permissions::from_mode(0o600))
+            std::fs::set_permissions(prompt_file, std::fs::Permissions::from_mode(0o600))
                 .with_context(|| {
                     format!("Failed to chmod prompt file {}", prompt_file.display())
                 })?;
         }
 
-        Ok(prompt_file)
+        Ok(prompt_file.to_path_buf())
     }
 
     fn clamp_char_boundary(text: &str, max_bytes: usize) -> usize {
@@ -703,6 +713,7 @@ impl CLISubprocessAdapter {
         prompt: &str,
         system_prompt: Option<&str>,
     ) -> Result<(String, Option<std::path::PathBuf>), anyhow::Error> {
+        let prompt_file_path = output_dir.join("agent-system-prompt.md");
         let preview_boundary = Self::clamp_char_boundary(prompt, FILE_BACKED_INLINE_PROMPT_BYTES);
         let prompt_overflow = if preview_boundary < prompt.len() {
             &prompt[preview_boundary..]
@@ -716,7 +727,17 @@ impl CLISubprocessAdapter {
             String::new()
         };
         if !prompt_overflow.is_empty() {
-            inline_prompt.push_str(FILE_BACKED_PROMPT_CONTINUATION_NOTE);
+            if matches!(self.cli.as_str(), "claude" | "launch" | "RustyClawd") {
+                inline_prompt.push_str(FILE_BACKED_PROMPT_CONTINUATION_NOTE);
+            } else {
+                // Non-Claude CLIs only see the file via --add-dir, so name it.
+                inline_prompt.push_str(&format!(
+                    "\n\nIMPORTANT: Additional task instructions, output requirements, and \
+                     context continue in the file {}. Read that file and treat its content \
+                     as part of this same request and follow it fully.",
+                    prompt_file_path.display()
+                ));
+            }
         }
 
         let mut appended_prompt = String::new();
@@ -737,7 +758,7 @@ impl CLISubprocessAdapter {
             None
         } else {
             Some(Self::write_private_prompt_file(
-                output_dir,
+                &prompt_file_path,
                 &appended_prompt,
             )?)
         };
@@ -803,10 +824,12 @@ impl CLISubprocessAdapter {
                 effective_system_prompt.len()
             );
             if let Some(ref pf) = prompt_file {
-                // Claude-family CLIs support --append-system-prompt directly.
+                // Claude-family CLIs read the file via --append-system-prompt-file.
+                // (--append-system-prompt takes TEXT: passing the path there
+                // dropped the overflow and the no-reentry guard, #159.)
                 // Copilot CLI does not — use --add-dir so the agent can read the file.
                 if matches!(self.cli.as_str(), "claude" | "launch" | "RustyClawd") {
-                    cmd.args(["--append-system-prompt", &pf.to_string_lossy()]);
+                    cmd.args(["--append-system-prompt-file", &pf.to_string_lossy()]);
                 } else {
                     // For Copilot and others: make the prompt file accessible via --add-dir
                     // and include a note in the inline prompt pointing to it.

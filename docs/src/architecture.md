@@ -323,6 +323,10 @@ The production adapter spawns subprocesses:
   [--model EXPLICIT_MODEL] -` in the effective workspace, without implicit
   `--add-dir` or model selection. Full system/persona, leaf/no-reentry, task and
   autonomy instructions are delivered through stdin for every prompt size.
+  For Claude/Copilot, a prompt + effective system prompt over 32 KiB switches to
+  file-backed transport: Claude-family CLIs get the overflow and system prompt
+  via `--append-system-prompt-file`; see
+  [Agent prompt transport](agent-prompt-transport.md).
 
 ### Private Codex execution ownership
 
