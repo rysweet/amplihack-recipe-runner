@@ -3348,6 +3348,38 @@ mod tests {
         assert_eq!(result.unwrap(), "ok");
     }
 
+    /// #130 regression (execve level): Linux rejects `execve` with `E2BIG`
+    /// when ANY single `KEY=value` string exceeds `MAX_ARG_STRLEN` (128 KiB),
+    /// even when the whole env block is far below `ARG_MAX`. A 130 KiB
+    /// `RECIPE_VAR_*` value must still reach the script byte-for-byte.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn execve_rejects_single_env_string_over_max_arg_strlen() {
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        clear_env_byte_budget_for_test();
+
+        let big = "a".repeat(130 * 1024);
+        assert_eq!(big.len(), 133_120);
+        assert!(
+            "RECIPE_VAR_BIG".len() + 1 + big.len() + 1 > 128 * 1024,
+            "fixture must exceed MAX_ARG_STRLEN as a single env string"
+        );
+        assert!(
+            big.len() < env_byte_budget(),
+            "fixture must stay under the total budget so only the per-string cap is hit"
+        );
+        let extra = map_of(&[("RECIPE_VAR_BIG", big.as_str())]);
+
+        let adapter = CLISubprocessAdapter::new();
+        let result =
+            adapter.execute_bash_step("printf %s \"$RECIPE_VAR_BIG\" | wc -c", ".", None, &extra);
+
+        let out = result.unwrap_or_else(|e| {
+            panic!("a single >MAX_ARG_STRLEN recipe var must not fail execve: {e:#}")
+        });
+        assert_eq!(out.trim(), "133120");
+    }
+
     // ══════════════════════════════════════════════════════════════════
     // #143: bash interpreter resolution
     // ══════════════════════════════════════════════════════════════════
