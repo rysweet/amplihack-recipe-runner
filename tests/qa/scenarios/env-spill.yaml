@@ -1,0 +1,24 @@
+name: Per-value env spill lifecycle
+description: Run the candidate CLI with an oversized recipe value read in bash, parallel spilling steps, a planted legacy context path, and required-JSON cleanup (Linux; requires bash, realpath, sha256sum, and Python 3).
+version: "1.0.0"
+config:
+  timeout: 180000
+  retries: 0
+  parallel: false
+environment:
+  requires: [RECIPE_RUNNER_QA_BINARY]
+agents:
+  - name: cli-agent
+    type: cli
+    config:
+      defaultTimeout: 180000
+steps:
+  - name: Candidate env-spill lifecycle
+    agent: cli-agent
+    action: execute_command
+    target: bash tests/qa/env-spill.sh
+    timeout: 180000
+assertions: []
+metadata:
+  tags: [recipe-runner, env-spill, security, cleanup]
+  priority: critical

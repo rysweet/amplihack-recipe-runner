@@ -3179,8 +3179,8 @@ mod tests {
     //
     // Contract for the runtime-MEASURED env budget (replacing the hardcoded
     // 1_500_000 literal) and the fail-loud `bounded_env`. `bounded_env` MAY
-    // drop NON-protected leftovers (lossless — recoverable via
-    // AMPLIHACK_CONTEXT_FILE) but MUST fail loud with a NAMED error (names +
+    // drop NON-protected leftovers (inherited vars only; recipe values are
+    // protected and spilled to files instead, #130) but MUST fail loud with a NAMED error (names +
     // sizes only, never values) when protected vars alone exceed the budget,
     // so a raw execve E2BIG (`os error 7`) can never surface. Protected =
     // AMPLIHACK_*/RECIPE_VAR_* prefixes + PATH/HOME + the critical scalar
@@ -3207,7 +3207,7 @@ mod tests {
             "HOME",
             "AMPLIHACK_TREE_ID",
             "AMPLIHACK_SESSION_DEPTH",
-            "AMPLIHACK_CONTEXT_FILE",
+            "AMPLIHACK_MAX_DEPTH",
             "RECIPE_VAR_task_description",
             "TASK_DESCRIPTION",
             "REPO_PATH",
