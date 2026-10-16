@@ -236,7 +236,13 @@ fn run() -> i32 {
 
     // Parse recipe — try as file path first, then as recipe name
     info!("run: parsing recipe from {:?}", recipe_path);
-    let parser = RecipeParser::new();
+    // `--validate-only` reports step-field warnings itself via
+    // `validate_with_yaml`; parsing must not print them a second time.
+    let parser = if cli.validate_only {
+        RecipeParser::new().without_field_warnings()
+    } else {
+        RecipeParser::new()
+    };
     let resolved_path;
     let recipe = if recipe_path.is_file() {
         resolved_path = recipe_path;

@@ -43,11 +43,27 @@ const KNOWN_STEP_FIELDS: &[&str] = &[
     "recipe",
     "context",
     "continue_on_error",
+    "fatal",
+    "nonfatal",
     "parallel_group",
     "when_tags",
     "recovery_on_failure",
     "model",
 ];
+
+/// Step fields that were honoured by earlier executors and are now ignored,
+/// with the reason shown in the parse-time warning.
+const RETIRED_STEP_FIELDS: &[(&str, &str)] = &[(
+    "max_env_value_bytes",
+    "the runner now spills oversized env values to private files automatically; \
+     remove it from the recipe",
+)];
+
+/// Most step-field warnings reported for one recipe.
+const MAX_STEP_FIELD_WARNINGS: usize = 100;
+
+/// Longest piece of recipe text (name, id, field) quoted in a warning.
+const MAX_WARNING_TEXT_CHARS: usize = 128;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
@@ -70,12 +86,17 @@ pub enum ParseError {
     Extends(String),
 }
 
-pub struct RecipeParser;
+pub struct RecipeParser {
+    /// Report unknown and retired step fields when parsing (#130).
+    emit_field_warnings: bool,
+}
 
 impl RecipeParser {
     pub fn new() -> Self {
         debug!("RecipeParser::new: creating parser instance");
-        Self
+        Self {
+            emit_field_warnings: true,
+        }
     }
 
     /// Parse a recipe YAML file from disk.
@@ -141,6 +162,21 @@ impl RecipeParser {
             }
         }
 
+        if self.emit_field_warnings
+            && let Ok(raw) = serde_yaml::from_str::<serde_yaml::Value>(yaml_content)
+        {
+            for warning in step_field_warnings(&raw) {
+                // Without a logger configured for warnings (the CLI's default),
+                // `warn!` would drop the message, and silently ignored fields
+                // are exactly what this check exists to surface.
+                if log::log_enabled!(log::Level::Warn) {
+                    log::warn!("{warning}");
+                } else {
+                    eprintln!("warning: {warning}");
+                }
+            }
+        }
+
         Ok(recipe)
     }
 
@@ -195,48 +231,105 @@ impl RecipeParser {
         // Check for unrecognized fields if raw YAML is provided
         if let Some(yaml_str) = raw_yaml
             && let Ok(data) = serde_yaml::from_str::<serde_yaml::Value>(yaml_str)
-            && let Some(map) = data.as_mapping()
         {
-            let known: HashSet<&str> = KNOWN_TOP_FIELDS.iter().copied().collect();
-            for key in map.keys() {
-                if let Some(key_str) = key.as_str()
-                    && !known.contains(key_str)
-                {
-                    warnings.push(format!(
-                        "Unrecognized top-level field '{}' (possible typo)",
-                        key_str
-                    ));
-                }
-            }
-
-            // Check step-level fields
-            let step_known: HashSet<&str> = KNOWN_STEP_FIELDS.iter().copied().collect();
-            if let Some(steps) = map.get(serde_yaml::Value::String("steps".to_string()))
-                && let Some(steps_seq) = steps.as_sequence()
-            {
-                for (i, step_raw) in steps_seq.iter().enumerate() {
-                    if let Some(step_map) = step_raw.as_mapping() {
-                        let default_sid = format!("index {}", i);
-                        let sid = step_map
-                            .get(serde_yaml::Value::String("id".to_string()))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(&default_sid);
-                        for key in step_map.keys() {
-                            if let Some(key_str) = key.as_str()
-                                && !step_known.contains(key_str)
-                            {
-                                warnings.push(format!(
-                                    "Step '{}': unrecognized field '{}' (possible typo)",
-                                    sid, key_str
-                                ));
-                            }
-                        }
+            if let Some(map) = data.as_mapping() {
+                let known: HashSet<&str> = KNOWN_TOP_FIELDS.iter().copied().collect();
+                for key in map.keys() {
+                    if let Some(key_str) = key.as_str()
+                        && !known.contains(key_str)
+                    {
+                        warnings.push(format!(
+                            "Unrecognized top-level field '{}' (possible typo)",
+                            warning_text(key_str)
+                        ));
                     }
                 }
             }
+            warnings.extend(step_field_warnings(&data));
         }
 
         warnings
+    }
+}
+
+impl RecipeParser {
+    /// Opt out of parse-time step-field warnings. `--validate-only` and
+    /// [`crate::validate_recipe`] use this because they report the same
+    /// warnings through [`RecipeParser::validate_with_yaml`].
+    pub fn without_field_warnings(self) -> Self {
+        Self {
+            emit_field_warnings: false,
+        }
+    }
+}
+
+/// #130: one warning per unknown or retired step field in the raw recipe YAML.
+/// Never fails; malformed shapes yield no warnings.
+fn step_field_warnings(raw: &serde_yaml::Value) -> Vec<String> {
+    let Some(map) = raw.as_mapping() else {
+        return Vec::new();
+    };
+    let Some(steps) = map.get("steps").and_then(|v| v.as_sequence()) else {
+        return Vec::new();
+    };
+    let recipe = map
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map_or_else(|| "<unnamed>".to_string(), warning_text);
+
+    let mut warnings = Vec::new();
+    let mut overflow = 0usize;
+    for (i, step) in steps.iter().enumerate() {
+        let Some(step_map) = step.as_mapping() else {
+            continue;
+        };
+        let step_id = step_map
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map_or_else(|| format!("<index {i}>"), warning_text);
+        for key in step_map.keys() {
+            let key_str = key.as_str();
+            if key_str.is_some_and(|k| KNOWN_STEP_FIELDS.contains(&k)) {
+                continue;
+            }
+            if warnings.len() == MAX_STEP_FIELD_WARNINGS {
+                overflow += 1;
+                continue;
+            }
+            let retired =
+                key_str.and_then(|k| RETIRED_STEP_FIELDS.iter().find(|(name, _)| *name == k));
+            warnings.push(match (retired, key_str) {
+                (Some((field, reason)), _) => format!(
+                    "recipe '{recipe}': step '{step_id}': field '{field}' is retired and \
+                     ignored — {reason}"
+                ),
+                (None, Some(k)) => format!(
+                    "recipe '{recipe}': step '{step_id}' has unknown field '{}' (ignored)",
+                    warning_text(k)
+                ),
+                (None, None) => format!(
+                    "recipe '{recipe}': step '{step_id}' has unknown field '<non-string key>' \
+                     (ignored)"
+                ),
+            });
+        }
+    }
+    if overflow > 0 {
+        warnings.push(format!("… and {overflow} more unknown step fields"));
+    }
+    warnings
+}
+
+/// Recipe-supplied text made safe for a terminal or log line: escaped, and
+/// capped at [`MAX_WARNING_TEXT_CHARS`] characters.
+fn warning_text(raw: &str) -> String {
+    let escaped: String = raw.escape_debug().collect();
+    if escaped.chars().count() <= MAX_WARNING_TEXT_CHARS {
+        escaped
+    } else {
+        let mut capped: String = escaped.chars().take(MAX_WARNING_TEXT_CHARS).collect();
+        capped.push('…');
+        capped
     }
 }
 
@@ -889,5 +982,199 @@ steps:
                 prop_assert!(result.is_err(), "Empty name should be rejected");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod step_field_warning_tests {
+    //! #130 PART 2: unknown step fields used to be dropped silently by serde,
+    //! which is how `max_env_value_bytes` stopped protecting amplihack recipes
+    //! without anyone noticing.
+    use super::*;
+    use crate::models::Step;
+
+    fn warnings_for(yaml: &str) -> Vec<String> {
+        step_field_warnings(&serde_yaml::from_str(yaml).unwrap())
+    }
+
+    const RETIRED: &str = "recipe 'r': step 'checkpoint': field 'max_env_value_bytes' is retired \
+                           and ignored — the runner now spills oversized env values to private \
+                           files automatically; remove it from the recipe";
+
+    #[test]
+    fn retired_max_env_value_bytes_parses_and_names_the_step() {
+        let yaml = "name: r\nsteps:\n  - id: checkpoint\n    command: echo hi\n    max_env_value_bytes: 65536\n";
+        let recipe = RecipeParser::new()
+            .parse(yaml)
+            .expect("an unknown field must never fail the parse");
+        assert_eq!(recipe.steps[0].id, "checkpoint");
+        assert_eq!(warnings_for(yaml), vec![RETIRED.to_string()]);
+    }
+
+    #[test]
+    fn unknown_field_gets_the_generic_warning() {
+        let yaml = "name: r\nsteps:\n  - id: s1\n    command: echo\n    foo: 1\n";
+        assert_eq!(
+            warnings_for(yaml),
+            vec!["recipe 'r': step 's1' has unknown field 'foo' (ignored)".to_string()]
+        );
+    }
+
+    #[test]
+    fn missing_ids_and_names_use_placeholders() {
+        let yaml = "steps:\n  - id: a\n    command: x\n  - command: y\n    foo: 1\n";
+        assert_eq!(
+            warnings_for(yaml),
+            vec![
+                "recipe '<unnamed>': step '<index 1>' has unknown field 'foo' (ignored)"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn known_fields_including_fatal_and_nonfatal_do_not_warn() {
+        let yaml = r#"
+name: r
+steps:
+  - id: a
+    type: bash
+    command: echo
+    output: out
+    condition: "true"
+    parse_json: true
+    parse_json_required: false
+    working_dir: .
+    timeout: 5
+    auto_stage: false
+    continue_on_error: false
+    fatal: false
+    parallel_group: g
+    when_tags: [x]
+    recovery_on_failure: false
+  - id: b
+    type: agent
+    agent: builder
+    prompt: hi
+    mode: fast
+    model: m
+    nonfatal: true
+  - id: c
+    type: recipe
+    recipe: child
+    context: {k: v}
+"#;
+        assert!(RecipeParser::new().parse(yaml).is_ok());
+        assert_eq!(warnings_for(yaml), Vec::<String>::new());
+    }
+
+    #[test]
+    fn known_step_fields_cover_every_step_field_and_alias() {
+        // Exhaustive literal: adding a Step field without updating this test
+        // (and KNOWN_STEP_FIELDS) is a compile error, not a false warning.
+        let step = Step {
+            id: "x".into(),
+            step_type: Some(StepType::Bash),
+            command: Some("c".into()),
+            agent: Some("a".into()),
+            prompt: Some("p".into()),
+            output: Some("o".into()),
+            condition: Some("true".into()),
+            parse_json: true,
+            parse_json_required: true,
+            mode: Some("m".into()),
+            working_dir: Some(".".into()),
+            timeout: Some(1),
+            auto_stage: Some(true),
+            recipe: Some("r".into()),
+            sub_context: Some(Default::default()),
+            continue_on_error: true,
+            fatal: true,
+            parallel_group: Some("g".into()),
+            when_tags: vec!["t".into()],
+            recovery_on_failure: true,
+            model: Some("m".into()),
+        };
+        let json = serde_json::to_value(&step).unwrap();
+        for key in json.as_object().unwrap().keys() {
+            assert!(
+                KNOWN_STEP_FIELDS.contains(&key.as_str()),
+                "Step field '{key}' missing from KNOWN_STEP_FIELDS"
+            );
+        }
+        assert!(KNOWN_STEP_FIELDS.contains(&"nonfatal"), "serde alias");
+        assert!(!KNOWN_STEP_FIELDS.contains(&"max_env_value_bytes"));
+    }
+
+    #[test]
+    fn warning_text_from_yaml_is_escaped_and_capped() {
+        // S8: keys are attacker-controlled text going to a terminal/log.
+        let long = "z".repeat(300);
+        let yaml = format!(
+            "name: r\nsteps:\n  - id: s\n    command: x\n    \"bad\\nkey\\u001b[31m'\": 1\n    {long}: 1\n"
+        );
+        let w = warnings_for(&yaml);
+        assert_eq!(w.len(), 2, "{w:?}");
+        for line in &w {
+            assert!(!line.contains('\n') && !line.contains('\u{1b}'), "{line:?}");
+        }
+        assert!(w.iter().any(|l| l.contains("bad\\nkey")), "{w:?}");
+        let capped = w.iter().find(|l| l.contains("zzz")).unwrap();
+        assert!(capped.contains('…'), "{capped}");
+        assert!(
+            capped.chars().filter(|c| *c == 'z').count() <= 128,
+            "{capped}"
+        );
+    }
+
+    #[test]
+    fn non_string_keys_do_not_panic() {
+        let yaml = "name: r\nsteps:\n  - id: s\n    command: x\n    1: one\n";
+        assert_eq!(
+            warnings_for(yaml),
+            vec!["recipe 'r': step 's' has unknown field '<non-string key>' (ignored)".to_string()]
+        );
+    }
+
+    #[test]
+    fn malformed_shapes_yield_no_warnings() {
+        for yaml in [
+            "just a string",
+            "name: r\nsteps: 3\n",
+            "name: r\nsteps:\n  - 7\n",
+        ] {
+            assert!(warnings_for(yaml).is_empty(), "{yaml}");
+        }
+    }
+
+    #[test]
+    fn warnings_are_capped_at_one_hundred() {
+        // S8/SR-13
+        let mut yaml = String::from("name: r\nsteps:\n  - id: s\n    command: x\n");
+        for i in 0..150 {
+            yaml.push_str(&format!("    f{i:03}: 1\n"));
+        }
+        let w = warnings_for(&yaml);
+        assert_eq!(w.len(), 101);
+        assert_eq!(w[100], "… and 50 more unknown step fields");
+    }
+
+    #[test]
+    fn validate_with_yaml_reports_step_fields_through_the_shared_helper() {
+        let yaml = "name: r\ndescrption: oops\nsteps:\n  - id: checkpoint\n    command: echo hi\n    max_env_value_bytes: 65536\n";
+        let parser = RecipeParser::new().without_field_warnings();
+        let recipe = parser.parse(yaml).unwrap();
+        let w = parser.validate_with_yaml(&recipe, Some(yaml));
+        assert!(w.contains(&RETIRED.to_string()), "{w:?}");
+        assert!(
+            w.contains(&"Unrecognized top-level field 'descrption' (possible typo)".to_string()),
+            "top-level warning is unchanged: {w:?}"
+        );
+        assert_eq!(
+            w.iter()
+                .filter(|l| l.contains("max_env_value_bytes"))
+                .count(),
+            1
+        );
     }
 }

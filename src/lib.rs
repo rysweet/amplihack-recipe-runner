@@ -144,7 +144,8 @@ pub fn validate_recipe(yaml_content: &str) -> Result<Vec<String>, parser::ParseE
         "validate_recipe: yaml_content length={}",
         yaml_content.len()
     );
-    let parser = RecipeParser::new();
+    // The returned warnings already include step-field warnings.
+    let parser = RecipeParser::new().without_field_warnings();
     let recipe = parser.parse(yaml_content)?;
     Ok(parser.validate_with_yaml(&recipe, Some(yaml_content)))
 }
