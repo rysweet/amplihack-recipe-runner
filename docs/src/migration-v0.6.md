@@ -83,9 +83,10 @@ fi
 
 ## Unknown step field warnings have new wording
 
-The parser now reports unknown step fields during every parse, not only under
-`--validate-only`. Unknown fields are still warnings, and `--validate-only`
-still exits `0`. The step-field message changed:
+The parser now reports unknown step fields whenever it parses a recipe, not
+only under `--validate-only`. Each distinct warning is printed once per
+process. Unknown fields are still warnings, and `--validate-only` still exits
+`0`. The step-field message changed:
 
 | | Before 0.6.0 | 0.6.0 |
 | --- | --- | --- |

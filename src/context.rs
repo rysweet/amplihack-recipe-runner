@@ -44,14 +44,15 @@ static HEREDOC_START_RE: LazyLock<Regex> = LazyLock::new(|| {
 // command path and argv (large argv/scripts are spilled to files elsewhere).
 //
 // The value is cached in a `OnceLock` and exposed through the single accessor
-// [`env_byte_budget`], which both the context layer
-// ([`RecipeContext::shell_env_for_step`]) and the subprocess layer
-// (`cli_subprocess::bounded_env`) consult so the two can never drift.
+// [`env_byte_budget`], which both the bash-step spill planner
+// (`env_spill::spill_for_bash`) and `cli_subprocess::bounded_env` consult so
+// the two can never drift.
 
 /// Conservative floor used only when `sysconf`/`getrlimit` are unavailable or
 /// when subtracting the argv reserve would leave a pathologically small (or
-/// underflowed) budget. 256 KiB comfortably exceeds a curated file-first env
-/// yet stays well under any real `ARG_MAX`.
+/// underflowed) budget. 256 KiB comfortably holds a typical curated env,
+/// with larger recipe values spilled to files, yet stays well under any real
+/// `ARG_MAX`.
 pub(crate) const ENV_BUDGET_FLOOR: usize = 256 * 1024;
 
 /// Headroom reserved for the command path plus argv, kept separate from the

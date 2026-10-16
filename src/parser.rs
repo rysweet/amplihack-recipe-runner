@@ -166,6 +166,11 @@ impl RecipeParser {
             && let Ok(raw) = serde_yaml::from_str::<serde_yaml::Value>(yaml_content)
         {
             for warning in step_field_warnings(&raw) {
+                // Sub-recipes are re-parsed on every invocation; report each
+                // distinct warning once per process.
+                if !first_report(&warning) {
+                    continue;
+                }
                 // Without a logger configured for warnings (the CLI's default),
                 // `warn!` would drop the message, and silently ignored fields
                 // are exactly what this check exists to surface.
@@ -318,6 +323,17 @@ fn step_field_warnings(raw: &serde_yaml::Value) -> Vec<String> {
         warnings.push(format!("… and {overflow} more unknown step fields"));
     }
     warnings
+}
+
+/// Whether `warning` has not been reported by [`RecipeParser::parse`] in this
+/// process yet. Records it as reported.
+fn first_report(warning: &str) -> bool {
+    static REPORTED: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
+    REPORTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashSet::new)
+        .insert(warning.to_string())
 }
 
 /// Recipe-supplied text made safe for a terminal or log line: escaped, and
@@ -995,6 +1011,20 @@ mod step_field_warning_tests {
 
     fn warnings_for(yaml: &str) -> Vec<String> {
         step_field_warnings(&serde_yaml::from_str(yaml).unwrap())
+    }
+
+    #[test]
+    fn each_distinct_warning_is_reported_once_per_process() {
+        let warning = format!(
+            "recipe 'r': step '{}' has unknown field 'x'",
+            uuid::Uuid::new_v4()
+        );
+        assert!(first_report(&warning), "first sighting must be reported");
+        assert!(
+            !first_report(&warning),
+            "a repeat parse must not report it again"
+        );
+        assert!(first_report(&format!("{warning} (other)")));
     }
 
     const RETIRED: &str = "recipe 'r': step 'checkpoint': field 'max_env_value_bytes' is retired \

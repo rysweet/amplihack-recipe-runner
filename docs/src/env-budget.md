@@ -251,7 +251,7 @@ is never silently truncated.
 | File names | `v0`, `v1`, ... by index. Variable names never appear in paths. |
 | File mode | `0600`, created with `O_CREAT \| O_EXCL` |
 | Contents | the raw value bytes, nothing else |
-| Cleanup | removed when the step finishes: on success, non-zero exit, `timeout:` expiry, and any runner-side error after the spill (including a `bounded_env` failure) |
+| Cleanup | removed when the step finishes: on success, non-zero exit, `timeout:` expiry, and any runner-side error after the spill (including a `bounded_env` failure). If removal fails, a `warn` record names the directory. |
 
 Parallel steps each get their own directory. Spill files are never written
 into the step's `working_dir`, and spilled values are never copied into the
@@ -438,11 +438,12 @@ wording isn't, so don't match on it in scripts.
 
 | Event | Level | Illustrative message |
 | --- | --- | --- |
-| Values spilled for a step | `info` | `env spill: 2 value(s) moved to private files: RECIPE_VAR_report (204800 bytes), REPORT (204800 bytes)` |
-| Spill directory | `debug` | `env spill dir: /tmp/amplihack-env-spill-Xa81Qz` |
-| Unspillable name dropped | `warn` | `env spill: dropping BASH_REPORT (204800 bytes): name cannot be restored as a shell variable` |
+| Values spilled for a step | `info` | `Spilled 2 env value(s) for bash step to private files: RECIPE_VAR_report (204800 bytes), REPORT (204800 bytes)` |
+| Spill directory not removed | `warn` | `failed to remove env spill directory /tmp/amplihack-env-spill-Xa81Qz: Permission denied (os error 13); it still holds spilled values` |
+| Spill directory | `debug` | `Env spill directory: /tmp/amplihack-env-spill-Xa81Qz` |
+| Unspillable name dropped | `warn` | `Dropping env var BASH_REPORT (204800 bytes) from bash step: too large for one environment string and not a name the step preamble can assign` |
 | Inherited var over `MAX_ARG_STRLEN` | `warn` | `dropping inherited env var "BIG_BLOB" (KEY=value\0 is 140010 bytes): exceeds MAX_ARG_STRLEN (131072)` |
-| Non-protected inherited var trimmed | `warn` | `env budget: dropping non-protected var "BIG_CACHED_BLOB" (73422 bytes)` |
+| Non-protected inherited var trimmed | `warn` | `bounded_env: dropped 1 non-protected inherited env var(s) to keep the child environment under the measured execve budget (<budget> bytes). ... Dropped (names only): ["BIG_CACHED_BLOB"]` |
 
 Spill errors name the variable and its byte length, plus the underlying I/O
 error, for example `failed to spill NAME (LEN bytes): <io error>`.

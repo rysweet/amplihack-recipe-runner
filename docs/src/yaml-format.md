@@ -110,6 +110,8 @@ Details:
 - Warnings go through the logger at `warn` level when it's enabled (for
   example `RUST_LOG=warn`). Otherwise they go to stderr prefixed with
   `warning: `.
+- Each distinct warning is printed once per process, so a sub-recipe that
+  runs several times in one recipe run is reported once.
 - `--validate-only` lists the same messages in its own report and doesn't
   print them twice. Unknown fields are warnings, so it still exits `0`. See
   [`--validate-only`](cli-reference.md#--validate-only).

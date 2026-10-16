@@ -203,6 +203,23 @@ impl EnvSpill {
     }
 }
 
+impl Drop for EnvSpill {
+    /// `TempDir` ignores removal errors; a leftover directory holds value
+    /// bytes, so report it (path only). `TempDir`'s own drop then finds
+    /// nothing left to remove.
+    fn drop(&mut self) {
+        let dir = self.dir.path();
+        if let Err(e) = std::fs::remove_dir_all(dir)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            log::warn!(
+                "failed to remove env spill directory {}: {e}; it still holds spilled values",
+                dir.display()
+            );
+        }
+    }
+}
+
 fn private_tempdir(root: &Path) -> anyhow::Result<tempfile::TempDir> {
     let mut builder = tempfile::Builder::new();
     builder.prefix("amplihack-env-spill-");
@@ -621,6 +638,37 @@ mod tests {
         drop(spill);
         assert!(!dir.exists());
         assert!(entries_in(root.path()).is_empty());
+    }
+
+    #[test]
+    fn failed_spill_cleanup_is_reported_not_swallowed() {
+        let root = tempfile::tempdir().unwrap();
+        let spill = EnvSpill::write(root.path(), &[("A", "ISSUE130_CLEANUP_VALUE")]).unwrap();
+        let dir = spill.dir().to_path_buf();
+        // A read-only directory keeps its entries; root ignores the mode.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::remove_file(dir.join("v0")).is_ok() {
+            return;
+        }
+
+        let capture = crate::adapters::test_log::LogCapture::start();
+        drop(spill);
+        let records = capture.this_thread();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let shown = dir.display().to_string();
+        assert!(
+            records
+                .iter()
+                .any(|(l, m)| *l == log::Level::Warn && m.contains(&shown)),
+            "cleanup failure must be logged with the directory path"
+        );
+        assert!(
+            records
+                .iter()
+                .all(|(_, m)| !m.contains("ISSUE130_CLEANUP_VALUE")),
+            "the warning must not contain value bytes"
+        );
     }
 
     // ── preamble ──────────────────────────────────────────────────────

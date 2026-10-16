@@ -93,3 +93,29 @@ fn known_fields_including_fatal_and_nonfatal_are_silent() {
     assert!(!stderr.contains("unknown field"), "{stderr}");
     assert!(!stderr.contains("retired"), "{stderr}");
 }
+
+#[test]
+fn a_sub_recipe_run_twice_warns_once() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("child.yaml"),
+        "name: child\nsteps:\n  - id: c1\n    type: bash\n    command: echo child\n    foo: 1\n",
+    )
+    .unwrap();
+    let parent = dir.path().join("parent.yaml");
+    std::fs::write(
+        &parent,
+        "name: parent\nsteps:\n  - id: first\n    type: recipe\n    recipe: child\n  - id: second\n    type: recipe\n    recipe: child\n",
+    )
+    .unwrap();
+    let dir_arg = dir.path().to_str().unwrap();
+    let (code, _stdout, stderr) = run(&parent, &["-R", dir_arg]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        stderr
+            .matches("recipe 'child': step 'c1' has unknown field 'foo'")
+            .count(),
+        1,
+        "{stderr}"
+    );
+}
