@@ -118,7 +118,10 @@ a spill in two phases:
 
 The plan is deterministic. Only recipe values (the step's `extra_env`) are
 candidates; inherited variables are never spilled. Empty values are never
-spilled.
+spilled. Because the spill runs before `bounded_env`, the runner moves recipe
+values to files rather than dropping ambient variables: a non-protected
+inherited variable is trimmed only if the environment is still over budget
+after every spillable recipe value has been moved.
 
 `RECIPE_VAR_x` and its legacy alias `X` hold the same value but are planned
 independently, each with its own file. Each is judged on its own
@@ -308,10 +311,22 @@ agent through its prompt, and prompts over `MAX_INLINE_AGENT_PROMPT_BYTES`
 already go through a file. An agent child's environment is the sanitized
 inherited environment plus `AMPLIHACK_AGENT_BINARY`.
 
-That inherited environment is filtered with the same per-string rule. A
-variable is dropped, with a warning naming it and its size, when
-`env_pair_bytes(KEY, value) > PER_VALUE_ENV_CAP`. The rule counts the key, so a
-long name with a value just under 128 KiB is caught too.
+That inherited environment is filtered before any step-specific variable is
+added. A variable is dropped, with a warning naming it and giving its size, when
+its whole `KEY=value\0` string is longer than `MAX_ARG_STRLEN`:
+
+```text
+env_pair_bytes(KEY, value) = len(KEY) + 1 + len(value) + 1 > 131072
+```
+
+This is the same check the kernel applies in `execve`, so the runner drops only
+inherited variables that no child could receive. The rule counts the key, `=`
+and the NUL, so a 1,000-byte name with a 130,071-byte value (131,073 bytes in
+all) is dropped, while the same name with a 130,070-byte value (exactly 131,072
+bytes) is passed through. `PER_VALUE_ENV_CAP` does not apply to inherited
+variables. That 4 KiB margin governs only the recipe values the runner spills.
+The filter applies to bash and agent children alike, and runs before the bash
+interpreter is resolved from the parent environment.
 
 ---
 
@@ -423,7 +438,7 @@ wording isn't, so don't match on it in scripts.
 | Values spilled for a step | `info` | `env spill: 2 value(s) moved to private files: RECIPE_VAR_report (204800 bytes), REPORT (204800 bytes)` |
 | Spill directory | `debug` | `env spill dir: /tmp/amplihack-env-spill-Xa81Qz` |
 | Unspillable name dropped | `warn` | `env spill: dropping BASH_REPORT (204800 bytes): name cannot be restored as a shell variable` |
-| Inherited var over the per-string cap | `warn` | `dropping inherited env var "BIG_BLOB" (140000 bytes): exceeds per-string limit` |
+| Inherited var over `MAX_ARG_STRLEN` | `warn` | `dropping inherited env var "BIG_BLOB" (KEY=value\0 is 140010 bytes): exceeds MAX_ARG_STRLEN (131072)` |
 | Non-protected inherited var trimmed | `warn` | `env budget: dropping non-protected var "BIG_CACHED_BLOB" (73422 bytes)` |
 
 Spill errors name the variable and its byte length, plus the underlying I/O
@@ -500,7 +515,7 @@ or be triggered in production.
 | Spill file missing when the step starts | The step exits 125 naming the variable. The command doesn't run. |
 | Non-protected inherited vars over budget | Dropped largest-first, with names and sizes logged. |
 | Protected vars alone over budget | **Fail loud**: `EnvBudgetError` naming the vars, no spawn, no `E2BIG`. |
-| Inherited var's `KEY=value` > 126976 bytes | Filtered out of every child env, with a warning. |
+| Inherited var's `KEY=value\0` > 131072 bytes (`MAX_ARG_STRLEN`) | Filtered out of every child env, with a warning. Smaller inherited vars pass through unchanged. |
 | `sysconf` / `getrlimit` unavailable | The budget falls back to the 256 KiB floor. |
 
 ---

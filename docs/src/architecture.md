@@ -442,8 +442,9 @@ assumptions and the unverified Darwin/other Unix scope.
 variables (`AMPLIHACK_SESSION_DEPTH`, `AMPLIHACK_TREE_ID`, `AMPLIHACK_MAX_DEPTH`,
 `AMPLIHACK_MAX_SESSIONS`) and strips `CLAUDECODE` to prevent nested session
 confusion.
-It also drops any inherited variable whose `KEY=value\0` string exceeds
-`PER_VALUE_ENV_CAP` (128 KiB minus 4 KiB). For bash steps,
+It also drops any inherited variable whose whole `KEY=value\0` string exceeds
+`MAX_ARG_STRLEN` (131072 bytes), the kernel's per-string limit, and logs a
+warning naming it. For bash steps,
 `env_spill::spill_for_bash()` then moves oversized and over-budget recipe
 values into private files and prepends a preamble that reads them back. See
 [Per-value env spill](env-budget.md#per-value-env-spill-bash-steps).
