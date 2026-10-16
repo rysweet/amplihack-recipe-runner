@@ -7,7 +7,7 @@
 /// when running inside a nested Claude Code session (#2758). Session tree env
 /// vars are propagated so child processes respect recursion depth limits.
 use crate::adapters::Adapter;
-use crate::adapters::env_spill::{self, PER_VALUE_ENV_CAP, env_pair_bytes};
+use crate::adapters::env_spill::{self, MAX_ARG_STRLEN, env_pair_bytes};
 use anyhow::Context;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -532,10 +532,41 @@ pub struct CLISubprocessAdapter {
     working_dir: String,
 }
 
-/// #130: whether an inherited `KEY=value\0` string is too large to pass to
-/// any child (`env_pair_bytes > PER_VALUE_ENV_CAP`).
+/// #130: whether an inherited `KEY=value\0` string exceeds the kernel's
+/// per-string limit (`env_pair_bytes > MAX_ARG_STRLEN`), so no child could receive it.
 fn inherited_env_entry_too_large(key: &str, value: &str) -> bool {
-    env_pair_bytes(key, value) > PER_VALUE_ENV_CAP
+    env_pair_bytes(key, value) > MAX_ARG_STRLEN
+}
+
+/// #130: warning for one dropped inherited variable. Names and sizes only;
+/// the value is never formatted.
+fn inherited_drop_warning(key: &str, value: &str) -> String {
+    format!(
+        "dropping inherited env var {:?} (KEY=value\\0 is {} bytes): exceeds MAX_ARG_STRLEN ({})",
+        key,
+        env_pair_bytes(key, value),
+        MAX_ARG_STRLEN
+    )
+}
+
+/// Sanitize the inherited environment: removes `CLAUDECODE` and every
+/// variable whose whole `KEY=value\0` string is over `MAX_ARG_STRLEN` (one
+/// warning per dropped variable). Takes the variables as an argument so tests
+/// can exercise it without touching the process environment.
+fn filter_inherited_env(
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> HashMap<String, String> {
+    vars.into_iter()
+        .filter(|(k, _)| k != "CLAUDECODE")
+        .filter(|(k, v)| {
+            if inherited_env_entry_too_large(k, v) {
+                log::warn!("{}", inherited_drop_warning(k, v));
+                false
+            } else {
+                true
+            }
+        })
+        .collect()
 }
 
 impl CLISubprocessAdapter {
@@ -573,35 +604,16 @@ impl CLISubprocessAdapter {
         log::debug!("CLISubprocessAdapter::build_child_env: building child environment");
 
         // #130 root-cause defense: a single inherited `KEY=value\0` string
-        // longer than the kernel's per-string cap (`MAX_ARG_STRLEN`, 128 KiB)
+        // longer than the kernel's per-string limit (`MAX_ARG_STRLEN`, 128 KiB)
         // makes `execve` fail with `E2BIG` (`os error 7`) no matter how small
-        // our own vars are. Such an oversized *inherited* value is unusable by
-        // any child anyway, so we sanitize it out here (names only in the log).
-        // The variables we explicitly set below (session tree, PATH/HOME) are
-        // always small and are added after this filter, so they are never
-        // affected.
-        let mut oversized: Vec<String> = Vec::new();
-        let mut child_env: HashMap<String, String> = env::vars()
-            .filter(|(k, _)| k != "CLAUDECODE")
-            .filter(|(k, v)| {
-                if inherited_env_entry_too_large(k, v) {
-                    oversized.push(k.clone());
-                    false
-                } else {
-                    true
-                }
-            })
-            .collect();
-        if !oversized.is_empty() {
-            log::warn!(
-                "build_child_env: dropped {} oversized inherited env var(s) (KEY=value over \
-                 {} bytes each) that would blow execve regardless of any other setting. Move \
-                 large inherited payloads out of the environment. Dropped (names only): {:?}",
-                oversized.len(),
-                PER_VALUE_ENV_CAP,
-                oversized,
-            );
-        }
+        // our own vars are. The filter counts the whole string (key, `=`, value
+        // and NUL) against `MAX_ARG_STRLEN`, the same check the kernel applies,
+        // so it drops only variables no child could receive; anything at or
+        // under the limit passes through unchanged. Each drop is logged with
+        // its name and size, never its value. The variables we explicitly set
+        // below (session tree, PATH/HOME) are always small and are added after
+        // this filter, so they are never affected.
+        let mut child_env = filter_inherited_env(env::vars());
 
         // Defense-in-depth: ensure HOME and PATH are always present and non-empty,
         // even when the parent shell has them unset. Mirrors amplihack-rs fork
@@ -3661,19 +3673,60 @@ mod tests {
     }
 
     #[test]
-    fn inherited_filter_counts_the_whole_env_string() {
-        // T10 / D15: a value just under 128 KiB with a long key is still an
-        // env string over the cap and must not reach any child (agent steps
-        // get build_child_env verbatim).
-        let key = format!("ISSUE130_{}", "K".repeat(200));
-        let value = "v".repeat(128 * 1024 - 8);
-        assert!(value.len() <= 128 * 1024, "old value-only filter kept this");
-        assert!(inherited_env_entry_too_large(&key, &value));
+    fn inherited_filter_counts_the_whole_env_string_against_max_arg_strlen() {
+        // T10 / D5: the inherited filter applies the kernel's own check,
+        // `len(KEY) + 1 + len(value) + 1 > MAX_ARG_STRLEN`.
+        let key = format!("ISSUE130_{}", "K".repeat(991));
+        assert_eq!(key.len(), 1000);
 
-        let fits = "v".repeat(crate::adapters::env_spill::PER_VALUE_ENV_CAP - key.len() - 2);
-        assert!(!inherited_env_entry_too_large(&key, &fits));
-        assert!(inherited_env_entry_too_large(&key, &format!("{fits}v")));
+        let at_limit = "v".repeat(130_070);
+        assert_eq!(env_pair_bytes(&key, &at_limit), MAX_ARG_STRLEN);
+        assert!(!inherited_env_entry_too_large(&key, &at_limit));
+
+        let over = "v".repeat(130_071);
+        assert_eq!(env_pair_bytes(&key, &over), MAX_ARG_STRLEN + 1);
+        assert!(inherited_env_entry_too_large(&key, &over));
+
+        // Dropped by the old `PER_VALUE_ENV_CAP` filter; the kernel accepts it.
+        let old_cap_plus_one = "v".repeat(126_977);
+        assert!(
+            env_pair_bytes(&key, &old_cap_plus_one) > crate::adapters::env_spill::PER_VALUE_ENV_CAP
+        );
+        assert!(!inherited_env_entry_too_large(&key, &old_cap_plus_one));
+
         assert!(!inherited_env_entry_too_large("PATH", "/usr/bin:/bin"));
+    }
+
+    #[test]
+    fn filter_inherited_env_drops_only_oversized_pairs_and_claudecode() {
+        let key = format!("ISSUE130_{}", "K".repeat(991));
+        let vars = vec![
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("CLAUDECODE".to_string(), "1".to_string()),
+            (key.clone(), "v".repeat(130_070)),
+            ("ISSUE130_OVER".to_string(), "v".repeat(MAX_ARG_STRLEN)),
+        ];
+        let env = filter_inherited_env(vars);
+        let mut names: Vec<&str> = env.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec![key.as_str(), "PATH"]);
+    }
+
+    #[test]
+    fn inherited_drop_warning_gives_name_size_and_limit_only() {
+        let value = format!("ISSUE130_SENTINEL_{}", "x".repeat(140_000));
+        let msg = inherited_drop_warning("BIG_BLOB", &value);
+        assert_eq!(
+            msg,
+            format!(
+                "dropping inherited env var \"BIG_BLOB\" (KEY=value\\0 is {} bytes): \
+                 exceeds MAX_ARG_STRLEN (131072)",
+                env_pair_bytes("BIG_BLOB", &value)
+            )
+        );
+        assert!(!msg.contains("ISSUE130_SENTINEL_"));
+        // Control characters in a name are escaped, not emitted raw.
+        assert!(inherited_drop_warning("A\nB", "v").contains("\"A\\nB\""));
     }
 
     // ══════════════════════════════════════════════════════════════════
