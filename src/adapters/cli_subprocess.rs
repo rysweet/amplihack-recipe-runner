@@ -3411,6 +3411,7 @@ mod tests {
     // ── #130: per-value env spill through execute_bash_step ───────────
 
     use crate::adapters::env_spill::SpillRootGuard;
+    use crate::adapters::test_log::LogCapture;
 
     fn sha256_hex(s: &str) -> String {
         use sha2::{Digest, Sha256};
@@ -3670,6 +3671,219 @@ mod tests {
             )
             .unwrap_or_else(|e| panic!("{e:#}"));
         assert_eq!(out.lines().collect::<Vec<_>>(), vec!["unset", "fine"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spilled_edge_values_round_trip_and_the_spill_is_observable() {
+        // T4 / D3: newline-only, multi-byte UTF-8 and empty values under budget
+        // pressure. The budget leaves room for the protected vars and the empty
+        // recipe value only; the unspillable filler keeps the env over budget
+        // until every non-empty recipe value has been spilled, and
+        // `bounded_env` then drops it.
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        let _reset = BudgetReset;
+        set_env_byte_budget_for_test(
+            protected_inherited_bytes() + env_pair_bytes("RECIPE_VAR_empty", ""),
+        );
+
+        let utf8 = "é漢🦀\n".repeat(200);
+        let big = format!("{}  trail \n\n", patterned("big", 130 * 1024));
+        let filler = "f".repeat(4096);
+        let mut extra = map_of(&[
+            ("RECIPE_VAR_big", big.as_str()),
+            ("RECIPE_VAR_nl1", "\n"),
+            ("RECIPE_VAR_nl3", "\n\n\n"),
+            ("RECIPE_VAR_utf8", utf8.as_str()),
+            ("RECIPE_VAR_empty", ""),
+        ]);
+        extra.insert("ISSUE130-FILLER".to_string(), filler);
+
+        let mut script = String::new();
+        let mut expected = Vec::new();
+        for (name, value) in [
+            ("RECIPE_VAR_big", big.as_str()),
+            ("RECIPE_VAR_nl1", "\n"),
+            ("RECIPE_VAR_nl3", "\n\n\n"),
+            ("RECIPE_VAR_utf8", utf8.as_str()),
+        ] {
+            script.push_str(&format!(
+                "env | grep -q '^{name}=' && echo \"{name} exported\" || echo \"{name} spilled\"\n\
+                 printf %s \"${name}\" | sha256sum | cut -c1-64\n"
+            ));
+            expected.push(format!("{name} spilled"));
+            expected.push(sha256_hex(value));
+        }
+        // The planner never spills empty values (nothing to gain), so the empty
+        // value must reach the step exported, set and empty.
+        script.push_str(
+            "env | grep -qx 'RECIPE_VAR_empty=' && echo 'RECIPE_VAR_empty exported'\n\
+             echo \"${RECIPE_VAR_empty+set}\"\n\
+             [[ -z $RECIPE_VAR_empty ]] && echo empty\n",
+        );
+        expected.extend(["RECIPE_VAR_empty exported", "set", "empty"].map(String::from));
+
+        let out = CLISubprocessAdapter::new()
+            .with_binary("claude")
+            .execute_bash_step(&script, ".", None, &extra)
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(out.lines().collect::<Vec<_>>(), expected);
+    }
+
+    /// Mode of the spill directory and of each file in it, as seen from inside
+    /// the step, all on one line (`700 600 600 `).
+    #[cfg(target_os = "linux")]
+    fn stat_spill_modes_script(root: &Path) -> String {
+        format!(
+            "{{ for d in '{}'/*; do stat -c %a \"$d\"; for f in \"$d\"/*; do stat -c %a \"$f\"; done; done; }} | tr '\\n' ' '",
+            root.display()
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spill_modes_are_private_inside_the_step_and_removed_after_success() {
+        // T6 / D4: 0700 directory and 0600 files on the real execution path.
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        clear_env_byte_budget_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let _g = SpillRootGuard::set(root.path());
+        let a = patterned("a", 130 * 1024);
+        let b = patterned("b", 130 * 1024);
+        let extra = map_of(&[("RECIPE_VAR_a", a.as_str()), ("RECIPE_VAR_b", b.as_str())]);
+        let out = CLISubprocessAdapter::new()
+            .execute_bash_step(&stat_spill_modes_script(root.path()), ".", None, &extra)
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(out.trim(), "700 600 600");
+        assert_eq!(entries_in(root.path()), 0, "spill dir must be removed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spill_modes_are_private_inside_the_step_and_removed_after_exit_3() {
+        // T6 / D4 (exit 3)
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        clear_env_byte_budget_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let _g = SpillRootGuard::set(root.path());
+        let a = patterned("a", 130 * 1024);
+        let b = patterned("b", 130 * 1024);
+        let extra = map_of(&[("RECIPE_VAR_a", a.as_str()), ("RECIPE_VAR_b", b.as_str())]);
+        let cmd = format!("{} >&2; exit 3", stat_spill_modes_script(root.path()));
+        let err = CLISubprocessAdapter::new()
+            .execute_bash_step(&cmd, ".", None, &extra)
+            .expect_err("exit 3 must fail");
+        let shown = format!("{err:#}");
+        assert!(shown.contains("(exit 3)"), "{shown}");
+        assert!(shown.contains("700 600 600"), "{shown}");
+        assert_eq!(entries_in(root.path()), 0, "spill dir must be removed");
+    }
+
+    /// Unique per test run, so a sentinel can't collide with any other output.
+    fn unique_tag() -> String {
+        uuid::Uuid::new_v4().simple().to_string()
+    }
+
+    fn assert_no_record_contains(capture: &LogCapture, sentinel: &str) {
+        for message in capture.all_messages() {
+            assert!(
+                !message.contains(sentinel),
+                "a log record carries value bytes ({} bytes long)",
+                message.len()
+            );
+        }
+    }
+
+    fn assert_this_thread_logged(capture: &LogCapture, level: log::Level, needle: &str) {
+        let records = capture.this_thread();
+        assert!(
+            records
+                .iter()
+                .any(|(l, m)| *l == level && m.contains(needle)),
+            "no {level} record on this thread names {needle}; got {} record(s)",
+            records.len()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spill_logs_name_variables_but_never_their_values() {
+        // D2 / DP-1a/b: one cap-phase and one budget-phase spill.
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        let _reset = BudgetReset;
+        set_env_byte_budget_for_test(protected_inherited_bytes() + 4096);
+        let tag = unique_tag();
+        let sentinel = format!("ISSUE130SENTINEL{tag}");
+        let cap_name = format!("RECIPE_VAR_dp1_cap_{tag}");
+        let budget_name = format!("RECIPE_VAR_dp1_budget_{tag}");
+        let cap_value = format!("{sentinel}{}", patterned("cap", 130 * 1024));
+        let budget_value = format!("{sentinel}{}", patterned("budget", 16 * 1024));
+        let extra = map_of(&[
+            (cap_name.as_str(), cap_value.as_str()),
+            (budget_name.as_str(), budget_value.as_str()),
+        ]);
+
+        let capture = LogCapture::start();
+        let out = CLISubprocessAdapter::new()
+            .with_binary("claude")
+            .execute_bash_step(
+                &format!("echo \"${{#{cap_name}}} ${{#{budget_name}}}\""),
+                ".",
+                None,
+                &extra,
+            )
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(
+            out.trim(),
+            format!("{} {}", cap_value.len(), budget_value.len())
+        );
+
+        assert_this_thread_logged(&capture, log::Level::Info, &cap_name);
+        assert_this_thread_logged(&capture, log::Level::Info, &budget_name);
+        assert_no_record_contains(&capture, &sentinel);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cap_phase_drop_warning_names_the_variable_but_not_its_value() {
+        // D2 / DP-1a/b: `env_spill::drop_warning` for an unspillable name.
+        let _seam = ENV_BUDGET_TEST_LOCK.lock().unwrap();
+        clear_env_byte_budget_for_test();
+        let tag = unique_tag();
+        let sentinel = format!("ISSUE130SENTINEL{tag}");
+        let name = format!("BASH_DP1_{tag}");
+        let value = format!("{sentinel}{}", "x".repeat(130 * 1024));
+        let extra = map_of(&[(name.as_str(), value.as_str())]);
+
+        let capture = LogCapture::start();
+        let out = CLISubprocessAdapter::new()
+            .execute_bash_step(&format!("echo \"${{{name}:-unset}}\""), ".", None, &extra)
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(out.trim(), "unset");
+
+        assert_this_thread_logged(&capture, log::Level::Warn, &name);
+        assert_no_record_contains(&capture, &sentinel);
+    }
+
+    #[test]
+    fn inherited_filter_warning_names_the_variable_but_not_its_value() {
+        // D2 / DP-1a/b: the inherited-filter warning, driven through the seam
+        // so the process environment is never mutated.
+        let tag = unique_tag();
+        let sentinel = format!("ISSUE130SENTINEL{tag}");
+        let name = format!("ISSUE130_INHERITED_{tag}");
+        let value = format!("{sentinel}{}", "x".repeat(MAX_ARG_STRLEN));
+
+        let capture = LogCapture::start();
+        let env = filter_inherited_env(vec![
+            (name.clone(), value),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+        ]);
+        assert!(!env.contains_key(&name));
+        assert!(env.contains_key("PATH"));
+
+        assert_this_thread_logged(&capture, log::Level::Warn, &format!("{name:?}"));
+        assert_no_record_contains(&capture, &sentinel);
     }
 
     #[test]
