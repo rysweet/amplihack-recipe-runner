@@ -325,8 +325,10 @@ and the NUL, so a 1,000-byte name with a 130,071-byte value (131,073 bytes in
 all) is dropped, while the same name with a 130,070-byte value (exactly 131,072
 bytes) is passed through. `PER_VALUE_ENV_CAP` does not apply to inherited
 variables. That 4 KiB margin governs only the recipe values the runner spills.
-The filter applies to bash and agent children alike, and runs before the bash
-interpreter is resolved from the parent environment.
+The filter applies to bash and agent children alike. For a bash step, the
+interpreter is resolved first, from the unfiltered parent environment, and the
+filter and the `extra_env` merge follow (see
+[Order of operations for a bash step](#order-of-operations-for-a-bash-step)).
 
 ---
 

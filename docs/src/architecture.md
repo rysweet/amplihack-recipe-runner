@@ -444,7 +444,7 @@ variables (`AMPLIHACK_SESSION_DEPTH`, `AMPLIHACK_TREE_ID`, `AMPLIHACK_MAX_DEPTH`
 confusion.
 It also drops any inherited variable whose whole `KEY=value\0` string exceeds
 `MAX_ARG_STRLEN` (131072 bytes), the kernel's per-string limit, and logs a
-warning naming it. For bash steps,
+warning for each one, naming it and giving its pair size. For bash steps,
 `env_spill::spill_for_bash()` then moves oversized and over-budget recipe
 values into private files and prepends a preamble that reads them back. See
 [Per-value env spill](env-budget.md#per-value-env-spill-bash-steps).
