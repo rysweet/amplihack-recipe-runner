@@ -12,6 +12,10 @@ import sys, os, json, pathlib, time, stat, subprocess, threading
 root = pathlib.Path(os.environ['CODEX_TEST_ROOT'])
 args = sys.argv[1:]
 mode = os.environ['TEST_SCENARIO']
+def publish(name, text):
+    tmp = root/(name+'.tmp')
+    tmp.write_text(text)
+    os.replace(tmp, root/name)
 final = pathlib.Path(args[args.index('--output-last-message')+1]) if '--output-last-message' in args else None
 record = {'args':args, 'final':str(final) if final else None, 'absent':not final.exists() if final else False,
           'directory_mode':stat.S_IMODE(final.parent.stat().st_mode) if final else None}
@@ -26,14 +30,14 @@ if mode == 'cancel_json':
 if mode in ('tree_timeout', 'tree_success', 'cancel'):
     descendant = subprocess.Popen(['/usr/bin/python3', '-c', 'import time, signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); print("ready", flush=True); time.sleep(30)'], stdout=subprocess.PIPE)
     descendant.stdout.readline()
-    (root/'descendant.pid').write_text(str(descendant.pid))
-    (root/'launcher.pid').write_text(str(os.getpid()))
+    publish('descendant.pid', str(descendant.pid))
+    publish('launcher.pid', str(os.getpid()))
     if mode in ('tree_timeout', 'cancel'): time.sleep(30)
 if mode == 'writer':
     code = 'import sys, time, signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); f=open(sys.argv[1], "wb", buffering=0); print("ready", flush=True)\nwhile True: f.write(b"x"); time.sleep(0.001)'
     descendant = subprocess.Popen(['/usr/bin/python3', '-c', code, str(final)], stdout=subprocess.PIPE)
     descendant.stdout.readline()
-    (root/'descendant.pid').write_text(str(descendant.pid))
+    publish('descendant.pid', str(descendant.pid))
 if mode == 'blocked': time.sleep(30)
 if mode == 'partial':
     if final: final.write_text('false success')
