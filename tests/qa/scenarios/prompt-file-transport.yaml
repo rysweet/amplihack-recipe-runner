@@ -1,0 +1,24 @@
+name: Over-32KiB agent prompt file transport (#159)
+description: Run the candidate with a >32 KiB agent prompt through an isolated fake launcher; Claude must receive the overflow via --append-system-prompt-file, and Copilot's inline note must name the prompt file (Unix QA; requires bash, realpath, and Python 3).
+version: "1.0.0"
+config:
+  timeout: 180000
+  retries: 0
+  parallel: false
+environment:
+  requires: [RECIPE_RUNNER_QA_BINARY]
+agents:
+  - name: cli-agent
+    type: cli
+    config:
+      defaultTimeout: 180000
+steps:
+  - name: Claude file flag and Copilot path-naming note
+    agent: cli-agent
+    action: execute_command
+    target: bash tests/qa/prompt-file-transport.sh
+    timeout: 180000
+assertions: []
+metadata:
+  tags: [recipe-runner, claude, copilot, transport, regression, issue-159]
+  priority: critical
