@@ -224,10 +224,11 @@ the name is a valid identifier that bash allows you to assign. A name is
 spillable when:
 
 - it matches `^[A-Za-z_][A-Za-z0-9_]*$` (ASCII only), and
-- it isn't one of `IFS PATH HOME BASHOPTS BASHPID EUID PPID SHELLOPTS UID
-  GROUPS FUNCNAME LINENO RANDOM SRANDOM SECONDS EPOCHSECONDS EPOCHREALTIME
-  HISTCMD DIRSTACK OPTIND OPTARG PS4 ENV POSIXLY_CORRECT CDPATH GLOBIGNORE`, and
-- it doesn't start with `BASH` or `COMP_`.
+- it isn't one of `IFS PATH HOME EUID PPID SHELLOPTS UID GROUPS FUNCNAME
+  LINENO RANDOM SRANDOM SECONDS EPOCHSECONDS EPOCHREALTIME HISTCMD DIRSTACK
+  OPTIND OPTARG PS4 ENV POSIXLY_CORRECT CDPATH GLOBIGNORE`, and
+- it doesn't start with `BASH` (which covers `BASHOPTS`, `BASHPID` and
+  `BASH_*`) or `COMP_`.
 
 A recipe value whose name fails these rules and is over the per-value cap is
 **dropped from the child environment**, with one warning naming the variable
