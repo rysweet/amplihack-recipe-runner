@@ -731,6 +731,46 @@ steps:
 }
 
 #[test]
+fn test_hooks_do_not_run_in_dry_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pre = tmp.path().join("pre_hook_ran.txt");
+    let post = tmp.path().join("post_hook_ran.txt");
+
+    let yaml = format!(
+        r#"
+name: "dry-run-hook-test"
+hooks:
+  pre_step: "touch {pre}"
+  post_step: "touch {post}"
+steps:
+  - id: "serial"
+    command: "echo serial"
+  - id: "left"
+    command: "echo left"
+    parallel_group: "pair"
+  - id: "right"
+    command: "echo right"
+    parallel_group: "pair"
+"#,
+        pre = pre.display(),
+        post = post.display(),
+    );
+
+    let parser = RecipeParser::new();
+    let recipe = parser.parse(&yaml).unwrap();
+    let runner = RecipeRunner::new(RealBashAdapter)
+        .with_working_dir(tmp.path().to_str().unwrap())
+        .with_dry_run(true);
+    let result = runner.execute(&recipe, None);
+
+    assert!(result.success, "Dry run should succeed: {:?}", result);
+    assert!(
+        !pre.exists() && !post.exists(),
+        "a dry run must not run pre_step or post_step hooks"
+    );
+}
+
+#[test]
 fn test_hook_post_step_actually_executes() {
     let tmp = tempfile::tempdir().unwrap();
     let marker = tmp.path().join("post_hook_ran.txt");

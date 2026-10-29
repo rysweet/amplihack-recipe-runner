@@ -528,6 +528,15 @@ impl<A: Adapter> RecipeRunner<A> {
             return;
         }
         if let Some(cmd) = hook {
+            // A dry run executes nothing, hooks included: they are arbitrary
+            // shell commands with effects of their own.
+            if self.dry_run {
+                info!(
+                    "DRY RUN: would run {} hook for step '{}'",
+                    hook_name, step_id
+                );
+                return;
+            }
             let rendered = ctx.render_shell(cmd);
             let env_vars = ctx.shell_env_for_step();
             info!("Running {} hook for step '{}'", hook_name, step_id);
@@ -1849,6 +1858,74 @@ steps:
         let result = runner.execute(&recipe, None);
         assert!(result.success);
         assert_eq!(result.step_results[0].output, "[dry run]");
+    }
+
+    /// Counts every call that would start a process.
+    struct CallCountingAdapter(std::sync::atomic::AtomicUsize);
+
+    impl Adapter for CallCountingAdapter {
+        fn execute_agent_step(
+            &self,
+            _prompt: &str,
+            _agent_name: Option<&str>,
+            _system_prompt: Option<&str>,
+            _mode: Option<&str>,
+            _working_dir: &str,
+            _model: Option<&str>,
+            _timeout: Option<u64>,
+        ) -> Result<String, anyhow::Error> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("agent".to_string())
+        }
+
+        fn execute_bash_step(
+            &self,
+            _command: &str,
+            _working_dir: &str,
+            _timeout: Option<u64>,
+            _extra_env: &std::collections::HashMap<String, String>,
+        ) -> Result<String, anyhow::Error> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("bash".to_string())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "call-counting"
+        }
+    }
+
+    #[test]
+    fn test_dry_run_starts_no_hook_or_step() {
+        let yaml = r#"
+name: "dry-run-hooks"
+hooks:
+  pre_step: "echo pre"
+  post_step: "echo post"
+  on_error: "echo err"
+steps:
+  - id: "serial"
+    command: "echo serial"
+  - id: "left"
+    command: "echo left"
+    parallel_group: "pair"
+  - id: "right"
+    prompt: "say right"
+    parallel_group: "pair"
+"#;
+        let recipe = RecipeParser::new().parse(yaml).unwrap();
+        let runner = RecipeRunner::new(CallCountingAdapter(Default::default())).with_dry_run(true);
+        let result = runner.execute(&recipe, None);
+        assert!(result.success, "dry run should succeed: {:?}", result);
+        assert_eq!(result.step_results.len(), 3);
+        assert_eq!(
+            runner.adapter.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a dry run must not reach the adapter for any hook or step"
+        );
     }
 
     /// A mock adapter that returns output with trailing newlines, simulating

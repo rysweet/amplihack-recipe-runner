@@ -619,6 +619,7 @@ hooks:
 Hooks are shell commands rendered through the context. `pre_step` runs before
 every step dispatch. `post_step` runs after a successful step. `on_error` runs
 after a failed step. Hook failures are logged but do not abort the recipe.
+A dry run (`--dry-run`) runs no hook; it logs each hook it would have run.
 
 ### Execution Listeners
 
