@@ -234,10 +234,18 @@ fn now_secs() -> u64 {
 }
 
 fn should_skip_update_check(args: &[OsString]) -> bool {
-    if std::env::var(NO_UPDATE_CHECK_ENV).unwrap_or_default() == "1" {
+    std::env::var(NO_UPDATE_CHECK_ENV).unwrap_or_default() == "1" || args_skip_update_check(args)
+}
+
+/// Option that turns the startup update check off for one run. It is read from
+/// the raw arguments because the check runs before argument parsing.
+const NO_UPDATE_CHECK_OPTION: &str = "--no-update-check";
+
+/// Whether the arguments alone turn the startup update check off.
+fn args_skip_update_check(args: &[OsString]) -> bool {
+    if args.iter().skip(1).any(|arg| arg == NO_UPDATE_CHECK_OPTION) {
         return true;
     }
-
     let first_arg = args.get(1).and_then(|arg| arg.to_str());
     matches!(
         first_arg,
@@ -380,22 +388,41 @@ mod tests {
 
     #[test]
     fn should_skip_for_update_related_args() {
-        assert!(should_skip_update_check(&[
+        // The argument rule alone, so the result does not depend on whether
+        // RECIPE_RUNNER_NO_UPDATE_CHECK is set in the test environment.
+        assert!(args_skip_update_check(&[
             OsString::from("recipe-runner-rs"),
             OsString::from("update")
         ]));
-        assert!(should_skip_update_check(&[
+        assert!(args_skip_update_check(&[
             OsString::from("recipe-runner-rs"),
             OsString::from("--version")
         ]));
-        assert!(should_skip_update_check(&[
+        assert!(args_skip_update_check(&[
             OsString::from("recipe-runner-rs"),
             OsString::from("help")
         ]));
-        assert!(!should_skip_update_check(&[
+        assert!(!args_skip_update_check(&[
             OsString::from("recipe-runner-rs"),
             OsString::from("list")
         ]));
+    }
+
+    #[test]
+    fn no_update_check_option_skips_the_check_in_any_position() {
+        for args in [
+            vec!["recipe-runner-rs", "--no-update-check", "recipe.yaml"],
+            vec!["recipe-runner-rs", "recipe.yaml", "--no-update-check"],
+            vec!["recipe-runner-rs", "list", "--no-update-check"],
+        ] {
+            let args: Vec<OsString> = args.into_iter().map(OsString::from).collect();
+            assert!(args_skip_update_check(&args), "{args:?}");
+        }
+        let without: Vec<OsString> = ["recipe-runner-rs", "recipe.yaml"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        assert!(!args_skip_update_check(&without));
     }
 
     #[test]
