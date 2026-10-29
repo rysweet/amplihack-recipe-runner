@@ -159,7 +159,7 @@ fn runner_rejects_oversized_codex_success_instead_of_truncating() {
 }
 
 #[test]
-fn other_providers_keep_historical_json_repair_context() {
+fn other_providers_keep_the_step_model_in_json_repair() {
     for provider in ["claude", "copilot"] {
         let recipe = RecipeParser::new().parse(
             "name: repair\nsteps:\n  - id: repair\n    prompt: task\n    agent: missing:persona\n    mode: autonomous\n    model: explicit\n    timeout: 17\n    parse_json: true\n    auto_stage: false\n"
@@ -182,7 +182,7 @@ fn other_providers_keep_historical_json_repair_context() {
                 &repair.model,
                 repair.timeout
             ),
-            (&None, &None, &None, &None, None)
+            (&None, &None, &None, &Some("explicit".to_string()), None)
         );
     }
 }
