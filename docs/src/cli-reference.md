@@ -130,7 +130,7 @@ recipe-runner-rs deploy.yaml --dry-run --progress
 
 ### `--no-auto-stage`
 
-Disable automatic git staging of file changes made during recipe execution.
+Disable automatic git staging of file changes made during recipe execution. This applies to every step, including a step that sets `auto_stage: true`.
 
 ```bash
 recipe-runner-rs codegen.yaml --no-auto-stage
@@ -243,6 +243,8 @@ recipe-runner-rs ci.yaml --include-tags test --exclude-tags slow
 ### `--audit-dir <DIR>`
 
 Directory where JSONL audit log files are written. Each recipe run produces one audit log file.
+
+By default a failure to create the log or write an entry is logged as a warning and the run continues. With `--require-audit` (which needs `--audit-dir`), a log that cannot be opened fails the run before any step runs, and an entry that cannot be written fails its step and stops the run.
 
 ```bash
 # Write audit logs to a directory

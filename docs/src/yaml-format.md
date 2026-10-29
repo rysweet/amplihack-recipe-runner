@@ -60,7 +60,7 @@ step.
 | `mode`              | string          | no       | —       | Execution mode                                           |
 | `working_dir`       | string          | no       | —       | Override working directory for this step                 |
 | `timeout`           | int             | no       | —       | Step timeout in seconds                                  |
-| `auto_stage`        | bool            | no       | `true`  | Git auto-stage after agent steps                         |
+| `auto_stage`        | bool            | no       | `true`  | Git auto-stage after agent steps; `false` opts the step out, and `--no-auto-stage` turns staging off for every step |
 | `model`             | string          | no       | —       | Model override for agent steps (e.g., "haiku", "sonnet") |
 | `recipe`            | string          | no       | —       | Sub-recipe name (recipe steps)                           |
 | `recovery_on_failure` | bool            | no       | `false` | Attempt agentic recovery if sub-recipe fails (see below) |

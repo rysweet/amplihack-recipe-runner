@@ -59,6 +59,7 @@ pub struct RecipeRunner<A: Adapter> {
     /// [`sub_recipe_paths::anchored_search_dirs`].
     recipe_origin_dir: Option<PathBuf>,
     audit_dir: Option<PathBuf>,
+    require_audit: bool,
     active_tags: Vec<String>,
     exclude_tags: Vec<String>,
     listener: Box<dyn ExecutionListener>,
@@ -85,6 +86,7 @@ impl<A: Adapter> RecipeRunner<A> {
             recipe_search_dirs: Vec::new(),
             recipe_origin_dir: None,
             audit_dir: None,
+            require_audit: false,
             active_tags: Vec::new(),
             exclude_tags: Vec::new(),
             listener: Box::new(NullListener),
@@ -139,6 +141,18 @@ impl<A: Adapter> RecipeRunner<A> {
     pub fn with_depth(self, depth: u32) -> Self {
         log::debug!("RecipeRunner::with_depth: depth={}", depth);
         self.depth.set(depth);
+        self
+    }
+
+    /// When set, a failure to open the audit log fails the run before any
+    /// step starts, and a failure to write an entry fails that step and stops
+    /// the run.
+    pub fn with_require_audit(mut self, require_audit: bool) -> Self {
+        log::debug!(
+            "RecipeRunner::with_require_audit: require_audit={}",
+            require_audit
+        );
+        self.require_audit = require_audit;
         self
     }
 
@@ -285,6 +299,25 @@ impl<A: Adapter> RecipeRunner<A> {
         let mut success = true;
 
         let audit_file = self.open_audit_log(&recipe.name);
+        if self.require_audit && audit_file.is_none() {
+            error!(
+                "Audit log for recipe '{}' could not be opened and an audit log is required; no step runs",
+                recipe.name
+            );
+            return RecipeResult {
+                recipe_name: recipe.name.clone(),
+                success: false,
+                step_results: vec![StepResult {
+                    step_id: "audit-log".to_string(),
+                    status: StepStatus::Failed,
+                    output: String::new(),
+                    error: "audit log could not be opened and an audit log is required".to_string(),
+                    duration: None,
+                }],
+                context: ctx.to_map(),
+                duration: Some(start.elapsed()),
+            };
+        }
 
         let mut step_idx = 0;
         while step_idx < recipe.steps.len() {
@@ -355,9 +388,9 @@ impl<A: Adapter> RecipeRunner<A> {
                     if !terminal_before_hook {
                         self.terminal.apply(&mut result);
                     }
+                    let audit_failed = self.audit_entry_failed(&audit_file, &mut result);
                     let failed = result.status == StepStatus::Failed;
                     self.listener.on_step_complete(&result);
-                    self.write_audit_entry(&audit_file, &result);
 
                     if !failed && let Some(ref output_key) = gs.output {
                         let value = match serde_json::from_str(&result.output) {
@@ -367,7 +400,8 @@ impl<A: Adapter> RecipeRunner<A> {
                         ctx.set(output_key, value);
                     }
 
-                    if self.terminal.is_terminal() || (failed && !gs.is_nonfatal()) {
+                    if self.terminal.is_terminal() || audit_failed || (failed && !gs.is_nonfatal())
+                    {
                         group_failed = true;
                     }
 
@@ -449,9 +483,9 @@ impl<A: Adapter> RecipeRunner<A> {
                 }
 
                 self.terminal.apply(&mut result);
+                let audit_failed = self.audit_entry_failed(&audit_file, &mut result);
                 let failed = result.status == StepStatus::Failed;
                 self.listener.on_step_complete(&result);
-                self.write_audit_entry(&audit_file, &result);
 
                 // Save checkpoint after each step for resume-on-failure
                 if self.save_checkpoints && !failed {
@@ -472,7 +506,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     }
                 }
 
-                if self.terminal.is_terminal() || (failed && !step.is_nonfatal()) {
+                if self.terminal.is_terminal() || audit_failed || (failed && !step.is_nonfatal()) {
                     step_results.push(result);
                     success = false;
                     break;
@@ -556,13 +590,31 @@ impl<A: Adapter> RecipeRunner<A> {
         audit::open_audit_log(dir, recipe_name)
     }
 
-    fn write_audit_entry(&self, file: &Option<std::fs::File>, result: &StepResult) {
+    /// Writes the step's audit entry. When an audit log is required and the
+    /// entry cannot be written, marks the step failed and returns `true`.
+    fn audit_entry_failed(&self, file: &Option<std::fs::File>, result: &mut StepResult) -> bool {
+        if self.write_audit_entry(file, result) || !self.require_audit {
+            return false;
+        }
+        result.status = StepStatus::Failed;
+        result.error = if result.error.is_empty() {
+            "audit log entry could not be written and an audit log is required".to_string()
+        } else {
+            format!(
+                "{}; audit log entry could not be written and an audit log is required",
+                result.error
+            )
+        };
+        true
+    }
+
+    fn write_audit_entry(&self, file: &Option<std::fs::File>, result: &StepResult) -> bool {
         log::debug!(
             "write_audit_entry: step_id={:?}, status={:?}",
             result.step_id,
             result.status
         );
-        audit::write_audit_entry(file, result);
+        audit::write_audit_entry(file, result)
     }
 
     fn execute_step(&self, step: &Step, ctx: &mut RecipeContext) -> StepResult {
@@ -1213,7 +1265,9 @@ impl<A: Adapter> RecipeRunner<A> {
             step.id,
             step.auto_stage
         );
-        let should_stage = step.auto_stage.unwrap_or(self.auto_stage);
+        // A step can opt out of staging, but cannot opt in when the runner has
+        // staging turned off (for example with --no-auto-stage).
+        let should_stage = self.auto_stage && step.auto_stage.unwrap_or(true);
         if !should_stage {
             return;
         }
@@ -1895,6 +1949,76 @@ steps:
 
         fn name(&self) -> &str {
             "call-counting"
+        }
+    }
+
+    fn staged_files(repo: &std::path::Path) -> String {
+        let out = Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn repo_with_untracked_file() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        let init = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(init.success(), "git init");
+        std::fs::write(repo.path().join("work.txt"), "agent output\n").unwrap();
+        repo
+    }
+
+    #[test]
+    fn no_auto_stage_wins_over_a_step_that_asks_for_staging() {
+        let yaml = "name: stage\nsteps:\n  - id: work\n    type: agent\n    prompt: do work\n    auto_stage: true\n";
+        let recipe = RecipeParser::new().parse(yaml).unwrap();
+        for (runner_stages, expected) in [(false, ""), (true, "work.txt")] {
+            let repo = repo_with_untracked_file();
+            let result = RecipeRunner::new(MockAdapter)
+                .with_working_dir(repo.path().to_str().unwrap())
+                .with_auto_stage(runner_stages)
+                .execute(&recipe, None);
+            assert!(result.success, "{result:?}");
+            assert_eq!(
+                staged_files(repo.path()),
+                expected,
+                "runner auto_stage {runner_stages}"
+            );
+        }
+    }
+
+    #[test]
+    fn required_audit_log_that_cannot_be_opened_runs_no_step() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where the audit directory should be: it cannot be created.
+        let not_a_dir = dir.path().join("audit");
+        std::fs::write(&not_a_dir, "").unwrap();
+        let recipe = RecipeParser::new()
+            .parse("name: audited\nsteps:\n  - id: one\n    command: echo one\n")
+            .unwrap();
+        for (required, expect_success, expect_calls) in [(true, false, 0), (false, true, 1)] {
+            let runner = RecipeRunner::new(CallCountingAdapter(Default::default()))
+                .with_auto_stage(false)
+                .with_audit_dir(not_a_dir.clone())
+                .with_require_audit(required);
+            let result = runner.execute(&recipe, None);
+            assert_eq!(
+                result.success, expect_success,
+                "required {required}: {result:?}"
+            );
+            assert_eq!(
+                runner.adapter.0.load(std::sync::atomic::Ordering::SeqCst),
+                expect_calls,
+                "required {required}"
+            );
+            if required {
+                assert_eq!(result.step_results[0].step_id, "audit-log");
+            }
         }
     }
 
