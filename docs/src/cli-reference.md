@@ -116,7 +116,7 @@ recipe-runner-rs deploy.yaml \
 
 ### `--dry-run`
 
-Parse and validate the recipe without executing any steps. Useful for checking recipe correctness before committing to a run.
+Parse and validate the recipe without executing any steps or `pre_step`, `post_step` and `on_error` hooks. Useful for checking recipe correctness before committing to a run.
 
 ```bash
 recipe-runner-rs deploy.yaml --dry-run
