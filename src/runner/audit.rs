@@ -72,13 +72,23 @@ pub fn open_audit_log(audit_dir: &Path, recipe_name: &str) -> Option<std::fs::Fi
 }
 
 /// Write a step result as a single JSONL line to the audit log.
-pub fn write_audit_entry(file: &Option<std::fs::File>, result: &StepResult) {
+///
+/// Returns `false` when an audit log is open but the entry could not be
+/// written, and `true` otherwise (including when no audit log is configured).
+pub fn write_audit_entry(file: &Option<std::fs::File>, result: &StepResult) -> bool {
     log::debug!(
         "write_audit_entry: step_id={:?}, status={:?}",
         result.step_id,
         result.status
     );
-    if let Some(mut f) = file.as_ref().and_then(|f| f.try_clone().ok()) {
+    let Some(file) = file.as_ref() else {
+        return true;
+    };
+    let Ok(mut f) = file.try_clone() else {
+        warn!("Failed to reopen audit log for writing");
+        return false;
+    };
+    {
         let entry = serde_json::json!({
             "step_id": result.step_id,
             "status": format!("{}", result.status),
@@ -88,13 +98,40 @@ pub fn write_audit_entry(file: &Option<std::fs::File>, result: &StepResult) {
         });
         if let Err(e) = writeln!(f, "{}", entry) {
             warn!("Failed to write audit log entry: {}", e);
+            return false;
         }
     }
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_audit_entry_reports_whether_the_entry_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let result = StepResult {
+            step_id: "s".to_string(),
+            status: crate::models::StepStatus::Completed,
+            output: String::new(),
+            error: String::new(),
+            duration: None,
+        };
+        assert!(write_audit_entry(&None, &result), "no audit log configured");
+        let writable = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        assert!(write_audit_entry(&Some(writable), &result));
+        let read_only = std::fs::File::open(&path).unwrap();
+        assert!(
+            !write_audit_entry(&Some(read_only), &result),
+            "a failed write is reported"
+        );
+    }
 
     /// A recipe `name:` is free text with no length bound anywhere. Used raw as
     /// a filename component it exceeds NAME_MAX, `File::create` fails with

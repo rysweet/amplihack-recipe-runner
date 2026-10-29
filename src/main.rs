@@ -95,6 +95,11 @@ struct Cli {
     #[arg(long)]
     audit_dir: Option<PathBuf>,
 
+    /// Fail the run if the audit log cannot be opened (no step runs) or an
+    /// entry cannot be written (that step fails and the run stops)
+    #[arg(long, requires = "audit_dir")]
+    require_audit: bool,
+
     /// Agent binary to use for agent steps (e.g., claude, copilot, codex).
     /// Falls back to AMPLIHACK_AGENT_BINARY env var, then "claude".
     #[arg(long)]
@@ -397,6 +402,7 @@ fn run() -> i32 {
     if let Some(ref audit_dir) = cli.audit_dir {
         runner = runner.with_audit_dir(audit_dir.clone());
     }
+    runner = runner.with_require_audit(cli.require_audit);
 
     if cli.progress {
         // Use FileLogListener (writes structured JSON log + stderr) when available,
