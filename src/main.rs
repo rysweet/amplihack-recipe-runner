@@ -39,6 +39,12 @@ struct Cli {
     #[arg(long)]
     capabilities: bool,
 
+    /// Make no update check at startup: no network request and no update
+    /// cache file (the same as RECIPE_RUNNER_NO_UPDATE_CHECK=1 for one run).
+    /// Accepted before or after a subcommand.
+    #[arg(long, global = true)]
+    no_update_check: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 
@@ -181,7 +187,10 @@ fn run() -> i32 {
     update::maybe_print_update_notice_from_args(&std::env::args_os().collect::<Vec<_>>());
 
     let cli = Cli::parse();
-    debug!("run: starting recipe runner");
+    debug!(
+        "run: starting recipe runner (no_update_check={})",
+        cli.no_update_check
+    );
 
     // Handle subcommands
     if let Some(Commands::Update) = &cli.command {

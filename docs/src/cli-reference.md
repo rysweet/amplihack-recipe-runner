@@ -32,6 +32,18 @@ the compiled package `version`, and `capabilities: ["codex_exec"]` on Unix
 It performs no update, cache-write, network, or agent-startup work. Do not combine
 it with other arguments. See the [capability API](codex-exec.md#compatibility-probe-api).
 
+### `--no-update-check`
+
+Make no update check at startup for this run: no request to GitHub and no update cache file under
+`$HOME/.config/recipe-runner-rs/`. The option is read before argument parsing and is accepted in any position,
+including after a subcommand.
+Setting `RECIPE_RUNNER_NO_UPDATE_CHECK=1` in the environment has the same effect. Without either, the
+startup check is unchanged.
+
+```bash
+recipe-runner-rs deploy.yaml --no-update-check
+```
+
 ### `--agent-binary <PROVIDER>`
 
 Select the agent provider, for example `claude`, `copilot`, or `codex`. Takes
