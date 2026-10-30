@@ -55,6 +55,21 @@ impl AgentResolver {
         }
     }
 
+    /// Search `dirs` in order and then, when `include_defaults` is true, the
+    /// default locations under the home and working directories.
+    pub fn from_dirs(dirs: Vec<PathBuf>, include_defaults: bool) -> Self {
+        debug!(
+            "AgentResolver::from_dirs: {} explicit path(s), include_defaults={}",
+            dirs.len(),
+            include_defaults
+        );
+        let mut search_paths = dirs;
+        if include_defaults {
+            search_paths.extend(default_search_paths());
+        }
+        Self { search_paths }
+    }
+
     /// Resolve an agent reference to its system prompt content.
     ///
     /// Accepts `namespace:name` or `namespace:category:name` format.
