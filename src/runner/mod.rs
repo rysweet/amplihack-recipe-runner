@@ -990,13 +990,15 @@ impl<A: Adapter> RecipeRunner<A> {
                     recipe_name, failure_summary
                 );
 
+                // The recovery call works on the step's behalf, so it keeps the
+                // step's model rather than falling back to the CLI default.
                 let recovery = self.adapter.execute_agent_step(
                     &recovery_prompt,
                     None,
                     None,
                     None,
                     working_dir,
-                    None,
+                    step.model.as_deref(),
                     None, // timeout
                 );
                 if let Err(ref error) = recovery {
@@ -1239,13 +1241,15 @@ impl<A: Adapter> RecipeRunner<A> {
             self.dispatch_step(&repair_step, ctx)
                 .map_err(anyhow::Error::new)
         } else {
+            // The repair call keeps the step's model, as the Codex path above
+            // does by re-dispatching a copy of the step.
             self.adapter.execute_agent_step(
                 &ctx.render(&retry_prompt),
                 None,
                 None,
                 None,
                 step.working_dir.as_deref().unwrap_or(&self.working_dir),
-                None,
+                step.model.as_deref(),
                 None,
             )
         };
@@ -1820,6 +1824,93 @@ mod tests {
         assert_eq!(
             result.step_results[0].output.lines().collect::<Vec<_>>(),
             vec![expected.as_str(), expected.as_str()]
+        );
+    }
+
+    /// Records the model of every agent call; the first call of each prompt
+    /// gets output that is not JSON.
+    struct ModelRecordingAdapter(std::sync::Mutex<Vec<Option<String>>>);
+
+    impl Adapter for ModelRecordingAdapter {
+        fn execute_agent_step(
+            &self,
+            prompt: &str,
+            _agent_name: Option<&str>,
+            _system_prompt: Option<&str>,
+            _mode: Option<&str>,
+            _working_dir: &str,
+            model: Option<&str>,
+            _timeout: Option<u64>,
+        ) -> Result<String, anyhow::Error> {
+            self.0.lock().unwrap().push(model.map(str::to_string));
+            if prompt == "ordinary failure" {
+                anyhow::bail!("ordinary failure");
+            }
+            if prompt.contains("previous response was not valid JSON") {
+                return Ok(r#"{"ok":true}"#.to_string());
+            }
+            Ok("not json".to_string())
+        }
+
+        fn execute_bash_step(
+            &self,
+            command: &str,
+            _working_dir: &str,
+            _timeout: Option<u64>,
+            _extra_env: &std::collections::HashMap<String, String>,
+        ) -> Result<String, anyhow::Error> {
+            Ok(format!("Bash output for: {}", command))
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "model-recording"
+        }
+    }
+
+    #[test]
+    fn json_repair_call_keeps_the_step_model() {
+        let recipe = RecipeParser::new()
+            .parse("name: repair\nsteps:\n  - id: ask\n    type: agent\n    prompt: give json\n    model: step-model\n    parse_json: true\n")
+            .unwrap();
+        let runner =
+            RecipeRunner::new(ModelRecordingAdapter(Default::default())).with_auto_stage(false);
+        let result = runner.execute(&recipe, None);
+        assert!(result.success, "{result:?}");
+        let models = runner.adapter.0.lock().unwrap().clone();
+        assert_eq!(
+            models,
+            vec![Some("step-model".to_string()); 2],
+            "primary and repair calls"
+        );
+    }
+
+    #[test]
+    fn sub_recipe_recovery_call_keeps_the_step_model() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("child.yaml"),
+            "name: child\nsteps:\n  - id: fail\n    type: agent\n    prompt: ordinary failure\n    model: child-model\n",
+        )
+        .unwrap();
+        let recipe = RecipeParser::new()
+            .parse("name: parent\nsteps:\n  - id: child\n    type: recipe\n    recipe: child\n    model: step-model\n    recovery_on_failure: true\n")
+            .unwrap();
+        let runner = RecipeRunner::new(ModelRecordingAdapter(Default::default()))
+            .with_working_dir(root.path().to_str().unwrap())
+            .with_auto_stage(false);
+        runner.execute(&recipe, None);
+        let models = runner.adapter.0.lock().unwrap().clone();
+        assert_eq!(
+            models,
+            vec![
+                Some("child-model".to_string()),
+                Some("step-model".to_string())
+            ],
+            "the child's own call, then the recovery call"
         );
     }
 
