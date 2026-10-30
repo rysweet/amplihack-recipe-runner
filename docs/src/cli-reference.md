@@ -35,7 +35,8 @@ it with other arguments. See the [capability API](codex-exec.md#compatibility-pr
 ### `--no-update-check`
 
 Make no update check at startup for this run: no request to GitHub and no update cache file under
-`$HOME/.config/recipe-runner-rs/`. The option is read before argument parsing, so it works in any position.
+`$HOME/.config/recipe-runner-rs/`. The option is read before argument parsing and is accepted in any position,
+including after a subcommand.
 Setting `RECIPE_RUNNER_NO_UPDATE_CHECK=1` in the environment has the same effect. Without either, the
 startup check is unchanged.
 

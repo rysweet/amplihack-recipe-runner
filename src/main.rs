@@ -41,7 +41,8 @@ struct Cli {
 
     /// Make no update check at startup: no network request and no update
     /// cache file (the same as RECIPE_RUNNER_NO_UPDATE_CHECK=1 for one run).
-    #[arg(long)]
+    /// Accepted before or after a subcommand.
+    #[arg(long, global = true)]
     no_update_check: bool,
 
     #[command(subcommand)]
