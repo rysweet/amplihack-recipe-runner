@@ -1556,7 +1556,7 @@ fn validate_context(rules: &HashMap<String, String>, ctx: &HashMap<String, Value
                 if !std::path::Path::new(&resolved).is_dir() {
                     errors.push(format!("  ✗ '{}' path '{}' does not exist", var_name, path));
                 } else if !std::path::Path::new(&resolved).join(".git").exists()
-                    && Command::new("git")
+                    && git_for_given_dir()
                         .args(["-C", &resolved, "rev-parse", "--git-dir"])
                         .output()
                         .map(|o| !o.status.success())
@@ -1594,9 +1594,26 @@ fn validate_context(rules: &HashMap<String, String>, ctx: &HashMap<String, Value
     errors
 }
 
+/// Environment variables that make git use a repository other than the one
+/// containing its working directory. Git sets GIT_DIR for hooks that run in a
+/// worktree, as an absolute path, so a runner started from such a hook would
+/// otherwise stage in, and validate against, the hook's repository.
+const GIT_LOCATION_VARS: [&str; 3] = ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"];
+
+/// A `git` command that finds its repository from its working directory (or
+/// `-C`), not from GIT_DIR, GIT_WORK_TREE or GIT_INDEX_FILE in the runner's
+/// environment.
+fn git_for_given_dir() -> Command {
+    let mut command = Command::new("git");
+    for name in GIT_LOCATION_VARS {
+        command.env_remove(name);
+    }
+    command
+}
+
 fn git_stage_all(working_dir: &str) -> Option<String> {
     log::debug!("git_stage_all: working_dir={:?}", working_dir);
-    let result = Command::new("git")
+    let result = git_for_given_dir()
         .args(["add", "-A"])
         .current_dir(working_dir)
         .output()
@@ -1606,7 +1623,7 @@ fn git_stage_all(working_dir: &str) -> Option<String> {
         return None;
     }
 
-    let diff = Command::new("git")
+    let diff = git_for_given_dir()
         .args(["diff", "--cached", "--name-only"])
         .current_dir(working_dir)
         .output()
@@ -2044,7 +2061,7 @@ steps:
     }
 
     fn staged_files(repo: &std::path::Path) -> String {
-        let out = Command::new("git")
+        let out = git_for_given_dir()
             .args(["diff", "--cached", "--name-only"])
             .current_dir(repo)
             .output()
@@ -2054,7 +2071,7 @@ steps:
 
     fn repo_with_untracked_file() -> tempfile::TempDir {
         let repo = tempfile::tempdir().unwrap();
-        let init = Command::new("git")
+        let init = git_for_given_dir()
             .args(["init", "-q"])
             .current_dir(repo.path())
             .status()
@@ -2081,6 +2098,140 @@ steps:
                 "runner auto_stage {runner_stages}"
             );
         }
+    }
+
+    /// Set only in the child process that
+    /// `runner_git_ignores_git_location_variables` starts.
+    const GIT_LOCATION_CHILD: &str = "RECIPE_RUNNER_GIT_LOCATION_CHILD";
+
+    /// Runs only in that child, where GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE
+    /// name another repository: staging and the git_repo check use the
+    /// directory the runner was given.
+    #[test]
+    fn git_location_child_checks() {
+        if std::env::var_os(GIT_LOCATION_CHILD).is_none() {
+            return;
+        }
+        let yaml = "name: stage\nsteps:\n  - id: work\n    type: agent\n    prompt: do work\n";
+        let recipe = RecipeParser::new().parse(yaml).unwrap();
+        // In a repository, the step's file is staged in that repository.
+        let repo = repo_with_untracked_file();
+        let result = RecipeRunner::new(MockAdapter)
+            .with_working_dir(repo.path().to_str().unwrap())
+            .execute(&recipe, None);
+        assert!(result.success, "{result:?}");
+        assert_eq!(staged_files(repo.path()), "work.txt");
+        // In a directory outside any repository, nothing is staged.
+        let plain = tempfile::tempdir().unwrap();
+        std::fs::write(plain.path().join("work.txt"), "agent output\n").unwrap();
+        let result = RecipeRunner::new(MockAdapter)
+            .with_working_dir(plain.path().to_str().unwrap())
+            .execute(&recipe, None);
+        assert!(result.success, "{result:?}");
+        // The git_repo check finds no repository for that directory.
+        let rules = HashMap::from([("repo".to_string(), "git_repo".to_string())]);
+        let ctx = HashMap::from([(
+            "repo".to_string(),
+            Value::String(plain.path().to_str().unwrap().to_string()),
+        )]);
+        let errors = validate_context(&rules, &ctx);
+        assert!(
+            errors.len() == 1 && errors[0].contains("is not a git repository"),
+            "{errors:?}"
+        );
+    }
+
+    /// Git sets GIT_DIR for hooks that run in a worktree. Runs the staging
+    /// test and the child checks with GIT_DIR, GIT_WORK_TREE and
+    /// GIT_INDEX_FILE naming a worktree of another repository, and requires
+    /// that repository to be unchanged.
+    #[test]
+    fn runner_git_ignores_git_location_variables() {
+        let root = tempfile::tempdir().unwrap();
+        let enclosing = root.path().join("enclosing");
+        let worktree = root.path().join("enclosing-wt");
+        let tmp = root.path().join("tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        let git = |args: &[&str]| {
+            let out = git_for_given_dir()
+                .args([
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args([
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            out.stdout
+        };
+        let e = enclosing.to_str().unwrap();
+        git(&["init", "-q", e]);
+        std::fs::write(enclosing.join("keep.txt"), "keep\n").unwrap();
+        git(&["-C", e, "add", "keep.txt"]);
+        git(&["-C", e, "commit", "-q", "-m", "base"]);
+        git(&[
+            "-C",
+            e,
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wt",
+            worktree.to_str().unwrap(),
+        ]);
+        let gitdir = enclosing.join(".git");
+        let wt_gitdir = gitdir.join("worktrees/enclosing-wt");
+        let snapshot = || {
+            let files: Vec<Vec<u8>> = [
+                gitdir.join("config"),
+                gitdir.join("HEAD"),
+                gitdir.join("index"),
+                wt_gitdir.join("HEAD"),
+                wt_gitdir.join("index"),
+            ]
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect();
+            (files, git(&["-C", e, "for-each-ref"]))
+        };
+        let before = snapshot();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runner::tests::no_auto_stage_wins_over_a_step_that_asks_for_staging",
+                "runner::tests::git_location_child_checks",
+                "--test-threads=1",
+            ])
+            .env("GIT_DIR", &wt_gitdir)
+            .env("GIT_WORK_TREE", &worktree)
+            .env("GIT_INDEX_FILE", wt_gitdir.join("index"))
+            .env("GIT_CEILING_DIRECTORIES", root.path())
+            .env("TMPDIR", &tmp)
+            .env(GIT_LOCATION_CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success()
+                && stdout.contains("running 2 tests")
+                && stdout.contains("2 passed"),
+            "child: {stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            snapshot() == before,
+            "the repository named by GIT_DIR changed"
+        );
     }
 
     #[test]
