@@ -58,6 +58,10 @@ pub struct RecipeRunner<A: Adapter> {
     /// sub-recipes referenced by `recipe:`-typed steps. See
     /// [`sub_recipe_paths::anchored_search_dirs`].
     recipe_origin_dir: Option<PathBuf>,
+    /// Whether sub-recipes may also be found in the anchored and default
+    /// locations, and whether an agent step may run without its agent
+    /// definition. See [`Self::with_default_search`].
+    default_search: bool,
     audit_dir: Option<PathBuf>,
     require_audit: bool,
     active_tags: Vec<String>,
@@ -85,6 +89,7 @@ impl<A: Adapter> RecipeRunner<A> {
             max_total_steps: Cell::new(200),
             recipe_search_dirs: Vec::new(),
             recipe_origin_dir: None,
+            default_search: true,
             audit_dir: None,
             require_audit: false,
             active_tags: Vec::new(),
@@ -122,6 +127,19 @@ impl<A: Adapter> RecipeRunner<A> {
     pub fn with_recipe_search_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
         log::debug!("RecipeRunner::with_recipe_search_dirs: {} dirs", dirs.len());
         self.recipe_search_dirs = dirs;
+        self
+    }
+
+    /// With `false`, sub-recipes resolve only from the directories given to
+    /// [`Self::with_recipe_search_dirs`] (no anchored or default locations),
+    /// and an agent step whose agent definition the agent resolver cannot
+    /// find fails instead of running without it. The default is `true`.
+    pub fn with_default_search(mut self, default_search: bool) -> Self {
+        log::debug!(
+            "RecipeRunner::with_default_search: default_search={}",
+            default_search
+        );
+        self.default_search = default_search;
         self
     }
 
@@ -868,6 +886,15 @@ impl<A: Adapter> RecipeRunner<A> {
                     agent_name = Some(agent_ref.as_str());
                     match self.agent_resolver.resolve(agent_ref) {
                         Ok(content) => agent_system_prompt = Some(content),
+                        Err(e) if !self.default_search => {
+                            return Err(StepExecutionError {
+                                step_id: step.id.clone(),
+                                message: format!(
+                                    "agent definition '{}' not resolved and default search is off: {}",
+                                    agent_ref, e
+                                ),
+                            });
+                        }
                         Err(AgentResolveError::NotFound { .. })
                         | Err(AgentResolveError::InvalidReference(_)) => {
                             warn!(
@@ -1132,6 +1159,11 @@ impl<A: Adapter> RecipeRunner<A> {
             return Some(path.display().to_string());
         }
 
+        // With default search off, only the explicit directories count.
+        if !self.default_search {
+            return None;
+        }
+
         // 2. Anchored search: recipe-local → working_dir → walk-up to .git.
         //    These dirs are computed from the runner's `working_dir` (-C
         //    arg) rather than the subprocess cwd, so resolution is stable
@@ -1171,6 +1203,10 @@ impl<A: Adapter> RecipeRunner<A> {
     fn sub_recipe_search_diagnostic(&self) -> String {
         let mut all: Vec<PathBuf> = Vec::new();
         all.extend(self.recipe_search_dirs.iter().cloned());
+        if !self.default_search {
+            return Self::format_search_dirs(all)
+                + "  (default search is off: no anchored or default locations)\n";
+        }
         all.extend(sub_recipe_paths::anchored_search_dirs(
             self.recipe_origin_dir.as_deref(),
             Path::new(&self.working_dir),
@@ -1203,8 +1239,12 @@ impl<A: Adapter> RecipeRunner<A> {
                 .join("recipes"),
         );
         all.push(PathBuf::from(".claude").join("recipes"));
+        Self::format_search_dirs(all)
+    }
 
-        // De-dupe while preserving order.
+    /// One `  - <dir>` line per directory, de-duplicated in order, marking
+    /// directories that do not exist.
+    fn format_search_dirs(all: Vec<PathBuf>) -> String {
         let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         let mut lines = String::new();
         for d in all {
@@ -2141,6 +2181,80 @@ steps:
             0,
             "a dry run must not reach the adapter for any hook or step"
         );
+    }
+
+    #[test]
+    fn without_default_search_an_unresolved_agent_definition_fails_before_the_adapter() {
+        let yaml =
+            "name: agent\nsteps:\n  - id: ask\n    agent: amplihack:absent\n    prompt: hello\n";
+        let recipe = RecipeParser::new().parse(yaml).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let runner = |default_search: bool| {
+            RecipeRunner::new(CallCountingAdapter(Default::default()))
+                .with_working_dir(work.path().to_str().unwrap())
+                .with_auto_stage(false)
+                .with_agent_resolver(AgentResolver::from_dirs(
+                    vec![work.path().to_path_buf()],
+                    false,
+                ))
+                .with_default_search(default_search)
+        };
+        let calls = |r: &RecipeRunner<CallCountingAdapter>| {
+            r.adapter.0.load(std::sync::atomic::Ordering::SeqCst)
+        };
+
+        let off = runner(false);
+        let result = off.execute(&recipe, None);
+        assert!(!result.success, "{result:?}");
+        assert!(
+            result.step_results[0]
+                .error
+                .contains("agent definition 'amplihack:absent' not resolved"),
+            "{:?}",
+            result.step_results[0]
+        );
+        assert_eq!(calls(&off), 0, "the agent step must not reach the adapter");
+
+        // With default search on, the step runs without the definition, as before.
+        let on = runner(true);
+        assert!(on.execute(&recipe, None).success);
+        assert_eq!(calls(&on), 1);
+    }
+
+    #[test]
+    fn without_default_search_a_sub_recipe_resolves_only_from_explicit_dirs() {
+        let work = tempfile::tempdir().unwrap();
+        let explicit = tempfile::tempdir().unwrap();
+        let child = "name: child\nsteps:\n  - id: one\n    command: echo child\n";
+        // Anchored location: the working directory's amplifier-bundle/recipes.
+        let near = work.path().join("amplifier-bundle").join("recipes");
+        std::fs::create_dir_all(&near).unwrap();
+        std::fs::write(near.join("child.yaml"), child).unwrap();
+        let recipe = RecipeParser::new()
+            .parse("name: parent\nsteps:\n  - id: call\n    type: recipe\n    recipe: child\n")
+            .unwrap();
+        let runner = |default_search: bool, dirs: Vec<PathBuf>| {
+            RecipeRunner::new(CallCountingAdapter(Default::default()))
+                .with_working_dir(work.path().to_str().unwrap())
+                .with_auto_stage(false)
+                .with_recipe_search_dirs(dirs)
+                .with_default_search(default_search)
+        };
+
+        assert!(runner(true, Vec::new()).execute(&recipe, None).success);
+
+        let result = runner(false, Vec::new()).execute(&recipe, None);
+        assert!(!result.success);
+        let error = &result.step_results[0].error;
+        assert!(
+            error.contains("Sub-recipe 'child' not found")
+                && error.contains("default search is off"),
+            "{error}"
+        );
+
+        std::fs::write(explicit.path().join("child.yaml"), child).unwrap();
+        let result = runner(false, vec![explicit.path().to_path_buf()]).execute(&recipe, None);
+        assert!(result.success, "{result:?}");
     }
 
     /// A mock adapter that returns output with trailing newlines, simulating

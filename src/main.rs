@@ -5,6 +5,7 @@
 use clap::{Parser, Subcommand};
 use log::{debug, info};
 use recipe_runner_rs::adapters::cli_subprocess::CLISubprocessAdapter;
+use recipe_runner_rs::agent_resolver::AgentResolver;
 use recipe_runner_rs::discovery;
 use recipe_runner_rs::parser::RecipeParser;
 use recipe_runner_rs::runner::{FileLogListener, RecipeRunner, StderrListener};
@@ -64,6 +65,17 @@ struct Cli {
     /// Directory to search for sub-recipes (can be specified multiple times)
     #[arg(short = 'R', long = "recipe-dir")]
     recipe_dirs: Vec<String>,
+
+    /// Directory to search for agent definitions before the default
+    /// locations (can be specified multiple times)
+    #[arg(long = "agent-dir", value_name = "DIR")]
+    agent_dirs: Vec<String>,
+
+    /// Find recipes, sub-recipes and agent definitions only in the
+    /// directories given with --recipe-dir and --agent-dir. A sub-recipe or
+    /// agent definition that is not found there fails its step.
+    #[arg(long, global = true)]
+    no_default_search: bool,
 
     /// Dry run (log steps without executing)
     #[arg(long)]
@@ -203,7 +215,7 @@ fn run() -> i32 {
 
     if let Some(Commands::List { recipe_dirs }) = &cli.command {
         let dirs: Vec<PathBuf> = recipe_dirs.iter().map(PathBuf::from).collect();
-        let search = if dirs.is_empty() {
+        let search = if dirs.is_empty() && !cli.no_default_search {
             None
         } else {
             Some(dirs.as_slice())
@@ -270,7 +282,7 @@ fn run() -> i32 {
     } else {
         let name = recipe_path.to_string_lossy();
         let extra_dirs: Vec<PathBuf> = cli.recipe_dirs.iter().map(PathBuf::from).collect();
-        let search = if extra_dirs.is_empty() {
+        let search = if extra_dirs.is_empty() && !cli.no_default_search {
             None
         } else {
             Some(extra_dirs.as_slice())
@@ -396,7 +408,15 @@ fn run() -> i32 {
         .with_dry_run(cli.dry_run)
         .with_auto_stage(!cli.no_auto_stage)
         .with_recipe_search_dirs(cli.recipe_dirs.into_iter().map(PathBuf::from).collect())
+        .with_default_search(!cli.no_default_search)
         .with_tags(cli.include_tags, cli.exclude_tags);
+
+    if !cli.agent_dirs.is_empty() || cli.no_default_search {
+        runner = runner.with_agent_resolver(AgentResolver::from_dirs(
+            cli.agent_dirs.iter().map(PathBuf::from).collect(),
+            !cli.no_default_search,
+        ));
+    }
 
     // Anchor sub-recipe resolution to the directory holding the top-level
     // recipe file. Without this, sub-recipes co-located with the parent

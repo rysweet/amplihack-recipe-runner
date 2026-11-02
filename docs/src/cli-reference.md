@@ -98,6 +98,31 @@ recipe-runner-rs my-recipe -R ./recipes -R ../shared
 recipe-runner-rs list -R ./recipes -R /opt/shared-recipes
 ```
 
+### `--no-default-search`
+
+Find recipes, sub-recipes and agent definitions only in the directories given with `--recipe-dir` and
+`--agent-dir`. Without the option the runner also looks in its default locations: the directories named by
+`AMPLIHACK_PACKAGE_RECIPE_DIR`, `RECIPE_RUNNER_RECIPE_DIRS` and `AMPLIHACK_HOME`, the `amplifier-bundle/recipes`
+and `.claude/recipes` directories under `$HOME/.amplihack`, the project-relative `amplifier-bundle`,
+`src/amplihack` and `.claude` directories and, for sub-recipes, the directory of the top-level recipe and the
+working directory and its ancestors up to the Git root.
+
+With the option, a recipe named on the command line that is not in a `--recipe-dir` directory exits with code 3,
+and a sub-recipe that is not in one fails its step. An agent step whose agent definition is not in an
+`--agent-dir` directory fails before any agent starts, where without the option it runs without the definition
+and logs a warning. `list --no-default-search` lists only the `--recipe-dir` directories. The option is accepted
+before or after a subcommand.
+
+```bash
+recipe-runner-rs deploy --no-default-search -R ./recipes --agent-dir ./agents
+```
+
+### `--agent-dir <DIR>`
+
+Add a directory to search for agent definitions before the default locations (`$HOME/.amplihack/.claude/agents`
+and the project-relative `.claude/agents`, `amplifier-bundle/agents` and `src/amplihack` agent directories). Can be
+specified multiple times. A relative path is taken from the current directory.
+
 ### `--set <KEY=VALUE>`
 
 Override a context variable. Can be specified multiple times to set several variables. Values are automatically typed using smart parsing (see [Smart Context Value Parsing](#smart-context-value-parsing---set)).
@@ -356,7 +381,7 @@ recipe-runner-rs deploy.yaml --set message="deploy to production"
 
 ### `RECIPE_RUNNER_RECIPE_DIRS`
 
-Additional recipe search directories, separated by colons. These directories are searched in addition to any specified via `--recipe-dir`.
+Additional recipe search directories, separated by colons. These directories are searched in addition to any specified via `--recipe-dir`, except with `--no-default-search`, which leaves them out.
 
 ```bash
 # Set via environment
