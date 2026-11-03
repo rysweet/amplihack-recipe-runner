@@ -176,6 +176,27 @@ Add a directory to search for agent definitions before the default locations (`$
 and the project-relative `.claude/agents`, `amplifier-bundle/agents` and `src/amplihack` agent directories). Can be
 specified multiple times. A relative path is taken from the current directory.
 
+### `--env-allow <NAME>`
+
+Pass only the named parent environment variables to agent and shell children. Can be specified multiple times.
+Without the option every parent variable is passed on, as before. With it, a parent variable that is not named is
+not passed on, whatever its value.
+
+These are still present, because the runner or the recipe sets them rather than inheriting them:
+
+- `HOME` and `PATH`, which fall back to `/root` and `/usr/local/bin:/usr/bin:/bin` when they are not named;
+- `AMPLIHACK_SESSION_DEPTH`, `AMPLIHACK_MAX_DEPTH`, `AMPLIHACK_MAX_SESSIONS`, `AMPLIHACK_TREE_ID` and
+  `AMPLIHACK_AGENT_BINARY`;
+- a step's own `env:` block and the `RECIPE_VAR_*` variables for shell steps.
+
+`CLAUDECODE` is never passed, even if it is named. The runner's own settings read from its environment, such as
+`AMPLIHACK_BASH`, `AMPLIHACK_AGENT_BINARY` and the rate-limit knobs, are read from the parent as usual; the option
+restricts only what children receive.
+
+```bash
+recipe-runner-rs deploy.yaml --env-allow PATH --env-allow HOME --env-allow ANTHROPIC_API_KEY
+```
+
 ### `--set <KEY=VALUE>`
 
 Override a context variable. Can be specified multiple times to set several variables. Values are automatically typed using smart parsing (see [Smart Context Value Parsing](#smart-context-value-parsing---set)).

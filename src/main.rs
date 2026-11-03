@@ -160,6 +160,15 @@ struct Cli {
     /// CLIs that read the file through --add-dir (such as Copilot).
     #[arg(long)]
     no_add_dir: bool,
+
+    /// Pass only the named parent environment variables to agent and shell
+    /// children (can be specified multiple times). Without this option every
+    /// parent variable is passed on. The variables the runner sets itself
+    /// (HOME and PATH defaults, the session-tree variables and
+    /// AMPLIHACK_AGENT_BINARY), a step's `env:` block and RECIPE_VAR_* are
+    /// still passed.
+    #[arg(long = "env-allow", value_name = "NAME")]
+    env_allow: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -467,6 +476,9 @@ fn run() -> i32 {
     }
     if cli.no_add_dir {
         adapter = adapter.without_working_dir_grant();
+    }
+    if !cli.env_allow.is_empty() {
+        adapter = adapter.with_env_allow(cli.env_allow.iter().cloned());
     }
     let mut runner = RecipeRunner::new(adapter)
         .with_working_dir(&cli.working_dir)

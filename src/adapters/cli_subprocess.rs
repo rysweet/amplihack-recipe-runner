@@ -619,6 +619,10 @@ pub struct CLISubprocessAdapter {
     /// Whether to pass `--add-dir <working directory>` to the agent CLI.
     /// Default `true`.
     add_working_dir: bool,
+    /// When `Some`, only these parent variables reach agent and shell
+    /// children (see [`CLISubprocessAdapter::with_env_allow`]). `None` keeps
+    /// the default: every parent variable is inherited.
+    env_allow: Option<Vec<String>>,
 }
 
 /// #130: whether an inherited `KEY=value\0` string exceeds the kernel's
@@ -636,6 +640,19 @@ fn inherited_drop_warning(key: &str, value: &str) -> String {
         env_pair_bytes(key, value),
         MAX_ARG_STRLEN
     )
+}
+
+/// Keep only the inherited variables whose names are in `allow`. Names are
+/// compared exactly (environment names are case-sensitive on the platforms the
+/// runner supports). Takes the variables as an argument so tests can exercise
+/// it without touching the process environment.
+fn restrict_to_allowlist(
+    vars: HashMap<String, String>,
+    allow: &[String],
+) -> HashMap<String, String> {
+    vars.into_iter()
+        .filter(|(k, _)| allow.iter().any(|name| name == k))
+        .collect()
 }
 
 /// Sanitize the inherited environment: removes `CLAUDECODE` and every
@@ -674,6 +691,7 @@ impl CLISubprocessAdapter {
             launcher: None,
             allow_all_tools: true,
             add_working_dir: true,
+            env_allow: None,
         }
     }
 
@@ -759,6 +777,31 @@ impl CLISubprocessAdapter {
         self
     }
 
+    /// Pass only the named parent variables to agent and shell children.
+    ///
+    /// Opt-in: without this call every parent variable is inherited, as
+    /// before. With it, a parent variable that is not named is not passed on,
+    /// whatever its value. The variables the runner sets itself are still
+    /// present: `HOME` and `PATH` fall back to fixed defaults when they are not
+    /// named, the session-tree variables (`AMPLIHACK_SESSION_DEPTH`,
+    /// `AMPLIHACK_MAX_DEPTH`, `AMPLIHACK_MAX_SESSIONS`, `AMPLIHACK_TREE_ID`)
+    /// and `AMPLIHACK_AGENT_BINARY` are set, and a step's own `env:` block and
+    /// the `RECIPE_VAR_*` variables are added. `CLAUDECODE` is never passed,
+    /// even if it is named.
+    pub fn with_env_allow<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let names: Vec<String> = names.into_iter().map(Into::into).collect();
+        log::debug!(
+            "CLISubprocessAdapter::with_env_allow: {} name(s) allowed",
+            names.len()
+        );
+        self.env_allow = Some(names);
+        self
+    }
+
     pub fn with_binary(mut self, binary: &str) -> Self {
         log::debug!("CLISubprocessAdapter::with_binary: binary={:?}", binary);
         self.cli = binary.to_string();
@@ -776,7 +819,14 @@ impl CLISubprocessAdapter {
     /// - Removes CLAUDECODE so nested Claude sessions work.
     /// - Propagates session tree env vars, incrementing depth by 1.
     /// - Generates a tree ID if none exists.
+    #[cfg(test)]
     fn build_child_env() -> HashMap<String, String> {
+        Self::build_child_env_with(None)
+    }
+
+    /// As [`Self::build_child_env`], with the inherited variables restricted
+    /// to `allow` when it is `Some`.
+    fn build_child_env_with(allow: Option<&[String]>) -> HashMap<String, String> {
         log::debug!("CLISubprocessAdapter::build_child_env: building child environment");
 
         // #130 root-cause defense: a single inherited `KEY=value\0` string
@@ -790,6 +840,9 @@ impl CLISubprocessAdapter {
         // below (session tree, PATH/HOME) are always small and are added after
         // this filter, so they are never affected.
         let mut child_env = filter_inherited_env(env::vars());
+        if let Some(allow) = allow {
+            child_env = restrict_to_allowlist(child_env, allow);
+        }
 
         // Defense-in-depth: ensure HOME and PATH are always present and non-empty,
         // even when the parent shell has them unset. Mirrors amplihack-rs fork
@@ -1118,7 +1171,7 @@ impl CLISubprocessAdapter {
         }
 
         if self.cli == "codex" {
-            let mut child_env = Self::build_child_env();
+            let mut child_env = Self::build_child_env_with(self.env_allow.as_deref());
             child_env.insert("AMPLIHACK_AGENT_BINARY".into(), self.cli.clone());
             let child_env = bounded_env(&child_env)?;
             let envelope = format!(
@@ -1207,7 +1260,7 @@ impl CLISubprocessAdapter {
         // Append non-interactive footer so nested sessions never hang (#2464)
         let full_prompt = format!("{}{}", prompt, NON_INTERACTIVE_FOOTER);
 
-        let mut child_env = Self::build_child_env();
+        let mut child_env = Self::build_child_env_with(self.env_allow.as_deref());
         // Ensure nested agent steps inherit the same agent binary preference
         child_env.insert("AMPLIHACK_AGENT_BINARY".to_string(), self.cli.clone());
         // Bound the child environment to the MEASURED budget once, before the
@@ -1574,7 +1627,7 @@ impl Adapter for CLISubprocessAdapter {
         // means a misconfigured AMPLIHACK_BASH aborts before any env-budget work
         // and before the >64 KiB script tempfile — nothing to clean up.
         let bash = resolve_bash_interpreter()?;
-        let mut child_env = Self::build_child_env();
+        let mut child_env = Self::build_child_env_with(self.env_allow.as_deref());
         // Propagate agent binary preference so scripts spawning nested agents
         // use the same binary as the parent (mirrors execute_agent_step_impl).
         child_env.insert("AMPLIHACK_AGENT_BINARY".to_string(), self.cli.clone());
@@ -2641,6 +2694,123 @@ mod tests {
             .map(|(i, _)| &args[i + 1])
             .collect();
         assert_eq!(grants, vec![&out.to_string_lossy().into_owned()]);
+    }
+
+    // ── --env-allow: only named parent variables reach children ───────
+
+    fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn restrict_to_allowlist_keeps_only_named_variables() {
+        let inherited = vars(&[("KEEP_ME", "1"), ("DROP_ME", "2"), ("keep_me", "3")]);
+        let kept = restrict_to_allowlist(inherited, &["KEEP_ME".to_string()]);
+        // Exact, case-sensitive match: neither DROP_ME nor keep_me survives.
+        assert_eq!(kept, vars(&[("KEEP_ME", "1")]));
+    }
+
+    #[test]
+    fn restrict_to_allowlist_with_no_names_keeps_nothing() {
+        let kept = restrict_to_allowlist(vars(&[("A", "1")]), &[]);
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn env_allow_defaults_to_none_and_is_set_by_with_env_allow() {
+        assert!(CLISubprocessAdapter::new().env_allow.is_none());
+        let adapter = CLISubprocessAdapter::new().with_env_allow(["A", "B"]);
+        assert_eq!(
+            adapter.env_allow,
+            Some(vec!["A".to_string(), "B".to_string()])
+        );
+    }
+
+    #[test]
+    fn build_child_env_with_allowlist_drops_unnamed_parent_variables() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = unique_tag();
+        let named = format!("ENVALLOW_NAMED_{tag}");
+        let unnamed = format!("ENVALLOW_UNNAMED_{tag}");
+        // SAFETY: serialized by ENV_MUTEX; names are unique to this test.
+        unsafe {
+            env::set_var(&named, "visible");
+            env::set_var(&unnamed, "hidden");
+        }
+
+        let allowed = [named.clone()];
+        let restricted = CLISubprocessAdapter::build_child_env_with(Some(&allowed));
+        let default = CLISubprocessAdapter::build_child_env_with(None);
+
+        // SAFETY: as above.
+        unsafe {
+            env::remove_var(&named);
+            env::remove_var(&unnamed);
+        }
+
+        assert_eq!(restricted.get(&named).map(String::as_str), Some("visible"));
+        assert!(!restricted.contains_key(&unnamed));
+        // Default behaviour is unchanged: everything is inherited.
+        assert_eq!(default.get(&unnamed).map(String::as_str), Some("hidden"));
+        // Variables the runner sets itself are still present.
+        for key in [
+            "HOME",
+            "PATH",
+            "AMPLIHACK_SESSION_DEPTH",
+            "AMPLIHACK_MAX_DEPTH",
+            "AMPLIHACK_MAX_SESSIONS",
+            "AMPLIHACK_TREE_ID",
+        ] {
+            assert!(restricted.contains_key(key), "{key} must be present");
+        }
+    }
+
+    #[test]
+    fn build_child_env_with_allowlist_never_passes_claudecode() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::new("CLAUDECODE");
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe {
+            env::set_var("CLAUDECODE", "1");
+        }
+        let allowed = ["CLAUDECODE".to_string()];
+        let restricted = CLISubprocessAdapter::build_child_env_with(Some(&allowed));
+        assert!(!restricted.contains_key("CLAUDECODE"));
+    }
+
+    #[test]
+    fn bash_step_sees_only_allowed_parent_variables() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = unique_tag();
+        let named = format!("ENVALLOW_NAMED_{tag}");
+        let unnamed = format!("ENVALLOW_UNNAMED_{tag}");
+        // SAFETY: serialized by ENV_MUTEX; names are unique to this test.
+        unsafe {
+            env::set_var(&named, "visible");
+            env::set_var(&unnamed, "hidden");
+        }
+        let script = format!("printf '%s|%s' \"${{{named}-unset}}\" \"${{{unnamed}-unset}}\"");
+        let empty_env = HashMap::new();
+
+        let restricted = CLISubprocessAdapter::new().with_env_allow([named.clone()]);
+        let restricted_out = restricted
+            .execute_bash_step(&script, ".", None, &empty_env)
+            .unwrap();
+        let default_out = CLISubprocessAdapter::new()
+            .execute_bash_step(&script, ".", None, &empty_env)
+            .unwrap();
+
+        // SAFETY: as above.
+        unsafe {
+            env::remove_var(&named);
+            env::remove_var(&unnamed);
+        }
+
+        assert_eq!(restricted_out, "visible|unset");
+        assert_eq!(default_out, "visible|hidden");
     }
 
     #[test]
