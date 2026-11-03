@@ -60,6 +60,35 @@ stdin delivery, lifecycle cleanup, and final-file validation must succeed.
 Successful final text is verbatim within `MAX_STEP_OUTPUT_BYTES`; oversized
 files fail instead of being truncated.
 
+### `--timeout-action <kill|report>`
+
+Choose what happens when an agent step's `timeout`, a shell step's `timeout` or the 30 second deadline of a
+`pre_step`, `post_step` or `on_error` hook is reached.
+
+- `kill` (default): the child is killed and the step fails, as before.
+- `report`: the overrun is reported once on stderr, naming the kind of step, the limit and the process id, and the
+  runner keeps waiting. Nothing is killed and the step does not fail because of the timeout; its result is whatever
+  the child produces when it ends. The `timeout` utility is not used for shell steps in this mode.
+
+A hook's overrun is reported with the same line as a shell step ("Shell step exceeded its 30s timeout"), because a
+hook runs as a shell step.
+
+The Codex adapter has its own deadline handling and does not take part: with `report`, a Codex step runs without a
+deadline, and the runner prints a notice on stderr once per step saying so (it does not depend on `RUST_LOG`).
+
+```bash
+recipe-runner-rs deploy.yaml --timeout-action report --log-dir ./agent-logs
+```
+
+### `--log-dir <DIR>`
+
+Keep agent output and stderr logs in `DIR`. A directory the runner creates (with its parents) is readable only by
+its owner (mode 0700); the mode of a directory that already exists is left as it is. The log files are created
+readable only by their owner (mode 0600) in either case. Each agent attempt writes `agent-step-<attempt>-<time>.log` (the agent's standard output) and
+`agent-stderr-<attempt>-<time>.log` (its standard error), and neither is removed when the step ends. Without the
+option the output log is removed with the step's temporary directory and the stderr log is kept under
+`/tmp/amplihack-agent-stderr` only when the step fails or times out. The Codex adapter's private output is not copied.
+
 ### `-C, --working-dir <DIR>`
 
 Set the working directory for recipe execution.
