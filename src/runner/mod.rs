@@ -1815,6 +1815,7 @@ mod tests {
         assert_eq!(env.get("LARGE").map(String::len), Some(8192));
     }
 
+    #[cfg(target_os = "linux")]
     fn sha256_hex(s: &str) -> String {
         use sha2::{Digest, Sha256};
         hex::encode(Sha256::digest(s.as_bytes()))

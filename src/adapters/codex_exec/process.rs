@@ -23,7 +23,7 @@ pub(super) struct OwnedProcess {
     closed: bool,
 }
 impl OwnedProcess {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn spawn(
         command: Command,
         resources: &Path,

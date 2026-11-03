@@ -7,7 +7,10 @@ use std::{
 
 #[test]
 fn exhausted_observational_budget_still_consumes_waitable_launcher() {
-    let mut child = Command::new("/bin/true").spawn().unwrap();
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };

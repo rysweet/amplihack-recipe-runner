@@ -235,7 +235,7 @@ fn an_agent_definition_resolves_only_from_explicit_directories() {
         format!(
             "#!/usr/bin/env bash\n\
              set -u\n\
-             n=$(ls '{calls}' | wc -l)\n\
+             n=$(( $(ls '{calls}' | wc -l) ))\n\
              for a in \"$@\"; do printf '%s\\0' \"$a\" >> '{calls}/'\"$n\"; done\n\
              echo done\n",
             calls = calls.display(),
