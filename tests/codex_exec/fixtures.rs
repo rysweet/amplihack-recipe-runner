@@ -17,10 +17,17 @@ def publish(name, text):
     tmp.write_text(text)
     os.replace(tmp, root/name)
 final = pathlib.Path(args[args.index('--output-last-message')+1]) if '--output-last-message' in args else None
-record = {'args':args, 'final':str(final) if final else None, 'absent':not final.exists() if final else False,
+record = {'args':args, 'cwd':str(pathlib.Path.cwd()), 'final':str(final) if final else None, 'absent':not final.exists() if final else False,
           'directory_mode':stat.S_IMODE(final.parent.stat().st_mode) if final else None}
 (root/'record.json').write_text(json.dumps(record))
 with (root/'attempts.jsonl').open('a') as log: log.write(json.dumps(record)+'\n')
+def reject_trusted_directory():
+    print('Not inside a trusted directory and --skip-git-repo-check was not specified.', file=sys.stderr)
+    print('authentication network rate limit token=SECRET_TOKEN prompt=PRIVATE_PROMPT /synthetic/private/PATH_CANARY', file=sys.stderr)
+    sys.exit(7)
+if mode == 'trust_failure_early':
+    final.write_text('false success')
+    reject_trusted_directory()
 if mode == 'cancel_json':
     if len((root/'attempts.jsonl').read_text().splitlines()) == 1:
         sys.stdin.read()
@@ -74,6 +81,7 @@ if final:
         if mode == 'unsafe_mode': final.chmod(0o644)
 if mode == 'auth_failure':
     print('authentication rejected token=SECRET_TOKEN prompt=PRIVATE_PROMPT', file=sys.stderr)
+if mode == 'trust_failure': reject_trusted_directory()
 sys.exit(7 if mode in ('nonzero', 'auth_failure') else 0)
 "#;
 
@@ -84,6 +92,18 @@ pub(super) fn run(
     provider: &str,
 ) -> (tempfile::TempDir, Value, Value) {
     let root = tempfile::tempdir().unwrap();
+    if scenario == "git_checkout" {
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(root.path())
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
     fs::write(root.path().join("prompt"), prompt).unwrap();
     let launcher = root.path().join("launcher");
     fs::write(&launcher, LAUNCHER).unwrap();
@@ -100,7 +120,10 @@ pub(super) fn run(
         .env("TEST_PROVIDER", provider)
         .env(
             "AMPLIHACK_RATELIMIT_MAX_RETRIES",
-            if matches!(scenario, "retry" | "cleanup_failure") {
+            if matches!(
+                scenario,
+                "retry" | "cleanup_failure" | "trust_failure" | "trust_failure_early"
+            ) {
                 "1"
             } else {
                 "0"

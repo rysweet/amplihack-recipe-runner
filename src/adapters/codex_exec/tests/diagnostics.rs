@@ -94,3 +94,32 @@ fn failure_categories_never_echo_provider_secrets() {
         assert!(!category.is_empty());
     }
 }
+
+#[test]
+fn known_trusted_directory_rejection_is_actionable_and_secret_safe() {
+    let rejection = "Not inside a trusted directory and --skip-git-repo-check was not specified.";
+    let expected = "working directory rejected: not inside a trusted directory; run from the intended existing Git checkout and set the recipe working directory to that checkout";
+    for message in [
+        rejection.to_string(),
+        rejection.to_ascii_uppercase(),
+        format!(
+            "  {rejection}\r\nauthentication network rate limit SECRET_CANARY PRIVATE_PROMPT /synthetic/private/PATH_CANARY"
+        ),
+    ] {
+        for limited in [false, true] {
+            assert_eq!(classify_failure(&message, limited), expected);
+        }
+    }
+}
+
+#[test]
+fn other_directory_errors_are_not_classified_as_the_known_rejection() {
+    for message in [
+        "trusted directory SECRET_CANARY",
+        "Not inside a trusted directory SECRET_CANARY",
+        "--skip-git-repo-check was not specified. SECRET_CANARY",
+        "unknown provider error SECRET_CANARY",
+    ] {
+        assert!(classify_failure(message, false).starts_with("unclassified"));
+    }
+}

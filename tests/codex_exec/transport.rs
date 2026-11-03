@@ -8,7 +8,14 @@ fn assert_envelope(task: String) {
     let args = record["args"].as_array().unwrap();
     assert_eq!(&args[..3], &[json!("codex"), json!("--"), json!("exec")]);
     assert_eq!(args.last().unwrap(), "-");
-    for forbidden in ["-p", "--model", "--add-dir", "--system-prompt", "--json"] {
+    for forbidden in [
+        "-p",
+        "--model",
+        "--add-dir",
+        "--system-prompt",
+        "--json",
+        "--skip-git-repo-check",
+    ] {
         assert!(!args.contains(&json!(forbidden)));
     }
     let input = fs::read_to_string(root.path().join("stdin")).unwrap();
@@ -37,6 +44,23 @@ fn leading_dash_unicode_multiline_nul_stdin_envelope() {
 #[test]
 fn large_stdin_envelope() {
     assert_envelope(format!("{}TAIL_SENTINEL", "λ".repeat(100_000)));
+}
+
+#[test]
+fn existing_git_checkout_succeeds_without_a_trust_bypass() {
+    let (root, result, record) = run("git_checkout", "task", None, "codex");
+    assert!(root.path().join(".git").is_dir());
+    assert_eq!(
+        record["cwd"],
+        root.path().canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_eq!(result["ok"], "  FINAL\n\0Unicode: λ\n\n");
+    assert!(
+        !record["args"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("--skip-git-repo-check"))
+    );
 }
 
 #[test]

@@ -25,7 +25,9 @@ pub(crate) use cancellation::Interruption;
 pub(super) use cancellation::{Cancellation, check_cancellation};
 pub(super) use diagnostics::ExitFailure;
 #[cfg(unix)]
-use diagnostics::{DiagnosticReader, classify_failure, drain_diagnostics, join_readers};
+use diagnostics::{
+    DiagnosticReader, classify_failure, drain_diagnostics, join_readers, trusted_directory_failure,
+};
 #[cfg(unix)]
 use final_output::read_final_output;
 #[cfg(unix)]
@@ -84,22 +86,35 @@ fn execute_with_readers(
     process.shutdown(&mut failures);
     stop.store(true, std::sync::atomic::Ordering::Release);
     let diagnostic = join_readers(stdout, stderr, &mut failures);
+    let diagnostic = String::from_utf8_lossy(&diagnostic);
+    let trust_failure = trusted_directory_failure(&diagnostic);
     // Classify the drained diagnostic before adding cleanup errors, so a
     // nonzero child status remains discoverable even when teardown fails.
-    let execution = execution.and_then(|status| {
-        if status.success() {
-            Ok(())
-        } else {
-            let diagnostic = String::from_utf8_lossy(&diagnostic);
-            let rate_limited = super::cli_subprocess::is_rate_limit(&diagnostic);
-            Err(ExitFailure {
-                status,
-                rate_limited,
-                classification: classify_failure(&diagnostic, rate_limited),
+    let execution = execution
+        .map_err(|error| {
+            // Early launcher rejection can interrupt stdin delivery. Retain its
+            // safe category without replacing the primary error or its type.
+            match trust_failure {
+                Some(category) => error.context(category),
+                None => error,
             }
-            .into())
-        }
-    });
+        })
+        .and_then(|status| {
+            if status.success() {
+                Ok(())
+            } else {
+                // A known local trust rejection is terminal even if other
+                // diagnostic lines happen to contain a rate-limit marker.
+                let rate_limited =
+                    trust_failure.is_none() && super::cli_subprocess::is_rate_limit(&diagnostic);
+                Err(ExitFailure {
+                    status,
+                    rate_limited,
+                    classification: classify_failure(&diagnostic, rate_limited),
+                }
+                .into())
+            }
+        });
     let execution = combine_result(execution, check_cancellation());
     let cleanup = if failures.is_empty() {
         Ok(())
