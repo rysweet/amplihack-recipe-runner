@@ -4,7 +4,7 @@
 ///
 use clap::{Parser, Subcommand};
 use log::{debug, info};
-use recipe_runner_rs::adapters::cli_subprocess::CLISubprocessAdapter;
+use recipe_runner_rs::adapters::cli_subprocess::{CLISubprocessAdapter, TimeoutAction};
 use recipe_runner_rs::agent_resolver::AgentResolver;
 use recipe_runner_rs::discovery;
 use recipe_runner_rs::parser::RecipeParser;
@@ -27,6 +27,16 @@ mod exit_codes {
     pub const NOT_FOUND: i32 = 3;
     /// Invalid CLI arguments or context overrides.
     pub const BAD_ARGS: i32 = 4;
+}
+
+/// What to do when a step's timeout is reached.
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum TimeoutActionArg {
+    /// Kill the child and fail the step.
+    #[default]
+    Kill,
+    /// Report the overrun once and keep waiting; nothing is killed.
+    Report,
 }
 
 #[derive(Parser)]
@@ -122,6 +132,18 @@ struct Cli {
     /// Falls back to AMPLIHACK_AGENT_BINARY env var, then "claude".
     #[arg(long)]
     agent_binary: Option<String>,
+
+    /// What to do when an agent step's timeout, a shell step's timeout or a
+    /// hook's deadline is reached: "kill" (default) kills the child and fails
+    /// the step; "report" reports the overrun once on stderr and keeps
+    /// waiting, killing nothing.
+    #[arg(long, value_enum, default_value_t = TimeoutActionArg::Kill)]
+    timeout_action: TimeoutActionArg,
+
+    /// Keep agent output and stderr logs in this directory (created if
+    /// missing, readable only by the owner).
+    #[arg(long, value_name = "DIR")]
+    log_dir: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -402,6 +424,12 @@ fn run() -> i32 {
     let mut adapter = CLISubprocessAdapter::new();
     if let Some(ref binary) = cli.agent_binary {
         adapter = adapter.with_binary(binary);
+    }
+    if matches!(cli.timeout_action, TimeoutActionArg::Report) {
+        adapter = adapter.with_timeout_action(TimeoutAction::Report);
+    }
+    if let Some(ref dir) = cli.log_dir {
+        adapter = adapter.with_log_dir(dir.clone());
     }
     let mut runner = RecipeRunner::new(adapter)
         .with_working_dir(&cli.working_dir)

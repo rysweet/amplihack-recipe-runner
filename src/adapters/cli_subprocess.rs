@@ -223,6 +223,72 @@ pub fn resolve_bash_interpreter() -> anyhow::Result<PathBuf> {
     Ok(resolved)
 }
 
+/// What the adapter does when a step's timeout (an agent step's, a shell
+/// step's or a hook's deadline) is reached.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TimeoutAction {
+    /// Kill the child and fail the step. The default.
+    #[default]
+    Kill,
+    /// Report the overrun once on stderr and keep waiting. Nothing is killed
+    /// and the step is not failed because of the timeout.
+    Report,
+}
+
+/// The one-line stderr report for a step that has passed its timeout while
+/// `TimeoutAction::Report` is in force.
+pub(crate) fn timeout_report_line(what: &str, secs: u64, pid: u32) -> String {
+    format!(
+        "  [{}] {what} exceeded its {secs}s timeout; --timeout-action report is set, \
+         so it keeps running and nothing is killed (pid {pid})",
+        utc_hms()
+    )
+}
+
+/// Run `cmd` to completion, capturing stdout and stderr as `Command::output`
+/// does, and report once if it is still running after `secs` seconds. The
+/// child is never killed.
+fn output_reporting_overrun(
+    mut cmd: Command,
+    secs: u64,
+    what: &str,
+) -> std::io::Result<std::process::Output> {
+    use std::process::Stdio;
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(Duration::from_secs(secs)) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!("{}", timeout_report_line(what, secs, pid));
+            rx.recv()
+                .unwrap_or_else(|_| Err(std::io::Error::other("step output reader ended early")))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(std::io::Error::other("step output reader ended early"))
+        }
+    }
+}
+
+/// Create `dir` (and parents) readable only by the owner, for agent logs.
+fn create_private_log_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
 /// What bash should execute for one step.
 #[derive(Clone, Copy)]
 pub(crate) enum BashInvocation<'a> {
@@ -530,6 +596,10 @@ impl RateLimitConfig {
 pub struct CLISubprocessAdapter {
     cli: String,
     working_dir: String,
+    /// What to do when a timeout is reached. Default: kill.
+    timeout_action: TimeoutAction,
+    /// When set, agent output and stderr logs are kept here.
+    log_dir: Option<PathBuf>,
 }
 
 /// #130: whether an inherited `KEY=value\0` string exceeds the kernel's
@@ -580,6 +650,40 @@ impl CLISubprocessAdapter {
         Self {
             cli,
             working_dir: ".".to_string(),
+            timeout_action: TimeoutAction::Kill,
+            log_dir: None,
+        }
+    }
+
+    /// Choose what happens when an agent step's timeout, a shell step's
+    /// timeout or a hook's deadline is reached. The default is
+    /// [`TimeoutAction::Kill`]. With [`TimeoutAction::Report`] the overrun is
+    /// reported once on stderr and the child keeps running.
+    ///
+    /// The Codex adapter has its own deadline handling and is not affected by
+    /// `Report`: its steps run without a deadline, with a warning.
+    pub fn with_timeout_action(mut self, action: TimeoutAction) -> Self {
+        self.timeout_action = action;
+        self
+    }
+
+    /// Keep agent output and stderr logs in `dir`, which is created if it does
+    /// not exist (readable only by the owner). Without it the output log is
+    /// removed with the step's temporary directory and the stderr log is kept
+    /// under `/tmp/amplihack-agent-stderr` only when the step fails. The
+    /// Codex adapter's private output is not copied.
+    pub fn with_log_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.log_dir = Some(dir.into());
+        self
+    }
+
+    /// Remove a stderr log that is no longer needed, unless logs are kept.
+    fn discard_stderr_log(&self, file: &Path) {
+        if self.log_dir.is_some() {
+            return;
+        }
+        if let Err(e) = std::fs::remove_file(file) {
+            log::debug!("Failed to clean up stderr file {}: {}", file.display(), e);
         }
     }
 
@@ -936,6 +1040,16 @@ impl CLISubprocessAdapter {
                 prompt,
                 NON_INTERACTIVE_FOOTER
             );
+            let codex_timeout = match (self.timeout_action, timeout) {
+                (TimeoutAction::Report, Some(secs)) => {
+                    log::warn!(
+                        "--timeout-action report does not apply to the Codex adapter; \
+                         the {secs}s step timeout is not enforced or reported"
+                    );
+                    None
+                }
+                _ => timeout,
+            };
             #[cfg(unix)]
             let cancellation = super::codex_exec::Cancellation::install()?;
             let result = (|| {
@@ -957,7 +1071,7 @@ impl CLISubprocessAdapter {
                         &resolved_cwd,
                         &child_env,
                         &envelope,
-                        timeout,
+                        codex_timeout,
                     );
                     let cleanup = resources.close().context("Failed to clean Codex resources");
                     let result = super::codex_exec::finish_resources(result, cleanup);
@@ -1041,21 +1155,33 @@ impl CLISubprocessAdapter {
             // The attempt number keeps per-attempt filenames unique.
             let output_dir = output_log_dir.join(".recipe-output");
             std::fs::create_dir_all(&output_dir)?;
-            let output_file = output_dir.join(format!(
+            let output_name = format!(
                 "agent-step-{}-{}.log",
                 attempt,
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos()
-            ));
+            );
+            let output_file = match &self.log_dir {
+                Some(dir) => {
+                    create_private_log_dir(dir).with_context(|| {
+                        format!("Failed to create agent log directory {}", dir.display())
+                    })?;
+                    dir.join(&output_name)
+                }
+                None => output_dir.join(&output_name),
+            };
 
             let log_fh = std::fs::File::create(&output_file)?;
 
             // Capture stderr to a persistent file in /tmp so that on failure
             // we can include the agent's actual error output in the bail message
             // (the temp_dir gets cleaned up before the error is reported).
-            let stderr_persist_dir = std::path::PathBuf::from("/tmp/amplihack-agent-stderr");
+            let stderr_persist_dir = self
+                .log_dir
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp/amplihack-agent-stderr"));
             if let Err(e) = std::fs::create_dir_all(&stderr_persist_dir) {
                 log::warn!(
                     "Failed to create stderr persist dir {}: {}",
@@ -1144,7 +1270,7 @@ impl CLISubprocessAdapter {
             // which left the heartbeat with no way to ever learn the child was
             // gone — the exit was observable only by the thread that could not
             // report it. Polling publishes the exit the moment it happens.
-            let deadline = timeout.map(|secs| Instant::now() + Duration::from_secs(secs));
+            let mut deadline = timeout.map(|secs| Instant::now() + Duration::from_secs(secs));
             let status = loop {
                 match child.try_wait()? {
                     Some(s) => {
@@ -1153,7 +1279,18 @@ impl CLISubprocessAdapter {
                     }
                     None => {
                         let expired = deadline.is_some_and(|d| Instant::now() >= d);
-                        if expired {
+                        if expired && self.timeout_action == TimeoutAction::Report {
+                            // Report once, then wait without a deadline.
+                            eprintln!(
+                                "{}",
+                                timeout_report_line(
+                                    "Agent step",
+                                    timeout.unwrap_or_default(),
+                                    child.id()
+                                )
+                            );
+                            deadline = None;
+                        } else if expired {
                             let secs = timeout.unwrap_or_default();
                             log::warn!(
                                 "Agent step timed out after {}s — killing pid {}",
@@ -1228,14 +1365,9 @@ impl CLISubprocessAdapter {
             // temp_dir is dropped after the loop exits, cleaning up automatically.
 
             if status.success() {
-                // On success, remove the persistent stderr file.
-                if let Err(e) = std::fs::remove_file(&stderr_file) {
-                    log::debug!(
-                        "Failed to clean up stderr file {}: {}",
-                        stderr_file.display(),
-                        e
-                    );
-                }
+                // On success, remove the persistent stderr file (unless logs
+                // are kept with --log-dir).
+                self.discard_stderr_log(&stderr_file);
                 return Ok(stdout.trim().to_string());
             }
 
@@ -1272,13 +1404,7 @@ impl CLISubprocessAdapter {
                     );
                     // Remove this failed attempt's stderr file before retrying
                     // so transient files don't leak across attempts.
-                    if let Err(e) = std::fs::remove_file(&stderr_file) {
-                        log::debug!(
-                            "Failed to clean up stderr file {}: {}",
-                            stderr_file.display(),
-                            e
-                        );
-                    }
+                    self.discard_stderr_log(&stderr_file);
                     if !wait.is_zero() {
                         std::thread::sleep(wait);
                     }
@@ -1425,14 +1551,25 @@ impl Adapter for CLISubprocessAdapter {
             Some(tf) => BashInvocation::File(tf.path()),
             None => BashInvocation::Inline(command),
         };
-        let argv = bash_command_argv(&bash, invocation, timeout);
-        let output = Command::new(&argv[0])
+        // With `--timeout-action report` the `timeout` utility is not used:
+        // the overrun is reported and the step keeps running, nothing is killed.
+        let report_secs = match (self.timeout_action, timeout) {
+            (TimeoutAction::Report, Some(secs)) => Some(secs),
+            _ => None,
+        };
+        let kill_timeout = if report_secs.is_some() { None } else { timeout };
+        let argv = bash_command_argv(&bash, invocation, kill_timeout);
+        let mut shell_cmd = Command::new(&argv[0]);
+        shell_cmd
             .args(&argv[1..])
             .current_dir(effective_dir)
             .env_clear()
-            .envs(bounded.iter().map(|(k, v)| (k, v)))
-            .output()
-            .with_context(|| bash_spawn_context(&invocation, timeout))?;
+            .envs(bounded.iter().map(|(k, v)| (k, v)));
+        let output = match report_secs {
+            Some(secs) => output_reporting_overrun(shell_cmd, secs, "Shell step"),
+            None => shell_cmd.output(),
+        }
+        .with_context(|| bash_spawn_context(&invocation, kill_timeout))?;
 
         // Drop the tempfiles (auto-clean on drop) only AFTER bash completed.
         drop(script_file);
@@ -2099,6 +2236,152 @@ mod tests {
         let adapter = CLISubprocessAdapter::default();
         assert_eq!(adapter.cli, "claude");
         assert_eq!(adapter.working_dir, ".");
+    }
+
+    // ── --timeout-action report and --log-dir ─────────────────────────
+
+    #[test]
+    fn timeout_action_defaults_to_kill() {
+        assert_eq!(TimeoutAction::default(), TimeoutAction::Kill);
+        assert_eq!(
+            CLISubprocessAdapter::new().timeout_action,
+            TimeoutAction::Kill
+        );
+    }
+
+    #[test]
+    fn timeout_report_line_names_the_step_kind_limit_and_pid() {
+        let line = timeout_report_line("Shell step", 7, 4242);
+        assert!(
+            line.contains("Shell step exceeded its 7s timeout"),
+            "{line}"
+        );
+        assert!(line.contains("nothing is killed (pid 4242)"), "{line}");
+    }
+
+    #[test]
+    fn kill_is_still_the_default_for_a_shell_step_past_its_timeout() {
+        let adapter = CLISubprocessAdapter::new();
+        let started = Instant::now();
+        let result =
+            adapter.execute_bash_step("sleep 30; echo late", ".", Some(1), &HashMap::new());
+        assert!(result.is_err(), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    #[test]
+    fn report_lets_a_shell_step_run_past_its_timeout_and_return_its_output() {
+        let adapter = CLISubprocessAdapter::new().with_timeout_action(TimeoutAction::Report);
+        let started = Instant::now();
+        let result = adapter
+            .execute_bash_step("sleep 2; echo finished", ".", Some(1), &HashMap::new())
+            .expect("a reported overrun must not fail the step");
+        assert_eq!(result, "finished");
+        assert!(started.elapsed() >= Duration::from_secs(2));
+    }
+
+    #[test]
+    fn report_keeps_a_failing_shell_step_failing_with_its_stderr() {
+        let adapter = CLISubprocessAdapter::new().with_timeout_action(TimeoutAction::Report);
+        let err = adapter
+            .execute_bash_step("echo oops >&2; exit 3", ".", Some(30), &HashMap::new())
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("exit 3") && text.contains("oops"), "{text}");
+    }
+
+    #[test]
+    fn report_runs_a_large_file_backed_step_past_its_timeout() {
+        let adapter = CLISubprocessAdapter::new().with_timeout_action(TimeoutAction::Report);
+        let script = format!("# {}\nsleep 2; echo big", "x".repeat(70 * 1024));
+        let result = adapter
+            .execute_bash_step(&script, ".", Some(1), &HashMap::new())
+            .unwrap();
+        assert_eq!(result, "big");
+    }
+
+    /// A launcher stand-in that sleeps past the step timeout, then writes to
+    /// stdout and stderr and exits 0.
+    fn slow_launcher(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("slow-launcher");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nsleep 2\necho agent-said-this\necho agent-err-said-this >&2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Point agent steps at `launcher` through the environment. The caller
+    /// holds `ENV_MUTEX` and an `EnvGuard` for `AMPLIHACK_LAUNCHER_BINARY`.
+    fn use_launcher(launcher: &Path) {
+        // SAFETY: callers hold ENV_MUTEX to serialize env var access.
+        unsafe {
+            env::set_var("AMPLIHACK_LAUNCHER_BINARY", launcher);
+        }
+    }
+
+    #[test]
+    fn agent_step_past_its_timeout_is_killed_by_default() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
+        let tmp = tempfile::tempdir().unwrap();
+        use_launcher(&slow_launcher(tmp.path()));
+        let adapter = CLISubprocessAdapter::new();
+        let err = adapter
+            .execute_agent_step_impl("p", None, None, tmp.path().to_str().unwrap(), Some(1))
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn report_lets_an_agent_step_run_past_its_timeout() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
+        let tmp = tempfile::tempdir().unwrap();
+        use_launcher(&slow_launcher(tmp.path()));
+        let adapter = CLISubprocessAdapter::new().with_timeout_action(TimeoutAction::Report);
+        let out = adapter
+            .execute_agent_step_impl("p", None, None, tmp.path().to_str().unwrap(), Some(1))
+            .expect("a reported overrun must not fail the step");
+        assert_eq!(out, "agent-said-this");
+    }
+
+    #[test]
+    fn log_dir_keeps_agent_output_and_stderr_logs() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
+        let tmp = tempfile::tempdir().unwrap();
+        use_launcher(&slow_launcher(tmp.path()));
+        let logs = tmp.path().join("logs").join("nested");
+        let adapter = CLISubprocessAdapter::new().with_log_dir(&logs);
+        let out = adapter
+            .execute_agent_step_impl("p", None, None, tmp.path().to_str().unwrap(), None)
+            .unwrap();
+        assert_eq!(out, "agent-said-this");
+
+        let mut output_logs = String::new();
+        let mut stderr_logs = String::new();
+        for entry in std::fs::read_dir(&logs).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let text = std::fs::read_to_string(&path).unwrap();
+            if name.starts_with("agent-step-") {
+                output_logs.push_str(&text);
+            } else if name.starts_with("agent-stderr-") {
+                stderr_logs.push_str(&text);
+            }
+        }
+        assert!(output_logs.contains("agent-said-this"), "{output_logs}");
+        assert!(stderr_logs.contains("agent-err-said-this"), "{stderr_logs}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&logs).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "log dir must be private: {mode:o}");
+        }
     }
 
     #[test]
