@@ -75,44 +75,88 @@ fn shell_step_receives_only_the_named_variable() {
     assert_eq!(step_output(&restricted), "visible|unset");
 }
 
-#[test]
-fn agent_step_receives_only_the_named_variable() {
-    let dir = tempfile::tempdir().unwrap();
-    // `amplihack <cli> ...` is the agent command line; this stand-in records
-    // the two marker variables it was given.
-    let launcher = dir.path().join("amplihack");
-    std::fs::write(
-        &launcher,
-        format!("#!/bin/sh\nprintf '%s|%s' \"${{{NAMED}-unset}}\" \"${{{UNNAMED}-unset}}\"\n"),
-    )
-    .unwrap();
-    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let recipe = dir.path().join("agent.yaml");
+/// Run an agent recipe through `launcher` with both marker variables in the
+/// environment, and return the step output.
+fn agent_run(dir: &Path, launcher: &Path, extra: &[&str]) -> String {
+    let recipe = dir.join("agent.yaml");
     std::fs::write(
         &recipe,
         "name: agent\nsteps:\n  - id: one\n    agent: none\n    prompt: hello\n",
     )
     .unwrap();
-    let recipe = recipe.to_str().unwrap();
-    let launcher = launcher.to_str().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_recipe-runner-rs"))
+        .arg(&recipe)
+        .args(["--output-format", "json"])
+        .args(extra)
+        .current_dir(dir)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("TMPDIR", std::env::temp_dir())
+        .env("HOME", dir)
+        .env("RECIPE_RUNNER_NO_UPDATE_CHECK", "1")
+        .env("AMPLIHACK_LAUNCHER_BINARY", launcher)
+        .env(NAMED, "visible")
+        .env(UNNAMED, "hidden")
+        .output()
+        .unwrap();
+    step_output(&out)
+}
 
-    let launch_env = |extra: &[&str]| {
-        let mut args = vec![recipe, "--output-format", "json", "--env-allow", "PATH"];
-        args.extend_from_slice(extra);
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_recipe-runner-rs"));
-        cmd.args(&args)
-            .current_dir(dir.path())
-            .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .env("TMPDIR", std::env::temp_dir())
-            .env("HOME", dir.path())
-            .env("RECIPE_RUNNER_NO_UPDATE_CHECK", "1")
-            .env("AMPLIHACK_LAUNCHER_BINARY", launcher)
-            .env(NAMED, "visible")
-            .env(UNNAMED, "hidden");
-        cmd.output().unwrap()
-    };
+fn write_executable(path: &Path, text: &str) {
+    std::fs::write(path, text).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
 
-    let restricted = launch_env(&["--env-allow", NAMED]);
-    assert!(step_output(&restricted).contains("visible|unset"));
+#[test]
+fn agent_step_receives_only_the_named_variable() {
+    let dir = tempfile::tempdir().unwrap();
+    // `amplihack <cli> ...` is the agent command line; this stand-in prints
+    // the two marker variables it was given.
+    let launcher = dir.path().join("amplihack");
+    write_executable(
+        &launcher,
+        &format!("#!/bin/sh\nprintf '%s|%s' \"${{{NAMED}-unset}}\" \"${{{UNNAMED}-unset}}\"\n"),
+    );
+
+    // Default: every parent variable reaches the child, as before.
+    let default = agent_run(dir.path(), &launcher, &[]);
+    assert!(default.contains("visible|hidden"), "{default}");
+
+    let restricted = agent_run(
+        dir.path(),
+        &launcher,
+        &["--env-allow", "PATH", "--env-allow", NAMED],
+    );
+    assert!(restricted.contains("visible|unset"), "{restricted}");
+}
+
+#[test]
+fn codex_agent_step_receives_only_the_named_variable() {
+    let dir = tempfile::tempdir().unwrap();
+    // The Codex path hands the prompt on stdin and reads the final message
+    // from the file named by --output-last-message.
+    let launcher = dir.path().join("amplihack");
+    write_executable(
+        &launcher,
+        &format!(
+            "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n if [ \"$1\" = --output-last-message ]; then shift; final=$1; fi\n shift\ndone\ncat >/dev/null\nprintf '%s|%s' \"${{{NAMED}-unset}}\" \"${{{UNNAMED}-unset}}\" > \"$final\"\n"
+        ),
+    );
+
+    let default = agent_run(dir.path(), &launcher, &["--agent-binary", "codex"]);
+    assert_eq!(default, "visible|hidden");
+
+    let restricted = agent_run(
+        dir.path(),
+        &launcher,
+        &[
+            "--agent-binary",
+            "codex",
+            "--env-allow",
+            "PATH",
+            "--env-allow",
+            NAMED,
+        ],
+    );
+    assert_eq!(restricted, "visible|unset");
 }
