@@ -97,3 +97,37 @@ fn log_dir_keeps_the_agent_logs() {
     assert!(all.contains("agent-said-this"), "{all}");
     assert!(all.contains("agent-err-said-this"), "{all}");
 }
+
+#[test]
+fn codex_step_under_report_prints_one_notice_without_rust_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let launcher = dir.path().join("launcher");
+    std::fs::write(
+        &launcher,
+        "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n if [ \"$1\" = --output-last-message ]; then shift; final=$1; fi\n shift\ndone\ncat >/dev/null\nprintf codex-done > \"$final\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let recipe =
+        "name: agent\nsteps:\n  - id: one\n    agent: none\n    prompt: hello\n    timeout: 30\n";
+    let out = run(
+        dir.path(),
+        recipe,
+        Some(&launcher),
+        &["--agent-binary", "codex", "--timeout-action", "report"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(result(&out)["step_results"][0]["output"], "codex-done");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr
+            .matches("does not apply to the Codex adapter")
+            .count(),
+        1,
+        "{stderr}"
+    );
+}

@@ -245,6 +245,17 @@ pub(crate) fn timeout_report_line(what: &str, secs: u64, pid: u32) -> String {
     )
 }
 
+/// The stderr notice, once per Codex step, that `--timeout-action report` does
+/// not apply to the Codex adapter: the step runs without a deadline.
+pub(crate) fn codex_report_notice(secs: u64) -> String {
+    format!(
+        "  [{}] --timeout-action report does not apply to the Codex adapter: \
+         the {secs}s step timeout is neither enforced nor reported, and the step \
+         runs without a deadline",
+        utc_hms()
+    )
+}
+
 /// Run `cmd` to completion, capturing stdout and stderr as `Command::output`
 /// does, and report once if it is still running after `secs` seconds. The
 /// child is never killed.
@@ -668,13 +679,32 @@ impl CLISubprocessAdapter {
     }
 
     /// Keep agent output and stderr logs in `dir`, which is created if it does
-    /// not exist (readable only by the owner). Without it the output log is
+    /// not exist (readable only by the owner; the mode of a directory that
+    /// already exists is left as it is). The log files themselves are created
+    /// readable only by the owner. Without it the output log is
     /// removed with the step's temporary directory and the stderr log is kept
     /// under `/tmp/amplihack-agent-stderr` only when the step fails. The
     /// Codex adapter's private output is not copied.
     pub fn with_log_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.log_dir = Some(dir.into());
         self
+    }
+
+    /// Create one of the agent's log files. With `--log-dir` the file is
+    /// readable only by its owner (mode 0o600), whether or not the directory
+    /// already existed; otherwise it is created as before.
+    fn create_log_file(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        if self.log_dir.is_none() {
+            return std::fs::File::create(path);
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(path)
     }
 
     /// Remove a stderr log that is no longer needed, unless logs are kept.
@@ -1042,10 +1072,9 @@ impl CLISubprocessAdapter {
             );
             let codex_timeout = match (self.timeout_action, timeout) {
                 (TimeoutAction::Report, Some(secs)) => {
-                    log::warn!(
-                        "--timeout-action report does not apply to the Codex adapter; \
-                         the {secs}s step timeout is not enforced or reported"
-                    );
+                    // On stderr, not through `log`: the binary shows no warnings
+                    // by default, and this one says a deadline is not applied.
+                    eprintln!("{}", codex_report_notice(secs));
                     None
                 }
                 _ => timeout,
@@ -1173,7 +1202,7 @@ impl CLISubprocessAdapter {
                 None => output_dir.join(&output_name),
             };
 
-            let log_fh = std::fs::File::create(&output_file)?;
+            let log_fh = self.create_log_file(&output_file)?;
 
             // Capture stderr to a persistent file in /tmp so that on failure
             // we can include the agent's actual error output in the bail message
@@ -1197,7 +1226,7 @@ impl CLISubprocessAdapter {
                     .unwrap_or_default()
                     .as_nanos()
             ));
-            let stderr_fh = std::fs::File::create(&stderr_file)?;
+            let stderr_fh = self.create_log_file(&stderr_file)?;
 
             // Always launch via `amplihack <agent>` so the amplihack infrastructure
             // (env setup, guards, hooks) is properly initialized.
@@ -2347,6 +2376,47 @@ mod tests {
             .execute_agent_step_impl("p", None, None, tmp.path().to_str().unwrap(), Some(1))
             .expect("a reported overrun must not fail the step");
         assert_eq!(out, "agent-said-this");
+    }
+
+    #[test]
+    fn codex_report_notice_says_the_step_has_no_deadline() {
+        let notice = codex_report_notice(9);
+        assert!(
+            notice.contains("does not apply to the Codex adapter"),
+            "{notice}"
+        );
+        assert!(notice.contains("9s step timeout"), "{notice}");
+        assert!(notice.contains("without a deadline"), "{notice}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_files_are_private_even_in_a_directory_that_already_exists() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
+        let tmp = tempfile::tempdir().unwrap();
+        use_launcher(&slow_launcher(tmp.path()));
+        let logs = tmp.path().join("existing-logs");
+        std::fs::create_dir(&logs).unwrap();
+        std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let adapter = CLISubprocessAdapter::new().with_log_dir(&logs);
+        adapter
+            .execute_agent_step_impl("p", None, None, tmp.path().to_str().unwrap(), None)
+            .unwrap();
+
+        // The existing directory keeps its mode; the log files do not inherit
+        // the umask's group or other read bits.
+        let dir_mode = std::fs::metadata(&logs).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o755);
+        let mut files = 0;
+        for entry in std::fs::read_dir(&logs).unwrap() {
+            let mode = entry.unwrap().metadata().unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "log file mode {mode:o}");
+            files += 1;
+        }
+        assert_eq!(files, 2, "one output log and one stderr log");
     }
 
     #[test]

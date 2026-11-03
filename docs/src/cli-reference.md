@@ -70,8 +70,11 @@ Choose what happens when an agent step's `timeout`, a shell step's `timeout` or 
   runner keeps waiting. Nothing is killed and the step does not fail because of the timeout; its result is whatever
   the child produces when it ends. The `timeout` utility is not used for shell steps in this mode.
 
+A hook's overrun is reported with the same line as a shell step ("Shell step exceeded its 30s timeout"), because a
+hook runs as a shell step.
+
 The Codex adapter has its own deadline handling and does not take part: with `report`, a Codex step runs without a
-deadline and the runner logs a warning.
+deadline, and the runner prints a notice on stderr once per step saying so (it does not depend on `RUST_LOG`).
 
 ```bash
 recipe-runner-rs deploy.yaml --timeout-action report --log-dir ./agent-logs
@@ -79,8 +82,9 @@ recipe-runner-rs deploy.yaml --timeout-action report --log-dir ./agent-logs
 
 ### `--log-dir <DIR>`
 
-Keep agent output and stderr logs in `DIR`, which is created if it does not exist and is readable only by its
-owner. Each agent attempt writes `agent-step-<attempt>-<time>.log` (the agent's standard output) and
+Keep agent output and stderr logs in `DIR`. A directory the runner creates (with its parents) is readable only by
+its owner (mode 0700); the mode of a directory that already exists is left as it is. The log files are created
+readable only by their owner (mode 0600) in either case. Each agent attempt writes `agent-step-<attempt>-<time>.log` (the agent's standard output) and
 `agent-stderr-<attempt>-<time>.log` (its standard error), and neither is removed when the step ends. Without the
 option the output log is removed with the step's temporary directory and the stderr log is kept under
 `/tmp/amplihack-agent-stderr` only when the step fails or times out. The Codex adapter's private output is not copied.
