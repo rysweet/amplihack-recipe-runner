@@ -4440,16 +4440,20 @@ mod tests {
 
     // ── #130: per-value env spill through execute_bash_step ───────────
 
+    #[cfg(target_os = "linux")]
     use crate::adapters::env_spill::SpillRootGuard;
     use crate::adapters::test_log::LogCapture;
 
+    #[cfg(target_os = "linux")]
     fn sha256_hex(s: &str) -> String {
         use sha2::{Digest, Sha256};
         hex::encode(Sha256::digest(s.as_bytes()))
     }
 
     /// Restores the measured budget even if the test panics.
+    #[cfg(target_os = "linux")]
     struct BudgetReset;
+    #[cfg(target_os = "linux")]
     impl Drop for BudgetReset {
         fn drop(&mut self) {
             clear_env_byte_budget_for_test();
@@ -4458,6 +4462,7 @@ mod tests {
 
     /// Upper bound on the bytes of every protected var `execute_bash_step`
     /// will put in the child env before any recipe var is added.
+    #[cfg(target_os = "linux")]
     fn protected_inherited_bytes() -> usize {
         let mut env = CLISubprocessAdapter::build_child_env();
         env.insert("AMPLIHACK_AGENT_BINARY".into(), "claude".into());
@@ -4468,11 +4473,13 @@ mod tests {
             + 256
     }
 
+    #[cfg(target_os = "linux")]
     fn entries_in(dir: &Path) -> usize {
         std::fs::read_dir(dir).unwrap().count()
     }
 
     /// Deterministic value of exactly `len` bytes.
+    #[cfg(target_os = "linux")]
     fn patterned(tag: &str, len: usize) -> String {
         let unit = format!("{tag}:0123456789abcdef|");
         unit.repeat(len / unit.len() + 1)[..len].to_string()
