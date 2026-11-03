@@ -60,6 +60,59 @@ stdin delivery, lifecycle cleanup, and final-file validation must succeed.
 Successful final text is verbatim within `MAX_STEP_OUTPUT_BYTES`; oversized
 files fail instead of being truncated.
 
+### `--timeout-action <kill|report>`
+
+Choose what happens when an agent step's `timeout`, a shell step's `timeout` or the 30 second deadline of a
+`pre_step`, `post_step` or `on_error` hook is reached.
+
+- `kill` (default): the child is killed and the step fails, as before.
+- `report`: the overrun is reported once on stderr, naming the kind of step, the limit and the process id, and the
+  runner keeps waiting. Nothing is killed and the step does not fail because of the timeout; its result is whatever
+  the child produces when it ends. The `timeout` utility is not used for shell steps in this mode.
+
+A hook's overrun is reported with the same line as a shell step ("Shell step exceeded its 30s timeout"), because a
+hook runs as a shell step.
+
+The Codex adapter has its own deadline handling and does not take part: with `report`, a Codex step runs without a
+deadline, and the runner prints a notice on stderr once per step saying so (it does not depend on `RUST_LOG`).
+
+```bash
+recipe-runner-rs deploy.yaml --timeout-action report --log-dir ./agent-logs
+```
+
+### `--log-dir <DIR>`
+
+Keep agent output and stderr logs in `DIR`. A directory the runner creates (with its parents) is readable only by
+its owner (mode 0700); the mode of a directory that already exists is left as it is. The log files are created
+readable only by their owner (mode 0600) in either case. Each agent attempt writes `agent-step-<attempt>-<time>.log` (the agent's standard output) and
+`agent-stderr-<attempt>-<time>.log` (its standard error), and neither is removed when the step ends. Without the
+option the output log is removed with the step's temporary directory and the stderr log is kept under
+`/tmp/amplihack-agent-stderr` only when the step fails or times out. The Codex adapter's private output is not copied.
+
+### `--launcher <PATH>`
+
+Run agent steps through the launcher at `PATH` instead of `amplihack`. The path must be absolute: a relative path
+exits with code 4, and the program is never chosen by a search of `PATH`. The option takes precedence over
+`AMPLIHACK_LAUNCHER_BINARY`. Without the option, `AMPLIHACK_LAUNCHER_BINARY` applies, then `amplihack`, as before.
+
+```bash
+recipe-runner-rs review.yaml --launcher /opt/tools/amplihack
+```
+
+### `--no-allow-all-tools`
+
+Do not pass `--allow-all-tools` to the Copilot CLI. This is the per-run equivalent of setting
+`AMPLIHACK_NO_ALLOW_ALL_TOOLS` to a non-empty value; either one suppresses the flag. Without them the runner passes
+`--allow-all-tools` to `copilot` so that non-interactive steps do not wait for tool approval; with the flag
+suppressed, a step that needs a tool the CLI would ask about fails instead.
+
+### `--no-add-dir`
+
+Do not grant the step's working directory to the agent CLI with `--add-dir`. Without the option every Claude-family
+and Copilot agent step is given `--add-dir <working directory>`. With it, that grant is not made. The directory
+that holds an overflow prompt file is still granted to a CLI that reads the file through `--add-dir`, because that
+CLI cannot read its prompt without it. The Codex adapter passes no `--add-dir` and is unaffected.
+
 ### `-C, --working-dir <DIR>`
 
 Set the working directory for recipe execution.
@@ -122,6 +175,27 @@ recipe-runner-rs deploy --no-default-search -R ./recipes --agent-dir ./agents
 Add a directory to search for agent definitions before the default locations (`$HOME/.amplihack/.claude/agents`
 and the project-relative `.claude/agents`, `amplifier-bundle/agents` and `src/amplihack` agent directories). Can be
 specified multiple times. A relative path is taken from the current directory.
+
+### `--env-allow <NAME>`
+
+Pass only the named parent environment variables to agent and shell children. Can be specified multiple times.
+Without the option every parent variable is passed on, as before. With it, a parent variable that is not named is
+not passed on, whatever its value.
+
+These are still present, because the runner or the recipe sets them rather than inheriting them:
+
+- `HOME` and `PATH`, which fall back to `/root` and `/usr/local/bin:/usr/bin:/bin` when they are not named;
+- `AMPLIHACK_SESSION_DEPTH`, `AMPLIHACK_MAX_DEPTH`, `AMPLIHACK_MAX_SESSIONS`, `AMPLIHACK_TREE_ID` and
+  `AMPLIHACK_AGENT_BINARY`;
+- a step's own `env:` block and the `RECIPE_VAR_*` variables for shell steps.
+
+`CLAUDECODE` is never passed, even if it is named. The runner's own settings read from its environment, such as
+`AMPLIHACK_BASH`, `AMPLIHACK_AGENT_BINARY` and the rate-limit knobs, are read from the parent as usual; the option
+restricts only what children receive.
+
+```bash
+recipe-runner-rs deploy.yaml --env-allow PATH --env-allow HOME --env-allow ANTHROPIC_API_KEY
+```
 
 ### `--set <KEY=VALUE>`
 
@@ -564,7 +638,7 @@ exponential backoff. Tune the behavior with these variables (see
 | `AMPLIHACK_RATELIMIT_BASE_DELAY_SECS` | `60` | Base backoff window; `0` = instant. |
 | `AMPLIHACK_RATELIMIT_MAX_DELAY_SECS` | `600` | Cap on any single backoff delay. |
 | `AMPLIHACK_RATELIMIT_FALLBACK_AUTO_MODEL` | _unset_ | Force `--model auto` on the final Claude/Copilot retry; excludes Codex. |
-| `AMPLIHACK_LAUNCHER_BINARY` | `amplihack` | Test-only launcher override. |
+| `AMPLIHACK_LAUNCHER_BINARY` | `amplihack` | Launcher override. `--launcher <PATH>` takes precedence. |
 
 Each attempt receives its own step timeout. Backoff and repeated attempts
 increase total duration, and retries may repeat side effects. Codex retains
