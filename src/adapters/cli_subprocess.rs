@@ -611,6 +611,14 @@ pub struct CLISubprocessAdapter {
     timeout_action: TimeoutAction,
     /// When set, agent output and stderr logs are kept here.
     log_dir: Option<PathBuf>,
+    /// Absolute path of the launcher executable, taking precedence over
+    /// `AMPLIHACK_LAUNCHER_BINARY` (see [`CLISubprocessAdapter::with_launcher`]).
+    launcher: Option<std::path::PathBuf>,
+    /// Whether to pass `--allow-all-tools` to the Copilot CLI. Default `true`.
+    allow_all_tools: bool,
+    /// Whether to pass `--add-dir <working directory>` to the agent CLI.
+    /// Default `true`.
+    add_working_dir: bool,
 }
 
 /// #130: whether an inherited `KEY=value\0` string exceeds the kernel's
@@ -663,6 +671,9 @@ impl CLISubprocessAdapter {
             working_dir: ".".to_string(),
             timeout_action: TimeoutAction::Kill,
             log_dir: None,
+            launcher: None,
+            allow_all_tools: true,
+            add_working_dir: true,
         }
     }
 
@@ -715,6 +726,37 @@ impl CLISubprocessAdapter {
         if let Err(e) = std::fs::remove_file(file) {
             log::debug!("Failed to clean up stderr file {}: {}", file.display(), e);
         }
+    }
+
+    /// Run agent steps through the launcher at `path` instead of `amplihack`.
+    ///
+    /// Opt-in. The path must be absolute; an agent step with a relative path
+    /// fails before anything is started, so the program that runs is never
+    /// chosen by a search of `PATH` or by the working directory. It takes
+    /// precedence over `AMPLIHACK_LAUNCHER_BINARY`; without it that variable,
+    /// then `amplihack`, apply as before.
+    pub fn with_launcher(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
+        log::debug!("CLISubprocessAdapter::with_launcher: path={:?}", path);
+        self.launcher = Some(path);
+        self
+    }
+
+    /// Do not pass `--allow-all-tools` to the Copilot CLI. This is the
+    /// per-run equivalent of `AMPLIHACK_NO_ALLOW_ALL_TOOLS`; either one
+    /// suppresses the flag. The default is to pass it.
+    pub fn without_allow_all_tools(mut self) -> Self {
+        self.allow_all_tools = false;
+        self
+    }
+
+    /// Do not grant the step's working directory to the agent CLI with
+    /// `--add-dir`. The directory that holds an overflow prompt file for a CLI
+    /// that reads it through `--add-dir` is still granted, because that CLI
+    /// cannot read the prompt without it. The default is to grant both.
+    pub fn without_working_dir_grant(mut self) -> Self {
+        self.add_working_dir = false;
+        self
     }
 
     pub fn with_binary(mut self, binary: &str) -> Self {
@@ -924,10 +966,22 @@ impl CLISubprocessAdapter {
         // infrastructure (env setup, guards, hooks) is properly initialized.
         // Tests inject a fake launcher via AMPLIHACK_LAUNCHER_BINARY; when
         // unset, behavior is identical to the previous hardcoded "amplihack".
-        let launcher = env::var("AMPLIHACK_LAUNCHER_BINARY")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "amplihack".to_string());
+        let launcher: std::ffi::OsString = match &self.launcher {
+            Some(path) => {
+                if !path.is_absolute() {
+                    anyhow::bail!(
+                        "launcher path must be absolute, got {:?}",
+                        path.display().to_string()
+                    );
+                }
+                path.clone().into_os_string()
+            }
+            None => env::var("AMPLIHACK_LAUNCHER_BINARY")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "amplihack".to_string())
+                .into(),
+        };
         let mut cmd = std::process::Command::new(launcher);
         cmd.arg(&self.cli);
         // All subsequent flags (-p, --model, --add-dir, --system-prompt, etc.)
@@ -949,6 +1003,7 @@ impl CLISubprocessAdapter {
         // nested copilot agents prompt for tool approval and hang/exit 1 (#88).
         // Opt out by setting AMPLIHACK_NO_ALLOW_ALL_TOOLS to any non-empty value.
         if self.cli == "copilot"
+            && self.allow_all_tools
             && env::var("AMPLIHACK_NO_ALLOW_ALL_TOOLS")
                 .map(|v| v.is_empty())
                 .unwrap_or(true)
@@ -991,7 +1046,9 @@ impl CLISubprocessAdapter {
             }
         }
 
-        cmd.args(["--add-dir", &resolved_cwd.to_string_lossy()]);
+        if self.add_working_dir {
+            cmd.args(["--add-dir", &resolved_cwd.to_string_lossy()]);
+        }
         if let Some(m) = model {
             cmd.args(["--model", m]);
         }
@@ -2452,6 +2509,138 @@ mod tests {
             let mode = std::fs::metadata(&logs).unwrap().permissions().mode();
             assert_eq!(mode & 0o077, 0, "log dir must be private: {mode:o}");
         }
+    }
+
+    // ── --launcher, --no-allow-all-tools, --no-add-dir ────────────────
+
+    fn command_args(cmd: &std::process::Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn launcher_option_takes_precedence_over_the_environment_variable() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe {
+            env::set_var("AMPLIHACK_LAUNCHER_BINARY", "/from/env/launcher");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+
+        let from_env = CLISubprocessAdapter::new()
+            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .unwrap();
+        assert_eq!(from_env.get_program(), "/from/env/launcher");
+
+        let explicit = CLISubprocessAdapter::new()
+            .with_launcher("/opt/explicit/launcher")
+            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .unwrap();
+        assert_eq!(explicit.get_program(), "/opt/explicit/launcher");
+    }
+
+    #[test]
+    fn launcher_option_must_be_an_absolute_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        for relative in ["amplihack", "./launcher", "bin/launcher"] {
+            let err = CLISubprocessAdapter::new()
+                .with_launcher(relative)
+                .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("must be absolute"),
+                "{relative}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn launcher_defaults_are_unchanged_without_the_option() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe {
+            env::remove_var("AMPLIHACK_LAUNCHER_BINARY");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let cmd = CLISubprocessAdapter::new()
+            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .unwrap();
+        assert_eq!(cmd.get_program(), "amplihack");
+    }
+
+    #[test]
+    fn without_allow_all_tools_omits_the_copilot_flag() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::new("AMPLIHACK_NO_ALLOW_ALL_TOOLS");
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe {
+            env::remove_var("AMPLIHACK_NO_ALLOW_ALL_TOOLS");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+
+        let default = CLISubprocessAdapter::new()
+            .with_binary("copilot")
+            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .unwrap();
+        assert!(command_args(&default).contains(&"--allow-all-tools".to_string()));
+
+        let opted_out = CLISubprocessAdapter::new()
+            .with_binary("copilot")
+            .without_allow_all_tools()
+            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .unwrap();
+        assert!(!command_args(&opted_out).contains(&"--allow-all-tools".to_string()));
+    }
+
+    #[test]
+    fn without_working_dir_grant_omits_add_dir_for_the_working_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("work");
+        std::fs::create_dir(&cwd).unwrap();
+        let cwd_text = cwd.to_string_lossy().into_owned();
+
+        let default = CLISubprocessAdapter::new()
+            .build_agent_command(tmp.path(), &cwd, "hello", None, None)
+            .unwrap();
+        let args = command_args(&default);
+        let pos = args.iter().position(|a| a == "--add-dir").unwrap();
+        assert_eq!(args[pos + 1], cwd_text);
+
+        let without = CLISubprocessAdapter::new()
+            .without_working_dir_grant()
+            .build_agent_command(tmp.path(), &cwd, "hello", None, None)
+            .unwrap();
+        let args = command_args(&without);
+        assert!(!args.contains(&"--add-dir".to_string()), "{args:?}");
+        assert!(!args.contains(&cwd_text), "{args:?}");
+    }
+
+    #[test]
+    fn without_working_dir_grant_keeps_the_overflow_prompt_directory_grant() {
+        // A CLI that reads an overflow prompt through --add-dir cannot do so
+        // without the output directory, so that grant stays.
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let cwd = tmp.path().join("work");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::create_dir(&cwd).unwrap();
+        let prompt = "p".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1);
+        let cmd = CLISubprocessAdapter::new()
+            .with_binary("copilot")
+            .without_working_dir_grant()
+            .build_agent_command(&out, &cwd, &prompt, None, None)
+            .unwrap();
+        let args = command_args(&cmd);
+        let grants: Vec<&String> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--add-dir")
+            .map(|(i, _)| &args[i + 1])
+            .collect();
+        assert_eq!(grants, vec![&out.to_string_lossy().into_owned()]);
     }
 
     #[test]

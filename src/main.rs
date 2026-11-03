@@ -144,6 +144,20 @@ struct Cli {
     /// missing, readable only by the owner).
     #[arg(long, value_name = "DIR")]
     log_dir: Option<PathBuf>,
+
+    /// Run agent steps through the launcher at this absolute path instead of
+    /// `amplihack`. Takes precedence over AMPLIHACK_LAUNCHER_BINARY.
+    #[arg(long, value_name = "PATH")]
+    launcher: Option<PathBuf>,
+
+    /// Do not pass --allow-all-tools to the Copilot CLI (the same as
+    /// AMPLIHACK_NO_ALLOW_ALL_TOOLS for one run).
+    #[arg(long)]
+    no_allow_all_tools: bool,
+
+    /// Do not grant the working directory to the agent CLI with --add-dir.
+    #[arg(long)]
+    no_add_dir: bool,
 }
 
 #[derive(Subcommand)]
@@ -430,6 +444,22 @@ fn run() -> i32 {
     }
     if let Some(ref dir) = cli.log_dir {
         adapter = adapter.with_log_dir(dir.clone());
+    }
+    if let Some(ref launcher) = cli.launcher {
+        if !launcher.is_absolute() {
+            eprintln!(
+                "Error: --launcher must be an absolute path, got '{}'.",
+                launcher.display()
+            );
+            return exit_codes::BAD_ARGS;
+        }
+        adapter = adapter.with_launcher(launcher.clone());
+    }
+    if cli.no_allow_all_tools {
+        adapter = adapter.without_allow_all_tools();
+    }
+    if cli.no_add_dir {
+        adapter = adapter.without_working_dir_grant();
     }
     let mut runner = RecipeRunner::new(adapter)
         .with_working_dir(&cli.working_dir)
