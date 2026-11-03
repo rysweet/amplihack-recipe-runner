@@ -93,7 +93,7 @@ option the output log is removed with the step's temporary directory and the std
 
 Run agent steps through the launcher at `PATH` instead of `amplihack`. The path must be absolute: a relative path
 exits with code 4, and the program is never chosen by a search of `PATH`. The option takes precedence over
-`AMPLIHACK_LAUNCHER_BINARY`. Without it that variable, then `amplihack`, apply as before.
+`AMPLIHACK_LAUNCHER_BINARY`. Without the option, `AMPLIHACK_LAUNCHER_BINARY` applies, then `amplihack`, as before.
 
 ```bash
 recipe-runner-rs review.yaml --launcher /opt/tools/amplihack

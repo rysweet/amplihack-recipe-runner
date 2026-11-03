@@ -156,6 +156,8 @@ struct Cli {
     no_allow_all_tools: bool,
 
     /// Do not grant the working directory to the agent CLI with --add-dir.
+    /// The directory that holds an overflow prompt file is still granted to
+    /// CLIs that read the file through --add-dir (such as Copilot).
     #[arg(long)]
     no_add_dir: bool,
 }
@@ -285,6 +287,18 @@ fn run() -> i32 {
             return exit_codes::BAD_ARGS;
         }
     };
+
+    // A relative --launcher is a bad argument whether or not the recipe runs,
+    // so --validate-only reports it too.
+    if let Some(ref launcher) = cli.launcher
+        && !launcher.is_absolute()
+    {
+        eprintln!(
+            "Error: --launcher must be an absolute path, got '{}'.",
+            launcher.display()
+        );
+        return exit_codes::BAD_ARGS;
+    }
 
     // Parse context overrides with type detection
     let mut user_context: HashMap<String, Value> = HashMap::new();
@@ -446,13 +460,6 @@ fn run() -> i32 {
         adapter = adapter.with_log_dir(dir.clone());
     }
     if let Some(ref launcher) = cli.launcher {
-        if !launcher.is_absolute() {
-            eprintln!(
-                "Error: --launcher must be an absolute path, got '{}'.",
-                launcher.display()
-            );
-            return exit_codes::BAD_ARGS;
-        }
         adapter = adapter.with_launcher(launcher.clone());
     }
     if cli.no_allow_all_tools {

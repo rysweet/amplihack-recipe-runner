@@ -733,8 +733,8 @@ impl CLISubprocessAdapter {
     /// Opt-in. The path must be absolute; an agent step with a relative path
     /// fails before anything is started, so the program that runs is never
     /// chosen by a search of `PATH` or by the working directory. It takes
-    /// precedence over `AMPLIHACK_LAUNCHER_BINARY`; without it that variable,
-    /// then `amplihack`, apply as before.
+    /// precedence over `AMPLIHACK_LAUNCHER_BINARY`. Without the option,
+    /// `AMPLIHACK_LAUNCHER_BINARY` applies, then `amplihack`, as before.
     pub fn with_launcher(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         let path = path.into();
         log::debug!("CLISubprocessAdapter::with_launcher: path={:?}", path);

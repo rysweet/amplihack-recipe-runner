@@ -78,6 +78,34 @@ fn relative_launcher_path_exits_with_bad_args() {
 }
 
 #[test]
+fn relative_launcher_path_is_rejected_with_validate_only_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(
+        dir.path(),
+        None,
+        &["--validate-only", "--launcher", "bin/launcher"],
+    );
+    assert_eq!(out.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("must be an absolute path"));
+}
+
+#[test]
+fn no_add_dir_help_mentions_the_overflow_prompt_directory() {
+    let out = Command::new(env!("CARGO_BIN_EXE_recipe-runner-rs"))
+        .arg("--help")
+        .env("RECIPE_RUNNER_NO_UPDATE_CHECK", "1")
+        .output()
+        .unwrap();
+    let help = String::from_utf8_lossy(&out.stdout);
+    let at = help.find("--no-add-dir").expect("--no-add-dir in help");
+    assert!(
+        help[at..].contains("overflow prompt file is still granted"),
+        "{}",
+        &help[at..]
+    );
+}
+
+#[test]
 fn no_add_dir_stops_the_working_directory_grant() {
     let dir = tempfile::tempdir().unwrap();
     let launcher = stand_in(dir.path(), "launcher", "L");
