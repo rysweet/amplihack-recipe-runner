@@ -12,6 +12,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Release binaries are built with this exact Rust toolchain, so a release is
+  # not built with whatever "stable" is on the day it runs. Raise it in a pull
+  # request when the toolchain should move.
+  RELEASE_RUST_TOOLCHAIN: "1.99.1"
 
 # Serialize release runs on a ref so two closely-spaced pushes cannot race the
 # tag push / GitHub Release publish step for the same version.
@@ -165,6 +169,12 @@ jobs:
     needs: plan
     if: needs.plan.outputs.action == 'release'
     runs-on: ${{ matrix.runner }}
+    # id-token and attestations are needed only to sign the build provenance of
+    # each archive; the workflow-wide default stays contents: read.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -185,6 +195,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
+          toolchain: ${{ env.RELEASE_RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -204,7 +215,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Build release
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package
         run: |
@@ -212,6 +223,11 @@ jobs:
           cp target/${{ matrix.target }}/release/recipe-runner-rs dist/ 2>/dev/null || true
           cd dist && tar czf ../recipe-runner-rs-${{ matrix.target }}.tar.gz -- *
           cd .. && sha256sum recipe-runner-rs-${{ matrix.target }}.tar.gz > recipe-runner-rs-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: recipe-runner-rs-${{ matrix.target }}.tar.gz
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
