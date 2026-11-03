@@ -223,6 +223,83 @@ pub fn resolve_bash_interpreter() -> anyhow::Result<PathBuf> {
     Ok(resolved)
 }
 
+/// What the adapter does when a step's timeout (an agent step's, a shell
+/// step's or a hook's deadline) is reached.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TimeoutAction {
+    /// Kill the child and fail the step. The default.
+    #[default]
+    Kill,
+    /// Report the overrun once on stderr and keep waiting. Nothing is killed
+    /// and the step is not failed because of the timeout.
+    Report,
+}
+
+/// The one-line stderr report for a step that has passed its timeout while
+/// `TimeoutAction::Report` is in force.
+pub(crate) fn timeout_report_line(what: &str, secs: u64, pid: u32) -> String {
+    format!(
+        "  [{}] {what} exceeded its {secs}s timeout; --timeout-action report is set, \
+         so it keeps running and nothing is killed (pid {pid})",
+        utc_hms()
+    )
+}
+
+/// The stderr notice, once per Codex step, that `--timeout-action report` does
+/// not apply to the Codex adapter: the step runs without a deadline.
+pub(crate) fn codex_report_notice(secs: u64) -> String {
+    format!(
+        "  [{}] --timeout-action report does not apply to the Codex adapter: \
+         the {secs}s step timeout is neither enforced nor reported, and the step \
+         runs without a deadline",
+        utc_hms()
+    )
+}
+
+/// Run `cmd` to completion, capturing stdout and stderr as `Command::output`
+/// does, and report once if it is still running after `secs` seconds. The
+/// child is never killed.
+fn output_reporting_overrun(
+    mut cmd: Command,
+    secs: u64,
+    what: &str,
+) -> std::io::Result<std::process::Output> {
+    use std::process::Stdio;
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(Duration::from_secs(secs)) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!("{}", timeout_report_line(what, secs, pid));
+            rx.recv()
+                .unwrap_or_else(|_| Err(std::io::Error::other("step output reader ended early")))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(std::io::Error::other("step output reader ended early"))
+        }
+    }
+}
+
+/// Create `dir` (and parents) readable only by the owner, for agent logs.
+fn create_private_log_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
 /// What bash should execute for one step.
 #[derive(Clone, Copy)]
 pub(crate) enum BashInvocation<'a> {
@@ -530,6 +607,22 @@ impl RateLimitConfig {
 pub struct CLISubprocessAdapter {
     cli: String,
     working_dir: String,
+    /// What to do when a timeout is reached. Default: kill.
+    timeout_action: TimeoutAction,
+    /// When set, agent output and stderr logs are kept here.
+    log_dir: Option<PathBuf>,
+    /// Absolute path of the launcher executable, taking precedence over
+    /// `AMPLIHACK_LAUNCHER_BINARY` (see [`CLISubprocessAdapter::with_launcher`]).
+    launcher: Option<std::path::PathBuf>,
+    /// Whether to pass `--allow-all-tools` to the Copilot CLI. Default `true`.
+    allow_all_tools: bool,
+    /// Whether to pass `--add-dir <working directory>` to the agent CLI.
+    /// Default `true`.
+    add_working_dir: bool,
+    /// When `Some`, only these parent variables reach agent and shell
+    /// children (see [`CLISubprocessAdapter::with_env_allow`]). `None` keeps
+    /// the default: every parent variable is inherited.
+    env_allow: Option<Vec<String>>,
 }
 
 /// #130: whether an inherited `KEY=value\0` string exceeds the kernel's
@@ -547,6 +640,19 @@ fn inherited_drop_warning(key: &str, value: &str) -> String {
         env_pair_bytes(key, value),
         MAX_ARG_STRLEN
     )
+}
+
+/// Keep only the inherited variables whose names are in `allow`. Names are
+/// compared exactly (environment names are case-sensitive on the platforms the
+/// runner supports). Takes the variables as an argument so tests can exercise
+/// it without touching the process environment.
+fn restrict_to_allowlist(
+    vars: HashMap<String, String>,
+    allow: &[String],
+) -> HashMap<String, String> {
+    vars.into_iter()
+        .filter(|(k, _)| allow.iter().any(|name| name == k))
+        .collect()
 }
 
 /// Sanitize the inherited environment: removes `CLAUDECODE` and every
@@ -580,7 +686,120 @@ impl CLISubprocessAdapter {
         Self {
             cli,
             working_dir: ".".to_string(),
+            timeout_action: TimeoutAction::Kill,
+            log_dir: None,
+            launcher: None,
+            allow_all_tools: true,
+            add_working_dir: true,
+            env_allow: None,
         }
+    }
+
+    /// Choose what happens when an agent step's timeout, a shell step's
+    /// timeout or a hook's deadline is reached. The default is
+    /// [`TimeoutAction::Kill`]. With [`TimeoutAction::Report`] the overrun is
+    /// reported once on stderr and the child keeps running.
+    ///
+    /// The Codex adapter has its own deadline handling and is not affected by
+    /// `Report`: its steps run without a deadline, with a warning.
+    pub fn with_timeout_action(mut self, action: TimeoutAction) -> Self {
+        self.timeout_action = action;
+        self
+    }
+
+    /// Keep agent output and stderr logs in `dir`, which is created if it does
+    /// not exist (readable only by the owner; the mode of a directory that
+    /// already exists is left as it is). The log files themselves are created
+    /// readable only by the owner. Without it the output log is
+    /// removed with the step's temporary directory and the stderr log is kept
+    /// under `/tmp/amplihack-agent-stderr` only when the step fails. The
+    /// Codex adapter's private output is not copied.
+    pub fn with_log_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.log_dir = Some(dir.into());
+        self
+    }
+
+    /// Create one of the agent's log files. With `--log-dir` the file is
+    /// readable only by its owner (mode 0o600), whether or not the directory
+    /// already existed; otherwise it is created as before.
+    fn create_log_file(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        if self.log_dir.is_none() {
+            return std::fs::File::create(path);
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(path)
+    }
+
+    /// Remove a stderr log that is no longer needed, unless logs are kept.
+    fn discard_stderr_log(&self, file: &Path) {
+        if self.log_dir.is_some() {
+            return;
+        }
+        if let Err(e) = std::fs::remove_file(file) {
+            log::debug!("Failed to clean up stderr file {}: {}", file.display(), e);
+        }
+    }
+
+    /// Run agent steps through the launcher at `path` instead of `amplihack`.
+    ///
+    /// Opt-in. The path must be absolute; an agent step with a relative path
+    /// fails before anything is started, so the program that runs is never
+    /// chosen by a search of `PATH` or by the working directory. It takes
+    /// precedence over `AMPLIHACK_LAUNCHER_BINARY`. Without the option,
+    /// `AMPLIHACK_LAUNCHER_BINARY` applies, then `amplihack`, as before.
+    pub fn with_launcher(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
+        log::debug!("CLISubprocessAdapter::with_launcher: path={:?}", path);
+        self.launcher = Some(path);
+        self
+    }
+
+    /// Do not pass `--allow-all-tools` to the Copilot CLI. This is the
+    /// per-run equivalent of `AMPLIHACK_NO_ALLOW_ALL_TOOLS`; either one
+    /// suppresses the flag. The default is to pass it.
+    pub fn without_allow_all_tools(mut self) -> Self {
+        self.allow_all_tools = false;
+        self
+    }
+
+    /// Do not grant the step's working directory to the agent CLI with
+    /// `--add-dir`. The directory that holds an overflow prompt file for a CLI
+    /// that reads it through `--add-dir` is still granted, because that CLI
+    /// cannot read the prompt without it. The default is to grant both.
+    pub fn without_working_dir_grant(mut self) -> Self {
+        self.add_working_dir = false;
+        self
+    }
+
+    /// Pass only the named parent variables to agent and shell children.
+    ///
+    /// Opt-in: without this call every parent variable is inherited, as
+    /// before. With it, a parent variable that is not named is not passed on,
+    /// whatever its value. The variables the runner sets itself are still
+    /// present: `HOME` and `PATH` fall back to fixed defaults when they are not
+    /// named, the session-tree variables (`AMPLIHACK_SESSION_DEPTH`,
+    /// `AMPLIHACK_MAX_DEPTH`, `AMPLIHACK_MAX_SESSIONS`, `AMPLIHACK_TREE_ID`)
+    /// and `AMPLIHACK_AGENT_BINARY` are set, and a step's own `env:` block and
+    /// the `RECIPE_VAR_*` variables are added. `CLAUDECODE` is never passed,
+    /// even if it is named.
+    pub fn with_env_allow<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let names: Vec<String> = names.into_iter().map(Into::into).collect();
+        log::debug!(
+            "CLISubprocessAdapter::with_env_allow: {} name(s) allowed",
+            names.len()
+        );
+        self.env_allow = Some(names);
+        self
     }
 
     pub fn with_binary(mut self, binary: &str) -> Self {
@@ -600,7 +819,14 @@ impl CLISubprocessAdapter {
     /// - Removes CLAUDECODE so nested Claude sessions work.
     /// - Propagates session tree env vars, incrementing depth by 1.
     /// - Generates a tree ID if none exists.
+    #[cfg(test)]
     fn build_child_env() -> HashMap<String, String> {
+        Self::build_child_env_with(None)
+    }
+
+    /// As [`Self::build_child_env`], with the inherited variables restricted
+    /// to `allow` when it is `Some`.
+    fn build_child_env_with(allow: Option<&[String]>) -> HashMap<String, String> {
         log::debug!("CLISubprocessAdapter::build_child_env: building child environment");
 
         // #130 root-cause defense: a single inherited `KEY=value\0` string
@@ -614,6 +840,9 @@ impl CLISubprocessAdapter {
         // below (session tree, PATH/HOME) are always small and are added after
         // this filter, so they are never affected.
         let mut child_env = filter_inherited_env(env::vars());
+        if let Some(allow) = allow {
+            child_env = restrict_to_allowlist(child_env, allow);
+        }
 
         // Defense-in-depth: ensure HOME and PATH are always present and non-empty,
         // even when the parent shell has them unset. Mirrors amplihack-rs fork
@@ -790,10 +1019,22 @@ impl CLISubprocessAdapter {
         // infrastructure (env setup, guards, hooks) is properly initialized.
         // Tests inject a fake launcher via AMPLIHACK_LAUNCHER_BINARY; when
         // unset, behavior is identical to the previous hardcoded "amplihack".
-        let launcher = env::var("AMPLIHACK_LAUNCHER_BINARY")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "amplihack".to_string());
+        let launcher: std::ffi::OsString = match &self.launcher {
+            Some(path) => {
+                if !path.is_absolute() {
+                    anyhow::bail!(
+                        "launcher path must be absolute, got {:?}",
+                        path.display().to_string()
+                    );
+                }
+                path.clone().into_os_string()
+            }
+            None => env::var("AMPLIHACK_LAUNCHER_BINARY")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "amplihack".to_string())
+                .into(),
+        };
         let mut cmd = std::process::Command::new(launcher);
         cmd.arg(&self.cli);
         // All subsequent flags (-p, --model, --add-dir, --system-prompt, etc.)
@@ -815,6 +1056,7 @@ impl CLISubprocessAdapter {
         // nested copilot agents prompt for tool approval and hang/exit 1 (#88).
         // Opt out by setting AMPLIHACK_NO_ALLOW_ALL_TOOLS to any non-empty value.
         if self.cli == "copilot"
+            && self.allow_all_tools
             && env::var("AMPLIHACK_NO_ALLOW_ALL_TOOLS")
                 .map(|v| v.is_empty())
                 .unwrap_or(true)
@@ -857,7 +1099,9 @@ impl CLISubprocessAdapter {
             }
         }
 
-        cmd.args(["--add-dir", &resolved_cwd.to_string_lossy()]);
+        if self.add_working_dir {
+            cmd.args(["--add-dir", &resolved_cwd.to_string_lossy()]);
+        }
         if let Some(m) = model {
             cmd.args(["--model", m]);
         }
@@ -927,7 +1171,7 @@ impl CLISubprocessAdapter {
         }
 
         if self.cli == "codex" {
-            let mut child_env = Self::build_child_env();
+            let mut child_env = Self::build_child_env_with(self.env_allow.as_deref());
             child_env.insert("AMPLIHACK_AGENT_BINARY".into(), self.cli.clone());
             let child_env = bounded_env(&child_env)?;
             let envelope = format!(
@@ -936,6 +1180,15 @@ impl CLISubprocessAdapter {
                 prompt,
                 NON_INTERACTIVE_FOOTER
             );
+            let codex_timeout = match (self.timeout_action, timeout) {
+                (TimeoutAction::Report, Some(secs)) => {
+                    // On stderr, not through `log`: the binary shows no warnings
+                    // by default, and this one says a deadline is not applied.
+                    eprintln!("{}", codex_report_notice(secs));
+                    None
+                }
+                _ => timeout,
+            };
             #[cfg(unix)]
             let cancellation = super::codex_exec::Cancellation::install()?;
             let result = (|| {
@@ -957,7 +1210,7 @@ impl CLISubprocessAdapter {
                         &resolved_cwd,
                         &child_env,
                         &envelope,
-                        timeout,
+                        codex_timeout,
                     );
                     let cleanup = resources.close().context("Failed to clean Codex resources");
                     let result = super::codex_exec::finish_resources(result, cleanup);
@@ -1007,7 +1260,7 @@ impl CLISubprocessAdapter {
         // Append non-interactive footer so nested sessions never hang (#2464)
         let full_prompt = format!("{}{}", prompt, NON_INTERACTIVE_FOOTER);
 
-        let mut child_env = Self::build_child_env();
+        let mut child_env = Self::build_child_env_with(self.env_allow.as_deref());
         // Ensure nested agent steps inherit the same agent binary preference
         child_env.insert("AMPLIHACK_AGENT_BINARY".to_string(), self.cli.clone());
         // Bound the child environment to the MEASURED budget once, before the
@@ -1041,21 +1294,33 @@ impl CLISubprocessAdapter {
             // The attempt number keeps per-attempt filenames unique.
             let output_dir = output_log_dir.join(".recipe-output");
             std::fs::create_dir_all(&output_dir)?;
-            let output_file = output_dir.join(format!(
+            let output_name = format!(
                 "agent-step-{}-{}.log",
                 attempt,
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos()
-            ));
+            );
+            let output_file = match &self.log_dir {
+                Some(dir) => {
+                    create_private_log_dir(dir).with_context(|| {
+                        format!("Failed to create agent log directory {}", dir.display())
+                    })?;
+                    dir.join(&output_name)
+                }
+                None => output_dir.join(&output_name),
+            };
 
-            let log_fh = std::fs::File::create(&output_file)?;
+            let log_fh = self.create_log_file(&output_file)?;
 
             // Capture stderr to a persistent file in /tmp so that on failure
             // we can include the agent's actual error output in the bail message
             // (the temp_dir gets cleaned up before the error is reported).
-            let stderr_persist_dir = std::path::PathBuf::from("/tmp/amplihack-agent-stderr");
+            let stderr_persist_dir = self
+                .log_dir
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp/amplihack-agent-stderr"));
             if let Err(e) = std::fs::create_dir_all(&stderr_persist_dir) {
                 log::warn!(
                     "Failed to create stderr persist dir {}: {}",
@@ -1071,7 +1336,7 @@ impl CLISubprocessAdapter {
                     .unwrap_or_default()
                     .as_nanos()
             ));
-            let stderr_fh = std::fs::File::create(&stderr_file)?;
+            let stderr_fh = self.create_log_file(&stderr_file)?;
 
             // Always launch via `amplihack <agent>` so the amplihack infrastructure
             // (env setup, guards, hooks) is properly initialized.
@@ -1144,7 +1409,7 @@ impl CLISubprocessAdapter {
             // which left the heartbeat with no way to ever learn the child was
             // gone — the exit was observable only by the thread that could not
             // report it. Polling publishes the exit the moment it happens.
-            let deadline = timeout.map(|secs| Instant::now() + Duration::from_secs(secs));
+            let mut deadline = timeout.map(|secs| Instant::now() + Duration::from_secs(secs));
             let status = loop {
                 match child.try_wait()? {
                     Some(s) => {
@@ -1153,7 +1418,18 @@ impl CLISubprocessAdapter {
                     }
                     None => {
                         let expired = deadline.is_some_and(|d| Instant::now() >= d);
-                        if expired {
+                        if expired && self.timeout_action == TimeoutAction::Report {
+                            // Report once, then wait without a deadline.
+                            eprintln!(
+                                "{}",
+                                timeout_report_line(
+                                    "Agent step",
+                                    timeout.unwrap_or_default(),
+                                    child.id()
+                                )
+                            );
+                            deadline = None;
+                        } else if expired {
                             let secs = timeout.unwrap_or_default();
                             log::warn!(
                                 "Agent step timed out after {}s — killing pid {}",
@@ -1228,14 +1504,9 @@ impl CLISubprocessAdapter {
             // temp_dir is dropped after the loop exits, cleaning up automatically.
 
             if status.success() {
-                // On success, remove the persistent stderr file.
-                if let Err(e) = std::fs::remove_file(&stderr_file) {
-                    log::debug!(
-                        "Failed to clean up stderr file {}: {}",
-                        stderr_file.display(),
-                        e
-                    );
-                }
+                // On success, remove the persistent stderr file (unless logs
+                // are kept with --log-dir).
+                self.discard_stderr_log(&stderr_file);
                 return Ok(stdout.trim().to_string());
             }
 
@@ -1272,13 +1543,7 @@ impl CLISubprocessAdapter {
                     );
                     // Remove this failed attempt's stderr file before retrying
                     // so transient files don't leak across attempts.
-                    if let Err(e) = std::fs::remove_file(&stderr_file) {
-                        log::debug!(
-                            "Failed to clean up stderr file {}: {}",
-                            stderr_file.display(),
-                            e
-                        );
-                    }
+                    self.discard_stderr_log(&stderr_file);
                     if !wait.is_zero() {
                         std::thread::sleep(wait);
                     }
@@ -1362,7 +1627,7 @@ impl Adapter for CLISubprocessAdapter {
         // means a misconfigured AMPLIHACK_BASH aborts before any env-budget work
         // and before the >64 KiB script tempfile — nothing to clean up.
         let bash = resolve_bash_interpreter()?;
-        let mut child_env = Self::build_child_env();
+        let mut child_env = Self::build_child_env_with(self.env_allow.as_deref());
         // Propagate agent binary preference so scripts spawning nested agents
         // use the same binary as the parent (mirrors execute_agent_step_impl).
         child_env.insert("AMPLIHACK_AGENT_BINARY".to_string(), self.cli.clone());
@@ -1425,14 +1690,25 @@ impl Adapter for CLISubprocessAdapter {
             Some(tf) => BashInvocation::File(tf.path()),
             None => BashInvocation::Inline(command),
         };
-        let argv = bash_command_argv(&bash, invocation, timeout);
-        let output = Command::new(&argv[0])
+        // With `--timeout-action report` the `timeout` utility is not used:
+        // the overrun is reported and the step keeps running, nothing is killed.
+        let report_secs = match (self.timeout_action, timeout) {
+            (TimeoutAction::Report, Some(secs)) => Some(secs),
+            _ => None,
+        };
+        let kill_timeout = if report_secs.is_some() { None } else { timeout };
+        let argv = bash_command_argv(&bash, invocation, kill_timeout);
+        let mut shell_cmd = Command::new(&argv[0]);
+        shell_cmd
             .args(&argv[1..])
             .current_dir(effective_dir)
             .env_clear()
-            .envs(bounded.iter().map(|(k, v)| (k, v)))
-            .output()
-            .with_context(|| bash_spawn_context(&invocation, timeout))?;
+            .envs(bounded.iter().map(|(k, v)| (k, v)));
+        let output = match report_secs {
+            Some(secs) => output_reporting_overrun(shell_cmd, secs, "Shell step"),
+            None => shell_cmd.output(),
+        }
+        .with_context(|| bash_spawn_context(&invocation, kill_timeout))?;
 
         // Drop the tempfiles (auto-clean on drop) only AFTER bash completed.
         drop(script_file);
@@ -2099,6 +2375,442 @@ mod tests {
         let adapter = CLISubprocessAdapter::default();
         assert_eq!(adapter.cli, "claude");
         assert_eq!(adapter.working_dir, ".");
+    }
+
+    // ── --timeout-action report and --log-dir ─────────────────────────
+
+    #[test]
+    fn timeout_action_defaults_to_kill() {
+        assert_eq!(TimeoutAction::default(), TimeoutAction::Kill);
+        assert_eq!(
+            CLISubprocessAdapter::new().timeout_action,
+            TimeoutAction::Kill
+        );
+    }
+
+    #[test]
+    fn timeout_report_line_names_the_step_kind_limit_and_pid() {
+        let line = timeout_report_line("Shell step", 7, 4242);
+        assert!(
+            line.contains("Shell step exceeded its 7s timeout"),
+            "{line}"
+        );
+        assert!(line.contains("nothing is killed (pid 4242)"), "{line}");
+    }
+
+    #[test]
+    fn kill_is_still_the_default_for_a_shell_step_past_its_timeout() {
+        let adapter = CLISubprocessAdapter::new();
+        let started = Instant::now();
+        let result =
+            adapter.execute_bash_step("sleep 30; echo late", ".", Some(1), &HashMap::new());
+        assert!(result.is_err(), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    #[test]
+    fn report_lets_a_shell_step_run_past_its_timeout_and_return_its_output() {
+        let adapter = CLISubprocessAdapter::new().with_timeout_action(TimeoutAction::Report);
+        let started = Instant::now();
+        let result = adapter
+            .execute_bash_step("sleep 2; echo finished", ".", Some(1), &HashMap::new())
+            .expect("a reported overrun must not fail the step");
+        assert_eq!(result, "finished");
+        assert!(started.elapsed() >= Duration::from_secs(2));
+    }
+
+    #[test]
+    fn report_keeps_a_failing_shell_step_failing_with_its_stderr() {
+        let adapter = CLISubprocessAdapter::new().with_timeout_action(TimeoutAction::Report);
+        let err = adapter
+            .execute_bash_step("echo oops >&2; exit 3", ".", Some(30), &HashMap::new())
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("exit 3") && text.contains("oops"), "{text}");
+    }
+
+    #[test]
+    fn report_runs_a_large_file_backed_step_past_its_timeout() {
+        let adapter = CLISubprocessAdapter::new().with_timeout_action(TimeoutAction::Report);
+        let script = format!("# {}\nsleep 2; echo big", "x".repeat(70 * 1024));
+        let result = adapter
+            .execute_bash_step(&script, ".", Some(1), &HashMap::new())
+            .unwrap();
+        assert_eq!(result, "big");
+    }
+
+    /// A launcher stand-in that sleeps past the step timeout, then writes to
+    /// stdout and stderr and exits 0.
+    fn slow_launcher(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("slow-launcher");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nsleep 2\necho agent-said-this\necho agent-err-said-this >&2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Point agent steps at `launcher` through the environment. The caller
+    /// holds `ENV_MUTEX` and an `EnvGuard` for `AMPLIHACK_LAUNCHER_BINARY`.
+    fn use_launcher(launcher: &Path) {
+        // SAFETY: callers hold ENV_MUTEX to serialize env var access.
+        unsafe {
+            env::set_var("AMPLIHACK_LAUNCHER_BINARY", launcher);
+        }
+    }
+
+    #[test]
+    fn agent_step_past_its_timeout_is_killed_by_default() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
+        let tmp = tempfile::tempdir().unwrap();
+        use_launcher(&slow_launcher(tmp.path()));
+        let adapter = CLISubprocessAdapter::new();
+        let err = adapter
+            .execute_agent_step_impl("p", None, None, tmp.path().to_str().unwrap(), Some(1))
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn report_lets_an_agent_step_run_past_its_timeout() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
+        let tmp = tempfile::tempdir().unwrap();
+        use_launcher(&slow_launcher(tmp.path()));
+        let adapter = CLISubprocessAdapter::new().with_timeout_action(TimeoutAction::Report);
+        let out = adapter
+            .execute_agent_step_impl("p", None, None, tmp.path().to_str().unwrap(), Some(1))
+            .expect("a reported overrun must not fail the step");
+        assert_eq!(out, "agent-said-this");
+    }
+
+    #[test]
+    fn codex_report_notice_says_the_step_has_no_deadline() {
+        let notice = codex_report_notice(9);
+        assert!(
+            notice.contains("does not apply to the Codex adapter"),
+            "{notice}"
+        );
+        assert!(notice.contains("9s step timeout"), "{notice}");
+        assert!(notice.contains("without a deadline"), "{notice}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_files_are_private_even_in_a_directory_that_already_exists() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
+        let tmp = tempfile::tempdir().unwrap();
+        use_launcher(&slow_launcher(tmp.path()));
+        let logs = tmp.path().join("existing-logs");
+        std::fs::create_dir(&logs).unwrap();
+        std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let adapter = CLISubprocessAdapter::new().with_log_dir(&logs);
+        adapter
+            .execute_agent_step_impl("p", None, None, tmp.path().to_str().unwrap(), None)
+            .unwrap();
+
+        // The existing directory keeps its mode; the log files do not inherit
+        // the umask's group or other read bits.
+        let dir_mode = std::fs::metadata(&logs).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o755);
+        let mut files = 0;
+        for entry in std::fs::read_dir(&logs).unwrap() {
+            let mode = entry.unwrap().metadata().unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "log file mode {mode:o}");
+            files += 1;
+        }
+        assert_eq!(files, 2, "one output log and one stderr log");
+    }
+
+    #[test]
+    fn log_dir_keeps_agent_output_and_stderr_logs() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
+        let tmp = tempfile::tempdir().unwrap();
+        use_launcher(&slow_launcher(tmp.path()));
+        let logs = tmp.path().join("logs").join("nested");
+        let adapter = CLISubprocessAdapter::new().with_log_dir(&logs);
+        let out = adapter
+            .execute_agent_step_impl("p", None, None, tmp.path().to_str().unwrap(), None)
+            .unwrap();
+        assert_eq!(out, "agent-said-this");
+
+        let mut output_logs = String::new();
+        let mut stderr_logs = String::new();
+        for entry in std::fs::read_dir(&logs).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let text = std::fs::read_to_string(&path).unwrap();
+            if name.starts_with("agent-step-") {
+                output_logs.push_str(&text);
+            } else if name.starts_with("agent-stderr-") {
+                stderr_logs.push_str(&text);
+            }
+        }
+        assert!(output_logs.contains("agent-said-this"), "{output_logs}");
+        assert!(stderr_logs.contains("agent-err-said-this"), "{stderr_logs}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&logs).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "log dir must be private: {mode:o}");
+        }
+    }
+
+    // ── --launcher, --no-allow-all-tools, --no-add-dir ────────────────
+
+    fn command_args(cmd: &std::process::Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn launcher_option_takes_precedence_over_the_environment_variable() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe {
+            env::set_var("AMPLIHACK_LAUNCHER_BINARY", "/from/env/launcher");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+
+        let from_env = CLISubprocessAdapter::new()
+            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .unwrap();
+        assert_eq!(from_env.get_program(), "/from/env/launcher");
+
+        let explicit = CLISubprocessAdapter::new()
+            .with_launcher("/opt/explicit/launcher")
+            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .unwrap();
+        assert_eq!(explicit.get_program(), "/opt/explicit/launcher");
+    }
+
+    #[test]
+    fn launcher_option_must_be_an_absolute_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        for relative in ["amplihack", "./launcher", "bin/launcher"] {
+            let err = CLISubprocessAdapter::new()
+                .with_launcher(relative)
+                .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("must be absolute"),
+                "{relative}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn launcher_defaults_are_unchanged_without_the_option() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe {
+            env::remove_var("AMPLIHACK_LAUNCHER_BINARY");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let cmd = CLISubprocessAdapter::new()
+            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .unwrap();
+        assert_eq!(cmd.get_program(), "amplihack");
+    }
+
+    #[test]
+    fn without_allow_all_tools_omits_the_copilot_flag() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::new("AMPLIHACK_NO_ALLOW_ALL_TOOLS");
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe {
+            env::remove_var("AMPLIHACK_NO_ALLOW_ALL_TOOLS");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+
+        let default = CLISubprocessAdapter::new()
+            .with_binary("copilot")
+            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .unwrap();
+        assert!(command_args(&default).contains(&"--allow-all-tools".to_string()));
+
+        let opted_out = CLISubprocessAdapter::new()
+            .with_binary("copilot")
+            .without_allow_all_tools()
+            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .unwrap();
+        assert!(!command_args(&opted_out).contains(&"--allow-all-tools".to_string()));
+    }
+
+    #[test]
+    fn without_working_dir_grant_omits_add_dir_for_the_working_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("work");
+        std::fs::create_dir(&cwd).unwrap();
+        let cwd_text = cwd.to_string_lossy().into_owned();
+
+        let default = CLISubprocessAdapter::new()
+            .build_agent_command(tmp.path(), &cwd, "hello", None, None)
+            .unwrap();
+        let args = command_args(&default);
+        let pos = args.iter().position(|a| a == "--add-dir").unwrap();
+        assert_eq!(args[pos + 1], cwd_text);
+
+        let without = CLISubprocessAdapter::new()
+            .without_working_dir_grant()
+            .build_agent_command(tmp.path(), &cwd, "hello", None, None)
+            .unwrap();
+        let args = command_args(&without);
+        assert!(!args.contains(&"--add-dir".to_string()), "{args:?}");
+        assert!(!args.contains(&cwd_text), "{args:?}");
+    }
+
+    #[test]
+    fn without_working_dir_grant_keeps_the_overflow_prompt_directory_grant() {
+        // A CLI that reads an overflow prompt through --add-dir cannot do so
+        // without the output directory, so that grant stays.
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let cwd = tmp.path().join("work");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::create_dir(&cwd).unwrap();
+        let prompt = "p".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1);
+        let cmd = CLISubprocessAdapter::new()
+            .with_binary("copilot")
+            .without_working_dir_grant()
+            .build_agent_command(&out, &cwd, &prompt, None, None)
+            .unwrap();
+        let args = command_args(&cmd);
+        let grants: Vec<&String> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--add-dir")
+            .map(|(i, _)| &args[i + 1])
+            .collect();
+        assert_eq!(grants, vec![&out.to_string_lossy().into_owned()]);
+    }
+
+    // ── --env-allow: only named parent variables reach children ───────
+
+    fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn restrict_to_allowlist_keeps_only_named_variables() {
+        let inherited = vars(&[("KEEP_ME", "1"), ("DROP_ME", "2"), ("keep_me", "3")]);
+        let kept = restrict_to_allowlist(inherited, &["KEEP_ME".to_string()]);
+        // Exact, case-sensitive match: neither DROP_ME nor keep_me survives.
+        assert_eq!(kept, vars(&[("KEEP_ME", "1")]));
+    }
+
+    #[test]
+    fn restrict_to_allowlist_with_no_names_keeps_nothing() {
+        let kept = restrict_to_allowlist(vars(&[("A", "1")]), &[]);
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn env_allow_defaults_to_none_and_is_set_by_with_env_allow() {
+        assert!(CLISubprocessAdapter::new().env_allow.is_none());
+        let adapter = CLISubprocessAdapter::new().with_env_allow(["A", "B"]);
+        assert_eq!(
+            adapter.env_allow,
+            Some(vec!["A".to_string(), "B".to_string()])
+        );
+    }
+
+    #[test]
+    fn build_child_env_with_allowlist_drops_unnamed_parent_variables() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = unique_tag();
+        let named = format!("ENVALLOW_NAMED_{tag}");
+        let unnamed = format!("ENVALLOW_UNNAMED_{tag}");
+        // SAFETY: serialized by ENV_MUTEX; names are unique to this test.
+        unsafe {
+            env::set_var(&named, "visible");
+            env::set_var(&unnamed, "hidden");
+        }
+
+        let allowed = [named.clone()];
+        let restricted = CLISubprocessAdapter::build_child_env_with(Some(&allowed));
+        let default = CLISubprocessAdapter::build_child_env_with(None);
+
+        // SAFETY: as above.
+        unsafe {
+            env::remove_var(&named);
+            env::remove_var(&unnamed);
+        }
+
+        assert_eq!(restricted.get(&named).map(String::as_str), Some("visible"));
+        assert!(!restricted.contains_key(&unnamed));
+        // Default behaviour is unchanged: everything is inherited.
+        assert_eq!(default.get(&unnamed).map(String::as_str), Some("hidden"));
+        // Variables the runner sets itself are still present.
+        for key in [
+            "HOME",
+            "PATH",
+            "AMPLIHACK_SESSION_DEPTH",
+            "AMPLIHACK_MAX_DEPTH",
+            "AMPLIHACK_MAX_SESSIONS",
+            "AMPLIHACK_TREE_ID",
+        ] {
+            assert!(restricted.contains_key(key), "{key} must be present");
+        }
+    }
+
+    #[test]
+    fn build_child_env_with_allowlist_never_passes_claudecode() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::new("CLAUDECODE");
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe {
+            env::set_var("CLAUDECODE", "1");
+        }
+        let allowed = ["CLAUDECODE".to_string()];
+        let restricted = CLISubprocessAdapter::build_child_env_with(Some(&allowed));
+        assert!(!restricted.contains_key("CLAUDECODE"));
+    }
+
+    #[test]
+    fn bash_step_sees_only_allowed_parent_variables() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = unique_tag();
+        let named = format!("ENVALLOW_NAMED_{tag}");
+        let unnamed = format!("ENVALLOW_UNNAMED_{tag}");
+        // SAFETY: serialized by ENV_MUTEX; names are unique to this test.
+        unsafe {
+            env::set_var(&named, "visible");
+            env::set_var(&unnamed, "hidden");
+        }
+        let script = format!("printf '%s|%s' \"${{{named}-unset}}\" \"${{{unnamed}-unset}}\"");
+        let empty_env = HashMap::new();
+
+        let restricted = CLISubprocessAdapter::new().with_env_allow([named.clone()]);
+        let restricted_out = restricted
+            .execute_bash_step(&script, ".", None, &empty_env)
+            .unwrap();
+        let default_out = CLISubprocessAdapter::new()
+            .execute_bash_step(&script, ".", None, &empty_env)
+            .unwrap();
+
+        // SAFETY: as above.
+        unsafe {
+            env::remove_var(&named);
+            env::remove_var(&unnamed);
+        }
+
+        assert_eq!(restricted_out, "visible|unset");
+        assert_eq!(default_out, "visible|hidden");
     }
 
     #[test]

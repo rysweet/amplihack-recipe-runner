@@ -4,7 +4,7 @@
 ///
 use clap::{Parser, Subcommand};
 use log::{debug, info};
-use recipe_runner_rs::adapters::cli_subprocess::CLISubprocessAdapter;
+use recipe_runner_rs::adapters::cli_subprocess::{CLISubprocessAdapter, TimeoutAction};
 use recipe_runner_rs::agent_resolver::AgentResolver;
 use recipe_runner_rs::discovery;
 use recipe_runner_rs::parser::RecipeParser;
@@ -27,6 +27,16 @@ mod exit_codes {
     pub const NOT_FOUND: i32 = 3;
     /// Invalid CLI arguments or context overrides.
     pub const BAD_ARGS: i32 = 4;
+}
+
+/// What to do when a step's timeout is reached.
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum TimeoutActionArg {
+    /// Kill the child and fail the step.
+    #[default]
+    Kill,
+    /// Report the overrun once and keep waiting; nothing is killed.
+    Report,
 }
 
 #[derive(Parser)]
@@ -122,6 +132,43 @@ struct Cli {
     /// Falls back to AMPLIHACK_AGENT_BINARY env var, then "claude".
     #[arg(long)]
     agent_binary: Option<String>,
+
+    /// What to do when an agent step's timeout, a shell step's timeout or a
+    /// hook's deadline is reached: "kill" (default) kills the child and fails
+    /// the step; "report" reports the overrun once on stderr and keeps
+    /// waiting, killing nothing.
+    #[arg(long, value_enum, default_value_t = TimeoutActionArg::Kill)]
+    timeout_action: TimeoutActionArg,
+
+    /// Keep agent output and stderr logs in this directory (created if
+    /// missing, readable only by the owner).
+    #[arg(long, value_name = "DIR")]
+    log_dir: Option<PathBuf>,
+
+    /// Run agent steps through the launcher at this absolute path instead of
+    /// `amplihack`. Takes precedence over AMPLIHACK_LAUNCHER_BINARY.
+    #[arg(long, value_name = "PATH")]
+    launcher: Option<PathBuf>,
+
+    /// Do not pass --allow-all-tools to the Copilot CLI (the same as
+    /// AMPLIHACK_NO_ALLOW_ALL_TOOLS for one run).
+    #[arg(long)]
+    no_allow_all_tools: bool,
+
+    /// Do not grant the working directory to the agent CLI with --add-dir.
+    /// The directory that holds an overflow prompt file is still granted to
+    /// CLIs that read the file through --add-dir (such as Copilot).
+    #[arg(long)]
+    no_add_dir: bool,
+
+    /// Pass only the named parent environment variables to agent and shell
+    /// children (can be specified multiple times). Without this option every
+    /// parent variable is passed on. The variables the runner sets itself
+    /// (HOME and PATH defaults, the session-tree variables and
+    /// AMPLIHACK_AGENT_BINARY), a step's `env:` block and RECIPE_VAR_* are
+    /// still passed.
+    #[arg(long = "env-allow", value_name = "NAME")]
+    env_allow: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -249,6 +296,18 @@ fn run() -> i32 {
             return exit_codes::BAD_ARGS;
         }
     };
+
+    // A relative --launcher is a bad argument whether or not the recipe runs,
+    // so --validate-only reports it too.
+    if let Some(ref launcher) = cli.launcher
+        && !launcher.is_absolute()
+    {
+        eprintln!(
+            "Error: --launcher must be an absolute path, got '{}'.",
+            launcher.display()
+        );
+        return exit_codes::BAD_ARGS;
+    }
 
     // Parse context overrides with type detection
     let mut user_context: HashMap<String, Value> = HashMap::new();
@@ -402,6 +461,24 @@ fn run() -> i32 {
     let mut adapter = CLISubprocessAdapter::new();
     if let Some(ref binary) = cli.agent_binary {
         adapter = adapter.with_binary(binary);
+    }
+    if matches!(cli.timeout_action, TimeoutActionArg::Report) {
+        adapter = adapter.with_timeout_action(TimeoutAction::Report);
+    }
+    if let Some(ref dir) = cli.log_dir {
+        adapter = adapter.with_log_dir(dir.clone());
+    }
+    if let Some(ref launcher) = cli.launcher {
+        adapter = adapter.with_launcher(launcher.clone());
+    }
+    if cli.no_allow_all_tools {
+        adapter = adapter.without_allow_all_tools();
+    }
+    if cli.no_add_dir {
+        adapter = adapter.without_working_dir_grant();
+    }
+    if !cli.env_allow.is_empty() {
+        adapter = adapter.with_env_allow(cli.env_allow.iter().cloned());
     }
     let mut runner = RecipeRunner::new(adapter)
         .with_working_dir(&cli.working_dir)
