@@ -2,7 +2,7 @@
 title: Codex agent steps
 description: Codex execution, configuration, results, and terminal failure contracts.
 doc_type: reference
-last_updated: 2026-10-07
+last_updated: 2026-11-03
 ---
 
 # Codex agent steps
@@ -86,6 +86,16 @@ Successful raw output is only the content of the final-message file. Whitespace,
 The existing `MAX_STEP_OUTPUT_BYTES` limit is 10,000,000 bytes. Codex final output at or below the limit is preserved; larger output fails explicitly before unbounded allocation. Successful Codex output is never silently truncated. There is no runtime output-limit setting.
 
 Spawn errors, incomplete or failed stdin writes, timeout, nonzero exit, missing or nonregular final files, symlinks, unsafe permissions, read failures, invalid UTF-8, and cleanup failures fail the attempt. A final file does not turn a nonzero exit or incomplete instruction delivery into success. Stdout and stderr are drained concurrently, retaining the latest 64 KiB per stream in memory while continuing to drain. After shutdown, each reader drains queued bytes until EOF or the pipe would block, bounded by 1 MiB of additional reads or 50 ms, so detached writers cannot prevent completion. No diagnostic spool files are created. Reader failures fail the attempt.
+
+If Codex reports `Not inside a trusted directory and --skip-git-repo-check was not specified.`, the runner reports:
+
+```text
+working directory rejected: not inside a trusted directory; run from the intended existing Git checkout and set the recipe working directory to that checkout
+```
+
+Run from the intended existing Git checkout, for example with `recipe-runner-rs codex-summary.yaml --agent-binary codex -C /path/to/checkout`. Check any step-level `working_dir` override as well: it takes precedence over the recipe working directory.
+
+This rejection is not retried as a rate limit, even if other diagnostic text mentions rate limiting. The recovery instruction is also retained when Codex exits before stdin delivery finishes. The runner reports fixed guidance without copying arbitrary launcher output, prompts, credentials, or rejected paths, and preserves Codex's default trust enforcement; it does not add `--skip-git-repo-check`.
 
 A step's `timeout` applies separately to each attempt. Its absolute deadline starts immediately after successful launcher spawn and covers group-anchor establishment (including the helper acknowledgment), reader setup, stdin delivery and execution. `timeout: 0` expires immediately. With no timeout, helper startup has no arbitrary short cap, but still checks for cancellation while awaiting acknowledgment; cleanup retains its own bounds. Synchronous OS spawn is outside this polling deadline.
 

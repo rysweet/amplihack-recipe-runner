@@ -68,8 +68,23 @@ pub(super) fn drain_diagnostics<R: std::io::Read + std::os::fd::AsRawFd + Send +
     })
 }
 
+// Match the complete known rejection line, never arbitrary directory-related text.
+pub(super) fn trusted_directory_failure(diagnostic: &str) -> Option<&'static str> {
+    diagnostic
+        .lines()
+        .any(|line| {
+            line.trim().eq_ignore_ascii_case(
+                "Not inside a trusted directory and --skip-git-repo-check was not specified.",
+            )
+        })
+        .then_some("working directory rejected: not inside a trusted directory; run from the intended existing Git checkout and set the recipe working directory to that checkout")
+}
+
 // Emit only fixed categories: arbitrary service output may contain credentials or prompts.
 pub(super) fn classify_failure(diagnostic: &str, rate_limited: bool) -> &'static str {
+    if let Some(category) = trusted_directory_failure(diagnostic) {
+        return category;
+    }
     let text = diagnostic.to_ascii_lowercase();
     if rate_limited {
         "service rate limit; retry later or check account quota"

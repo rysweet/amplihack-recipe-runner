@@ -64,11 +64,15 @@ fn owner_worker() {
     }
     let mut unrelated = command.spawn().unwrap();
     wait_file(&ready, &mut unrelated);
+    // Publish readiness only after all PIDs have been written. File creation
+    // alone can wake the supervisor before write() supplies the contents.
+    let pending = root.join("owned-pids.pending");
     fs::write(
-        root.join("owned-pids"),
+        &pending,
         format!("{launcher} {} {}", helpers[0], unrelated.id()),
     )
     .unwrap();
+    fs::rename(pending, root.join("owned-pids")).unwrap();
     std::thread::sleep(Duration::from_secs(30));
     // Only used if the supervisor fails to deliver real parent death.
     unrelated.kill().unwrap();
