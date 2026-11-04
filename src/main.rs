@@ -536,14 +536,32 @@ fn run() -> i32 {
     );
     let result = runner.execute(&recipe, ctx);
 
+    let diagnostics = runner.diagnostic_artifacts();
+    // Keep CLI-only diagnostics outside RecipeResult: its Display is also used
+    // for nested recipe output, and context is exported to subsequent steps.
+    #[derive(serde::Serialize)]
+    struct CliResult<'a> {
+        #[serde(flatten)]
+        result: &'a recipe_runner_rs::models::RecipeResult,
+        #[serde(
+            skip_serializing_if = "<[recipe_runner_rs::runner::DiagnosticArtifact]>::is_empty"
+        )]
+        diagnostic_artifacts: &'a [recipe_runner_rs::runner::DiagnosticArtifact],
+    }
     // Output
     if cli.output_format == "json" {
-        match serde_json::to_string_pretty(&result) {
+        match serde_json::to_string_pretty(&CliResult {
+            result: &result,
+            diagnostic_artifacts: &diagnostics,
+        }) {
             Ok(json) => println!("{}", json),
             Err(e) => eprintln!("Error: Failed to serialize result: {}", e),
         }
     } else {
         println!("\n{}", result);
+        for record in &diagnostics {
+            println!("{}", record.diagnostic.text_reference());
+        }
     }
 
     if result.success {
