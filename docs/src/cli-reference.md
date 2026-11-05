@@ -1,6 +1,23 @@
+---
+title: CLI Reference
+description: Command-line options, output and failure diagnostics for recipe-runner-rs.
+doc_type: reference
+---
+
 # CLI Reference
 
 Complete reference for the `recipe-runner-rs` command-line interface.
+
+## Contents
+
+- [Synopsis](#synopsis)
+- [Subcommands](#subcommands)
+- [Global options](#global-options)
+- [Failed bash stdout](#failed-bash-stdout)
+- [Exit codes](#exit-codes)
+- [Smart context value parsing](#smart-context-value-parsing---set)
+- [Environment variables](#environment-variables)
+- [Usage examples](#usage-examples)
 
 ## Synopsis
 
@@ -88,6 +105,10 @@ readable only by their owner (mode 0600) in either case. Each agent attempt writ
 `agent-stderr-<attempt>-<time>.log` (its standard error), and neither is removed when the step ends. Without the
 option the output log is removed with the step's temporary directory and the stderr log is kept under
 `/tmp/amplihack-agent-stderr` only when the step fails or times out. The Codex adapter's private output is not copied.
+
+The directory also holds [retained stdout from failed bash steps](#failed-bash-stdout). Relative paths resolve
+against the CLI's current working directory, independently of `-C` and the step's working directory. Without
+`--log-dir`, failed bash stdout is still retained in the ordinary temporary directory.
 
 ### `--launcher <PATH>`
 
@@ -390,6 +411,121 @@ recipe-runner-rs deploy.yaml --output-format json | jq '.steps[] | select(.statu
 # JSON output with progress on stderr
 recipe-runner-rs deploy.yaml --output-format json --progress 2>/dev/null
 ```
+
+## Failed Bash Stdout
+
+When a bash command finishes with a nonzero status and nonempty stdout, the CLI retains every captured stdout
+byte in a separate file. Whitespace, trailing newlines, NUL bytes and invalid UTF-8 are preserved without
+trimming or truncation. Empty failed stdout and successful commands create no failed-stdout artifact.
+Successful stdout keeps its existing decoding and trimming behaviour.
+
+### Storage and lifetime
+
+| Configuration | Artifact location |
+| --- | --- |
+| `--log-dir /absolute/directory` | The specified directory |
+| `--log-dir ./failure-logs` | `failure-logs` beneath the CLI's current working directory |
+| No `--log-dir` | The operating system's ordinary temporary directory, honouring `TMPDIR` on Unix |
+
+Each failure creates a unique `amplihack-failed-bash-stdout-*.log` file exclusively. Existing files, symlinks
+and their targets are not overwritten. On Unix, the file is private from creation and has mode 0600
+(owner read/write). Newly created configured directories have mode 0700; existing directory permissions
+are preserved. Choose a directory whose parent directories you trust.
+
+Artifacts remain readable after the adapter returns and the CLI terminates normally. They are plaintext
+and can contain sensitive command output. The runner does not delete them automatically: remove individual
+artifacts after inspection. Temporary-directory cleanup by the operating system can remove them, and
+survival of power loss is not guaranteed. Use `--log-dir` when temporary-directory cleanup is unsuitable.
+
+### Diagnostics and failure semantics
+
+After execution, `--output-format json` adds an optional top-level `diagnostic_artifacts` array. Each record
+identifies the bash `step_id` and either an absolute artifact path or a retention problem. Serial, parallel
+and nested failures accumulate in this array, including failures allowed to continue. Runs without
+failed-stdout diagnostics omit the field. Stdout bodies never enter the JSON result.
+
+A retained artifact has one of two lossless path representations:
+
+```json
+{"step_id": "diagnostic", "path": "/absolute/failure-logs/amplihack-failed-bash-stdout-example.log"}
+```
+
+UTF-8 paths use `path`, a normal JSON string. Unix paths containing invalid UTF-8 use `path_bytes`,
+an array of integers representing **every original path byte**, and omit `path`. For example,
+`{"step_id": "diagnostic", "path_bytes": [47, 116, 109, 112, 47, 255]}` names `/tmp/` followed by byte FF.
+
+Default text mode prints `Failed bash stdout retained at ` and a quoted absolute path to **stdout** after
+the ordinary recipe result. UTF-8 paths are JSON strings with escaped controls. Non-UTF-8 paths use `b"`
+followed by one `\xHH` escape for every original byte and a closing `"`. Decode these references before
+opening the file; quotes and escape sequences are not filename characters. Never evaluate a reference
+as a shell command.
+
+The command remains failed. Its original `Command failed (exit N)` context, stderr decoding and trimming,
+error chain, failed step error/output and classification remain unchanged. A command exiting 7 still
+produces a failed step and CLI exit 1. The diagnostic adds no runner stderr line, so it cannot displace
+prior stderr evidence. Diagnostics stay outside recipe context, shell exports and nested-step output.
+
+If creation, writing, flushing or persistence fails, the record instead has a `retention_error` string
+identifying the attempted directory and no artifact path. The directory uses the same lossless quoting
+as text references. Text mode prints `Failed to retain bash stdout: ` with quoted details to stdout. The original
+command failure remains unchanged. The CLI neither reports an incomplete artifact as complete nor falls
+back from an unusable configured directory to temporary storage. Closed or unwritable stderr does not
+prevent retention metadata from reaching JSON/stdout.
+
+### Example: both output streams and a nonzero exit
+
+This recipe requires only bash and writes distinct diagnostic markers:
+
+```yaml
+# failed-output.yaml
+name: failed-output
+steps:
+  - id: diagnostic
+    type: bash
+    command: |
+      printf 'build details on stdout\n'
+      printf 'build failed on stderr\n' >&2
+      exit 7
+```
+
+Run it from the directory containing `failed-output.yaml`:
+
+```bash
+recipe-runner-rs ./failed-output.yaml --no-default-search --no-update-check \
+  --no-auto-stage --log-dir ./failure-logs --output-format json \
+  >failure-result.json 2>failure-diagnostics.log
+status=$?
+printf 'CLI exit: %s\n' "$status"
+# Output: CLI exit: 1
+```
+
+`failure-result.json` reports `success: false`, step status `failed`, an empty step `output`, and an error
+containing `Command failed (exit 7): build failed on stderr`. Its `diagnostic_artifacts` record points to a
+private file beneath `failure-logs`. That file contains exactly `build details on stdout` followed by one
+newline. `failure-diagnostics.log` keeps the original failure diagnostic. Omitting `--log-dir` retains the
+same bytes in the ordinary temporary directory and reports that absolute path instead.
+
+This Python 3 example reads either JSON path representation and copies the artifact bytes to stdout on Unix:
+
+```bash
+python3 - <<'PY'
+import json
+import sys
+
+with open("failure-result.json", encoding="utf-8") as result_file:
+    result = json.load(result_file)
+record = result["diagnostic_artifacts"][0]
+if "retention_error" in record:
+    raise SystemExit(record["retention_error"])
+path = record["path"] if "path" in record else bytes(record["path_bytes"])
+with open(path, "rb") as artifact:
+    sys.stdout.buffer.write(artifact.read())
+PY
+# Output: build details on stdout
+```
+
+The decoder preserves invalid UTF-8 in paths, and binary reads preserve NUL bytes, invalid UTF-8 and
+trailing whitespace in retained output.
 
 ## Exit Codes
 

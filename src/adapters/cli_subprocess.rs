@@ -300,6 +300,126 @@ fn create_private_log_dir(dir: &Path) -> std::io::Result<()> {
     builder.create(dir)
 }
 
+/// Persist complete failed stdout without reusing or truncating a pathname.
+/// The returned absolute path survives both adapter return and CLI termination.
+fn retain_failed_stdout(stdout: &[u8], log_dir: Option<&Path>) -> std::io::Result<PathBuf> {
+    let dir = std::path::absolute(log_dir.map_or_else(env::temp_dir, Path::to_path_buf))?;
+    if log_dir.is_some() {
+        create_private_log_dir(&dir)?;
+    }
+    // NamedTempFile creates exclusively with private permissions. Set the final
+    // mode through the same handle as well, even under a restrictive umask.
+    let mut file = tempfile::Builder::new()
+        .prefix("amplihack-failed-bash-stdout-")
+        .suffix(".log")
+        .tempfile_in(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(stdout)?;
+    file.flush()?;
+    let (handle, path) = file.keep().map_err(|error| error.error)?;
+    drop(handle);
+    Ok(path)
+}
+
+/// Small failed-stdout metadata, kept outside command errors and recipe context.
+/// A path is absolute and names a complete, private file. A retention problem
+/// describes why no file could be retained; it is never an error-chain cause.
+#[derive(Clone, Debug)]
+pub struct BashStdoutDiagnostic {
+    pub path: Option<PathBuf>,
+    pub retention_error: Option<String>,
+}
+
+impl serde::Serialize for BashStdoutDiagnostic {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(path) = &self.path {
+            if let Some(text) = path.to_str() {
+                map.serialize_entry("path", text)?;
+            } else {
+                map.serialize_entry("path_bytes", path.as_os_str().as_encoded_bytes())?;
+            }
+        }
+        if let Some(problem) = &self.retention_error {
+            map.serialize_entry("retention_error", problem)?;
+        }
+        map.end()
+    }
+}
+
+impl BashStdoutDiagnostic {
+    /// Human-readable reference for CLI stdout. No stdout body is included.
+    pub fn text_reference(&self) -> String {
+        if let Some(path) = &self.path {
+            format!(
+                "Failed bash stdout retained at {}",
+                quote_diagnostic_path(path)
+            )
+        } else {
+            format!(
+                "Failed to retain bash stdout: {}",
+                quote_diagnostic(
+                    self.retention_error
+                        .as_deref()
+                        .unwrap_or("unknown retention problem")
+                )
+            )
+        }
+    }
+}
+
+/// The original command failure with a separate, typed diagnostic payload.
+/// Display, Debug and the error chain contain only the upstream command error.
+pub(crate) struct BashFailure {
+    message: String,
+    pub(crate) diagnostic: Option<BashStdoutDiagnostic>,
+}
+
+impl std::fmt::Display for BashFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::fmt::Debug for BashFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+impl std::error::Error for BashFailure {}
+
+/// Quote controls for safe text output, without filtering classifier keywords.
+fn quote_diagnostic(text: &str) -> String {
+    let quoted = serde_json::to_string(text).expect("string serialisation cannot fail");
+    let mut escaped = String::new();
+    for ch in quoted.chars() {
+        if ch.is_control() {
+            escaped.push_str(&format!("\\u{:04x}", ch as u32));
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped
+}
+
+/// Preserve Unix path bytes that cannot be represented by a JSON string.
+fn quote_diagnostic_path(path: &Path) -> String {
+    if let Some(text) = path.to_str() {
+        return quote_diagnostic(text);
+    }
+    let mut escaped = String::from("b\"");
+    for byte in path.as_os_str().as_encoded_bytes() {
+        escaped.push_str(&format!("\\x{byte:02x}"));
+    }
+    escaped.push('"');
+    escaped
+}
+
 /// What bash should execute for one step.
 #[derive(Clone, Copy)]
 pub(crate) enum BashInvocation<'a> {
@@ -714,6 +834,29 @@ impl CLISubprocessAdapter {
     /// removed with the step's temporary directory and the stderr log is kept
     /// under `/tmp/amplihack-agent-stderr` only when the step fails. The
     /// Codex adapter's private output is not copied.
+    ///
+    /// Nonempty stdout from failed bash steps is retained byte-for-byte in a
+    /// unique, exclusively created file in `dir`, or the ordinary temporary
+    /// directory when no log directory is configured. On Unix, files are private
+    /// from creation and have mode 0600. Relative paths resolve against the CLI
+    /// process working directory, independently of the bash step's directory.
+    /// Retention metadata travels in a typed bash failure, separately from its
+    /// unchanged Display and error chain. The runner collects it outside recipe
+    /// context and step output/error. The CLI exposes optional top-level JSON
+    /// `diagnostic_artifacts`, or quoted references/problems on text stdout.
+    /// No new diagnostic is written to stderr. UTF-8 paths use JSON strings;
+    /// non-UTF-8 paths use lossless byte arrays in JSON and `b"\\xHH..."` text
+    /// references, with one hexadecimal escape per original Unix path byte.
+    ///
+    /// Files survive adapter return and normal CLI termination and require
+    /// manual cleanup; they may contain sensitive plaintext command output.
+    /// External temporary-directory cleanup and power-loss recovery are outside
+    /// this persistence guarantee. Retention failures are reported separately
+    /// without a fallback directory, an incomplete-file success report or any
+    /// change to the original command failure and stderr handling. Retention
+    /// problems identify the attempted directory using lossless path quoting.
+    /// Empty failed stdout and successful commands create no such artifact;
+    /// successful output handling is unchanged.
     pub fn with_log_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.log_dir = Some(dir.into());
         self
@@ -1719,12 +1862,41 @@ impl Adapter for CLISubprocessAdapter {
         // full copy of a stderr it then discarded — and progress-chatty tools
         // (cargo, npm, git) routinely put megabytes there.
         if !output.status.success() {
+            let diagnostic = if output.stdout.is_empty() {
+                None
+            } else {
+                Some(
+                    match retain_failed_stdout(&output.stdout, self.log_dir.as_deref()) {
+                        Ok(path) => BashStdoutDiagnostic {
+                            path: Some(path),
+                            retention_error: None,
+                        },
+                        Err(error) => BashStdoutDiagnostic {
+                            path: None,
+                            retention_error: Some(format!(
+                                "{} (stdout directory {})",
+                                error,
+                                quote_diagnostic_path(
+                                    &self
+                                        .log_dir
+                                        .as_deref()
+                                        .map_or_else(env::temp_dir, Path::to_path_buf)
+                                )
+                            )),
+                        },
+                    },
+                )
+            };
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "Command failed (exit {}): {}",
-                output.status.code().unwrap_or(-1),
-                stderr.trim()
-            );
+            return Err(BashFailure {
+                message: format!(
+                    "Command failed (exit {}): {}",
+                    output.status.code().unwrap_or(-1),
+                    stderr.trim()
+                ),
+                diagnostic,
+            }
+            .into());
         }
 
         Ok(into_trimmed_string(output.stdout))
@@ -5636,6 +5808,338 @@ mod codex_exec_contract_tests {
         assert!(args.iter().any(|arg| *arg == "--output-last-message"));
         for forbidden in ["-p", "TASK_SENTINEL", "--model", "--add-dir"] {
             assert!(!args.iter().any(|arg| *arg == forbidden));
+        }
+    }
+}
+
+/// Issue #190 contracts exercised through the existing adapter interface so
+/// the regression suite compiles before stdout retention is implemented.
+#[cfg(all(test, unix))]
+mod failed_bash_stdout_contract_tests {
+    use super::*;
+    use crate::sub_recipe_recovery::{FailureClass, SubRecipeRecovery};
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn typed_failure_metadata_is_not_an_error_chain_cause() {
+        let fixture = Fixture::new();
+        let logs = fixture.path().join("connection reset by peer");
+        let baseline = fixture.fail(b"", &logs);
+        let upstream = anyhow::anyhow!("Command failed (exit 7): original diagnostic");
+        assert_eq!(chain(&baseline), chain(&upstream));
+        assert_eq!(format!("{baseline:#}"), format!("{upstream:#}"));
+        assert_eq!(
+            format!("{:?}", baseline.downcast_ref::<BashFailure>().unwrap()),
+            upstream.to_string()
+        );
+        let retained = fixture.fail(b" \0\xffprivate bytes\n\n ", &logs);
+        assert_eq!(chain(&retained), chain(&baseline));
+        assert_eq!(format!("{retained:#}"), format!("{baseline:#}"));
+        let payload = retained
+            .downcast_ref::<BashFailure>()
+            .expect("typed bash failure");
+        let diagnostic = payload.diagnostic.as_ref().expect("retention metadata");
+        assert_eq!(
+            std::fs::read(diagnostic.path.as_ref().unwrap()).unwrap(),
+            b" \0\xffprivate bytes\n\n "
+        );
+        assert!(diagnostic.retention_error.is_none());
+        let blocker = fixture.path().join("api error: 401");
+        std::fs::write(&blocker, b"untouched").unwrap();
+        let failed = fixture.fail(b"private bytes", &blocker);
+        let diagnostic = failed
+            .downcast_ref::<BashFailure>()
+            .unwrap()
+            .diagnostic
+            .as_ref()
+            .unwrap();
+        assert!(diagnostic.path.is_none());
+        assert!(
+            diagnostic
+                .retention_error
+                .as_ref()
+                .is_some_and(|s| !s.is_empty())
+        );
+        assert_eq!(chain(&failed), chain(&baseline));
+    }
+
+    struct Fixture {
+        root: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = tempfile::Builder::new()
+                .prefix("rr190-adapter-")
+                .tempdir()
+                .unwrap();
+            for name in ["home", "tmp", "config", "cache"] {
+                std::fs::create_dir(root.path().join(name)).unwrap();
+            }
+            Self { root }
+        }
+
+        fn path(&self) -> &Path {
+            self.root.path()
+        }
+
+        fn execute(&self, script: &str, logs: &Path) -> anyhow::Result<String> {
+            let mut environment = HashMap::from([("PATH".to_owned(), "/usr/bin:/bin".to_owned())]);
+            for (key, dir) in [
+                ("HOME", "home"),
+                ("TMPDIR", "tmp"),
+                ("XDG_CONFIG_HOME", "config"),
+                ("XDG_CACHE_HOME", "cache"),
+            ] {
+                environment.insert(
+                    key.to_owned(),
+                    self.path().join(dir).to_str().unwrap().to_owned(),
+                );
+            }
+            CLISubprocessAdapter::new()
+                .with_env_allow(std::iter::empty::<&str>())
+                .with_log_dir(logs)
+                .execute_bash_step(script, self.path().to_str().unwrap(), None, &environment)
+        }
+
+        fn fail(&self, stdout: &[u8], logs: &Path) -> anyhow::Error {
+            std::fs::write(self.path().join("payload.bin"), stdout).unwrap();
+            self.execute(
+                "cat payload.bin; printf 'original diagnostic\\n' >&2; exit 7",
+                logs,
+            )
+            .unwrap_err()
+        }
+    }
+
+    fn entries(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .expect("failed stdout artifact directory")
+            .map(|entry| entry.unwrap().path())
+            .collect()
+    }
+
+    fn only_artifact(dir: &Path) -> PathBuf {
+        let files = entries(dir);
+        assert_eq!(files.len(), 1, "one retained stdout artifact expected");
+        files.into_iter().next().unwrap()
+    }
+
+    fn chain(error: &anyhow::Error) -> Vec<String> {
+        error.chain().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn byte_exact_nonempty_stdout_is_retained_after_adapter_return() {
+        let fixture = Fixture::new();
+        for (index, bytes) in [
+            b" \t\r\n\0\xff\xfeend\n\n ".to_vec(),
+            (0..200_000).map(|i| (i % 256) as u8).collect(),
+            vec![0],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let logs = fixture.path().join(format!("logs-{index}"));
+            let error = fixture.fail(&bytes, &logs);
+            assert_eq!(
+                error.to_string(),
+                "Command failed (exit 7): original diagnostic"
+            );
+            assert_eq!(std::fs::read(only_artifact(&logs)).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn repeated_failures_create_distinct_files_without_overwriting_previous_bytes() {
+        let fixture = Fixture::new();
+        let logs = fixture.path().join("logs");
+        fixture.fail(b"first bytes", &logs);
+        let first = only_artifact(&logs);
+        fixture.fail(b"second bytes", &logs);
+        let paths = entries(&logs);
+        assert_eq!(paths.len(), 2);
+        let second = paths.iter().find(|path| **path != first).unwrap();
+        assert_eq!(std::fs::read(first).unwrap(), b"first bytes");
+        assert_eq!(std::fs::read(second).unwrap(), b"second bytes");
+    }
+
+    #[test]
+    fn a_previous_artifact_replaced_by_a_symlink_is_never_overwritten() {
+        let fixture = Fixture::new();
+        let logs = fixture.path().join("logs");
+        fixture.fail(b"first bytes", &logs);
+        let previous = only_artifact(&logs);
+        let sentinel = fixture.path().join("sentinel");
+        std::fs::write(&sentinel, b"sentinel bytes").unwrap();
+        std::fs::remove_file(&previous).unwrap();
+        symlink(&sentinel, &previous).unwrap();
+        fixture.fail(b"new bytes", &logs);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"sentinel bytes");
+        assert!(
+            std::fs::symlink_metadata(&previous)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_link(&previous).unwrap(), sentinel);
+        let files = entries(&logs);
+        assert_eq!(files.len(), 2);
+        let new_file = files.iter().find(|path| **path != previous).unwrap();
+        assert_eq!(std::fs::read(new_file).unwrap(), b"new bytes");
+    }
+
+    #[test]
+    fn artifacts_are_private_and_existing_directory_permissions_are_preserved() {
+        let fixture = Fixture::new();
+        for existing in [false, true] {
+            let logs = fixture
+                .path()
+                .join(if existing { "existing" } else { "new/nested" });
+            if existing {
+                std::fs::create_dir(&logs).unwrap();
+                std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o750)).unwrap();
+            }
+            fixture.fail(b"private bytes", &logs);
+            let artifact = only_artifact(&logs);
+            let metadata = std::fs::symlink_metadata(&artifact).unwrap();
+            assert!(metadata.file_type().is_file());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(&logs).unwrap().permissions().mode() & 0o777,
+                if existing { 0o750 } else { 0o700 }
+            );
+        }
+    }
+
+    #[test]
+    fn retention_failure_keeps_the_original_error_chain_and_status() {
+        let fixture = Fixture::new();
+        let logs = fixture.path().join("regular-file");
+        std::fs::write(&logs, b"untouched").unwrap();
+        let baseline = fixture.fail(b"", &logs);
+        let error = fixture.fail(
+            b"authentication failed; compilation error; rate limit",
+            &logs,
+        );
+        assert_eq!(
+            error.to_string(),
+            "Command failed (exit 7): original diagnostic"
+        );
+        assert_eq!(chain(&error), chain(&baseline));
+        assert_eq!(std::fs::read(logs).unwrap(), b"untouched");
+        assert_eq!(entries(&fixture.path().join("tmp")).len(), 0);
+    }
+
+    #[test]
+    fn diagnostics_preserve_actual_recovery_classification_and_typed_retryability() {
+        let fixture = Fixture::new();
+        let recovery = SubRecipeRecovery::new();
+        for (stderr, expected) in [
+            ("original diagnostic", FailureClass::Unknown),
+            ("authentication failed", FailureClass::Unrecoverable),
+            ("compilation error", FailureClass::Recoverable),
+        ] {
+            std::fs::write(fixture.path().join("stderr.bin"), stderr).unwrap();
+            let script = "cat payload.bin; cat stderr.bin >&2; exit 7";
+            std::fs::write(fixture.path().join("payload.bin"), b"").unwrap();
+            let baseline = fixture
+                .execute(script, &fixture.path().join("baseline-unused"))
+                .unwrap_err()
+                .context("bash step failed")
+                .context("Step 'probe' failed");
+            assert_eq!(
+                recovery.classify_failure(&format!("{baseline:#}"), Some(7)),
+                expected
+            );
+            assert!(!crate::adapters::codex_exec::retryable(&baseline));
+            for (index, keywords) in [
+                "authentication failed",
+                "compilation error",
+                "transport error: connection reset",
+                "rate limit exceeded: 429 too many requests",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                for retention_fails in [false, true] {
+                    let parent = fixture
+                        .path()
+                        .join(format!("{stderr}-{index}-{retention_fails}-{keywords}"));
+                    let logs = parent.join("logs");
+                    if retention_fails {
+                        std::fs::create_dir_all(&parent).unwrap();
+                        std::fs::write(&logs, b"not a directory").unwrap();
+                    }
+                    std::fs::write(fixture.path().join("payload.bin"), keywords).unwrap();
+                    let error = fixture
+                        .execute(script, &logs)
+                        .unwrap_err()
+                        .context("bash step failed")
+                        .context("Step 'probe' failed");
+                    assert_eq!(chain(&error), chain(&baseline));
+                    assert_eq!(format!("{error:#}"), format!("{baseline:#}"));
+                    assert_eq!(
+                        recovery.classify_failure(&format!("{error:#}"), Some(7)),
+                        expected
+                    );
+                    assert!(!crate::adapters::codex_exec::retryable(&error));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stdout_retention_preserves_lossy_trimmed_stderr_and_signal_exit_fallback() {
+        let fixture = Fixture::new();
+        for (index, tail, expected) in [
+            (
+                0,
+                "exit 7",
+                "Command failed (exit 7): \u{fffd}\0  original diagnostic",
+            ),
+            (
+                1,
+                "kill -TERM $$",
+                "Command failed (exit -1): \u{fffd}\0  original diagnostic",
+            ),
+        ] {
+            let logs = fixture.path().join(format!("logs-{index}"));
+            let error = fixture.execute(
+                &format!("printf 'private stdout'; printf '\\377\\000  original diagnostic\\n\\t' >&2; {tail}"),
+                &logs,
+            ).unwrap_err();
+            assert_eq!(chain(&error), vec![expected]);
+            assert_eq!(
+                std::fs::read(only_artifact(&logs)).unwrap(),
+                b"private stdout"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_failed_stdout_creates_no_directory_or_artifact() {
+        let fixture = Fixture::new();
+        let logs = fixture.path().join("unused");
+        let error = fixture.fail(b"", &logs);
+        assert_eq!(
+            error.to_string(),
+            "Command failed (exit 7): original diagnostic"
+        );
+        assert!(!logs.exists());
+    }
+
+    #[test]
+    fn successful_stdout_keeps_existing_trimming_and_decoding_without_artifacts() {
+        let fixture = Fixture::new();
+        for (script, expected) in [
+            ("printf ' \\nhello\\n\\t'", "hello"),
+            ("printf '\\377\\000hello\\n'", "\u{fffd}\0hello"),
+            ("printf ' \\n\\t'", ""),
+        ] {
+            let logs = fixture.path().join("unused");
+            assert_eq!(fixture.execute(script, &logs).unwrap(), expected);
+            assert!(!logs.exists());
         }
     }
 }

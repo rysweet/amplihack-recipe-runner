@@ -14,6 +14,7 @@ use terminal::{ParallelOutcome, TerminalFailure, TerminalState};
 pub(crate) mod cleanup_test_observer;
 
 use crate::adapters::Adapter;
+use crate::adapters::cli_subprocess::{BashFailure, BashStdoutDiagnostic};
 use crate::agent_resolver::{AgentResolveError, AgentResolver};
 use crate::context::RecipeContext;
 use crate::discovery;
@@ -27,6 +28,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::models::DEFAULT_MAX_DEPTH;
@@ -40,6 +42,33 @@ const MAX_PARALLEL_STEPS: usize = 50;
 /// Maximum size of step output stored in memory (10 MB).
 pub const MAX_STEP_OUTPUT_BYTES: usize = 10_000_000;
 
+/// A failed bash stdout artifact or retention problem from this invocation.
+/// Kept separate from step errors/output and exported recipe context.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DiagnosticArtifact {
+    pub step_id: String,
+    #[serde(flatten)]
+    pub diagnostic: BashStdoutDiagnostic,
+}
+
+fn record_bash_diagnostic(
+    records: &Mutex<Vec<DiagnosticArtifact>>,
+    step_id: &str,
+    error: &anyhow::Error,
+) {
+    if let Some(failure) = error.downcast_ref::<BashFailure>()
+        && let Some(diagnostic) = &failure.diagnostic
+    {
+        records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(DiagnosticArtifact {
+                step_id: step_id.to_owned(),
+                diagnostic: diagnostic.clone(),
+            });
+    }
+}
+
 /// Executes recipes by delegating steps to an adapter.
 pub struct RecipeRunner<A: Adapter> {
     adapter: A,
@@ -48,6 +77,7 @@ pub struct RecipeRunner<A: Adapter> {
     dry_run: bool,
     auto_stage: bool,
     terminal: TerminalState,
+    diagnostic_artifacts: Mutex<Vec<DiagnosticArtifact>>,
     depth: Cell<u32>,
     total_steps: Cell<u32>,
     max_depth: Cell<u32>,
@@ -83,6 +113,7 @@ impl<A: Adapter> RecipeRunner<A> {
             dry_run: false,
             auto_stage: true,
             terminal: TerminalState::default(),
+            diagnostic_artifacts: Mutex::new(Vec::new()),
             depth: Cell::new(0),
             total_steps: Cell::new(0),
             max_depth: Cell::new(DEFAULT_MAX_DEPTH),
@@ -213,12 +244,25 @@ impl<A: Adapter> RecipeRunner<A> {
         self
     }
 
+    /// Snapshot of failed bash stdout diagnostics from the latest invocation.
+    /// Public execute resets these records; nested recipes accumulate into them.
+    pub fn diagnostic_artifacts(&self) -> Vec<DiagnosticArtifact> {
+        self.diagnostic_artifacts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     /// Execute a recipe and return the result.
     pub fn execute(
         &self,
         recipe: &Recipe,
         user_context: Option<HashMap<String, Value>>,
     ) -> RecipeResult {
+        self.diagnostic_artifacts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         self.terminal.reset();
         info!(
             "RecipeRunner::execute: recipe='{}', dry_run={}",
@@ -869,6 +913,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     .execute_bash_step(&rendered, working_dir, step.timeout, &env_vars)
                     .map(|output| output.trim_end().to_string())
                     .map_err(|e| {
+                        record_bash_diagnostic(&self.diagnostic_artifacts, &step.id, &e);
                         self.terminal.observe(&e);
                         StepExecutionError {
                             step_id: step.id.clone(),
@@ -1352,6 +1397,7 @@ impl<A: Adapter> RecipeRunner<A> {
             return vec![(0, self.execute_step(steps[0], &mut ctx_clone))];
         }
         let terminal = &self.terminal;
+        let diagnostics = &self.diagnostic_artifacts;
 
         std::thread::scope(|s| {
             let mut handles = Vec::new();
@@ -1375,7 +1421,13 @@ impl<A: Adapter> RecipeRunner<A> {
                     let ctx_clone = ctx.clone();
                     let handle = s.spawn(move || {
                         Self::execute_bash_step_parallel(
-                            step, &ctx_clone, adapter, default_wd, dry_run, terminal,
+                            step,
+                            &ctx_clone,
+                            adapter,
+                            default_wd,
+                            dry_run,
+                            terminal,
+                            diagnostics,
                         )
                     });
                     handles.push((idx, handle));
@@ -1436,6 +1488,7 @@ impl<A: Adapter> RecipeRunner<A> {
         default_working_dir: &str,
         dry_run: bool,
         terminal: &TerminalState,
+        diagnostics: &Mutex<Vec<DiagnosticArtifact>>,
     ) -> ParallelOutcome {
         log::debug!(
             "execute_bash_step_parallel: step='{}', dry_run={}",
@@ -1532,6 +1585,7 @@ impl<A: Adapter> RecipeRunner<A> {
                 }
             }
             Err(e) => {
+                record_bash_diagnostic(diagnostics, &step.id, &e);
                 failure = TerminalFailure::classify(&e);
                 terminal.merge(failure.clone());
                 // Test-only acknowledgment at the actual worker error conversion.
@@ -1693,6 +1747,109 @@ mod tests {
     use super::*;
     use crate::adapters::Adapter;
 
+    #[test]
+    fn failed_stdout_records_reset_on_public_execute_including_early_return() {
+        use crate::adapters::cli_subprocess::CLISubprocessAdapter;
+        let root = tempfile::tempdir().unwrap();
+        let runner = RecipeRunner::new(
+            CLISubprocessAdapter::new()
+                .with_env_allow([
+                    "HOME",
+                    "TMPDIR",
+                    "XDG_CONFIG_HOME",
+                    "XDG_CACHE_HOME",
+                    "PATH",
+                ])
+                .with_log_dir(root.path()),
+        )
+        .with_working_dir(root.path().to_str().unwrap())
+        .with_auto_stage(false);
+        let failure = RecipeParser::new().parse("name: probe\nsteps:\n  - id: failure\n    type: bash\n    command: printf 'private bytes'; exit 7\n").unwrap();
+        for _ in 0..2 {
+            let result = runner.execute(&failure, None);
+            assert!(!result.success);
+            let records = runner.diagnostic_artifacts();
+            assert_eq!(
+                records.len(),
+                1,
+                "fresh invocation must replace previous records"
+            );
+            assert_eq!(records[0].step_id, "failure");
+            assert_eq!(
+                std::fs::read(records[0].diagnostic.path.as_ref().unwrap()).unwrap(),
+                b"private bytes"
+            );
+            assert!(!result.to_string().contains("amplihack-failed-bash-stdout"));
+            assert!(
+                !serde_json::to_string(&result.context)
+                    .unwrap()
+                    .contains("amplihack-failed-bash-stdout")
+            );
+        }
+        let invalid = RecipeParser::new().parse("name: invalid\ncontext_validation:\n  required: nonempty\nsteps:\n  - id: unused\n    type: bash\n    command: true\n").unwrap();
+        assert!(!runner.execute(&invalid, None).success);
+        assert!(
+            runner.diagnostic_artifacts().is_empty(),
+            "early return must also reset records"
+        );
+        let success = RecipeParser::new().parse("name: success\nsteps:\n  - id: ok\n    type: bash\n    command: printf 'ordinary output'\n").unwrap();
+        assert!(runner.execute(&success, None).success);
+        assert!(runner.diagnostic_artifacts().is_empty());
+    }
+
+    #[test]
+    fn failed_stdout_metadata_does_not_change_context_environment_or_result_display() {
+        use crate::adapters::cli_subprocess::CLISubprocessAdapter;
+        let root = tempfile::tempdir().unwrap();
+        let runner = RecipeRunner::new(
+            CLISubprocessAdapter::new()
+                .with_env_allow([
+                    "HOME",
+                    "TMPDIR",
+                    "XDG_CONFIG_HOME",
+                    "XDG_CACHE_HOME",
+                    "PATH",
+                ])
+                .with_log_dir(root.path()),
+        )
+        .with_working_dir(root.path().to_str().unwrap())
+        .with_auto_stage(false);
+        let document = "name: probe\ncontext:\n  sentinel: unchanged\n  amplihack_tree_id: fixture-tree\nsteps:\n  - id: failure\n    type: bash\n    command: PAYLOAD; exit 7\n    fatal: false\n  - id: after\n    type: bash\n    command: /usr/bin/env | /usr/bin/sort\n";
+        let mut baseline = runner.execute(
+            &RecipeParser::new()
+                .parse(&document.replace("PAYLOAD", "true"))
+                .unwrap(),
+            None,
+        );
+        let mut candidate = runner.execute(
+            &RecipeParser::new()
+                .parse(&document.replace("PAYLOAD", "printf 'private bytes'"))
+                .unwrap(),
+            None,
+        );
+        assert!(candidate.success);
+        assert_eq!(runner.diagnostic_artifacts().len(), 1);
+        assert_eq!(candidate.context, baseline.context);
+        assert_eq!(
+            candidate.step_results[1].output,
+            baseline.step_results[1].output
+        );
+        assert_eq!(
+            candidate.step_results[0].error,
+            baseline.step_results[0].error
+        );
+        baseline.duration = None;
+        candidate.duration = None;
+        for step in baseline
+            .step_results
+            .iter_mut()
+            .chain(candidate.step_results.iter_mut())
+        {
+            step.duration = None;
+        }
+        assert_eq!(candidate.to_string(), baseline.to_string());
+    }
+
     struct MockAdapter;
 
     impl Adapter for MockAdapter {
@@ -1805,6 +1962,7 @@ mod tests {
             ".",
             false,
             &TerminalState::default(),
+            &Mutex::new(Vec::new()),
         );
 
         assert_eq!(outcome.result.status, StepStatus::Failed);
