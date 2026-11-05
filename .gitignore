@@ -1,3 +1,5 @@
 /target/
 /worktrees/
 .claude/runtime/
+/.amplihack/graph_db
+/.amplihack/indexes/rust.scip

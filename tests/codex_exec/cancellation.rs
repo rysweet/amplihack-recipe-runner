@@ -1,8 +1,8 @@
-use super::fixtures::LAUNCHER;
+use super::fixtures::install_launcher;
+use super::process_observation::CancellationObservation;
 use serde_json::Value;
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
     process::Command,
     time::{Duration, Instant},
 };
@@ -10,9 +10,7 @@ use std::{
 #[cfg(target_os = "linux")]
 fn assert_runner_cancellation(signal: i32, variant: &str) {
     let root = tempfile::tempdir().unwrap();
-    let launcher = root.path().join("launcher");
-    fs::write(&launcher, LAUNCHER).unwrap();
-    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+    let launcher = install_launcher(root.path());
     let recipe = root.path().join("recipe.yaml");
     let agent = "  - id: agent\n    type: agent\n    prompt: safe fixture\n";
     let marker = "  - id: after\n    type: bash\n    command: touch continued\n";
@@ -51,6 +49,14 @@ fn assert_runner_cancellation(signal: i32, variant: &str) {
         .args(["--agent-binary", "codex", "--working-dir"])
         .arg(root.path())
         .env("CODEX_TEST_ROOT", root.path())
+        .env_remove("TEST_PROVIDER")
+        .env_remove("CODEX_TEST_OBSERVE_DESCENDANT")
+        .env("HOME", root.path())
+        .env("CODEX_HOME", root.path().join("codex-home"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("PYTHONNOUSERSITE", "1")
+        .env_remove("PYTHONPATH")
+        .env_remove("PYTHONHOME")
         .env(
             "TEST_SCENARIO",
             if variant == "json" {
@@ -84,19 +90,22 @@ fn assert_runner_cancellation(signal: i32, variant: &str) {
         .unwrap();
     assert_eq!(unsafe { libc::getpgid(launcher) }, launcher);
     assert_ne!(unsafe { libc::getpgid(runner.id() as i32) }, launcher);
+    let processes = CancellationObservation::capture(root.path(), runner.id() as i32)
+        .expect("known live cancellation processes must be observed");
     assert_eq!(unsafe { libc::kill(runner.id() as i32, signal) }, 0);
     let deadline = Instant::now() + Duration::from_secs(6);
     while runner.try_wait().unwrap().is_none() {
         if Instant::now() > deadline {
-            unsafe {
-                libc::kill(-launcher, libc::SIGKILL);
-            }
+            processes
+                .cleanup()
+                .expect("verified cancellation fallback cleanup failed");
             runner.kill().unwrap();
             runner.wait().unwrap();
             panic!("cancellation exceeded cleanup bounds");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+    processes.assert_stopped();
     let output = runner.wait_with_output().unwrap();
     assert!(
         !output.status.success(),
@@ -117,28 +126,6 @@ fn assert_runner_cancellation(signal: i32, variant: &str) {
         "{variant}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    for file in ["launcher.pid", "descendant.pid"] {
-        let pid = fs::read_to_string(root.path().join(file)).unwrap();
-        let live = fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
-            .map(|stat| {
-                !matches!(
-                    stat.rsplit_once(')')
-                        .unwrap()
-                        .1
-                        .split_whitespace()
-                        .next()
-                        .unwrap(),
-                    "Z" | "X"
-                )
-            })
-            .unwrap_or(false);
-        if live {
-            unsafe {
-                libc::kill(-launcher, libc::SIGKILL);
-            }
-        }
-        assert!(!live, "{file} alive at runner return");
-    }
     let record: Value =
         serde_json::from_slice(&fs::read(root.path().join("record.json")).unwrap()).unwrap();
     assert!(

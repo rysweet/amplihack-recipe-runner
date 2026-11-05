@@ -13,6 +13,8 @@ mod final_output;
 mod fixtures;
 #[path = "codex_exec/lifecycle.rs"]
 mod lifecycle;
+#[path = "codex_exec/process_observation.rs"]
+mod process_observation;
 #[path = "codex_exec/transport.rs"]
 mod transport;
 
@@ -37,6 +39,13 @@ fn adapter_worker() {
     }
     let prior = dispositions();
     let prompt = fs::read_to_string(format!("{root}/prompt")).unwrap();
+    let observes_descendant = matches!(
+        std::env::var("TEST_SCENARIO").unwrap().as_str(),
+        "tree_timeout" | "tree_success" | "writer"
+    );
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observer = observes_descendant
+        .then(|| process_observation::watch_ready(std::path::Path::new(&root), done.clone()));
     let result = CLISubprocessAdapter::new()
         .with_binary(&std::env::var("TEST_PROVIDER").unwrap())
         .execute_agent_step(
@@ -58,25 +67,24 @@ fn adapter_worker() {
                 )
             },
         );
+    // Inspect at adapter return, before observer joining or fallback cleanup.
+    let observation = observes_descendant
+        .then(|| process_observation::capture_return(std::path::Path::new(&root)));
+    done.store(true, std::sync::atomic::Ordering::Release);
+    if let Some(observer) = observer {
+        observer
+            .join()
+            .unwrap()
+            .expect("known live descendant observation failed");
+    }
+    if let Some(observation) = observation {
+        observation.expect("adapter-return descendant observation failed");
+    }
     assert_eq!(
         dispositions(),
         prior,
         "signal dispositions must be restored"
     );
-    if let Ok(pid) = fs::read_to_string(format!("{root}/descendant.pid")) {
-        let state = fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
-            .map(|stat| {
-                stat.rsplit_once(')')
-                    .unwrap()
-                    .1
-                    .split_whitespace()
-                    .next()
-                    .unwrap()
-                    .to_string()
-            })
-            .unwrap_or_else(|_| "absent".into());
-        fs::write(format!("{root}/return-state"), state).unwrap();
-    }
     let value = match result {
         Ok(s) => json!({"ok":s}),
         Err(e) => json!({"error":format!("{e:#}")}),
