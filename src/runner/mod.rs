@@ -490,7 +490,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     if failed && gs.is_nonfatal() && !self.terminal.is_terminal() {
                         warn!(
                             "Step '{}' failed but continue_on_error is set, continuing",
-                            gs.id
+                            diagnostic_identifier(&gs.id)
                         );
                     }
 

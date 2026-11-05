@@ -47,6 +47,12 @@ impl Fixture {
     }
 
     fn cli_with_args(&self, validate_only: bool, args: &[&str]) -> Output {
+        self.cli_command(validate_only, args)
+            .output()
+            .expect("run the current-source Cargo executable")
+    }
+
+    fn cli_command(&self, validate_only: bool, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_recipe-runner-rs"));
         command
             .current_dir(self.root.path())
@@ -68,8 +74,6 @@ impl Fixture {
         }
         command.args(args);
         command
-            .output()
-            .expect("run the current-source Cargo executable")
     }
 
     fn assert_no_effects(&self) {
@@ -296,6 +300,65 @@ fn cli_nested_failure_escapes_identifiers_in_text_stderr_and_progress() {
     assert!(error.contains(&completed_id.escape_debug().to_string()));
     assert!(!error.contains(failed_id));
     assert!(!error.contains(completed_id));
+}
+
+#[test]
+fn cli_parallel_nonfatal_failure_escapes_warning_and_preserves_structured_id() {
+    let fixture = Fixture::new();
+    let id = "dispatch\n\r\u{1b}[31m\"\\step";
+    std::fs::write(
+        &fixture.parent,
+        serde_yaml::to_string(&json!({
+            "name": "parallel-warning",
+            "context": {"selected": "../child"},
+            "steps": [
+                {
+                    "id": id,
+                    "recipe": "{{selected}}",
+                    "parallel_group": "workers",
+                    "continue_on_error": true
+                },
+                {"id": "sibling", "command": "true", "parallel_group": "workers"},
+                {"id": "after", "command": "printf continued > earlier-marker"}
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = fixture
+        .cli_command(false, &["--output-format", "json"])
+        .env("RUST_LOG", "warn")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", transcript(&output));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let escaped: String = id.escape_debug().collect();
+    assert!(
+        stderr.contains(&format!(
+            "Step '{escaped}' failed but continue_on_error is set, continuing"
+        )),
+        "{stderr:?}"
+    );
+    assert!(!stderr.contains(id), "raw identifier: {stderr:?}");
+    assert!(!stderr.contains('\r'), "raw carriage return: {stderr:?}");
+    assert!(!stderr.contains('\u{1b}'), "raw ESC: {stderr:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["step_results"][0]["step_id"], id);
+    assert_eq!(result["step_results"][0]["status"], "failed");
+    assert!(
+        result["step_results"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("resolved")
+    );
+    assert_eq!(result["step_results"][1]["status"], "completed");
+    assert_eq!(result["step_results"][2]["status"], "completed");
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.path().join("earlier-marker")).unwrap(),
+        "continued"
+    );
+    assert!(!fixture.root.path().join("child-marker").exists());
 }
 
 #[test]
