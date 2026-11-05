@@ -1,26 +1,31 @@
+use super::super::fixtures::{private_tempdir, supervised_python};
 use super::record_tests::private_record;
 use super::*;
 use std::{
     os::unix::process::CommandExt,
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
 };
 
 /// All signal targets in these tests come from this disposable process tree.
 /// The worker spawns a group-leading launcher, which spawns one descendant.
-struct Tree {
-    root: tempfile::TempDir,
-    worker: Child,
-    anchor: SpawnedWorker,
-    ownership: Ownership,
+pub(super) struct Tree {
+    pub(super) root: tempfile::TempDir,
+    pub(super) worker: ChildGuard,
+    pub(super) anchor: SpawnedWorker,
+    pub(super) ownership: Ownership,
 }
 
 impl Tree {
-    fn new() -> Self {
-        let root = tempfile::tempdir().unwrap();
+    pub(super) fn new() -> Self {
+        Self::try_new(|_| {}).unwrap()
+    }
+
+    fn try_new(before_capture: impl FnOnce(&Path)) -> io::Result<Self> {
+        let root = private_tempdir();
         let launcher = r#"
 import os, pathlib, subprocess, sys, time
 root = pathlib.Path(sys.argv[1])
-child = subprocess.Popen(['/usr/bin/python3', '-c', 'import time; time.sleep(30)'])
+child = spawn_owned(['/usr/bin/python3', '-c', 'import time; time.sleep(30)'])
 for name, pid in [('descendant.pid', child.pid), ('launcher.pid', os.getpid())]:
     tmp = root/(name+'.tmp')
     with tmp.open('x') as f:
@@ -32,15 +37,17 @@ time.sleep(30)
         let code = "import subprocess, sys, time; subprocess.Popen(['/usr/bin/python3', '-c', sys.argv[1], sys.argv[2]], start_new_session=True); time.sleep(30)";
         let mut worker = Command::new("/usr/bin/python3");
         super::super::fixtures::fixture_environment(&mut worker, root.path());
-        let mut worker = worker
-            .args(["-c", code, launcher])
-            .arg(root.path())
-            .process_group(0)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let anchor = SpawnedWorker::capture(worker.id()).unwrap();
+        let mut worker = ChildGuard::new(
+            worker
+                .args(["-c", code, &supervised_python(launcher)])
+                .arg(root.path())
+                .process_group(0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let anchor = SpawnedWorker::capture(worker.id())?;
         let deadline = Instant::now() + Duration::from_secs(5);
         while !root.path().join("launcher.pid").exists() {
             if Instant::now() >= deadline {
@@ -50,14 +57,21 @@ time.sleep(30)
             }
             thread::sleep(Duration::from_millis(1));
         }
-        let records = PrivateRecords::open(root.path(), deadline).unwrap();
-        let ownership = Ownership::capture(&records, &anchor).unwrap();
-        Self {
+        before_capture(root.path());
+        let records = PrivateRecords::open(root.path(), deadline)?;
+        let ownership = Ownership::capture(&records, &anchor)?;
+        let tree = Self {
             root,
             worker,
             anchor,
             ownership,
-        }
+        };
+        publish(
+            tree.root.path(),
+            "supervisor-release.json",
+            &json!({"ownership_retained":true}),
+        )?;
+        Ok(tree)
     }
 
     fn assert_alive(&self) {
@@ -87,7 +101,7 @@ impl Drop for Tree {
 fn unrelated_launcher_tree_and_missing_records_never_establish_ownership() {
     let tree = Tree::new();
     let unrelated = Tree::new();
-    let forged = tempfile::tempdir().unwrap();
+    let forged = private_tempdir();
     private_record(
         forged.path(),
         "launcher.pid",
@@ -181,4 +195,84 @@ fn untrusted_return_receipts_cannot_replace_retained_ownership_or_authorise_sign
     publish(tree.root.path(), "descendant-return.json", &forged).unwrap();
     assert!(tree.ownership.validate_return(tree.root.path()).is_err());
     tree.assert_alive();
+}
+
+pub(super) fn assert_eventually_stopped(identities: &[Identity]) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if identities.iter().all(|identity| {
+            observe(identity.pid).unwrap().is_none_or(|process| {
+                assert_eq!(process.identity, *identity);
+                process.state != "running"
+            })
+        }) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "failure abandoned a disposable process"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+pub(super) fn assert_child_reaped(pid: i32) {
+    // A zombie is stopped but has not been reaped. The spawning parent must
+    // have consumed the direct child's wait status before returning an error.
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+}
+
+#[test]
+fn setup_failures_stop_children_without_trusting_failed_records() {
+    use std::os::unix::fs::PermissionsExt;
+    let unrelated = Tree::new();
+    for stage in ["private_directory", "unrelated_launcher"] {
+        let mut identities = Vec::new();
+        let result = Tree::try_new(|root| {
+            let records =
+                PrivateRecords::open(root, Instant::now() + Duration::from_secs(1)).unwrap();
+            let launcher = observe(records.pid_file("launcher.pid").unwrap())
+                .unwrap()
+                .unwrap();
+            identities.push(observe(launcher.ppid).unwrap().unwrap().identity);
+            identities.push(launcher.identity);
+            identities.push(
+                observe(records.pid_file("descendant.pid").unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .identity,
+            );
+            if stage == "private_directory" {
+                fs::set_permissions(root, fs::Permissions::from_mode(0o755)).unwrap();
+            } else {
+                fs::write(
+                    root.join("launcher.pid"),
+                    unrelated.ownership.launcher.pid.to_string(),
+                )
+                .unwrap();
+            }
+        });
+        let error = result
+            .err()
+            .expect("injected setup failure must remain an error");
+        assert_eq!(
+            error.to_string(),
+            if stage == "private_directory" {
+                "fixture directory is not private"
+            } else {
+                "fixture ancestry or state mismatch"
+            }
+        );
+        assert_eventually_stopped(&identities);
+        assert_child_reaped(identities[0].pid);
+        unrelated.assert_alive();
+    }
 }

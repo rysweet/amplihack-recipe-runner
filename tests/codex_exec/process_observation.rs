@@ -42,7 +42,9 @@ mod records;
 use records::PrivateRecords;
 #[path = "process_observation/ownership.rs"]
 mod ownership;
-pub(super) use ownership::{Ownership, SpawnedWorker};
+#[cfg(target_os = "linux")]
+pub(super) use ownership::CancellationObservation;
+pub(super) use ownership::{ChildGuard, Ownership, RetainedOwnership, SpawnedWorker};
 
 fn publish(root: &Path, name: &str, value: &Value) -> io::Result<()> {
     let temporary = root.join(format!("{name}.tmp"));
@@ -71,7 +73,7 @@ pub(super) fn watch_ready(
     root: &Path,
     worker: SpawnedWorker,
     done: Arc<AtomicBool>,
-) -> JoinHandle<io::Result<Ownership>> {
+) -> JoinHandle<io::Result<RetainedOwnership>> {
     let root = root.to_owned();
     thread::spawn(move || {
         let records = PrivateRecords::open(&root, Instant::now() + Duration::from_secs(8))?;
@@ -79,16 +81,7 @@ pub(super) fn watch_ready(
             match records.pid_file("launcher.pid") {
                 Ok(_) => {
                     let evidence = Ownership::capture(&records, &worker)?;
-                    publish(
-                        &root,
-                        "descendant-live.json",
-                        &record(
-                            &evidence.descendant,
-                            "descendant_ready",
-                            observe(evidence.descendant.pid)?,
-                        ),
-                    )?;
-                    return Ok(evidence);
+                    return complete_ready(&root, evidence, observe);
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
@@ -99,6 +92,67 @@ pub(super) fn watch_ready(
             thread::sleep(Duration::from_millis(1));
         }
     })
+}
+
+// Retain cleanup authority before observation or publication can fail.
+fn complete_ready(
+    root: &Path,
+    evidence: Ownership,
+    observation: impl FnOnce(i32) -> io::Result<Option<Process>>,
+) -> io::Result<RetainedOwnership> {
+    let retained = RetainedOwnership(evidence);
+    publish(
+        root,
+        "descendant-live.json",
+        &record(
+            &retained.descendant,
+            "descendant_ready",
+            observation(retained.descendant.pid)?,
+        ),
+    )?;
+    publish(
+        root,
+        "supervisor-release.json",
+        &json!({"ownership_retained":true}),
+    )?;
+    Ok(retained)
+}
+
+/// Always join the observer and release retained authority before reporting an
+/// adapter failure. Untrusted records can never nominate a cleanup target.
+pub(super) fn finish_observed(
+    child: &mut ChildGuard,
+    root: &Path,
+    done: Arc<AtomicBool>,
+    observer: Option<JoinHandle<io::Result<RetainedOwnership>>>,
+    watchdog: Duration,
+) -> io::Result<std::process::ExitStatus> {
+    let deadline = Instant::now() + watchdog;
+    let status = (|| loop {
+        if let Some(status) = child.try_wait()? {
+            break Ok(status);
+        }
+        if Instant::now() >= deadline {
+            break Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "adapter exceeded watchdog",
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    })();
+    if status.is_err() {
+        child.stop();
+    }
+    done.store(true, Ordering::Release);
+    let observed = observer.map(|observer| observer.join());
+    // Dropping the joined result also cleans verified ownership on this path.
+    let status = status?;
+    if let Some(observed) = observed {
+        let ownership = observed.map_err(|_| invalid("fixture observer panicked"))??;
+        ownership.validate_return(root)?;
+        ownership.cleanup()?;
+    }
+    Ok(status)
 }
 
 /// Capture at adapter return. This untrusted record conveys no cleanup authority.
@@ -152,54 +206,6 @@ fn cleanup_identity(identity: &Identity) -> io::Result<()> {
         }
     }
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-pub(super) struct CancellationObservation(Ownership);
-
-#[cfg(target_os = "linux")]
-impl CancellationObservation {
-    pub(super) fn capture(
-        root: &Path,
-        worker: &SpawnedWorker,
-        deadline: Instant,
-    ) -> io::Result<Self> {
-        let records = PrivateRecords::open(root, deadline)?;
-        Ok(Self(Ownership::capture(&records, worker)?))
-    }
-
-    pub(super) fn launcher_pid(&self) -> i32 {
-        self.0.launcher.pid
-    }
-
-    pub(super) fn cleanup(&self) -> io::Result<()> {
-        self.0.cleanup()
-    }
-
-    pub(super) fn assert_stopped(&self) {
-        // Observe both at the return boundary before attempting any fallback.
-        let observations =
-            [&self.0.launcher, &self.0.descendant].map(|identity| observe(identity.pid));
-        for (identity, observed) in [&self.0.launcher, &self.0.descendant]
-            .into_iter()
-            .zip(observations)
-        {
-            match observed.expect("cancellation return observation failed") {
-                None => {}
-                Some(process) => {
-                    assert_eq!(
-                        process.identity, *identity,
-                        "cancellation PID identity changed"
-                    );
-                    if process.state == "running" {
-                        self.cleanup()
-                            .expect("verified cancellation fallback cleanup failed");
-                        panic!("owned cancellation process alive at runner return");
-                    }
-                }
-            }
-        }
-    }
 }
 
 fn read_observation(root: &Path, name: &str) -> Value {

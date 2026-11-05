@@ -209,7 +209,9 @@ The final source checks on Darwin recorded these results:
 | `pre-commit run --all-files` | Passed on the current tracked-file set | `hooks-scoped` |
 
 The workspace run passed all 601 library tests and all 39 Codex integration
-tests before reaching the two existing failures.
+tests before reaching two failures outside the authored diff. The supplied base
+control covers only the Codex module, with 16 passes and 14 failures. Base
+workspace behaviour for the filesystem cases is unverified.
 `retention_problem_identifies_non_utf8_directory_losslessly` failed while
 creating its non-UTF-8 test path with `Operation not permitted`.
 `non_utf8_pointer_round_trips_every_original_path_byte` found a retention error
@@ -219,7 +221,9 @@ pre-commit command leaves the protected graph outputs untracked; it does not
 supersede the earlier rejection when those files were staged. No hook was
 excluded or bypassed.
 
-The parent must resolve the two `failed_bash_stdout_tests` failures and the
+The two `failed_bash_stdout_tests` failures require an authorised Darwin
+filesystem investigation and a concrete runtime or separate scope decision.
+The parent must resolve those failures and the
 protected large-file hook rejection through authorised work, preserving original
 evidence. It must commit the final revision, execute every required command on
 that exact commit on Darwin and Linux, including both Linux cancellation signal
@@ -229,6 +233,34 @@ sampled memory and include commands, platform, commit identity and relevant
 artifact hashes. Any later change requires renewed affected validation. The
 separate open PR must reference #196 and link accessible baseline and acceptance
 evidence. Neither it nor PR #195 may be merged.
+
+## Linux fixture correction after review
+
+The qualified Linux runtime measured umask `0022`, directory mode `0755`
+and effective UID `1000` for `tempfile::tempdir()`. The default directory mode
+is `0777` reduced by umask. This violates the observation reader's exact
+`0700` requirement. Fixture roots now request `0700` at creation, before
+writing records or spawning children. Replacement record directories also
+request `0700`. The reader still checks the exact mode and effective UID.
+An isolated child sets ordinary umask `0022` and checks both acceptance of a
+private root and rejection after changing its mode to `0755`; the parallel
+test harness never changes its own umask.
+
+Direct-child guards now exist before identity capture or record validation can
+fail. Observers retain verified ownership before fallible observation and
+publication. The adapter watchdog joins its observer and releases retained
+cleanup authority before returning its error. A synthetic launcher supervises
+its own unreaped child handles until the observer retains ownership; failed
+setup therefore requires no signalling authority from rejected PID records.
+Regression controls inject directory and ancestry failures, observation and
+publication errors, and a watchdog expiry. They check descendant termination,
+direct-child reaping and survival of an unrelated tree.
+
+These corrections do not establish a passing Darwin workspace. The exact
+final Darwin receipt at `cde5b5db` remains a failure with 601 library passes,
+39 Codex passes in 4.80 seconds, and the two filesystem failures described
+above. No base-workspace run was supplied. The original failed parallel
+control and diagnostic-only serial control remain evidence for issue #196.
 
 ## References
 

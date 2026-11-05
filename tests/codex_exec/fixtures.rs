@@ -1,12 +1,8 @@
-use super::process_observation::{SpawnedWorker, watch_ready};
+use super::process_observation::{ChildGuard, SpawnedWorker, finish_observed, watch_ready};
+pub(super) use environment_tests::{install_launcher, private_tempdir, supervised_python};
 use recipe_runner_rs::runner::MAX_STEP_OUTPUT_BYTES;
 use serde_json::Value;
-use std::{
-    fs,
-    os::unix::fs::PermissionsExt,
-    process::Command,
-    time::{Duration, Instant},
-};
+use std::{fs, os::unix::fs::PermissionsExt, process::Command, time::Duration};
 
 pub(super) const LAUNCHER: &str = r#"#!/usr/bin/python3
 import sys, os, json, pathlib, time, stat, subprocess, threading
@@ -62,13 +58,13 @@ if mode == 'cancel_json':
         sys.exit(0)
     mode = 'cancel'
 if mode in ('tree_timeout', 'tree_success', 'cancel'):
-    descendant = subprocess.Popen(['/usr/bin/python3', '-c', 'import time, signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); print("ready", flush=True); time.sleep(30)'], stdout=subprocess.PIPE)
+    descendant = spawn_owned(['/usr/bin/python3', '-c', 'import time, signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); print("ready", flush=True); time.sleep(30)'], stdout=subprocess.PIPE)
     descendant.stdout.readline()
     ready(descendant)
     if mode in ('tree_timeout', 'cancel'): time.sleep(30)
 if mode == 'writer':
     code = 'import sys, time, signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); f=open(sys.argv[1], "wb", buffering=0); print("ready", flush=True)\nwhile True: f.write(b"x"); time.sleep(0.001)'
-    descendant = subprocess.Popen(['/usr/bin/python3', '-c', code, str(final)], stdout=subprocess.PIPE)
+    descendant = spawn_owned(['/usr/bin/python3', '-c', code, str(final)], stdout=subprocess.PIPE)
     descendant.stdout.readline()
     ready(descendant)
 if mode == 'blocked':
@@ -120,21 +116,6 @@ completed({
 }.get(mode, 'final_written'))
 sys.exit(7 if mode in ('nonzero', 'auth_failure') else 0)
 "#;
-
-/// Invoke a trusted interpreter directly. Executing a newly written shebang
-/// script can delay interpreter entry beyond the one-second attempt on Darwin.
-/// The adapter's provider argument selects a private Python source file.
-pub(super) fn install_launcher(root: &std::path::Path) -> std::path::PathBuf {
-    for provider in ["codex", "claude", "copilot"] {
-        let source = root.join(provider);
-        fs::write(&source, LAUNCHER).unwrap();
-        fs::set_permissions(source, fs::Permissions::from_mode(0o600)).unwrap();
-    }
-    // Apple's /usr/bin/python3 dispatcher requires this basename.
-    let launcher = root.join("python3");
-    std::os::unix::fs::symlink("/usr/bin/python3", &launcher).unwrap();
-    launcher
-}
 
 // This assertion specifies the launcher contract. The launcher must publish the
 // receipt after the selected operation, rather than merely after process entry.
@@ -205,7 +186,7 @@ pub(super) fn run(
     model: Option<&str>,
     provider: &str,
 ) -> (tempfile::TempDir, Value, Value) {
-    let root = tempfile::tempdir().unwrap();
+    let root = private_tempdir();
     if scenario == "git_checkout" {
         assert!(
             Command::new("/usr/bin/git")
@@ -247,39 +228,21 @@ pub(super) fn run(
     if let Some(model) = model {
         command.env("TEST_MODEL", model);
     }
-    let mut child = command.spawn().unwrap();
+    let mut child = ChildGuard::new(command.spawn().unwrap());
     let observes_descendant = matches!(scenario, "tree_timeout" | "tree_success" | "writer");
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observer = observes_descendant.then(|| {
         let worker = SpawnedWorker::capture(child.id()).expect("spawned worker identity");
         watch_ready(root.path(), worker, done.clone())
     });
-    let start = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if start.elapsed() > Duration::from_secs(8) {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            done.store(true, std::sync::atomic::Ordering::Release);
-            panic!("adapter exceeded watchdog");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    done.store(true, std::sync::atomic::Ordering::Release);
-    if let Some(observer) = observer {
-        let ownership = observer
-            .join()
-            .unwrap()
-            .expect("live fixture ownership must be verified");
-        // Boundary assertions still use the worker's immediate return receipt.
-        // Cleanup here cannot turn a live-at-return receipt into a passing test.
-        let boundary = ownership.validate_return(root.path());
-        let cleanup = ownership.cleanup();
-        boundary.expect("fixture return observation must match retained ownership");
-        cleanup.expect("verified fixture fallback cleanup failed");
-    }
+    let status = finish_observed(
+        &mut child,
+        root.path(),
+        done,
+        observer,
+        Duration::from_secs(8),
+    )
+    .expect("adapter fixture observation failed");
     assert!(status.success());
     let result =
         serde_json::from_slice(&fs::read(root.path().join("result.json")).unwrap()).unwrap();

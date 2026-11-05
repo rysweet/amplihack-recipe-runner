@@ -132,3 +132,129 @@ impl Ownership {
         cleanup_identity(&self.launcher)
     }
 }
+
+/// A direct Child handle authorises cleanup even when identity capture fails.
+pub(crate) struct ChildGuard(Option<std::process::Child>);
+impl ChildGuard {
+    pub(crate) fn new(child: std::process::Child) -> Self {
+        Self(Some(child))
+    }
+
+    pub(crate) fn stop(&mut self) {
+        let Some(child) = self.0.as_mut() else { return };
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        if let Err(error) = child.kill() {
+            eprintln!("direct fixture child kill failed: {error}");
+        }
+        if let Err(error) = child.wait() {
+            eprintln!("direct fixture child wait failed: {error}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn wait_with_output(mut self) -> io::Result<std::process::Output> {
+        use std::io::Read;
+        let status = self.wait()?;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        if let Some(mut pipe) = self.stdout.take() {
+            pipe.read_to_end(&mut stdout)?;
+        }
+        if let Some(mut pipe) = self.stderr.take() {
+            pipe.read_to_end(&mut stderr)?;
+        }
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+}
+impl std::ops::Deref for ChildGuard {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().unwrap()
+    }
+}
+impl std::ops::DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().unwrap()
+    }
+}
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Only verified in-memory ancestry can construct this cleanup guard.
+pub(crate) struct RetainedOwnership(pub(super) Ownership);
+impl std::ops::Deref for RetainedOwnership {
+    type Target = Ownership;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl Drop for RetainedOwnership {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.cleanup() {
+            eprintln!("verified fixture cleanup failed: {error}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct CancellationObservation(RetainedOwnership);
+
+#[cfg(target_os = "linux")]
+impl CancellationObservation {
+    pub(crate) fn capture(
+        root: &Path,
+        worker: &SpawnedWorker,
+        deadline: Instant,
+    ) -> io::Result<Self> {
+        let records = PrivateRecords::open(root, deadline)?;
+        let observation = Self(RetainedOwnership(Ownership::capture(&records, worker)?));
+        super::publish(
+            root,
+            "supervisor-release.json",
+            &serde_json::json!({"ownership_retained":true}),
+        )?;
+        Ok(observation)
+    }
+
+    pub(crate) fn launcher_pid(&self) -> i32 {
+        self.0.launcher.pid
+    }
+
+    pub(crate) fn cleanup(&self) -> io::Result<()> {
+        self.0.cleanup()
+    }
+
+    pub(crate) fn assert_stopped(&self) {
+        // Observe both at the return boundary before attempting any fallback.
+        let observations =
+            [&self.0.launcher, &self.0.descendant].map(|identity| observe(identity.pid));
+        for (identity, observed) in [&self.0.launcher, &self.0.descendant]
+            .into_iter()
+            .zip(observations)
+        {
+            match observed.expect("cancellation return observation failed") {
+                None => {}
+                Some(process) => {
+                    assert_eq!(
+                        process.identity, *identity,
+                        "cancellation PID identity changed"
+                    );
+                    if process.state == "running" {
+                        self.cleanup()
+                            .expect("verified cancellation fallback cleanup failed");
+                        panic!("owned cancellation process alive at runner return");
+                    }
+                }
+            }
+        }
+    }
+}
