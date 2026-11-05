@@ -431,6 +431,9 @@ escapes to UTF-8 and retries YAML decoding. Other escapes, scalar spellings and
 duplicate entries remain unchanged. YAML's existing scalar conversion still
 applies: for example, numeric `"version": 1` becomes the string `"1"` with either
 Unicode spelling. The same recipe validation checks follow either decoding path.
+Ignored fields also retain YAML's acceptance of numbers outside the range of a
+64-bit floating-point value, such as `1e400`. JSON syntax, Unicode strings and
+nesting limits remain checked throughout the document, including ignored fields.
 
 ### Unicode strings
 

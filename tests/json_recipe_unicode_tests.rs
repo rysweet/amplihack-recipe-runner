@@ -72,6 +72,72 @@ fn numeric_version_keeps_yaml_string_coercion_with_surrogate_pairs() {
 }
 
 #[test]
+fn ignored_oversized_numbers_keep_raw_utf8_acceptance_and_warnings() {
+    for number in [
+        "1e400",
+        "-1e400",
+        "1e999999999999999999999",
+        &"9".repeat(400),
+    ] {
+        for (fields, steps) in [
+            (
+                format!(r#""ignored":{number},"#),
+                r#"[{"id":"s","command":"true"}]"#.to_string(),
+            ),
+            (
+                format!(r#""ignored":{{"nested":[{number}]}},"#),
+                r#"[{"id":"s","command":"true"}]"#.to_string(),
+            ),
+            (
+                String::new(),
+                format!(r#"[{{"id":"s","command":"true","ignored":{{"nested":[{number}]}}}}]"#),
+            ),
+        ] {
+            let escaped = document(&fields, &steps);
+            let raw = escaped.replace(r"\uD83D\uDE80", "🚀");
+            let baseline = parser()
+                .parse(&raw)
+                .expect("raw UTF-8 skips ignored numbers");
+            let candidate = parser()
+                .parse(&escaped)
+                .expect("surrogate pairs must also skip ignored numbers");
+            assert_eq!(
+                serde_json::to_value(candidate).unwrap(),
+                serde_json::to_value(baseline).unwrap(),
+                "recipe differs: {escaped}"
+            );
+            assert_eq!(
+                validate_recipe(&escaped).unwrap(),
+                validate_recipe(&raw).unwrap(),
+                "warnings differ: {escaped}"
+            );
+        }
+    }
+}
+
+#[test]
+fn ignored_numbers_do_not_hide_invalid_json_or_unicode() {
+    for value in [
+        "01",
+        "1e",
+        "1e+",
+        "1.",
+        "+1",
+        "NaN",
+        "Infinity",
+        r#"[1e400,"\uD800"]"#,
+        r#"{"\uDC00":1e400}"#,
+        r#"[1e400,"\q"]"#,
+    ] {
+        let input = document(&format!(r#""ignored":{value},"#), r#"[{"id":"s"}]"#);
+        let original = serde_yaml::from_str::<Recipe>(&input).unwrap_err();
+        let error = parser().parse(&input).unwrap_err();
+        assert!(matches!(error, ParseError::Yaml(_)), "{input}: {error}");
+        assert_eq!(error.to_string(), format!("YAML parse error: {original}"));
+    }
+}
+
+#[test]
 fn scalar_spellings_and_string_fields_keep_the_raw_utf8_baseline() {
     for scalar in ["0", "-0", "-42", "1.25", "1e+03", "true", "false", "null"] {
         let mut cases = Vec::new();
@@ -203,12 +269,15 @@ fn json_fallback_requires_one_complete_document_and_bounded_nesting() {
     for suffix in [" {}", " null", " trailing", "\n---\nname: other"] {
         assert!(parser().parse(&format!("{valid}{suffix}")).is_err());
     }
-    let nested = format!("{}0{}", "[".repeat(256), "]".repeat(256));
-    let deep = document(&format!(r#""ignored":{nested},"#), r#"[{"id":"s"}]"#);
-    assert!(
-        parser().parse(&deep).is_err(),
-        "ignored values must retain recursion protection"
-    );
+    for depth in [125, 126, 127, 128, 256] {
+        let nested = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+        let deep = document(&format!(r#""ignored":{nested},"#), r#"[{"id":"s"}]"#);
+        assert_eq!(
+            parser().parse(&deep).is_ok(),
+            serde_json::from_str::<Value>(&deep).is_ok(),
+            "ignored values must retain the JSON recursion limit at depth {depth}"
+        );
+    }
     assert!(
         parser().parse(&valid).is_ok(),
         "the complete document is valid"

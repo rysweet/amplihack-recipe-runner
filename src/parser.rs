@@ -275,10 +275,7 @@ impl RecipeParser {
 /// Keep successful YAML decoding authoritative, with strict JSON as a fallback.
 fn decode_recipe_document<T: DeserializeOwned>(content: &str) -> Result<T, serde_yaml::Error> {
     serde_yaml::from_str(content).or_else(|yaml_error| {
-        // Typed decoding can skip ignored values without checking their Unicode.
-        // Validate the complete JSON document, including ignored nested strings.
-        // JSON Value retains the existing acceptance of duplicate map entries.
-        if serde_json::from_str::<serde_json::Value>(content).is_err() {
+        if !valid_json_document(content) {
             return Err(yaml_error);
         }
 
@@ -318,6 +315,50 @@ fn decode_recipe_document<T: DeserializeOwned>(content: &str) -> Result<T, serde
         // Preserve the original YAML diagnostic if the fallback cannot decode T.
         serde_yaml::from_str(&utf8).map_err(|_| yaml_error)
     })
+}
+
+/// Validate JSON without imposing a numeric representation on ignored fields.
+fn valid_json_document(content: &str) -> bool {
+    // IgnoredAny checks complete syntax and permits duplicate entries and
+    // numbers outside f64's range, but skips Unicode and recursion checks.
+    if serde_json::from_str::<serde::de::IgnoredAny>(content).is_err() {
+        return false;
+    }
+    let bytes = content.as_bytes();
+    let mut depth = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let start = i;
+                i += 1;
+                while bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                // Syntax validation above guarantees a closing quote. Decode
+                // every string, including ignored values and keys, to reject
+                // lone or malformed surrogates before conversion.
+                if serde_json::from_slice::<String>(&bytes[start..=i]).is_err() {
+                    return false;
+                }
+            }
+            b'[' | b'{' => {
+                depth += 1;
+                // Retain serde_json's default recursion limit from the former
+                // Value guard; IgnoredAny alone does not enforce this limit.
+                if depth >= 128 {
+                    return false;
+                }
+            }
+            b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    true
 }
 
 /// #130: one warning per unknown or retired step field in the raw recipe YAML.
