@@ -8,6 +8,15 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
+/// Escape a raw identifier for printable diagnostics without changing the identifier.
+///
+/// Uses the same visible control-character escapes as Rust debug strings, without
+/// enclosing quotes. Apply only to identifiers at display boundaries, not to
+/// assembled messages or structured fields. This function performs no I/O.
+pub fn diagnostic_identifier(raw: &str) -> String {
+    raw.escape_debug().collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StepType {
@@ -104,7 +113,7 @@ impl Step {
     pub fn effective_type(&self) -> StepType {
         trace!(
             "Step::effective_type: inferring type for step '{}'",
-            self.id
+            diagnostic_identifier(&self.id)
         );
         if let Some(t) = self.step_type {
             return t;
@@ -239,7 +248,12 @@ impl fmt::Display for StepResult {
             "StepResult::fmt: formatting step_id={:?}, status={:?}",
             self.step_id, self.status
         );
-        write!(f, "[{:>9}] {}", self.status, self.step_id)?;
+        write!(
+            f,
+            "[{:>9}] {}",
+            self.status,
+            diagnostic_identifier(&self.step_id)
+        )?;
         if let Some(d) = self.duration {
             write!(f, " ({:.1}s)", d.as_secs_f64())?;
         }
@@ -270,10 +284,16 @@ impl fmt::Display for RecipeResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         trace!(
             "RecipeResult::fmt: formatting recipe='{}', success={}",
-            self.recipe_name, self.success
+            diagnostic_identifier(&self.recipe_name),
+            self.success
         );
         let status = if self.success { "SUCCESS" } else { "FAILED" };
-        write!(f, "Recipe '{}': {}", self.recipe_name, status)?;
+        write!(
+            f,
+            "Recipe '{}': {}",
+            diagnostic_identifier(&self.recipe_name),
+            status
+        )?;
         if let Some(d) = self.duration {
             write!(f, " ({:.1}s)", d.as_secs_f64())?;
         }
@@ -287,7 +307,7 @@ impl fmt::Display for RecipeResult {
 
 /// Error raised when a step fails to execute.
 #[derive(Debug, thiserror::Error)]
-#[error("Step '{step_id}' failed: {message}")]
+#[error("Step '{}' failed: {message}", diagnostic_identifier(.step_id))]
 pub struct StepExecutionError {
     pub step_id: String,
     pub message: String,
@@ -296,6 +316,49 @@ pub struct StepExecutionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_displays_escape_identifiers_and_preserve_structured_values() {
+        let raw = "identifier\n\r\u{1b}[31m\"\\tail";
+        let escaped = "identifier\\n\\r\\u{1b}[31m\\\"\\\\tail";
+        assert_eq!(diagnostic_identifier(raw), escaped);
+        assert_eq!(diagnostic_identifier("ordinary-step_1"), "ordinary-step_1");
+        assert_eq!(diagnostic_identifier(""), "");
+        let error = StepExecutionError {
+            step_id: raw.into(),
+            message: "already escaped \\n with a real\nmessage line".into(),
+        };
+        assert_eq!(
+            error.to_string(),
+            format!("Step '{escaped}' failed: {}", error.message)
+        );
+        assert_eq!(error.step_id, raw);
+        let result = RecipeResult {
+            recipe_name: raw.into(),
+            success: false,
+            step_results: vec![StepResult {
+                step_id: raw.into(),
+                status: StepStatus::Failed,
+                output: String::new(),
+                error: error.to_string(),
+                duration: None,
+            }],
+            context: HashMap::new(),
+            duration: None,
+        };
+        let text = result.to_string();
+        assert!(text.contains(&format!("Recipe '{escaped}': FAILED")));
+        assert!(text.contains(&format!("[failed] {escaped}")));
+        assert!(
+            text.contains(&error.to_string()),
+            "message escaped twice: {text}"
+        );
+        assert!(!text.contains(raw));
+        let structured = serde_json::to_value(&result).unwrap();
+        assert_eq!(structured["recipe_name"], raw);
+        assert_eq!(structured["step_results"][0]["step_id"], raw);
+        assert_eq!(structured["step_results"][0]["error"], error.to_string());
+    }
 
     #[test]
     fn test_effective_type_explicit_bash() {

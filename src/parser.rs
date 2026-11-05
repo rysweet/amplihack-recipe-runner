@@ -158,7 +158,7 @@ impl RecipeParser {
             if !seen.insert(&step.id) {
                 return Err(ParseError::Invalid(format!(
                     "Duplicate step id: '{}'",
-                    step.id
+                    crate::models::diagnostic_identifier(&step.id)
                 )));
             }
         }
@@ -192,7 +192,7 @@ impl RecipeParser {
     pub fn validate(&self, recipe: &Recipe) -> Vec<String> {
         debug!(
             "RecipeParser::validate: validating recipe '{}'",
-            recipe.name
+            crate::models::diagnostic_identifier(&recipe.name)
         );
         self.validate_with_yaml(recipe, None)
     }
@@ -201,7 +201,7 @@ impl RecipeParser {
     pub fn validate_with_yaml(&self, recipe: &Recipe, raw_yaml: Option<&str>) -> Vec<String> {
         debug!(
             "RecipeParser::validate_with_yaml: validating recipe '{}' ({} steps)",
-            recipe.name,
+            crate::models::diagnostic_identifier(&recipe.name),
             recipe.steps.len()
         );
         let mut warnings = Vec::new();
@@ -213,7 +213,7 @@ impl RecipeParser {
                     if step.prompt.is_none() {
                         warnings.push(format!(
                             "Step '{}': agent step is missing a 'prompt' field",
-                            step.id
+                            crate::models::diagnostic_identifier(&step.id)
                         ));
                     }
                 }
@@ -221,7 +221,7 @@ impl RecipeParser {
                     if step.command.is_none() {
                         warnings.push(format!(
                             "Step '{}': bash step is missing a 'command' field",
-                            step.id
+                            crate::models::diagnostic_identifier(&step.id)
                         ));
                     }
                 }
@@ -229,7 +229,7 @@ impl RecipeParser {
                     if step.recipe.is_none() {
                         warnings.push(format!(
                             "Step '{}': recipe step is missing a 'recipe' field",
-                            step.id
+                            crate::models::diagnostic_identifier(&step.id)
                         ));
                     }
                 }
@@ -342,7 +342,7 @@ fn first_report(warning: &str) -> bool {
 /// Recipe-supplied text made safe for a terminal or log line: escaped, and
 /// capped at [`MAX_WARNING_TEXT_CHARS`] characters.
 fn warning_text(raw: &str) -> String {
-    let escaped: String = raw.escape_debug().collect();
+    let escaped = crate::models::diagnostic_identifier(raw);
     if escaped.chars().count() <= MAX_WARNING_TEXT_CHARS {
         escaped
     } else {
@@ -377,7 +377,7 @@ impl Default for RecipeParser {
 pub fn resolve_extends(recipe: &mut Recipe, search_dirs: &[PathBuf]) -> Result<(), ParseError> {
     info!(
         "resolve_extends: resolving extends for recipe '{}'",
-        recipe.name
+        crate::models::diagnostic_identifier(&recipe.name)
     );
     resolve_extends_with_visited(recipe, search_dirs, &mut HashSet::new())
 }
@@ -389,7 +389,8 @@ fn resolve_extends_with_visited(
 ) -> Result<(), ParseError> {
     debug!(
         "resolve_extends_with_visited: processing recipe '{}', visited={:?}",
-        recipe.name, visited
+        crate::models::diagnostic_identifier(&recipe.name),
+        visited
     );
     let parent_name = match recipe.extends.take() {
         Some(name) => name,
@@ -399,14 +400,14 @@ fn resolve_extends_with_visited(
     if !visited.insert(parent_name.clone()) {
         return Err(ParseError::Extends(format!(
             "Circular extends detected: '{}' was already visited in the extends chain",
-            parent_name
+            crate::models::diagnostic_identifier(&parent_name)
         )));
     }
 
     let parent_path = discovery::find_recipe(&parent_name, Some(search_dirs)).ok_or_else(|| {
         ParseError::Extends(format!(
             "Parent recipe '{}' not found in search directories",
-            parent_name
+            crate::models::diagnostic_identifier(&parent_name)
         ))
     })?;
 
@@ -456,7 +457,7 @@ fn resolve_extends_with_visited(
 
     debug!(
         "resolve_extends_with_visited: extends for '{}' resolved successfully",
-        recipe.name
+        crate::models::diagnostic_identifier(&recipe.name)
     );
     Ok(())
 }
@@ -464,6 +465,34 @@ fn resolve_extends_with_visited(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extends_diagnostics_escape_raw_identifiers() {
+        let raw = "parent\n\r\u{1b}[31m\"\\name";
+        let escaped = "parent\\n\\r\\u{1b}[31m\\\"\\\\name";
+        let recipe: Recipe = serde_json::from_value(serde_json::json!({
+            "name": "child", "extends": raw, "steps": []
+        }))
+        .unwrap();
+        let mut missing = recipe.clone();
+        let error = resolve_extends(&mut missing, &[]).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("Parent recipe '{escaped}' not found")),
+            "{error}"
+        );
+        assert!(!error.contains(raw));
+        let mut cyclic = recipe;
+        let mut visited = HashSet::from([raw.to_string()]);
+        let error = resolve_extends_with_visited(&mut cyclic, &[], &mut visited)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("Circular extends detected: '{escaped}'")),
+            "{error}"
+        );
+        assert!(!error.contains(raw));
+        assert!(visited.contains(raw), "visited identifiers must remain raw");
+    }
 
     #[test]
     fn test_parse_minimal_recipe() {

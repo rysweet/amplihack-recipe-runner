@@ -484,6 +484,10 @@ Validation checks the recipe being loaded or executed. It does not eagerly find 
 sub-recipe graph or prove that a valid name exists on disk. A child's invalid literal fails before any
 child steps run; earlier parent steps may already have completed when the child is loaded.
 
+Text results, nested failure summaries and progress messages show control characters in recipe and step
+identifiers as visible escapes, such as `\n`, `\r` and `\u{1b}`. JSON results and progress log events retain
+the original identifiers after JSON decoding. Progress logs use one serialised JSON object per line.
+
 ### Template references
 
 Supported expressions such as `{{child_name}}` and `{{deployment.recipe}}` defer the name check until

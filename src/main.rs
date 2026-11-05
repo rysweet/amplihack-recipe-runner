@@ -7,6 +7,7 @@ use log::{debug, info};
 use recipe_runner_rs::adapters::cli_subprocess::{CLISubprocessAdapter, TimeoutAction};
 use recipe_runner_rs::agent_resolver::AgentResolver;
 use recipe_runner_rs::discovery;
+use recipe_runner_rs::models::diagnostic_identifier;
 use recipe_runner_rs::parser::RecipeParser;
 use recipe_runner_rs::runner::{FileLogListener, RecipeRunner, StderrListener};
 use serde_json::Value;
@@ -367,7 +368,11 @@ fn run() -> i32 {
 
     // --explain: show recipe structure
     if cli.explain {
-        println!("Recipe: {} (v{})", recipe.name, recipe.version);
+        println!(
+            "Recipe: {} (v{})",
+            diagnostic_identifier(&recipe.name),
+            recipe.version
+        );
         if !recipe.description.is_empty() {
             println!("Description: {}", recipe.description);
         }
@@ -413,7 +418,7 @@ fn run() -> i32 {
                     .map(|p| p + 1)
                     .unwrap_or(0),
                 ty.to_lowercase(),
-                step.id,
+                diagnostic_identifier(&step.id),
                 cond,
                 out,
                 pj,
@@ -436,13 +441,13 @@ fn run() -> i32 {
         if warnings.is_empty() {
             println!(
                 "✓ Recipe '{}' is valid ({} steps)",
-                recipe.name,
+                diagnostic_identifier(&recipe.name),
                 recipe.steps.len()
             );
         } else {
             println!(
                 "⚠ Recipe '{}' has {} warning(s):",
-                recipe.name,
+                diagnostic_identifier(&recipe.name),
                 warnings.len()
             );
             for w in &warnings {
@@ -453,7 +458,11 @@ fn run() -> i32 {
     }
 
     if cli.output_format != "json" {
-        println!("Recipe: {} (v{})", recipe.name, recipe.version);
+        println!(
+            "Recipe: {} (v{})",
+            diagnostic_identifier(&recipe.name),
+            recipe.version
+        );
         println!("Steps: {}", recipe.steps.len());
     }
 
@@ -531,7 +540,7 @@ fn run() -> i32 {
     };
     info!(
         "run: executing recipe '{}' with {} steps",
-        recipe.name,
+        diagnostic_identifier(&recipe.name),
         recipe.steps.len()
     );
     let result = runner.execute(&recipe, ctx);

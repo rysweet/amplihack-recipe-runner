@@ -43,6 +43,10 @@ impl Fixture {
     }
 
     fn cli(&self, validate_only: bool) -> Output {
+        self.cli_with_args(validate_only, &[])
+    }
+
+    fn cli_with_args(&self, validate_only: bool, args: &[&str]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_recipe-runner-rs"));
         command
             .current_dir(self.root.path())
@@ -62,6 +66,7 @@ impl Fixture {
         if validate_only {
             command.arg("--validate-only");
         }
+        command.args(args);
         command
             .output()
             .expect("run the current-source Cargo executable")
@@ -182,4 +187,170 @@ fn cli_dynamic_path_passes_static_validation_but_fails_after_rendering() {
     assert_reference_failure(&execution, true);
     assert!(fixture.root.path().join("earlier-marker").exists());
     assert!(!fixture.root.path().join("child-marker").exists());
+}
+
+#[test]
+fn cli_nested_failure_escapes_identifiers_in_text_stderr_and_progress() {
+    let fixture = Fixture::new();
+    let recipe_name = "parent\n\r\u{1b}[31m\"\\name";
+    let parent_id = "dispatch\n\r\u{1b}[31m\"\\step";
+    let completed_id = "completed\n\r\u{1b}[31m\"\\step";
+    let failed_id = "failed\n\r\u{1b}[31m\"\\step";
+    let reference = "bad\n\r\u{1b}[31m\"\\name";
+    std::fs::write(
+        &fixture.parent,
+        serde_yaml::to_string(&json!({
+            "name": recipe_name,
+            "steps": [{"id": parent_id, "recipe": "child"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &fixture.child,
+        serde_yaml::to_string(&json!({
+            "name": "child",
+            "context": {"selected": reference},
+            "steps": [
+                {"id": completed_id, "command": "true"},
+                {"id": failed_id, "recipe": "{{selected}}"},
+                {"id": "never", "command": "printf child > child-marker"}
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    for args in [vec![], vec!["--progress"]] {
+        let output = fixture.cli_with_args(false, &args);
+        assert!(!output.status.success(), "{}", transcript(&output));
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        for text in [&stdout, &stderr] {
+            for id in [parent_id, completed_id, failed_id] {
+                let escaped: String = id.escape_debug().collect();
+                assert!(text.contains(&escaped), "missing {escaped}: {text:?}");
+                assert!(!text.contains(id), "raw identifier: {text:?}");
+            }
+            assert!(!text.contains('\r'), "raw carriage return: {text:?}");
+            assert!(!text.contains('\u{1b}'), "raw ESC: {text:?}");
+            assert!(
+                !text.contains("Searched the following directories"),
+                "{text}"
+            );
+        }
+        let escaped_name: String = recipe_name.escape_debug().collect();
+        assert!(stdout.contains(&format!("Recipe '{escaped_name}': FAILED")));
+        let escaped_completed: String = completed_id.escape_debug().collect();
+        assert!(stdout.contains(&format!("Completed steps: {escaped_completed}")));
+        assert!(
+            !stdout.contains("completed\\\\n"),
+            "error was escaped twice: {stdout}"
+        );
+        if !args.is_empty() {
+            let escaped_parent: String = parent_id.escape_debug().collect();
+            assert!(stderr.contains(&format!("▶ {escaped_parent} [sub-recipe]")));
+            assert!(stderr.contains(&format!("✗ {escaped_parent}")));
+            let path = stderr
+                .lines()
+                .find_map(|line| line.strip_prefix("[amplihack] recipe log: "))
+                .unwrap();
+            let events: Vec<serde_json::Value> = std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(events[0]["recipe"], recipe_name);
+            let transitions: Vec<_> = events[1..]
+                .iter()
+                .map(|event| {
+                    (
+                        event["step"].as_str().unwrap(),
+                        event["status"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                transitions,
+                vec![
+                    (parent_id, "start"),
+                    (completed_id, "start"),
+                    (completed_id, "done"),
+                    (failed_id, "start"),
+                    (failed_id, "fail"),
+                    (parent_id, "fail"),
+                ]
+            );
+            std::fs::remove_file(path).unwrap();
+        }
+        assert!(!fixture.root.path().join("child-marker").exists());
+    }
+
+    let output = fixture.cli_with_args(false, &["--output-format", "json"]);
+    assert!(!output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["recipe_name"], recipe_name);
+    assert_eq!(result["step_results"][0]["step_id"], parent_id);
+    let error = result["step_results"][0]["error"].as_str().unwrap();
+    assert!(error.contains(&failed_id.escape_debug().to_string()));
+    assert!(error.contains(&completed_id.escape_debug().to_string()));
+    assert!(!error.contains(failed_id));
+    assert!(!error.contains(completed_id));
+}
+
+#[test]
+fn cli_progress_escapes_completed_step_identifiers() {
+    let fixture = Fixture::new();
+    let id = "completed\n\r\u{1b}[31m";
+    std::fs::write(
+        &fixture.parent,
+        serde_yaml::to_string(&json!({
+            "name": "progress", "steps": [{"id": id, "command": "true"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = fixture.cli_with_args(false, &["--progress"]);
+    assert!(output.status.success(), "{}", transcript(&output));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let escaped: String = id.escape_debug().collect();
+    assert!(stderr.contains(&format!("▶ {escaped}")), "{stderr:?}");
+    assert!(stderr.contains(&format!("✓ {escaped}")), "{stderr:?}");
+    assert!(!stderr.contains(id), "{stderr:?}");
+    let path = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("[amplihack] recipe log: "))
+        .unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn cli_dry_run_json_preserves_identifiers_and_inspection_text_escapes_them() {
+    let fixture = Fixture::new();
+    let id = "identifier\n\r\u{1b}[31m\"\\tail";
+    std::fs::write(
+        &fixture.parent,
+        serde_yaml::to_string(&json!({
+            "name": id,
+            "steps": [{"id": id, "command": "printf child > child-marker", "parse_json": true}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = fixture.cli_with_args(false, &["--dry-run", "--output-format", "json"]);
+    assert!(output.status.success(), "{}", transcript(&output));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["recipe_name"], id);
+    assert_eq!(result["step_results"][0]["step_id"], id);
+    let step_output: serde_json::Value =
+        serde_json::from_str(result["step_results"][0]["output"].as_str().unwrap()).unwrap();
+    assert_eq!(step_output, json!({"dry_run": true, "step": id}));
+    for args in [vec!["--validate-only"], vec!["--explain"]] {
+        let output = fixture.cli_with_args(false, &args);
+        assert!(output.status.success(), "{}", transcript(&output));
+        let text = transcript(&output);
+        assert!(text.contains(&id.escape_debug().to_string()), "{text:?}");
+        assert!(!text.contains(id), "{text:?}");
+    }
+    fixture.assert_no_effects();
 }
