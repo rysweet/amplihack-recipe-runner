@@ -57,6 +57,89 @@ fn escaped_surrogate_pairs_match_raw_utf8_exactly() {
 }
 
 #[test]
+fn numeric_version_keeps_yaml_string_coercion_with_surrogate_pairs() {
+    let raw =
+        r#"{"name":"parity","version":1,"description":"🚀","steps":[{"id":"s","command":"true"}]}"#;
+    let escaped = r#"{"name":"parity","version":1,"description":"\uD83D\uDE80","steps":[{"id":"s","command":"true"}]}"#;
+    let raw = parse_recipe(raw).expect("the raw UTF-8 baseline accepts a numeric version");
+    assert_eq!(raw.version, "1");
+    let escaped =
+        parse_recipe(escaped).expect("surrogate pairs must retain YAML scalar acceptance");
+    assert_eq!(
+        serde_json::to_value(escaped).unwrap(),
+        serde_json::to_value(raw).unwrap()
+    );
+}
+
+#[test]
+fn scalar_spellings_and_string_fields_keep_the_raw_utf8_baseline() {
+    for scalar in ["0", "-0", "-42", "1.25", "1e+03", "true", "false", "null"] {
+        let mut cases = Vec::new();
+        for field in ["version", "author", "extends"] {
+            cases.push(document(
+                &format!(r#""{field}":{scalar},"#),
+                r#"[{"id":"s","command":"true"}]"#,
+            ));
+        }
+        for fields in [
+            format!(r#""tags":[{scalar}],"#),
+            format!(r#""context_validation":{{"x":{scalar}}},"#),
+            format!(r#""hooks":{{"pre_step":{scalar}}},"#),
+        ] {
+            cases.push(document(&fields, r#"[{"id":"s","command":"true"}]"#));
+        }
+        for field in ["id", "command", "prompt", "working_dir"] {
+            let step = if field == "id" {
+                format!(r#"[{{"id":{scalar},"command":"true"}}]"#)
+            } else {
+                format!(r#"[{{"id":"s","{field}":{scalar}}}]"#)
+            };
+            cases.push(document("", &step));
+        }
+        for escaped in cases {
+            let raw = escaped.replace(r"\uD83D\uDE80", "🚀");
+            let baseline = parser().parse(&raw);
+            let candidate = parser().parse(&escaped);
+            assert_eq!(
+                baseline.is_ok(),
+                candidate.is_ok(),
+                "scalar acceptance differs: {escaped}"
+            );
+            if let (Ok(raw), Ok(escaped)) = (baseline, candidate) {
+                assert_eq!(
+                    serde_json::to_value(escaped).unwrap(),
+                    serde_json::to_value(raw).unwrap(),
+                    "decoded fields differ for {scalar}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn surrogate_boundaries_case_and_backslash_runs_match_raw_utf8() {
+    let cases = [
+        ("\"\u{10000}\u{10ffff}\"", r#""\uD800\uDC00\uDBFF\uDFFF""#),
+        (r#""\\🚀""#, r#""\\\ud83d\ude80""#),
+        (r#""\\\\🚀""#, r#""\\\\\uD83d\uDe80""#),
+        (r#""\\uD83D\\uDE80 🚀""#, r#""\\uD83D\\uDE80 \uD83D\uDE80""#),
+    ];
+    for (raw_text, escaped_text) in cases {
+        let make = |text| {
+            format!(
+                r#"{{"name":"parity","description":{text},"steps":[{{"id":"s","command":"true"}}]}}"#
+            )
+        };
+        let raw = parse_recipe(&make(raw_text)).expect("the UTF-8 control must parse");
+        let escaped = parse_recipe(&make(escaped_text)).expect("valid pairs must parse");
+        assert_eq!(
+            serde_json::to_value(escaped).unwrap(),
+            serde_json::to_value(raw).unwrap()
+        );
+    }
+}
+
+#[test]
 fn parse_file_accepts_both_encodings() {
     let dir = tempfile::tempdir().unwrap();
     for (name, input) in [("raw.json", RAW), ("escaped.json", ESCAPED)] {

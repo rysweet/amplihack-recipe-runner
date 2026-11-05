@@ -425,9 +425,12 @@ inference as the [YAML recipe format](yaml-format.md). No format option or
 Unicode setting is required. Pass a JSON file by its explicit path.
 
 The parser first attempts YAML decoding. Successful YAML decoding remains
-authoritative, even when the input is also valid JSON. JSON decoding is tried
-only after YAML decoding fails. The same recipe validation checks follow
-either decoding path.
+authoritative, even when the input is also valid JSON. After YAML decoding fails,
+the fallback validates the complete JSON document, converts surrogate-pair
+escapes to UTF-8 and retries YAML decoding. Other escapes, scalar spellings and
+duplicate entries remain unchanged. YAML's existing scalar conversion still
+applies: for example, numeric `"version": 1` becomes the string `"1"` with either
+Unicode spelling. The same recipe validation checks follow either decoding path.
 
 ### Unicode strings
 

@@ -282,9 +282,41 @@ fn decode_recipe_document<T: DeserializeOwned>(content: &str) -> Result<T, serde
             return Err(yaml_error);
         }
 
-        // Decode from the original text so duplicate recognised fields still fail.
+        // Replace only surrogate-pair escapes, retaining all scalar spellings
+        // and duplicate entries for the same typed YAML decoder as raw UTF-8.
+        // JSON decoding directly into T would lose YAML's scalar-to-string
+        // coercion, for example for a numeric recipe version.
+        let bytes = content.as_bytes();
+        let mut utf8 = String::with_capacity(content.len());
+        let mut copied = 0;
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'\\' {
+                i += 1;
+                continue;
+            }
+            // The complete-document guard guarantees well-formed escapes and
+            // a low surrogate after every high surrogate. Skipping each other
+            // escape as a unit keeps literal backslashes untouched.
+            if bytes[i + 1] == b'u' {
+                let high = u32::from_str_radix(&content[i + 2..i + 6], 16)
+                    .expect("validated JSON Unicode escape");
+                if (0xd800..=0xdbff).contains(&high) {
+                    let low = u32::from_str_radix(&content[i + 8..i + 12], 16)
+                        .expect("validated JSON low surrogate");
+                    let scalar = 0x10000 + ((high - 0xd800) << 10) + (low - 0xdc00);
+                    utf8.push_str(&content[copied..i]);
+                    utf8.push(char::from_u32(scalar).expect("validated JSON surrogate pair"));
+                    i += 12;
+                    copied = i;
+                    continue;
+                }
+            }
+            i += 2;
+        }
+        utf8.push_str(&content[copied..]);
         // Preserve the original YAML diagnostic if the fallback cannot decode T.
-        serde_json::from_str(content).map_err(|_| yaml_error)
+        serde_yaml::from_str(&utf8).map_err(|_| yaml_error)
     })
 }
 
