@@ -4,6 +4,7 @@
 /// and step-type inference.
 use crate::discovery;
 use crate::models::{Recipe, StepType};
+use crate::runner::sub_recipe_paths::validate_recipe_references;
 use log::{debug, info};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -157,10 +158,12 @@ impl RecipeParser {
             if !seen.insert(&step.id) {
                 return Err(ParseError::Invalid(format!(
                     "Duplicate step id: '{}'",
-                    step.id
+                    crate::models::diagnostic_identifier(&step.id)
                 )));
             }
         }
+
+        validate_recipe_references(&recipe).map_err(|error| ParseError::Invalid(error.message))?;
 
         if self.emit_field_warnings
             && let Ok(raw) = serde_yaml::from_str::<serde_yaml::Value>(yaml_content)
@@ -189,7 +192,7 @@ impl RecipeParser {
     pub fn validate(&self, recipe: &Recipe) -> Vec<String> {
         debug!(
             "RecipeParser::validate: validating recipe '{}'",
-            recipe.name
+            crate::models::diagnostic_identifier(&recipe.name)
         );
         self.validate_with_yaml(recipe, None)
     }
@@ -198,7 +201,7 @@ impl RecipeParser {
     pub fn validate_with_yaml(&self, recipe: &Recipe, raw_yaml: Option<&str>) -> Vec<String> {
         debug!(
             "RecipeParser::validate_with_yaml: validating recipe '{}' ({} steps)",
-            recipe.name,
+            crate::models::diagnostic_identifier(&recipe.name),
             recipe.steps.len()
         );
         let mut warnings = Vec::new();
@@ -210,7 +213,7 @@ impl RecipeParser {
                     if step.prompt.is_none() {
                         warnings.push(format!(
                             "Step '{}': agent step is missing a 'prompt' field",
-                            step.id
+                            crate::models::diagnostic_identifier(&step.id)
                         ));
                     }
                 }
@@ -218,7 +221,7 @@ impl RecipeParser {
                     if step.command.is_none() {
                         warnings.push(format!(
                             "Step '{}': bash step is missing a 'command' field",
-                            step.id
+                            crate::models::diagnostic_identifier(&step.id)
                         ));
                     }
                 }
@@ -226,7 +229,7 @@ impl RecipeParser {
                     if step.recipe.is_none() {
                         warnings.push(format!(
                             "Step '{}': recipe step is missing a 'recipe' field",
-                            step.id
+                            crate::models::diagnostic_identifier(&step.id)
                         ));
                     }
                 }
@@ -339,7 +342,7 @@ fn first_report(warning: &str) -> bool {
 /// Recipe-supplied text made safe for a terminal or log line: escaped, and
 /// capped at [`MAX_WARNING_TEXT_CHARS`] characters.
 fn warning_text(raw: &str) -> String {
-    let escaped: String = raw.escape_debug().collect();
+    let escaped = crate::models::diagnostic_identifier(raw);
     if escaped.chars().count() <= MAX_WARNING_TEXT_CHARS {
         escaped
     } else {
@@ -374,7 +377,7 @@ impl Default for RecipeParser {
 pub fn resolve_extends(recipe: &mut Recipe, search_dirs: &[PathBuf]) -> Result<(), ParseError> {
     info!(
         "resolve_extends: resolving extends for recipe '{}'",
-        recipe.name
+        crate::models::diagnostic_identifier(&recipe.name)
     );
     resolve_extends_with_visited(recipe, search_dirs, &mut HashSet::new())
 }
@@ -386,7 +389,8 @@ fn resolve_extends_with_visited(
 ) -> Result<(), ParseError> {
     debug!(
         "resolve_extends_with_visited: processing recipe '{}', visited={:?}",
-        recipe.name, visited
+        crate::models::diagnostic_identifier(&recipe.name),
+        visited
     );
     let parent_name = match recipe.extends.take() {
         Some(name) => name,
@@ -396,14 +400,14 @@ fn resolve_extends_with_visited(
     if !visited.insert(parent_name.clone()) {
         return Err(ParseError::Extends(format!(
             "Circular extends detected: '{}' was already visited in the extends chain",
-            parent_name
+            crate::models::diagnostic_identifier(&parent_name)
         )));
     }
 
     let parent_path = discovery::find_recipe(&parent_name, Some(search_dirs)).ok_or_else(|| {
         ParseError::Extends(format!(
             "Parent recipe '{}' not found in search directories",
-            parent_name
+            crate::models::diagnostic_identifier(&parent_name)
         ))
     })?;
 
@@ -453,7 +457,7 @@ fn resolve_extends_with_visited(
 
     debug!(
         "resolve_extends_with_visited: extends for '{}' resolved successfully",
-        recipe.name
+        crate::models::diagnostic_identifier(&recipe.name)
     );
     Ok(())
 }
@@ -461,6 +465,34 @@ fn resolve_extends_with_visited(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extends_diagnostics_escape_raw_identifiers() {
+        let raw = "parent\n\r\u{1b}[31m\"\\name";
+        let escaped = "parent\\n\\r\\u{1b}[31m\\\"\\\\name";
+        let recipe: Recipe = serde_json::from_value(serde_json::json!({
+            "name": "child", "extends": raw, "steps": []
+        }))
+        .unwrap();
+        let mut missing = recipe.clone();
+        let error = resolve_extends(&mut missing, &[]).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("Parent recipe '{escaped}' not found")),
+            "{error}"
+        );
+        assert!(!error.contains(raw));
+        let mut cyclic = recipe;
+        let mut visited = HashSet::from([raw.to_string()]);
+        let error = resolve_extends_with_visited(&mut cyclic, &[], &mut visited)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("Circular extends detected: '{escaped}'")),
+            "{error}"
+        );
+        assert!(!error.contains(raw));
+        assert!(visited.contains(raw), "visited identifiers must remain raw");
+    }
 
     #[test]
     fn test_parse_minimal_recipe() {
@@ -1205,6 +1237,169 @@ steps:
                 .filter(|l| l.contains("max_env_value_bytes"))
                 .count(),
             1
+        );
+    }
+}
+
+#[cfg(test)]
+mod sub_recipe_reference_tests {
+    use super::{ParseError, RecipeParser};
+    use serde_json::{Value, json};
+
+    fn parse_step(step: Value) -> Result<crate::models::Recipe, ParseError> {
+        RecipeParser::new()
+            .parse(&serde_yaml::to_string(&json!({"name": "parent", "steps": [step]})).unwrap())
+    }
+
+    fn assert_name_guidance(error: &str, step: &str) {
+        assert!(error.contains(step), "missing step {step:?}: {error}");
+        assert!(
+            error.contains("[A-Za-z0-9_-]+"),
+            "missing name rule: {error}"
+        );
+        assert!(
+            error.contains("--recipe-dir"),
+            "missing search guidance: {error}"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_every_runtime_rejected_literal_name() {
+        let invalid = [
+            "",
+            "/absolute/child.yaml",
+            "child/name",
+            "child\\name",
+            "../child",
+            "..",
+            ".hidden",
+            "child.yaml",
+            "child.yml",
+            "a..b",
+            " child",
+            "child ",
+            "a b",
+            "a\tb",
+            "a\nb",
+            "a\0b",
+            "café",
+            "child:other",
+            "child$",
+            "child@",
+            "C:\\recipes\\child.yaml",
+        ];
+        let mut failures = Vec::new();
+        for reference in invalid {
+            match parse_step(json!({"id": "dispatch", "recipe": reference})) {
+                Err(ParseError::Invalid(message)) => assert_name_guidance(&message, "dispatch"),
+                other => failures.push(format!("{reference:?}: {other:?}")),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "invalid literals accepted or misclassified:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn parser_requires_reference_on_explicit_recipe_steps() {
+        for reference in [None, Some(json!(null)), Some(json!(""))] {
+            let mut step = json!({"id": "missing-reference", "type": "recipe"});
+            if let Some(value) = reference {
+                step["recipe"] = value;
+            }
+            let error = parse_step(step).expect_err("missing or empty recipe must fail parsing");
+            assert!(matches!(error, ParseError::Invalid(_)), "{error}");
+            assert_name_guidance(&error.to_string(), "missing-reference");
+        }
+    }
+
+    #[test]
+    fn parser_accepts_canonical_names_without_discovering_children() {
+        for reference in ["child", "A0_z-9", "_", "-", "123", "not-installed-194"] {
+            assert!(parse_step(json!({"id": "dispatch", "recipe": reference})).is_ok());
+        }
+        // Only the effective type matters. An explicit bash step does not dispatch a recipe.
+        assert!(
+            parse_step(
+                json!({"id": "bash", "type": "bash", "command": "true", "recipe": "/unused"})
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn parser_defers_supported_expressions_and_rejects_malformed_literals() {
+        for reference in [
+            "{{child}}",
+            "{{nested.child-name}}",
+            "prefix-{{child}}",
+            "/{{child}}.yaml",
+            "{{child}}/{{other}}",
+            "{{child}} {{ bad }}",
+        ] {
+            assert!(
+                parse_step(json!({"id": "dynamic", "recipe": reference})).is_ok(),
+                "{reference:?}"
+            );
+        }
+        for reference in [
+            "{{ child }}",
+            "{{}}",
+            "{{child",
+            "{child}",
+            "{{child/other}}",
+            "{{child!}}",
+        ] {
+            let error = parse_step(json!({"id": "malformed", "recipe": reference}))
+                .expect_err("text with no supported expression is a literal");
+            assert_name_guidance(&error.to_string(), "malformed");
+        }
+    }
+
+    #[test]
+    fn parser_rejects_invalid_configuration_despite_execution_options() {
+        for option in [
+            json!({"condition": "false"}),
+            json!({"when_tags": ["excluded"]}),
+            json!({"parallel_group": "workers"}),
+            json!({"continue_on_error": true}),
+            json!({"fatal": false}),
+        ] {
+            let mut step = json!({"id": "dispatch", "recipe": "../child"});
+            step.as_object_mut()
+                .unwrap()
+                .extend(option.as_object().unwrap().clone());
+            let error =
+                parse_step(step).expect_err("execution options cannot conceal invalid names");
+            assert_name_guidance(&error.to_string(), "dispatch");
+        }
+    }
+
+    #[test]
+    fn parser_reports_first_invalid_step_and_escapes_control_characters() {
+        let yaml = serde_yaml::to_string(&json!({"name": "parent", "steps": [
+            {"id": "first\nstep", "recipe": "bad\nname"},
+            {"id": "later-step", "recipe": "/other"}
+        ]}))
+        .unwrap();
+        let error = RecipeParser::new()
+            .parse(&yaml)
+            .expect_err("invalid reference")
+            .to_string();
+        assert_name_guidance(&error, "first\\nstep");
+        assert!(
+            error.contains("bad\\nname"),
+            "reference must be escaped: {error}"
+        );
+        assert!(
+            !error.contains("first\nstep") && !error.contains("bad\nname"),
+            "raw control characters: {error:?}"
+        );
+        assert!(
+            !error.contains("later-step"),
+            "report the first invalid step: {error}"
         );
     }
 }

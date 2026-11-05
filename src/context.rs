@@ -17,6 +17,11 @@ static TEMPLATE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\{\{([a-zA-Z0-9_.\-]+)\}\}").expect("valid template placeholder regex")
 });
 
+/// Whether rendering recognises at least one expression in this text.
+pub(crate) fn contains_template_expression(text: &str) -> bool {
+    TEMPLATE_RE.is_match(text)
+}
+
 /// Matches heredoc start markers: <<WORD, <<-WORD, <<'WORD', <<"WORD"
 /// Cannot use backreferences in Rust regex, so we match each quote style
 /// as separate alternatives.
@@ -558,6 +563,16 @@ fn persist_private_context_file(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn template_expression_recognition_matches_rendering_syntax() {
+        for text in ["{{child}}", "{{nested.child-name}}", "/{{child}}.yaml"] {
+            assert!(contains_template_expression(text), "{text:?}");
+        }
+        for text in ["child", "{{ child }}", "{{}}", "{{child", "{{child/other}}"] {
+            assert!(!contains_template_expression(text), "{text:?}");
+        }
+    }
 
     fn ctx(pairs: Vec<(&str, Value)>) -> RecipeContext {
         let mut data = HashMap::new();

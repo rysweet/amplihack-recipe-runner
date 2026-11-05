@@ -18,7 +18,39 @@
 //! These helpers are intentionally pure (no I/O beyond filesystem stat) so
 //! they can be unit-tested in isolation.
 
+use crate::context::contains_template_expression;
+use crate::models::{Recipe, StepExecutionError, StepType};
 use std::path::{Path, PathBuf};
+
+pub(super) const RECIPE_NAME_GUIDANCE: &str = "Sub-recipes require canonical names matching \
+    [A-Za-z0-9_-]+, without paths or file extensions. Use recipe: child and configure \
+    recipe search directories with --recipe-dir.";
+
+/// Check this recipe's effective recipe steps without discovering child files.
+/// Supported expressions defer the name check until their values are rendered.
+pub(crate) fn validate_recipe_references(recipe: &Recipe) -> Result<(), StepExecutionError> {
+    for step in &recipe.steps {
+        if step.effective_type() != StepType::Recipe {
+            continue;
+        }
+        let reason = match step.recipe.as_deref() {
+            None => "missing 'recipe' field",
+            Some(reference) if contains_template_expression(reference) => continue,
+            Some(reference) => match validate_sub_recipe_name(reference) {
+                Ok(()) => continue,
+                Err(reason) => reason,
+            },
+        };
+        return Err(StepExecutionError {
+            step_id: step.id.clone(),
+            message: format!(
+                "Step {:?}: invalid literal sub-recipe reference {:?}: {reason}. {RECIPE_NAME_GUIDANCE}",
+                step.id, step.recipe
+            ),
+        });
+    }
+    Ok(())
+}
 
 /// Maximum number of ancestor directories inspected when walking up looking
 /// for a `.git` marker. Bounded to defend against pathological symlink loops
@@ -159,6 +191,27 @@ pub(crate) fn anchored_search_dirs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_name_contract_accepts_only_ascii_letters_digits_hyphens_and_underscores() {
+        assert!(validate_sub_recipe_name("").is_err());
+        for byte in 0..=127_u8 {
+            let character = char::from(byte);
+            let name = format!("a{character}z");
+            let allowed = character.is_ascii_alphanumeric() || matches!(character, '-' | '_');
+            assert_eq!(validate_sub_recipe_name(&name).is_ok(), allowed, "{name:?}");
+        }
+        for name in [
+            "café",
+            "ｃhild",
+            "child\u{200b}",
+            "child.yaml",
+            "C:\\child",
+            "/child",
+        ] {
+            assert!(validate_sub_recipe_name(name).is_err(), "{name:?}");
+        }
+    }
 
     #[test]
     fn validate_accepts_normal_names() {

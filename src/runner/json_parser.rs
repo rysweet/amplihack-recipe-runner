@@ -4,6 +4,7 @@
 //! provides multi-strategy extraction that tries direct parsing, fenced code
 //! blocks, and balanced-bracket scanning.
 
+use crate::models::diagnostic_identifier;
 use log::warn;
 use regex::Regex;
 use serde_json::Value;
@@ -78,7 +79,7 @@ pub fn parse_json_output(output: &str, step_id: &str) -> Option<Value> {
 
     warn!(
         "All JSON extraction strategies failed for step '{}'",
-        step_id
+        diagnostic_identifier(step_id)
     );
     None
 }

@@ -3,7 +3,8 @@
 //! Listeners receive callbacks during recipe execution for progress reporting,
 //! logging, or custom integrations.
 
-use crate::models::{StepResult, StepStatus, StepType};
+use crate::models::{StepResult, StepStatus, StepType, diagnostic_identifier};
+use serde_json::{Value, json};
 use std::io::Write;
 use std::sync::Mutex;
 
@@ -49,7 +50,7 @@ impl ExecutionListener for StderrListener {
             StepType::Bash => "",
             StepType::Recipe => " [sub-recipe]",
         };
-        eprintln!("▶ {}{}", step_id, type_hint);
+        eprintln!("▶ {}{}", diagnostic_identifier(step_id), type_hint);
     }
     fn on_step_complete(&self, result: &StepResult) {
         log::debug!(
@@ -68,7 +69,12 @@ impl ExecutionListener for StderrListener {
             .duration
             .map(|d| format!(" ({:.1}s)", d.as_secs_f64()))
             .unwrap_or_default();
-        eprintln!("  {} {}{}", icon, result.step_id, dur);
+        eprintln!(
+            "  {} {}{}",
+            icon,
+            diagnostic_identifier(&result.step_id),
+            dur
+        );
     }
 }
 
@@ -109,10 +115,8 @@ impl FileLogListener {
                     .unwrap_or(0.0);
                 if let Err(e) = writeln!(
                     f,
-                    r#"{{"type":"recipe_start","recipe":"{}","ts":{:.3},"pid":{}}}"#,
-                    recipe_name,
-                    ts,
-                    std::process::id()
+                    "{}",
+                    json!({"type": "recipe_start", "recipe": recipe_name, "ts": ts, "pid": std::process::id()})
                 ) {
                     log::warn!("Failed to write recipe log header: {}", e);
                 }
@@ -135,7 +139,7 @@ impl FileLogListener {
         }
     }
 
-    fn write_event(&self, event: &str) {
+    fn write_event(&self, event: &Value) {
         if let Ok(mut f) = self.file.lock() {
             if let Err(e) = writeln!(f, "{}", event) {
                 log::warn!("Failed to write recipe log event: {}", e);
@@ -161,55 +165,102 @@ impl FileLogListener {
 
 impl ExecutionListener for FileLogListener {
     fn on_step_start(&self, step_id: &str, step_type: StepType) {
-        let type_hint = match step_type {
-            StepType::Agent => " [agent — may take several minutes]",
-            StepType::Bash => "",
-            StepType::Recipe => " [sub-recipe]",
-        };
-        // Also print to stderr for live visibility
-        eprintln!("▶ {}{}", step_id, type_hint);
-        self.write_event(&format!(
-            r#"{{"type":"step_transition","step":"{}","step_type":"{:?}","status":"start","ts":{:.3}}}"#,
-            step_id, step_type, Self::timestamp()
-        ));
+        StderrListener.on_step_start(step_id, step_type);
+        self.write_event(&json!({
+            "type": "step_transition",
+            "step": step_id,
+            "step_type": format!("{step_type:?}"),
+            "status": "start",
+            "ts": Self::timestamp(),
+        }));
     }
 
     fn on_step_complete(&self, result: &StepResult) {
-        let icon = match result.status {
-            StepStatus::Completed => "✓",
-            StepStatus::Skipped => "⊘",
-            StepStatus::Failed => "✗",
-            StepStatus::Degraded => "⚠",
-            _ => "?",
-        };
-        let dur = result
-            .duration
-            .map(|d| format!(" ({:.1}s)", d.as_secs_f64()))
-            .unwrap_or_default();
-        eprintln!("  {} {}{}", icon, result.step_id, dur);
-        self.write_event(&format!(
-            r#"{{"type":"step_transition","step":"{}","status":"{}","duration_secs":{},"ts":{:.3}}}"#,
-            result.step_id,
-            match result.status {
+        StderrListener.on_step_complete(result);
+        self.write_event(&json!({
+            "type": "step_transition",
+            "step": result.step_id,
+            "status": match result.status {
                 StepStatus::Completed => "done",
                 StepStatus::Skipped => "skip",
                 StepStatus::Failed => "fail",
                 StepStatus::Degraded => "degraded",
                 _ => "unknown",
             },
-            result.duration.map(|d| d.as_secs_f64()).unwrap_or(0.0),
-            Self::timestamp()
-        ));
+            "duration_secs": result.duration.map(|d| d.as_secs_f64()).unwrap_or(0.0),
+            "ts": Self::timestamp(),
+        }));
     }
 
     fn on_output(&self, step_id: &str, line: &str) {
-        self.write_event(&format!(
-            r#"{{"type":"output","step":"{}","line":"{}","ts":{:.3}}}"#,
-            step_id,
-            line.replace('\\', "\\\\")
-                .replace('"', "\\\"")
-                .replace('\n', "\\n"),
-            Self::timestamp()
-        ));
+        self.write_event(&json!({
+            "type": "output",
+            "step": step_id,
+            "line": line,
+            "ts": Self::timestamp(),
+        }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn structured_events_round_trip_control_characters_quotes_and_backslashes() {
+        let recipe = "listener-test\n\r\u{1b}[31m\"\\recipe";
+        let step = "step\n\r\u{1b}[31m\"\\id";
+        let line = "output\n\r\u{1b}[31m\t\0\"\\tail";
+        let (listener, path) = FileLogListener::new(recipe).unwrap();
+        listener.on_step_start(step, StepType::Recipe);
+        listener.on_output(step, line);
+        for status in [
+            StepStatus::Completed,
+            StepStatus::Skipped,
+            StepStatus::Failed,
+            StepStatus::Degraded,
+            StepStatus::Running,
+        ] {
+            listener.on_step_complete(&StepResult {
+                step_id: step.into(),
+                status,
+                output: String::new(),
+                error: String::new(),
+                duration: Some(Duration::from_millis(125)),
+            });
+        }
+        drop(listener);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(!text.contains('\r'));
+        assert!(!text.contains('\u{1b}'));
+        let events: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 8, "one JSON object per event");
+        assert_eq!(events[0]["type"], "recipe_start");
+        assert_eq!(events[0]["recipe"], recipe);
+        assert_eq!(events[0]["pid"], std::process::id());
+        assert_eq!(events[1]["type"], "step_transition");
+        assert_eq!(events[1]["status"], "start");
+        assert_eq!(events[1]["step_type"], "Recipe");
+        assert_eq!(events[2]["type"], "output");
+        assert_eq!(events[2]["line"], line);
+        for event in &events[1..] {
+            assert_eq!(event["step"], step);
+        }
+        for (event, status) in events[3..]
+            .iter()
+            .zip(["done", "skip", "fail", "degraded", "unknown"])
+        {
+            assert_eq!(event["type"], "step_transition");
+            assert_eq!(event["status"], status);
+            assert_eq!(event["duration_secs"], 0.125);
+        }
+        for event in &events {
+            assert!(event["ts"].as_f64().unwrap() > 0.0);
+        }
     }
 }

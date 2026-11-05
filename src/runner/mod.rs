@@ -20,6 +20,7 @@ use crate::context::RecipeContext;
 use crate::discovery;
 use crate::models::{
     Recipe, RecipeResult, Step, StepExecutionError, StepResult, StepStatus, StepType,
+    diagnostic_identifier,
 };
 use crate::parser::{RecipeParser, resolve_extends};
 use log::{error, info, warn};
@@ -266,7 +267,8 @@ impl<A: Adapter> RecipeRunner<A> {
         self.terminal.reset();
         info!(
             "RecipeRunner::execute: recipe='{}', dry_run={}",
-            recipe.name, self.dry_run
+            diagnostic_identifier(&recipe.name),
+            self.dry_run
         );
         // Resolve extends (single-level inheritance) if set
         let mut recipe = recipe.clone();
@@ -312,7 +314,7 @@ impl<A: Adapter> RecipeRunner<A> {
             if !errors.is_empty() {
                 let msg = format!(
                     "=== PRE-FLIGHT VALIDATION FAILED for '{}' ===\n{}\n\nFix the above, then retry.",
-                    recipe.name,
+                    diagnostic_identifier(&recipe.name),
                     errors.join("\n")
                 );
                 error!("{}", msg);
@@ -344,9 +346,27 @@ impl<A: Adapter> RecipeRunner<A> {
         recipe: &Recipe,
         user_context: Option<HashMap<String, Value>>,
     ) -> RecipeResult {
+        // Validate the whole effective recipe before any execution side effects,
+        // including for programmatically constructed and inherited recipes.
+        if let Err(error) = sub_recipe_paths::validate_recipe_references(recipe) {
+            error!("{}", error.message);
+            return RecipeResult {
+                recipe_name: recipe.name.clone(),
+                success: false,
+                step_results: vec![StepResult {
+                    step_id: error.step_id,
+                    status: StepStatus::Failed,
+                    output: String::new(),
+                    error: error.message,
+                    duration: None,
+                }],
+                context: HashMap::new(),
+                duration: None,
+            };
+        }
         info!(
             "run_steps: recipe='{}', steps={}",
-            recipe.name,
+            diagnostic_identifier(&recipe.name),
             recipe.steps.len()
         );
         let start = Instant::now();
@@ -364,7 +384,7 @@ impl<A: Adapter> RecipeRunner<A> {
         if self.require_audit && audit_file.is_none() {
             error!(
                 "Audit log for recipe '{}' could not be opened and an audit log is required; no step runs",
-                recipe.name
+                diagnostic_identifier(&recipe.name)
             );
             return RecipeResult {
                 recipe_name: recipe.name.clone(),
@@ -470,7 +490,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     if failed && gs.is_nonfatal() && !self.terminal.is_terminal() {
                         warn!(
                             "Step '{}' failed but continue_on_error is set, continuing",
-                            gs.id
+                            diagnostic_identifier(&gs.id)
                         );
                     }
 
@@ -504,7 +524,10 @@ impl<A: Adapter> RecipeRunner<A> {
                 }
 
                 if self.should_skip_by_tags(step) {
-                    info!("Skipping step '{}': excluded by tag filter", step.id);
+                    info!(
+                        "Skipping step '{}': excluded by tag filter",
+                        diagnostic_identifier(&step.id)
+                    );
                     step_results.push(StepResult {
                         step_id: step.id.clone(),
                         status: StepStatus::Skipped,
@@ -518,7 +541,10 @@ impl<A: Adapter> RecipeRunner<A> {
 
                 // Resume support: skip steps already completed in a prior run
                 if self.resume_completed.contains(&step.id) {
-                    info!("Skipping step '{}': already completed (resume)", step.id);
+                    info!(
+                        "Skipping step '{}': already completed (resume)",
+                        diagnostic_identifier(&step.id)
+                    );
                     step_results.push(StepResult {
                         step_id: step.id.clone(),
                         status: StepStatus::Skipped,
@@ -577,7 +603,7 @@ impl<A: Adapter> RecipeRunner<A> {
                 if failed && step.is_nonfatal() && !self.terminal.is_terminal() {
                     warn!(
                         "Step '{}' failed but continue_on_error is set, continuing",
-                        step.id
+                        diagnostic_identifier(&step.id)
                     );
                 }
 
@@ -598,7 +624,7 @@ impl<A: Adapter> RecipeRunner<A> {
     fn should_skip_by_tags(&self, step: &Step) -> bool {
         log::debug!(
             "should_skip_by_tags: step='{}', when_tags={:?}",
-            step.id,
+            diagnostic_identifier(&step.id),
             step.when_tags
         );
         if step.when_tags.is_empty() {
@@ -629,19 +655,29 @@ impl<A: Adapter> RecipeRunner<A> {
             if self.dry_run {
                 info!(
                     "DRY RUN: would run {} hook for step '{}'",
-                    hook_name, step_id
+                    hook_name,
+                    diagnostic_identifier(step_id)
                 );
                 return;
             }
             let rendered = ctx.render_shell(cmd);
             let env_vars = ctx.shell_env_for_step();
-            info!("Running {} hook for step '{}'", hook_name, step_id);
+            info!(
+                "Running {} hook for step '{}'",
+                hook_name,
+                diagnostic_identifier(step_id)
+            );
             if let Err(e) =
                 self.adapter
                     .execute_bash_step(&rendered, &self.working_dir, Some(30), &env_vars)
             {
                 self.terminal.observe(&e);
-                warn!("{} hook failed for step '{}': {}", hook_name, step_id, e);
+                warn!(
+                    "{} hook failed for step '{}': {}",
+                    hook_name,
+                    diagnostic_identifier(step_id),
+                    e
+                );
             }
         }
     }
@@ -692,9 +728,12 @@ impl<A: Adapter> RecipeRunner<A> {
         }
 
         if self.dry_run {
-            info!("DRY RUN: would execute step '{}'", step.id);
+            info!(
+                "DRY RUN: would execute step '{}'",
+                diagnostic_identifier(&step.id)
+            );
             let output = if step.parse_json {
-                format!(r#"{{"dry_run":true,"step":"{}"}}"#, step.id)
+                serde_json::json!({"dry_run": true, "step": step.id}).to_string()
             } else {
                 "[dry run]".to_string()
             };
@@ -719,7 +758,10 @@ impl<A: Adapter> RecipeRunner<A> {
             match ctx.evaluate(condition) {
                 Ok(true) => {}
                 Ok(false) => {
-                    info!("Skipping step '{}': condition is false", step.id);
+                    info!(
+                        "Skipping step '{}': condition is false",
+                        diagnostic_identifier(&step.id)
+                    );
                     return StepResult {
                         step_id: step.id.clone(),
                         status: StepStatus::Skipped,
@@ -729,7 +771,11 @@ impl<A: Adapter> RecipeRunner<A> {
                     };
                 }
                 Err(e) => {
-                    error!("Condition evaluation FAILED for step '{}': {}", step.id, e);
+                    error!(
+                        "Condition evaluation FAILED for step '{}': {}",
+                        diagnostic_identifier(&step.id),
+                        e
+                    );
                     return StepResult {
                         step_id: step.id.clone(),
                         status: StepStatus::Failed,
@@ -761,7 +807,7 @@ impl<A: Adapter> RecipeRunner<A> {
                 if o.len() > MAX_STEP_OUTPUT_BYTES {
                     warn!(
                         "Step '{}' output truncated from {} to {} bytes",
-                        step.id,
+                        diagnostic_identifier(&step.id),
                         o.len(),
                         MAX_STEP_OUTPUT_BYTES
                     );
@@ -771,12 +817,19 @@ impl<A: Adapter> RecipeRunner<A> {
                 }
             }
             Err(e) => {
-                error!("Step '{}' failed: {}", step.id, e);
+                // Keep the quoted sub-recipe diagnostic convention. Generic
+                // step errors also escape their identifier in Display.
+                let diagnostic = if step.effective_type() == StepType::Recipe {
+                    format!("Step {:?} failed: {}", e.step_id, e.message)
+                } else {
+                    e.to_string()
+                };
+                error!("{}", diagnostic);
                 return StepResult {
                     step_id: step.id.clone(),
                     status: StepStatus::Failed,
                     output: String::new(),
-                    error: e.to_string(),
+                    error: diagnostic,
                     duration: Some(step_start.elapsed()),
                 };
             }
@@ -807,11 +860,14 @@ impl<A: Adapter> RecipeRunner<A> {
                     // Retry: re-execute with explicit JSON instruction
                     warn!(
                         "Step '{}': parse_json failed on first attempt. Retrying with JSON reminder.",
-                        step.id
+                        diagnostic_identifier(&step.id)
                     );
                     let retry_result = self.retry_for_json(step, ctx).and_then(|retry_output| {
                         parse_json_output(&retry_output, &step.id).map(|parsed| {
-                            info!("Step '{}': parse_json succeeded on retry.", step.id);
+                            info!(
+                                "Step '{}': parse_json succeeded on retry.",
+                                diagnostic_identifier(&step.id)
+                            );
                             serde_json::to_string(&parsed).unwrap_or(retry_output)
                         })
                     });
@@ -834,7 +890,7 @@ impl<A: Adapter> RecipeRunner<A> {
                             if step.parse_json_required {
                                 error!(
                                     "Step '{}': parse_json failed (parse_json_required=true). Raw: {}...",
-                                    step.id,
+                                    diagnostic_identifier(&step.id),
                                     crate::safe_truncate(&output, 200)
                                 );
                                 (
@@ -845,7 +901,7 @@ impl<A: Adapter> RecipeRunner<A> {
                             } else {
                                 warn!(
                                     "Step '{}': parse_json failed, using raw output (degraded)",
-                                    step.id
+                                    diagnostic_identifier(&step.id)
                                 );
                                 (output, StepStatus::Degraded, String::new())
                             }
@@ -889,7 +945,7 @@ impl<A: Adapter> RecipeRunner<A> {
     ) -> Result<String, StepExecutionError> {
         log::debug!(
             "dispatch_step: step='{}', type={:?}",
-            step.id,
+            diagnostic_identifier(&step.id),
             step.effective_type()
         );
         if let Some(message) = self.terminal.diagnostic() {
@@ -978,7 +1034,7 @@ impl<A: Adapter> RecipeRunner<A> {
     ) -> Result<String, StepExecutionError> {
         log::debug!(
             "execute_sub_recipe: step='{}', recipe={:?}, depth={}",
-            step.id,
+            diagnostic_identifier(&step.id),
             step.recipe,
             self.depth.get()
         );
@@ -998,9 +1054,22 @@ impl<A: Adapter> RecipeRunner<A> {
             message: "Recipe step is missing the 'recipe' field".to_string(),
         })?;
 
+        // Resolve against incoming context, before applying child overrides.
+        // Render once: substituted text must never become another expression.
+        let recipe_name = ctx.render(recipe_name);
+        sub_recipe_paths::validate_sub_recipe_name(&recipe_name).map_err(|reason| {
+            StepExecutionError {
+                step_id: step.id.clone(),
+                message: format!(
+                    "Invalid resolved sub-recipe name {recipe_name:?}: {reason}. {}",
+                    sub_recipe_paths::RECIPE_NAME_GUIDANCE
+                ),
+            }
+        })?;
+
         // Use discovery module to find the recipe, falling back to local search dirs
         let path = self
-            .find_recipe_path(recipe_name)
+            .find_recipe_path(&recipe_name)
             .ok_or_else(|| StepExecutionError {
                 step_id: step.id.clone(),
                 message: format!(
@@ -1124,7 +1193,7 @@ impl<A: Adapter> RecipeRunner<A> {
     fn describe_sub_recipe_failure(&self, sub_result: &RecipeResult) -> String {
         log::debug!(
             "describe_sub_recipe_failure: recipe='{}'",
-            sub_result.recipe_name
+            diagnostic_identifier(&sub_result.recipe_name)
         );
         let failed: Vec<String> = sub_result
             .step_results
@@ -1141,14 +1210,19 @@ impl<A: Adapter> RecipeRunner<A> {
                 } else {
                     ("no detail", "no additional detail".to_string())
                 };
-                format!("- {} [{}]: {}", r.step_id, detail_source, detail)
+                format!(
+                    "- {} [{}]: {}",
+                    diagnostic_identifier(&r.step_id),
+                    detail_source,
+                    detail
+                )
             })
             .collect();
         let completed: Vec<String> = sub_result
             .step_results
             .iter()
             .filter(|r| r.status == StepStatus::Completed)
-            .map(|r| r.step_id.clone())
+            .map(|r| diagnostic_identifier(&r.step_id))
             .collect();
 
         let mut sections: Vec<String> = Vec::new();
@@ -1176,7 +1250,7 @@ impl<A: Adapter> RecipeRunner<A> {
     ) -> RecipeResult {
         log::debug!(
             "execute_with_depth: recipe='{}', depth={}",
-            recipe.name,
+            diagnostic_identifier(&recipe.name),
             self.depth.get()
         );
         self.run_steps(recipe, user_context)
@@ -1307,7 +1381,7 @@ impl<A: Adapter> RecipeRunner<A> {
 
     /// Retry an agent step with an explicit JSON-only instruction.
     fn retry_for_json(&self, step: &Step, ctx: &mut RecipeContext) -> Option<String> {
-        log::debug!("retry_for_json: step='{}'", step.id);
+        log::debug!("retry_for_json: step='{}'", diagnostic_identifier(&step.id));
         if self.terminal.is_terminal() || step.effective_type() != StepType::Agent {
             return None; // No pending repair after terminal observation
         }
@@ -1342,7 +1416,11 @@ impl<A: Adapter> RecipeRunner<A> {
             Ok(output) => Some(output),
             Err(e) => {
                 self.terminal.observe(&e);
-                warn!("Retry for step '{}' failed: {}", step.id, e);
+                warn!(
+                    "Retry for step '{}' failed: {}",
+                    diagnostic_identifier(&step.id),
+                    e
+                );
                 None
             }
         }
@@ -1351,7 +1429,7 @@ impl<A: Adapter> RecipeRunner<A> {
     fn maybe_auto_stage(&self, step: &Step) {
         log::debug!(
             "maybe_auto_stage: step='{}', auto_stage={:?}",
-            step.id,
+            diagnostic_identifier(&step.id),
             step.auto_stage
         );
         // A step can opt out of staging, but cannot opt in when the runner has
@@ -1364,7 +1442,11 @@ impl<A: Adapter> RecipeRunner<A> {
         let working_dir = step.working_dir.as_deref().unwrap_or(&self.working_dir);
         if let Some(staged) = git_stage_all(working_dir) {
             let count = staged.lines().count();
-            info!("Auto-staged {} file(s) after step '{}'", count, step.id);
+            info!(
+                "Auto-staged {} file(s) after step '{}'",
+                count,
+                diagnostic_identifier(&step.id)
+            );
         }
     }
 
@@ -1492,7 +1574,7 @@ impl<A: Adapter> RecipeRunner<A> {
     ) -> ParallelOutcome {
         log::debug!(
             "execute_bash_step_parallel: step='{}', dry_run={}",
-            step.id,
+            diagnostic_identifier(&step.id),
             dry_run
         );
         let step_start = Instant::now();
@@ -1567,7 +1649,7 @@ impl<A: Adapter> RecipeRunner<A> {
                             } else {
                                 warn!(
                                     "Step '{}': parse_json failed on bash step, using raw output (degraded)",
-                                    step.id
+                                    diagnostic_identifier(&step.id)
                                 );
                                 (output, StepStatus::Degraded, String::new())
                             }
