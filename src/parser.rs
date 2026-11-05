@@ -6,6 +6,7 @@ use crate::discovery;
 use crate::models::{Recipe, StepType};
 use crate::runner::sub_recipe_paths::validate_recipe_references;
 use log::{debug, info};
+use serde::de::DeserializeOwned;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -133,7 +134,7 @@ impl RecipeParser {
             });
         }
 
-        let recipe: Recipe = serde_yaml::from_str(yaml_content)?;
+        let recipe: Recipe = decode_recipe_document(yaml_content)?;
 
         if recipe.name.is_empty() {
             return Err(ParseError::Invalid(
@@ -166,7 +167,7 @@ impl RecipeParser {
         validate_recipe_references(&recipe).map_err(|error| ParseError::Invalid(error.message))?;
 
         if self.emit_field_warnings
-            && let Ok(raw) = serde_yaml::from_str::<serde_yaml::Value>(yaml_content)
+            && let Ok(raw) = decode_recipe_document::<serde_yaml::Value>(yaml_content)
         {
             for warning in step_field_warnings(&raw) {
                 // Sub-recipes are re-parsed on every invocation; report each
@@ -238,7 +239,7 @@ impl RecipeParser {
 
         // Check for unrecognized fields if raw YAML is provided
         if let Some(yaml_str) = raw_yaml
-            && let Ok(data) = serde_yaml::from_str::<serde_yaml::Value>(yaml_str)
+            && let Ok(data) = decode_recipe_document::<serde_yaml::Value>(yaml_str)
         {
             if let Some(map) = data.as_mapping() {
                 let known: HashSet<&str> = KNOWN_TOP_FIELDS.iter().copied().collect();
@@ -269,6 +270,95 @@ impl RecipeParser {
             emit_field_warnings: false,
         }
     }
+}
+
+/// Keep successful YAML decoding authoritative, with strict JSON as a fallback.
+fn decode_recipe_document<T: DeserializeOwned>(content: &str) -> Result<T, serde_yaml::Error> {
+    serde_yaml::from_str(content).or_else(|yaml_error| {
+        if !valid_json_document(content) {
+            return Err(yaml_error);
+        }
+
+        // Replace only surrogate-pair escapes, retaining all scalar spellings
+        // and duplicate entries for the same typed YAML decoder as raw UTF-8.
+        // JSON decoding directly into T would lose YAML's scalar-to-string
+        // coercion, for example for a numeric recipe version.
+        let bytes = content.as_bytes();
+        let mut utf8 = String::with_capacity(content.len());
+        let mut copied = 0;
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'\\' {
+                i += 1;
+                continue;
+            }
+            // The complete-document guard guarantees well-formed escapes and
+            // a low surrogate after every high surrogate. Skipping each other
+            // escape as a unit keeps literal backslashes untouched.
+            if bytes[i + 1] == b'u' {
+                let high = u32::from_str_radix(&content[i + 2..i + 6], 16)
+                    .expect("validated JSON Unicode escape");
+                if (0xd800..=0xdbff).contains(&high) {
+                    let low = u32::from_str_radix(&content[i + 8..i + 12], 16)
+                        .expect("validated JSON low surrogate");
+                    let scalar = 0x10000 + ((high - 0xd800) << 10) + (low - 0xdc00);
+                    utf8.push_str(&content[copied..i]);
+                    utf8.push(char::from_u32(scalar).expect("validated JSON surrogate pair"));
+                    i += 12;
+                    copied = i;
+                    continue;
+                }
+            }
+            i += 2;
+        }
+        utf8.push_str(&content[copied..]);
+        // Preserve the original YAML diagnostic if the fallback cannot decode T.
+        serde_yaml::from_str(&utf8).map_err(|_| yaml_error)
+    })
+}
+
+/// Validate JSON without imposing a numeric representation on ignored fields.
+fn valid_json_document(content: &str) -> bool {
+    // IgnoredAny checks complete syntax and permits duplicate entries and
+    // numbers outside f64's range, but skips Unicode and recursion checks.
+    if serde_json::from_str::<serde::de::IgnoredAny>(content).is_err() {
+        return false;
+    }
+    let bytes = content.as_bytes();
+    let mut depth = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let start = i;
+                i += 1;
+                while bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                // Syntax validation above guarantees a closing quote. Decode
+                // every string, including ignored values and keys, to reject
+                // lone or malformed surrogates before conversion.
+                if serde_json::from_slice::<String>(&bytes[start..=i]).is_err() {
+                    return false;
+                }
+            }
+            b'[' | b'{' => {
+                depth += 1;
+                // Retain serde_json's default recursion limit from the former
+                // Value guard; IgnoredAny alone does not enforce this limit.
+                if depth >= 128 {
+                    return false;
+                }
+            }
+            b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    true
 }
 
 /// #130: one warning per unknown or retired step field in the raw recipe YAML.
@@ -465,6 +555,22 @@ fn resolve_extends_with_visited(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_json_fallback_preserves_yaml_diagnostic() {
+        for input in [
+            r#"{"name":"bad","steps":[{"id":"s"}],"ignored":"\uD800"}"#,
+            r#"{"name":"bad","name":"again","description":"\uD83D\uDE80","steps":[{"id":"s"}]}"#,
+            "name: [invalid",
+        ] {
+            let original = serde_yaml::from_str::<Recipe>(input).unwrap_err();
+            let error = RecipeParser::new().parse(input).unwrap_err();
+            let ParseError::Yaml(error) = error else {
+                panic!("decoding failures must retain the YAML error variant");
+            };
+            assert_eq!(error.to_string(), original.to_string());
+        }
+    }
 
     #[test]
     fn extends_diagnostics_escape_raw_identifiers() {
