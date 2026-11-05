@@ -12,7 +12,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -37,6 +37,12 @@ fn invalid(message: &str) -> io::Error {
 #[path = "process_observation/native.rs"]
 mod native;
 use native::observe;
+#[path = "process_observation/records.rs"]
+mod records;
+use records::PrivateRecords;
+#[path = "process_observation/ownership.rs"]
+mod ownership;
+pub(super) use ownership::{Ownership, SpawnedWorker};
 
 fn publish(root: &Path, name: &str, value: &Value) -> io::Result<()> {
     let temporary = root.join(format!("{name}.tmp"));
@@ -50,50 +56,39 @@ fn publish(root: &Path, name: &str, value: &Value) -> io::Result<()> {
     fs::rename(temporary, root.join(name))
 }
 
-fn record(identity: &Identity, boundary: &str, observed: io::Result<Option<Process>>) -> Value {
-    let (state, current, error) = match observed {
-        Ok(Some(process)) => (process.state, Some(process.identity), None),
-        Ok(None) => ("absent", None, None),
-        Err(error) => ("unavailable", None, Some(error.to_string())),
+fn record(identity: &Identity, boundary: &str, observed: Option<Process>) -> Value {
+    let (state, current) = match observed {
+        Some(process) => (process.state, Some(process.identity)),
+        None => ("absent", None),
     };
     json!({"schema_version":1, "backend":if cfg!(target_os="macos") {"darwin_native"} else {"linux_proc"},
-        "boundary":boundary, "identity":identity, "observed_identity":current, "state":state, "error":error})
+        "boundary":boundary, "identity":identity, "observed_identity":current, "state":state, "error":null})
 }
 
-fn pid_file(root: &Path, name: &str) -> io::Result<i32> {
-    let value = fs::read_to_string(root.join(name))?;
-    let pid = value
-        .parse::<i32>()
-        .map_err(|_| invalid("invalid fixture PID record"))?;
-    if pid <= 1 {
-        return Err(invalid("fixture PID must be greater than one"));
-    }
-    Ok(pid)
-}
-
-/// Observe the ready descendant while the launcher keeps it alive. The launcher
-/// waits for atomic publication inside the adapter's deadline, never before it.
-pub(super) fn watch_ready(root: &Path, done: Arc<AtomicBool>) -> JoinHandle<io::Result<()>> {
+/// The parent supplies its freshly spawned worker identity. The launcher waits
+/// inside the unchanged adapter deadline until verified readiness is published.
+pub(super) fn watch_ready(
+    root: &Path,
+    worker: SpawnedWorker,
+    done: Arc<AtomicBool>,
+) -> JoinHandle<io::Result<Ownership>> {
     let root = root.to_owned();
     thread::spawn(move || {
+        let records = PrivateRecords::open(&root, Instant::now() + Duration::from_secs(8))?;
         loop {
-            match pid_file(&root, "launcher.pid") {
-                Ok(launcher) => {
-                    let pid = pid_file(&root, "descendant.pid")?;
-                    let process =
-                        observe(pid)?.ok_or_else(|| invalid("ready descendant is absent"))?;
-                    if process.ppid != launcher
-                        || process.identity.pgid != launcher
-                        || process.identity.uid != unsafe { libc::geteuid() }
-                        || process.state != "running"
-                    {
-                        return Err(invalid("ready descendant ownership or state mismatch"));
-                    }
-                    return publish(
+            match records.pid_file("launcher.pid") {
+                Ok(_) => {
+                    let evidence = Ownership::capture(&records, &worker)?;
+                    publish(
                         &root,
                         "descendant-live.json",
-                        &record(&process.identity, "descendant_ready", observe(pid)),
-                    );
+                        &record(
+                            &evidence.descendant,
+                            "descendant_ready",
+                            observe(evidence.descendant.pid)?,
+                        ),
+                    )?;
+                    return Ok(evidence);
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
@@ -106,27 +101,31 @@ pub(super) fn watch_ready(root: &Path, done: Arc<AtomicBool>) -> JoinHandle<io::
     })
 }
 
-/// Capture the boundary before joining the observer or performing any cleanup.
+/// Capture at adapter return. This untrusted record conveys no cleanup authority.
 pub(super) fn capture_return(root: &Path) -> io::Result<()> {
-    let live: Value = serde_json::from_slice(&fs::read(root.join("descendant-live.json"))?)?;
+    let records = PrivateRecords::open(root, Instant::now() + Duration::from_secs(1))?;
+    let live: Value = serde_json::from_slice(&records.read("descendant-live.json")?)?;
     let identity: Identity = serde_json::from_value(live["identity"].clone())?;
-    let observed = observe(identity.pid);
+    if live["schema_version"] != 1
+        || live["boundary"] != "descendant_ready"
+        || live["state"] != "running"
+        || live["observed_identity"] != live["identity"]
+        || !live["error"].is_null()
+        || identity.pid <= 1
+        || identity.pgid <= 1
+        || identity.uid != unsafe { libc::geteuid() }
+        || identity.birth.is_empty()
+        || identity.birth.len() > 2
+        || identity.birth.iter().all(|part| *part == 0)
+    {
+        return Err(invalid("invalid live process observation"));
+    }
+    let observed = observe(identity.pid)?;
     publish(
         root,
         "descendant-return.json",
         &record(&identity, "adapter_return", observed),
     )
-}
-
-/// Fallback signals only an unchanged synthetic identity owned by this user.
-/// The recorded adapter-return assertion still fails after successful cleanup.
-fn cleanup_if_running(root: &Path, identity: &Identity) -> io::Result<()> {
-    if identity.pid != pid_file(root, "descendant.pid")?
-        || identity.pgid != pid_file(root, "launcher.pid")?
-    {
-        return Err(invalid("fallback cleanup ownership is unverified"));
-    }
-    cleanup_identity(identity)
 }
 
 fn cleanup_identity(identity: &Identity) -> io::Result<()> {
@@ -156,42 +155,35 @@ fn cleanup_identity(identity: &Identity) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) struct CancellationObservation([Identity; 2]);
+pub(super) struct CancellationObservation(Ownership);
 
 #[cfg(target_os = "linux")]
 impl CancellationObservation {
-    pub(super) fn capture(root: &Path, runner: i32) -> io::Result<Self> {
-        let launcher = pid_file(root, "launcher.pid")?;
-        let descendant = pid_file(root, "descendant.pid")?;
-        let mut identities = Vec::new();
-        for (pid, parent) in [(launcher, runner), (descendant, launcher)] {
-            let process =
-                observe(pid)?.ok_or_else(|| invalid("ready cancellation process is absent"))?;
-            if process.identity.uid != unsafe { libc::geteuid() }
-                || process.identity.pgid != launcher
-                || process.ppid != parent
-                || process.state != "running"
-            {
-                return Err(invalid("cancellation process ownership or state mismatch"));
-            }
-            identities.push(process.identity);
-        }
-        Ok(Self(identities.try_into().unwrap()))
+    pub(super) fn capture(
+        root: &Path,
+        worker: &SpawnedWorker,
+        deadline: Instant,
+    ) -> io::Result<Self> {
+        let records = PrivateRecords::open(root, deadline)?;
+        Ok(Self(Ownership::capture(&records, worker)?))
+    }
+
+    pub(super) fn launcher_pid(&self) -> i32 {
+        self.0.launcher.pid
     }
 
     pub(super) fn cleanup(&self) -> io::Result<()> {
-        // Signal each recorded process separately; no authority is inferred for
-        // other members of a group after the runner has returned.
-        for identity in self.0.iter().rev() {
-            cleanup_identity(identity)?;
-        }
-        Ok(())
+        self.0.cleanup()
     }
 
     pub(super) fn assert_stopped(&self) {
         // Observe both at the return boundary before attempting any fallback.
-        let observations = self.0.each_ref().map(|identity| observe(identity.pid));
-        for (identity, observed) in self.0.iter().zip(observations) {
+        let observations =
+            [&self.0.launcher, &self.0.descendant].map(|identity| observe(identity.pid));
+        for (identity, observed) in [&self.0.launcher, &self.0.descendant]
+            .into_iter()
+            .zip(observations)
+        {
             match observed.expect("cancellation return observation failed") {
                 None => {}
                 Some(process) => {
@@ -211,11 +203,11 @@ impl CancellationObservation {
 }
 
 fn read_observation(root: &Path, name: &str) -> Value {
-    use std::os::unix::fs::PermissionsExt;
-    let metadata = fs::symlink_metadata(root.join(name)).expect("private observation is required");
-    assert!(metadata.file_type().is_file());
-    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-    let bytes = fs::read(root.join(name)).expect("native process observation is required");
+    let records = PrivateRecords::open(root, Instant::now() + Duration::from_secs(1))
+        .expect("private observation directory is required");
+    let bytes = records
+        .read(name)
+        .expect("validated native process observation is required");
     let observation: Value = serde_json::from_slice(&bytes).expect("complete process observation");
     assert_eq!(observation["schema_version"], 1);
     #[cfg(target_os = "macos")]
@@ -226,11 +218,8 @@ fn read_observation(root: &Path, name: &str) -> Value {
 }
 
 pub(super) fn assert_stopped_at_adapter_return(root: &Path) {
-    let pid: u32 = fs::read_to_string(root.join("descendant.pid"))
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert!(pid > 1);
+    let records = PrivateRecords::open(root, Instant::now() + Duration::from_secs(1)).unwrap();
+    let pid = records.pid_file("descendant.pid").unwrap();
     let live = read_observation(root, "descendant-live.json");
     assert_eq!(live["boundary"], "descendant_ready");
     assert_eq!(
@@ -258,9 +247,13 @@ pub(super) fn assert_stopped_at_adapter_return(root: &Path) {
         // Read failures, parse failures, PID reuse and unavailable platform
         // interfaces must fail. None of them establishes process absence.
         _ => {
-            let identity: Identity = serde_json::from_value(identity.clone()).unwrap();
-            cleanup_if_running(root, &identity).expect("verified fallback cleanup failed");
             panic!("descendant was live or its termination could not be verified at adapter return")
         }
     }
 }
+
+#[path = "process_observation/security_tests.rs"]
+mod security_tests;
+
+#[path = "process_observation/record_tests.rs"]
+mod record_tests;

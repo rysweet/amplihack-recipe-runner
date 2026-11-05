@@ -1,11 +1,57 @@
-use super::fixtures::install_launcher;
-use super::process_observation::CancellationObservation;
+use super::fixtures::{fixture_environment, install_launcher};
+#[cfg(target_os = "linux")]
+use super::process_observation::{CancellationObservation, SpawnedWorker};
 use serde_json::Value;
 use std::{
     fs,
     process::Command,
     time::{Duration, Instant},
 };
+
+fn runner_command(root: &std::path::Path, launcher: &std::path::Path, scenario: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_recipe-runner-rs"));
+    fixture_environment(&mut command, root)
+        .env("TEST_SCENARIO", scenario)
+        .env("AMPLIHACK_LAUNCHER_BINARY", launcher)
+        .env("RECIPE_RUNNER_NO_UPDATE_CHECK", "1");
+    command
+}
+
+/// Exercise the same command constructor on both platforms without sending a
+/// signal. The Linux signal scenarios below retain their original coverage.
+pub(super) fn assert_runner_environment_is_private() {
+    let root = tempfile::tempdir().unwrap();
+    let launcher = install_launcher(root.path());
+    let recipe = root.path().join("environment.yaml");
+    fs::write(&recipe, "name: environment\nsteps:\n  - id: agent\n    type: agent\n    prompt: synthetic environment probe\n").unwrap();
+    let mut runner = runner_command(root.path(), &launcher, "success")
+        .arg(recipe)
+        .args(["--agent-binary", "codex", "--working-dir"])
+        .arg(root.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let status = loop {
+        if let Some(status) = runner.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            runner.kill().unwrap();
+            runner.wait().unwrap();
+            panic!("environment probe exceeded watchdog");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        status.success(),
+        "synthetic runner environment probe failed"
+    );
+    let record: Value =
+        serde_json::from_slice(&fs::read(root.path().join("record.json")).unwrap()).unwrap();
+    assert_eq!(record["ambient_present"], serde_json::json!([]));
+}
 
 #[cfg(target_os = "linux")]
 fn assert_runner_cancellation(signal: i32, variant: &str) {
@@ -44,34 +90,23 @@ fn assert_runner_cancellation(signal: i32, variant: &str) {
         _ => agent.to_string(),
     };
     fs::write(&recipe, format!("name: cancellation\nsteps:\n{steps}")).unwrap();
-    let mut runner = Command::new(env!("CARGO_BIN_EXE_recipe-runner-rs"))
-        .arg(&recipe)
-        .args(["--agent-binary", "codex", "--working-dir"])
-        .arg(root.path())
-        .env("CODEX_TEST_ROOT", root.path())
-        .env_remove("TEST_PROVIDER")
-        .env_remove("CODEX_TEST_OBSERVE_DESCENDANT")
-        .env("HOME", root.path())
-        .env("CODEX_HOME", root.path().join("codex-home"))
-        .env("XDG_CONFIG_HOME", root.path().join("config"))
-        .env("PYTHONNOUSERSITE", "1")
-        .env_remove("PYTHONPATH")
-        .env_remove("PYTHONHOME")
-        .env(
-            "TEST_SCENARIO",
-            if variant == "json" {
-                "cancel_json"
-            } else {
-                "cancel"
-            },
-        )
-        .env("AMPLIHACK_LAUNCHER_BINARY", launcher)
-        .env("AMPLIHACK_SESSION_DEPTH", "0")
-        .env("RECIPE_RUNNER_NO_UPDATE_CHECK", "1")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut runner = runner_command(
+        root.path(),
+        &launcher,
+        if variant == "json" {
+            "cancel_json"
+        } else {
+            "cancel"
+        },
+    )
+    .arg(&recipe)
+    .args(["--agent-binary", "codex", "--working-dir"])
+    .arg(root.path())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+    let worker = SpawnedWorker::capture(runner.id()).expect("spawned cancellation runner identity");
     let start = Instant::now();
     while !root.path().join("launcher.pid").exists() {
         if start.elapsed() > Duration::from_secs(5) {
@@ -84,14 +119,12 @@ fn assert_runner_cancellation(signal: i32, variant: &str) {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let launcher: i32 = fs::read_to_string(root.path().join("launcher.pid"))
-        .unwrap()
-        .parse()
-        .unwrap();
+    let processes =
+        CancellationObservation::capture(root.path(), &worker, start + Duration::from_secs(5))
+            .expect("known live cancellation processes must be observed");
+    let launcher = processes.launcher_pid();
     assert_eq!(unsafe { libc::getpgid(launcher) }, launcher);
     assert_ne!(unsafe { libc::getpgid(runner.id() as i32) }, launcher);
-    let processes = CancellationObservation::capture(root.path(), runner.id() as i32)
-        .expect("known live cancellation processes must be observed");
     assert_eq!(unsafe { libc::kill(runner.id() as i32, signal) }, 0);
     let deadline = Instant::now() + Duration::from_secs(6);
     while runner.try_wait().unwrap().is_none() {

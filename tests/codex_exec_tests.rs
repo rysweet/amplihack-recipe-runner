@@ -4,7 +4,6 @@ use recipe_runner_rs::adapters::{Adapter, cli_subprocess::CLISubprocessAdapter};
 use serde_json::json;
 use std::fs;
 
-#[cfg(target_os = "linux")]
 #[path = "codex_exec/cancellation.rs"]
 mod cancellation;
 #[path = "codex_exec/final_output.rs"]
@@ -37,15 +36,26 @@ fn adapter_worker() {
             (action.sa_sigaction, flags)
         })
     }
+    for name in [
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GH_TOKEN",
+        "AMPLIHACK_AGENT_BINARY",
+        "AMPLIHACK_BASH",
+        "PYTHONPATH",
+        "FIXTURE_AMBIENT_SENTINEL",
+    ] {
+        assert!(
+            std::env::var_os(name).is_none(),
+            "ambient variable reached adapter worker: {name}"
+        );
+    }
     let prior = dispositions();
     let prompt = fs::read_to_string(format!("{root}/prompt")).unwrap();
     let observes_descendant = matches!(
         std::env::var("TEST_SCENARIO").unwrap().as_str(),
         "tree_timeout" | "tree_success" | "writer"
     );
-    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let observer = observes_descendant
-        .then(|| process_observation::watch_ready(std::path::Path::new(&root), done.clone()));
     let result = CLISubprocessAdapter::new()
         .with_binary(&std::env::var("TEST_PROVIDER").unwrap())
         .execute_agent_step(
@@ -70,13 +80,6 @@ fn adapter_worker() {
     // Inspect at adapter return, before observer joining or fallback cleanup.
     let observation = observes_descendant
         .then(|| process_observation::capture_return(std::path::Path::new(&root)));
-    done.store(true, std::sync::atomic::Ordering::Release);
-    if let Some(observer) = observer {
-        observer
-            .join()
-            .unwrap()
-            .expect("known live descendant observation failed");
-    }
     if let Some(observation) = observation {
         observation.expect("adapter-return descendant observation failed");
     }

@@ -1,3 +1,4 @@
+use super::process_observation::{SpawnedWorker, watch_ready};
 use recipe_runner_rs::runner::MAX_STEP_OUTPUT_BYTES;
 use serde_json::Value;
 use std::{
@@ -44,6 +45,7 @@ def ready(descendant):
 final = pathlib.Path(args[args.index('--output-last-message')+1]) if '--output-last-message' in args else None
 record = {'attempt_id':attempt_id, 'args':args, 'cwd':str(pathlib.Path.cwd()), 'final':str(final) if final else None, 'absent':not final.exists() if final else False,
           'directory_mode':stat.S_IMODE(final.parent.stat().st_mode) if final else None}
+record['ambient_present'] = [name for name in ('OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GH_TOKEN', 'AMPLIHACK_AGENT_BINARY', 'AMPLIHACK_BASH', 'PYTHONPATH', 'FIXTURE_AMBIENT_SENTINEL') if name in os.environ and (name != 'AMPLIHACK_AGENT_BINARY' or os.environ[name] != args[0])]
 (root/'record.json').write_text(json.dumps(record))
 with (root/'attempts.jsonl').open('a') as log: log.write(json.dumps(record)+'\n')
 def reject_trusted_directory():
@@ -174,6 +176,29 @@ pub(super) fn assert_scenario_completed(
     name
 }
 
+/// Both launch paths clear the environment, use trusted system executables and
+/// private writable paths. Synthetic fixtures need no ambient configuration.
+pub(super) fn fixture_environment<'a>(
+    command: &'a mut Command,
+    root: &std::path::Path,
+) -> &'a mut Command {
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LC_ALL", "C")
+        .env("HOME", root)
+        .env("TMPDIR", root)
+        .env("CODEX_HOME", root.join("codex-home"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("PYTHONNOUSERSITE", "1")
+        .env("CODEX_TEST_ROOT", root)
+        .env("AMPLIHACK_SESSION_DEPTH", "0")
+        .env("AMPLIHACK_MAX_DEPTH", "10")
+        .env("AMPLIHACK_RATELIMIT_MAX_RETRIES", "0")
+        .env("AMPLIHACK_RATELIMIT_BASE_DELAY_SECS", "0")
+        .env("AMPLIHACK_RATELIMIT_MAX_DELAY_SECS", "0")
+}
+
 pub(super) fn run(
     scenario: &str,
     prompt: &str,
@@ -183,11 +208,12 @@ pub(super) fn run(
     let root = tempfile::tempdir().unwrap();
     if scenario == "git_checkout" {
         assert!(
-            Command::new("git")
+            Command::new("/usr/bin/git")
                 .args(["init", "--quiet"])
                 .arg(root.path())
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", root.path())
                 .status()
                 .unwrap()
                 .success()
@@ -196,22 +222,13 @@ pub(super) fn run(
     fs::write(root.path().join("prompt"), prompt).unwrap();
     let launcher = install_launcher(root.path());
     let mut command = Command::new(std::env::current_exe().unwrap());
-    command
+    fixture_environment(&mut command, root.path())
         .args(["--exact", "adapter_worker", "--nocapture"])
-        .env("CODEX_TEST_ROOT", root.path())
         .env("AMPLIHACK_LAUNCHER_BINARY", launcher)
-        .env("AMPLIHACK_SESSION_DEPTH", "0")
-        .env("AMPLIHACK_MAX_DEPTH", "10")
         .env("TEST_OUTPUT_LIMIT", MAX_STEP_OUTPUT_BYTES.to_string())
         .env("TEST_SCENARIO", scenario)
         .env("TEST_PROVIDER", provider)
         .env("CODEX_TEST_OBSERVE_DESCENDANT", "1")
-        .env("HOME", root.path())
-        .env("CODEX_HOME", root.path().join("codex-home"))
-        .env("XDG_CONFIG_HOME", root.path().join("config"))
-        .env("PYTHONNOUSERSITE", "1")
-        .env_remove("PYTHONPATH")
-        .env_remove("PYTHONHOME")
         .env(
             "AMPLIHACK_RATELIMIT_MAX_RETRIES",
             if matches!(
@@ -223,30 +240,47 @@ pub(super) fn run(
                 "0"
             },
         )
-        .env("AMPLIHACK_RATELIMIT_BASE_DELAY_SECS", "0")
-        .env("AMPLIHACK_RATELIMIT_MAX_DELAY_SECS", "0")
         .env(
             "AMPLIHACK_RATELIMIT_FALLBACK_AUTO_MODEL",
             if scenario == "retry" { "1" } else { "" },
-        )
-        .env_remove("TEST_MODEL");
+        );
     if let Some(model) = model {
         command.env("TEST_MODEL", model);
     }
     let mut child = command.spawn().unwrap();
+    let observes_descendant = matches!(scenario, "tree_timeout" | "tree_success" | "writer");
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observer = observes_descendant.then(|| {
+        let worker = SpawnedWorker::capture(child.id()).expect("spawned worker identity");
+        watch_ready(root.path(), worker, done.clone())
+    });
     let start = Instant::now();
-    loop {
+    let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success());
-            break;
+            break status;
         }
         if start.elapsed() > Duration::from_secs(8) {
             child.kill().unwrap();
             child.wait().unwrap();
+            done.store(true, std::sync::atomic::Ordering::Release);
             panic!("adapter exceeded watchdog");
         }
         std::thread::sleep(Duration::from_millis(10));
+    };
+    done.store(true, std::sync::atomic::Ordering::Release);
+    if let Some(observer) = observer {
+        let ownership = observer
+            .join()
+            .unwrap()
+            .expect("live fixture ownership must be verified");
+        // Boundary assertions still use the worker's immediate return receipt.
+        // Cleanup here cannot turn a live-at-return receipt into a passing test.
+        let boundary = ownership.validate_return(root.path());
+        let cleanup = ownership.cleanup();
+        boundary.expect("fixture return observation must match retained ownership");
+        cleanup.expect("verified fixture fallback cleanup failed");
     }
+    assert!(status.success());
     let result =
         serde_json::from_slice(&fs::read(root.path().join("result.json")).unwrap()).unwrap();
     let record = match fs::read(root.path().join("record.json")) {
@@ -260,3 +294,6 @@ pub(super) fn run(
     };
     (root, result, record)
 }
+
+#[path = "fixtures/environment_tests.rs"]
+mod environment_tests;
