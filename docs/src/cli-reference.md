@@ -13,6 +13,7 @@ Complete reference for the `recipe-runner-rs` command-line interface.
 - [Synopsis](#synopsis)
 - [Subcommands](#subcommands)
 - [Global options](#global-options)
+- [Sub-recipe references](#sub-recipe-references)
 - [Failed bash stdout](#failed-bash-stdout)
 - [Exit codes](#exit-codes)
 - [Smart context value parsing](#smart-context-value-parsing---set)
@@ -154,6 +155,7 @@ recipe-runner-rs build.yaml -C ../other-repo --dry-run
 ### `-R, --recipe-dir <DIR>`
 
 Add a directory to the recipe search path. Can be specified multiple times to search across several directories.
+Use this option to locate children referenced by [sub-recipe names](#sub-recipe-references).
 
 ```bash
 # Single directory
@@ -411,6 +413,102 @@ recipe-runner-rs deploy.yaml --output-format json | jq '.steps[] | select(.statu
 # JSON output with progress on stderr
 recipe-runner-rs deploy.yaml --output-format json --progress 2>/dev/null
 ```
+
+## Sub-recipe references
+
+The top-level `RECIPE` argument accepts a recipe file path, such as `./parent.yaml` or an absolute path.
+A recipe step's `recipe:` field requires a canonical name: a non-empty string containing only ASCII
+letters, digits, underscores and hyphens (`[A-Za-z0-9_-]+`). Use `recipe: child` to find `child.yaml`
+in the recipe search directories. Omit the file extension.
+
+| Reference | Result |
+| --- | --- |
+| `child`, `build-project`, `workflow_prep`, `Build2` | These are valid literal names. |
+| `/opt/recipes/child.yaml`, `./child`, `team/child`, `team\child`, `../child` | Paths, separators and traversal are rejected. |
+| `child.yaml`, `child.v2`, `.child` | Dots and file extensions are rejected. |
+| `""`, `" child"`, `"child "`, `"child name"`, `"déploy"`, `"child@prod"` | Empty strings, whitespace, non-ASCII letters and other unsupported characters are rejected. |
+
+Names are checked exactly as supplied, without trimming whitespace, removing extensions or normalising paths.
+Configure the containing directory with `--recipe-dir`.
+
+### Search-directory example
+
+Save these files as `parent.yaml` and `recipes/child.yaml` beneath the current directory:
+
+```yaml
+# parent.yaml
+name: parent
+steps:
+  - id: prepare
+    type: bash
+    command: "printf 'Parent started\n'"
+  - id: run-child
+    type: recipe
+    recipe: child
+```
+
+```yaml
+# recipes/child.yaml
+name: child
+steps:
+  - id: report
+    type: bash
+    command: "printf 'Child executed\n'"
+```
+
+```bash
+recipe-runner-rs ./parent.yaml --recipe-dir ./recipes --no-default-search --validate-only
+# Exit status: 0. No steps execute.
+recipe-runner-rs ./parent.yaml --recipe-dir ./recipes --no-default-search --no-auto-stage
+# Exit status: 0. The parent runs prepare, then the child's report step.
+```
+
+Explicit search directories retain their configured order and take precedence over anchored and default
+locations. `--no-default-search` restricts child lookup to the explicit directories. Anchored searches
+remain tied to the top-level recipe location and working directory, with their existing symlink
+containment checks. See [`--no-default-search`](#--no-default-search) for the default locations.
+
+### Literal validation and failure timing
+
+Parsing and execution preflight check every step whose explicit or inferred type is `recipe`.
+A missing `recipe:` field, an empty name or an invalid literal fails before any step or step hook in
+that recipe runs. Conditions, tag filters, parallel grouping, `continue_on_error` and `fatal` settings
+do not bypass this check. Execution preflight also applies to recipes constructed programmatically.
+
+Both `--validate-only` and normal execution return a non-zero status for an invalid literal. The diagnostic
+identifies the offending step and reference, explains the canonical-name requirement and directs users
+to `--recipe-dir`. For example, changing `run-child` above to `recipe: ./recipes/child.yaml` rejects the
+parent before `prepare` executes. Restore `recipe: child` and supply `--recipe-dir ./recipes`.
+
+Validation checks the recipe being loaded or executed. It does not eagerly find and parse the entire
+sub-recipe graph or prove that a valid name exists on disk. A child's invalid literal fails before any
+child steps run; earlier parent steps may already have completed when the child is loaded.
+
+### Template references
+
+Supported expressions such as `{{child_name}}` and `{{deployment.recipe}}` defer the name check until
+execution. Expressions use double braces around one or more ASCII letters, digits, underscores, dots
+or hyphens, without spaces inside the braces. For example, replace the parent's `recipe: child` with
+`recipe: "{{child_name}}"`, then run:
+
+```bash
+recipe-runner-rs ./parent.yaml --recipe-dir ./recipes --no-default-search --no-auto-stage \
+  --set child_name=child
+# Exit status: 0. The resolved name is child, and the child's report step runs.
+```
+
+The runner renders the reference once using the current parent context, including earlier step outputs,
+before applying that step's child context overrides. It checks the complete rendered name against
+`[A-Za-z0-9_-]+` before filesystem lookup. Missing variables and null values render as empty strings;
+other non-string values retain the usual context rendering. Substituted text is not rendered again.
+Empty results, remaining braces, paths and other invalid resolved names fail with a diagnostic identifying
+the step and the resolved-name failure. Earlier parent steps may have executed before this value is known.
+
+Static validation accepts any reference containing a supported expression, including
+`"recipes/{{child_name}}.yaml"`; that example fails after rendering because the result contains a separator
+and a dot. Malformed template-like text without a supported expression, such as `"{{ child_name }}"`,
+receives ordinary literal validation and fails before execution. Successful static validation of a template
+does not establish that its resolved name is valid or that a matching child exists.
 
 ## Failed Bash Stdout
 

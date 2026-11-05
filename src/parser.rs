@@ -4,6 +4,7 @@
 /// and step-type inference.
 use crate::discovery;
 use crate::models::{Recipe, StepType};
+use crate::runner::sub_recipe_paths::validate_recipe_references;
 use log::{debug, info};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -161,6 +162,8 @@ impl RecipeParser {
                 )));
             }
         }
+
+        validate_recipe_references(&recipe).map_err(|error| ParseError::Invalid(error.message))?;
 
         if self.emit_field_warnings
             && let Ok(raw) = serde_yaml::from_str::<serde_yaml::Value>(yaml_content)
@@ -1205,6 +1208,169 @@ steps:
                 .filter(|l| l.contains("max_env_value_bytes"))
                 .count(),
             1
+        );
+    }
+}
+
+#[cfg(test)]
+mod sub_recipe_reference_tests {
+    use super::{ParseError, RecipeParser};
+    use serde_json::{Value, json};
+
+    fn parse_step(step: Value) -> Result<crate::models::Recipe, ParseError> {
+        RecipeParser::new()
+            .parse(&serde_yaml::to_string(&json!({"name": "parent", "steps": [step]})).unwrap())
+    }
+
+    fn assert_name_guidance(error: &str, step: &str) {
+        assert!(error.contains(step), "missing step {step:?}: {error}");
+        assert!(
+            error.contains("[A-Za-z0-9_-]+"),
+            "missing name rule: {error}"
+        );
+        assert!(
+            error.contains("--recipe-dir"),
+            "missing search guidance: {error}"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_every_runtime_rejected_literal_name() {
+        let invalid = [
+            "",
+            "/absolute/child.yaml",
+            "child/name",
+            "child\\name",
+            "../child",
+            "..",
+            ".hidden",
+            "child.yaml",
+            "child.yml",
+            "a..b",
+            " child",
+            "child ",
+            "a b",
+            "a\tb",
+            "a\nb",
+            "a\0b",
+            "café",
+            "child:other",
+            "child$",
+            "child@",
+            "C:\\recipes\\child.yaml",
+        ];
+        let mut failures = Vec::new();
+        for reference in invalid {
+            match parse_step(json!({"id": "dispatch", "recipe": reference})) {
+                Err(ParseError::Invalid(message)) => assert_name_guidance(&message, "dispatch"),
+                other => failures.push(format!("{reference:?}: {other:?}")),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "invalid literals accepted or misclassified:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn parser_requires_reference_on_explicit_recipe_steps() {
+        for reference in [None, Some(json!(null)), Some(json!(""))] {
+            let mut step = json!({"id": "missing-reference", "type": "recipe"});
+            if let Some(value) = reference {
+                step["recipe"] = value;
+            }
+            let error = parse_step(step).expect_err("missing or empty recipe must fail parsing");
+            assert!(matches!(error, ParseError::Invalid(_)), "{error}");
+            assert_name_guidance(&error.to_string(), "missing-reference");
+        }
+    }
+
+    #[test]
+    fn parser_accepts_canonical_names_without_discovering_children() {
+        for reference in ["child", "A0_z-9", "_", "-", "123", "not-installed-194"] {
+            assert!(parse_step(json!({"id": "dispatch", "recipe": reference})).is_ok());
+        }
+        // Only the effective type matters. An explicit bash step does not dispatch a recipe.
+        assert!(
+            parse_step(
+                json!({"id": "bash", "type": "bash", "command": "true", "recipe": "/unused"})
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn parser_defers_supported_expressions_and_rejects_malformed_literals() {
+        for reference in [
+            "{{child}}",
+            "{{nested.child-name}}",
+            "prefix-{{child}}",
+            "/{{child}}.yaml",
+            "{{child}}/{{other}}",
+            "{{child}} {{ bad }}",
+        ] {
+            assert!(
+                parse_step(json!({"id": "dynamic", "recipe": reference})).is_ok(),
+                "{reference:?}"
+            );
+        }
+        for reference in [
+            "{{ child }}",
+            "{{}}",
+            "{{child",
+            "{child}",
+            "{{child/other}}",
+            "{{child!}}",
+        ] {
+            let error = parse_step(json!({"id": "malformed", "recipe": reference}))
+                .expect_err("text with no supported expression is a literal");
+            assert_name_guidance(&error.to_string(), "malformed");
+        }
+    }
+
+    #[test]
+    fn parser_rejects_invalid_configuration_despite_execution_options() {
+        for option in [
+            json!({"condition": "false"}),
+            json!({"when_tags": ["excluded"]}),
+            json!({"parallel_group": "workers"}),
+            json!({"continue_on_error": true}),
+            json!({"fatal": false}),
+        ] {
+            let mut step = json!({"id": "dispatch", "recipe": "../child"});
+            step.as_object_mut()
+                .unwrap()
+                .extend(option.as_object().unwrap().clone());
+            let error =
+                parse_step(step).expect_err("execution options cannot conceal invalid names");
+            assert_name_guidance(&error.to_string(), "dispatch");
+        }
+    }
+
+    #[test]
+    fn parser_reports_first_invalid_step_and_escapes_control_characters() {
+        let yaml = serde_yaml::to_string(&json!({"name": "parent", "steps": [
+            {"id": "first\nstep", "recipe": "bad\nname"},
+            {"id": "later-step", "recipe": "/other"}
+        ]}))
+        .unwrap();
+        let error = RecipeParser::new()
+            .parse(&yaml)
+            .expect_err("invalid reference")
+            .to_string();
+        assert_name_guidance(&error, "first\\nstep");
+        assert!(
+            error.contains("bad\\nname"),
+            "reference must be escaped: {error}"
+        );
+        assert!(
+            !error.contains("first\nstep") && !error.contains("bad\nname"),
+            "raw control characters: {error:?}"
+        );
+        assert!(
+            !error.contains("later-step"),
+            "report the first invalid step: {error}"
         );
     }
 }

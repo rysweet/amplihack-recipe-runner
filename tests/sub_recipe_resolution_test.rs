@@ -21,6 +21,317 @@ use recipe_runner_rs::adapters::Adapter;
 use recipe_runner_rs::parser::RecipeParser;
 use recipe_runner_rs::runner::RecipeRunner;
 
+mod reference_validation {
+    use super::*;
+    use recipe_runner_rs::models::{Recipe, StepStatus, StepType};
+    use recipe_runner_rs::runner::ExecutionListener;
+    use serde_json::{Value, json};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct RecordingAdapter(Arc<Mutex<Vec<String>>>);
+
+    impl Adapter for RecordingAdapter {
+        fn execute_agent_step(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: &str,
+            _: Option<&str>,
+            _: Option<u64>,
+        ) -> Result<String, anyhow::Error> {
+            panic!("these fixtures contain no agent steps")
+        }
+        fn execute_bash_step(
+            &self,
+            command: &str,
+            _: &str,
+            _: Option<u64>,
+            _: &std::collections::HashMap<String, String>,
+        ) -> Result<String, anyhow::Error> {
+            self.0.lock().unwrap().push(command.into());
+            Ok(command.into())
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &str {
+            "recording"
+        }
+    }
+
+    struct Events(Arc<Mutex<Vec<String>>>);
+    impl ExecutionListener for Events {
+        fn on_step_start(&self, id: &str, _: StepType) {
+            self.0.lock().unwrap().push(id.into());
+        }
+        fn on_step_complete(&self, result: &recipe_runner_rs::models::StepResult) {
+            self.0.lock().unwrap().push(result.step_id.clone());
+        }
+        fn on_output(&self, id: &str, _: &str) {
+            self.0.lock().unwrap().push(id.into());
+        }
+    }
+
+    fn raw_recipe(steps: Value) -> Recipe {
+        // Deliberately bypass RecipeParser to exercise the programmatic execution boundary.
+        serde_json::from_value(json!({"name": "parent", "steps": steps})).unwrap()
+    }
+
+    fn diagnostic(result: &recipe_runner_rs::models::RecipeResult, id: &str) -> String {
+        assert!(!result.success, "invalid reference succeeded: {result:?}");
+        let step = result
+            .step_results
+            .iter()
+            .find(|s| s.step_id == id)
+            .expect("offending step result");
+        assert_eq!(step.status, StepStatus::Failed);
+        assert!(step.error.contains("[A-Za-z0-9_-]+"), "{}", step.error);
+        assert!(step.error.contains("--recipe-dir"), "{}", step.error);
+        step.error.clone()
+    }
+
+    #[test]
+    fn programmatic_preflight_prevents_commands_hooks_listeners_and_audit_creation() {
+        for options in [
+            json!({}),
+            json!({"condition": "false"}),
+            json!({"when_tags": ["excluded"]}),
+            json!({"parallel_group": "workers"}),
+            json!({"continue_on_error": true}),
+            json!({"fatal": false}),
+        ] {
+            for reference in [None, Some(""), Some("/absolute/child.yaml")] {
+                let temp = tempfile::tempdir().unwrap();
+                let adapter = RecordingAdapter::default();
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let mut invalid = json!({"id": "dispatch", "type": "recipe"});
+                if let Some(reference) = reference {
+                    invalid["recipe"] = json!(reference);
+                }
+                invalid
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(options.as_object().unwrap().clone());
+                let mut recipe = raw_recipe(json!([
+                    {"id": "earlier", "command": "FIRST_STEP_EXECUTED"}, invalid
+                ]));
+                recipe.hooks.pre_step = Some("printf hook > hook-marker".into());
+                recipe.hooks.post_step = recipe.hooks.pre_step.clone();
+                recipe.hooks.on_error = recipe.hooks.pre_step.clone();
+                let audit = temp.path().join("audit");
+                let result = RecipeRunner::new(adapter.clone())
+                    .with_auto_stage(false)
+                    .with_working_dir(temp.path().to_str().unwrap())
+                    .with_default_search(false)
+                    .with_audit_dir(audit.clone())
+                    .with_tags(Vec::new(), vec!["excluded".into()])
+                    .with_listener(Box::new(Events(events.clone())))
+                    .execute(&recipe, None);
+                assert!(
+                    adapter.0.lock().unwrap().is_empty(),
+                    "commands or step hooks ran for {options} / {reference:?}: {result:?}"
+                );
+                assert!(
+                    events.lock().unwrap().is_empty(),
+                    "listener reported execution"
+                );
+                assert!(
+                    !audit.exists() || std::fs::read_dir(audit).unwrap().next().is_none(),
+                    "audit created before validation"
+                );
+                diagnostic(&result, "dispatch");
+            }
+        }
+    }
+
+    #[test]
+    fn resolved_dynamic_names_use_current_context_before_child_overrides() {
+        for (reference, context, output) in [
+            ("{{selected}}", json!({"selected": "child"}), None),
+            (
+                "{{nested.child-name}}",
+                json!({"nested": {"child-name": "child"}}),
+                None,
+            ),
+            ("{{selected}}", json!({"selected": "wrong"}), Some("child")),
+            ("child-{{suffix}}", json!({"suffix": 42}), None),
+            ("{{selected}}", json!({"selected": true}), None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let name = if reference == "child-{{suffix}}" {
+                "child-42"
+            } else if context["selected"] == json!(true) {
+                "true"
+            } else {
+                "child"
+            };
+            std::fs::write(
+                dir.path().join(format!("{name}.yaml")),
+                "name: child\nsteps:\n  - id: child-command\n    command: CHILD_EXECUTED\n",
+            )
+            .unwrap();
+            let mut steps = Vec::new();
+            if let Some(value) = output {
+                steps.push(json!({"id": "select", "command": value, "output": "selected"}));
+            }
+            steps.push(json!({"id": "dispatch", "recipe": reference, "context": {"selected": "/invalid-child-override"}}));
+            let mut recipe = raw_recipe(json!(steps));
+            recipe.context = serde_json::from_value(context).unwrap();
+            let yaml = serde_yaml::to_string(&recipe).unwrap();
+            let recipe = RecipeParser::new().parse(&yaml).unwrap();
+            let adapter = RecordingAdapter::default();
+            let result = RecipeRunner::new(adapter.clone())
+                .with_auto_stage(false)
+                .with_working_dir(dir.path().to_str().unwrap())
+                .with_default_search(false)
+                .with_recipe_search_dirs(vec![dir.path().into()])
+                .execute(&recipe, None);
+            assert!(result.success, "{reference:?}: {result:?}");
+            assert!(
+                adapter
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c == "CHILD_EXECUTED")
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_rendered_names_fail_with_resolved_diagnostics_before_discovery() {
+        for (reference, value) in [
+            ("{{selected}}", None),
+            ("{{selected}}", Some(json!(null))),
+            ("{{selected}}", Some(json!(""))),
+            ("{{selected}}", Some(json!("../child"))),
+            ("{{selected}}", Some(json!("/absolute/child.yaml"))),
+            ("{{selected}}", Some(json!("child\\name"))),
+            ("{{selected}}", Some(json!(["child"]))),
+            ("{{selected}}", Some(json!({"name": "child"}))),
+            ("{{selected}}", Some(json!("{{other}}"))),
+            ("/{{selected}}.yaml", Some(json!("child"))),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut recipe = raw_recipe(json!([
+                {"id": "earlier", "command": "EARLIER_EXECUTED"},
+                {"id": "dispatch", "recipe": reference}
+            ]));
+            recipe.context.insert("other".into(), json!("child"));
+            if let Some(value) = value {
+                recipe.context.insert("selected".into(), value);
+            }
+            let recipe = RecipeParser::new()
+                .parse(&serde_yaml::to_string(&recipe).unwrap())
+                .unwrap();
+            let adapter = RecordingAdapter::default();
+            let result = RecipeRunner::new(adapter.clone())
+                .with_auto_stage(false)
+                .with_working_dir(dir.path().to_str().unwrap())
+                .with_default_search(false)
+                .with_recipe_search_dirs(vec![dir.path().into()])
+                .execute(&recipe, None);
+            assert_eq!(*adapter.0.lock().unwrap(), vec!["EARLIER_EXECUTED"]);
+            let error = diagnostic(&result, "dispatch");
+            assert!(error.to_lowercase().contains("resolved"), "{error}");
+            assert!(
+                !error.contains("Searched the following directories"),
+                "invalid resolved name reached discovery: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_name_diagnostic_escapes_step_id_and_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recipe = raw_recipe(json!([
+            {"id": "dispatch\nstep", "recipe": "{{selected}}"}
+        ]));
+        recipe.context.insert("selected".into(), json!("bad\nname"));
+        let result = RecipeRunner::new(RecordingAdapter::default())
+            .with_auto_stage(false)
+            .with_working_dir(dir.path().to_str().unwrap())
+            .with_default_search(false)
+            .execute(&recipe, None);
+        let error = diagnostic(&result, "dispatch\nstep");
+        assert!(error.contains("dispatch\\nstep"), "{error:?}");
+        assert!(error.contains("bad\\nname"), "{error:?}");
+        assert!(!error.contains("dispatch\nstep"), "{error:?}");
+        assert!(!error.contains("bad\nname"), "{error:?}");
+        assert!(error.contains("resolved"), "{error:?}");
+    }
+
+    #[test]
+    fn valid_dynamic_reference_does_not_render_substituted_text_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("child.yaml"), CHILD_RECIPE).unwrap();
+        let mut recipe = raw_recipe(json!([{"id": "dispatch", "recipe": "{{selected}}"}]));
+        recipe.context.insert("selected".into(), json!("{{other}}"));
+        recipe.context.insert("other".into(), json!("child"));
+        let adapter = RecordingAdapter::default();
+        let result = RecipeRunner::new(adapter.clone())
+            .with_auto_stage(false)
+            .with_working_dir(dir.path().to_str().unwrap())
+            .with_default_search(false)
+            .with_recipe_search_dirs(vec![dir.path().into()])
+            .execute(&recipe, None);
+        let error = diagnostic(&result, "dispatch");
+        assert!(
+            error.contains("{{other}}"),
+            "report the once-rendered name: {error}"
+        );
+        assert!(adapter.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn invalid_child_fails_before_child_steps_without_eager_parent_graph_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("child.yaml"), "name: child\nsteps:\n  - id: child-earlier\n    command: CHILD_EXECUTED\n  - id: invalid-child-dispatch\n    recipe: ../escape\n").unwrap();
+        let recipe = RecipeParser::new().parse("name: parent\nsteps:\n  - id: earlier\n    command: PARENT_EXECUTED\n  - id: dispatch\n    recipe: child\n").unwrap();
+        let adapter = RecordingAdapter::default();
+        let result = RecipeRunner::new(adapter.clone())
+            .with_auto_stage(false)
+            .with_working_dir(dir.path().to_str().unwrap())
+            .with_default_search(false)
+            .with_recipe_search_dirs(vec![dir.path().into()])
+            .execute(&recipe, None);
+        assert_eq!(
+            *adapter.0.lock().unwrap(),
+            vec!["PARENT_EXECUTED"],
+            "{result:?}"
+        );
+        let error = diagnostic(&result, "dispatch");
+        assert!(error.contains("invalid-child-dispatch"), "{error}");
+    }
+
+    #[test]
+    fn effective_inherited_steps_receive_programmatic_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("base.yaml"),
+            "name: base\nsteps:\n  - id: first\n    command: INHERITED_EXECUTED\n",
+        )
+        .unwrap();
+        let mut recipe = raw_recipe(json!([{"id": "dispatch", "recipe": "../escape"}]));
+        recipe.extends = Some("base".into());
+        let adapter = RecordingAdapter::default();
+        let result = RecipeRunner::new(adapter.clone())
+            .with_auto_stage(false)
+            .with_working_dir(dir.path().to_str().unwrap())
+            .with_default_search(false)
+            .with_recipe_search_dirs(vec![dir.path().into()])
+            .execute(&recipe, None);
+        assert!(
+            adapter.0.lock().unwrap().is_empty(),
+            "inherited step ran: {result:?}"
+        );
+        diagnostic(&result, "dispatch");
+    }
+}
+
 /// Minimal adapter that records nothing — sub-recipe resolution happens at
 /// parse/dispatch time, before any agent or bash adapter call is made.
 struct NoopAdapter;

@@ -344,6 +344,24 @@ impl<A: Adapter> RecipeRunner<A> {
         recipe: &Recipe,
         user_context: Option<HashMap<String, Value>>,
     ) -> RecipeResult {
+        // Validate the whole effective recipe before any execution side effects,
+        // including for programmatically constructed and inherited recipes.
+        if let Err(error) = sub_recipe_paths::validate_recipe_references(recipe) {
+            error!("{}", error.message);
+            return RecipeResult {
+                recipe_name: recipe.name.clone(),
+                success: false,
+                step_results: vec![StepResult {
+                    step_id: error.step_id,
+                    status: StepStatus::Failed,
+                    output: String::new(),
+                    error: error.message,
+                    duration: None,
+                }],
+                context: HashMap::new(),
+                duration: None,
+            };
+        }
         info!(
             "run_steps: recipe='{}', steps={}",
             recipe.name,
@@ -771,12 +789,19 @@ impl<A: Adapter> RecipeRunner<A> {
                 }
             }
             Err(e) => {
-                error!("Step '{}' failed: {}", step.id, e);
+                // Escape sub-recipe IDs explicitly; the generic error Display
+                // inserts the recipe-supplied ID without escaping it.
+                let diagnostic = if step.effective_type() == StepType::Recipe {
+                    format!("Step {:?} failed: {}", e.step_id, e.message)
+                } else {
+                    e.to_string()
+                };
+                error!("{}", diagnostic);
                 return StepResult {
                     step_id: step.id.clone(),
                     status: StepStatus::Failed,
                     output: String::new(),
-                    error: e.to_string(),
+                    error: diagnostic,
                     duration: Some(step_start.elapsed()),
                 };
             }
@@ -998,9 +1023,22 @@ impl<A: Adapter> RecipeRunner<A> {
             message: "Recipe step is missing the 'recipe' field".to_string(),
         })?;
 
+        // Resolve against incoming context, before applying child overrides.
+        // Render once: substituted text must never become another expression.
+        let recipe_name = ctx.render(recipe_name);
+        sub_recipe_paths::validate_sub_recipe_name(&recipe_name).map_err(|reason| {
+            StepExecutionError {
+                step_id: step.id.clone(),
+                message: format!(
+                    "Invalid resolved sub-recipe name {recipe_name:?}: {reason}. {}",
+                    sub_recipe_paths::RECIPE_NAME_GUIDANCE
+                ),
+            }
+        })?;
+
         // Use discovery module to find the recipe, falling back to local search dirs
         let path = self
-            .find_recipe_path(recipe_name)
+            .find_recipe_path(&recipe_name)
             .ok_or_else(|| StepExecutionError {
                 step_id: step.id.clone(),
                 message: format!(

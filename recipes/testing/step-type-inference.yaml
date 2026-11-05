@@ -42,8 +42,9 @@ steps:
     output: "prompt_inferred"
 
   # --- Inferred recipe: only `recipe` present ---
+  # Use --recipe-dir recipes/testing to find this child by its canonical name.
   - id: "infer-recipe-from-field"
-    recipe: "testing/output-chaining"
+    recipe: "output-chaining"
     output: "recipe_inferred"
 
   # --- Bash with command and condition (still bash) ---
