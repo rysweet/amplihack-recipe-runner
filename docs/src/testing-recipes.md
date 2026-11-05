@@ -59,6 +59,10 @@ in-flight agent; bounded channel waits detect deadlocks without timing sleeps.
 
 ### Test locations and discovery
 
+The [parallel Codex fixture reference](../issue-196-parallel-fixtures.md) describes
+worker configuration, attempt-specific scenario evidence, native process
+observation and the required Darwin/Linux acceptance evidence.
+
 `tests/codex_exec_tests.rs` remains the integration-test target and retains the
 root `adapter_worker` subprocess entrypoint selected by `--exact adapter_worker`.
 Its scenarios share infrastructure under `tests/codex_exec/`:

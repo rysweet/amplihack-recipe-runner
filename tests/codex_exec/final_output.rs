@@ -1,4 +1,4 @@
-use super::fixtures::run;
+use super::fixtures::{assert_scenario_completed, run};
 use serde_json::json;
 
 #[test]
@@ -13,11 +13,45 @@ fn assert_failure(mode: &str) {
     } else {
         "task".into()
     };
-    let (_, result, record) = run(mode, &prompt, None, "codex");
+    let (root, result, record) = run(mode, &prompt, None, "codex");
     assert!(result.get("error").is_some(), "{mode}: {result}");
     assert_ne!(result["error"], "", "{mode} needs contextual diagnostics");
     if let Some(path) = record["final"].as_str() {
         assert!(!std::path::Path::new(path).exists(), "{mode} leaked output");
+    }
+    let operation = match mode {
+        "missing" => "final_deliberately_omitted",
+        "directory" => "directory_created",
+        "symlink" => "symlink_created",
+        "fifo" => "fifo_created",
+        "unsafe_mode" => "unsafe_permissions_applied",
+        "invalid" => "invalid_utf8_written",
+        "oversize" => "oversized_final_written",
+        "nonzero" => "nonzero_exit_selected",
+        "partial" => "exit_before_stdin_read",
+        "blocked" => "blocking_without_stdin_read",
+        _ => panic!("no completion contract for this scenario"),
+    };
+    assert_scenario_completed(root.path(), mode, operation, &record);
+    let error = result["error"].as_str().unwrap();
+    if mode == "blocked" {
+        assert!(
+            error.contains("timed out"),
+            "blocked stdin must reach its deadline"
+        );
+        assert!(!root.path().join("stdin").exists());
+    } else {
+        assert!(
+            !error.contains("timed out"),
+            "scenario rejection must not be an incidental timeout"
+        );
+        if mode == "nonzero" {
+            assert!(error.contains("exit status: 7"));
+        }
+        if mode == "partial" {
+            assert!(error.contains("stdin"));
+            assert!(!root.path().join("stdin").exists());
+        }
     }
 }
 macro_rules! failure_case {
