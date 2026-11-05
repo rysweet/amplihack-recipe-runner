@@ -6,6 +6,7 @@ use crate::discovery;
 use crate::models::{Recipe, StepType};
 use crate::runner::sub_recipe_paths::validate_recipe_references;
 use log::{debug, info};
+use serde::de::DeserializeOwned;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -133,7 +134,7 @@ impl RecipeParser {
             });
         }
 
-        let recipe: Recipe = serde_yaml::from_str(yaml_content)?;
+        let recipe: Recipe = decode_recipe_document(yaml_content)?;
 
         if recipe.name.is_empty() {
             return Err(ParseError::Invalid(
@@ -166,7 +167,7 @@ impl RecipeParser {
         validate_recipe_references(&recipe).map_err(|error| ParseError::Invalid(error.message))?;
 
         if self.emit_field_warnings
-            && let Ok(raw) = serde_yaml::from_str::<serde_yaml::Value>(yaml_content)
+            && let Ok(raw) = decode_recipe_document::<serde_yaml::Value>(yaml_content)
         {
             for warning in step_field_warnings(&raw) {
                 // Sub-recipes are re-parsed on every invocation; report each
@@ -238,7 +239,7 @@ impl RecipeParser {
 
         // Check for unrecognized fields if raw YAML is provided
         if let Some(yaml_str) = raw_yaml
-            && let Ok(data) = serde_yaml::from_str::<serde_yaml::Value>(yaml_str)
+            && let Ok(data) = decode_recipe_document::<serde_yaml::Value>(yaml_str)
         {
             if let Some(map) = data.as_mapping() {
                 let known: HashSet<&str> = KNOWN_TOP_FIELDS.iter().copied().collect();
@@ -269,6 +270,22 @@ impl RecipeParser {
             emit_field_warnings: false,
         }
     }
+}
+
+/// Keep successful YAML decoding authoritative, with strict JSON as a fallback.
+fn decode_recipe_document<T: DeserializeOwned>(content: &str) -> Result<T, serde_yaml::Error> {
+    serde_yaml::from_str(content).or_else(|yaml_error| {
+        // Typed decoding can skip ignored values without checking their Unicode.
+        // Validate the complete JSON document, including ignored nested strings.
+        // JSON Value retains the existing acceptance of duplicate map entries.
+        if serde_json::from_str::<serde_json::Value>(content).is_err() {
+            return Err(yaml_error);
+        }
+
+        // Decode from the original text so duplicate recognised fields still fail.
+        // Preserve the original YAML diagnostic if the fallback cannot decode T.
+        serde_json::from_str(content).map_err(|_| yaml_error)
+    })
 }
 
 /// #130: one warning per unknown or retired step field in the raw recipe YAML.
@@ -465,6 +482,22 @@ fn resolve_extends_with_visited(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_json_fallback_preserves_yaml_diagnostic() {
+        for input in [
+            r#"{"name":"bad","steps":[{"id":"s"}],"ignored":"\uD800"}"#,
+            r#"{"name":"bad","name":"again","description":"\uD83D\uDE80","steps":[{"id":"s"}]}"#,
+            "name: [invalid",
+        ] {
+            let original = serde_yaml::from_str::<Recipe>(input).unwrap_err();
+            let error = RecipeParser::new().parse(input).unwrap_err();
+            let ParseError::Yaml(error) = error else {
+                panic!("decoding failures must retain the YAML error variant");
+            };
+            assert_eq!(error.to_string(), original.to_string());
+        }
+    }
 
     #[test]
     fn extends_diagnostics_escape_raw_identifiers() {

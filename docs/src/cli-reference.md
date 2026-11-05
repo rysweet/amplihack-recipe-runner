@@ -13,6 +13,7 @@ Complete reference for the `recipe-runner-rs` command-line interface.
 - [Synopsis](#synopsis)
 - [Subcommands](#subcommands)
 - [Global options](#global-options)
+- [JSON recipe input](#json-recipe-input)
 - [Sub-recipe references](#sub-recipe-references)
 - [Failed bash stdout](#failed-bash-stdout)
 - [Exit codes](#exit-codes)
@@ -277,6 +278,9 @@ recipe-runner-rs refactor.yaml --no-auto-stage -C /path/to/repo
 
 Parse and validate the recipe, print any warnings, then exit. Does not execute any steps. More thorough than `--dry-run` as it focuses on surfacing validation warnings.
 
+JSON recipe files support UTF-8 text and escaped Unicode surrogate pairs. See
+[JSON recipe input](#json-recipe-input) for decoding rules, limits and an example.
+
 Unknown step fields are listed once, in the same wording a normal run uses, and the command still exits `0` because they are warnings. A normal run reports the same unknown fields as parse-time warnings and keeps going (see [Unknown and retired step fields](yaml-format.md#unknown-and-retired-step-fields)). `--validate-only` doesn't repeat them as parse-time warnings.
 
 ```bash
@@ -413,6 +417,112 @@ recipe-runner-rs deploy.yaml --output-format json | jq '.steps[] | select(.statu
 # JSON output with progress on stderr
 recipe-runner-rs deploy.yaml --output-format json --progress 2>/dev/null
 ```
+
+## JSON recipe input
+
+Recipes accept JSON documents with the same fields, defaults and step-type
+inference as the [YAML recipe format](yaml-format.md). No format option or
+Unicode setting is required. Pass a JSON file by its explicit path.
+
+The parser first attempts YAML decoding. Successful YAML decoding remains
+authoritative, even when the input is also valid JSON. JSON decoding is tried
+only after YAML decoding fails. The same recipe validation checks follow
+either decoding path.
+
+### Unicode strings
+
+JSON strings accept both UTF-8 characters and valid escaped surrogate pairs.
+A surrogate pair consists of two `\uXXXX` escapes representing one character
+above U+FFFF. Both spellings decode to exactly the same recipe text in
+descriptions, prompts, top-level context and step context.
+
+| JSON string | Decoded text |
+|-------------|--------------|
+| `"\uD834\uDD1E"` | The musical symbol U+1D11E. |
+| `"𝄞"` | The same musical symbol U+1D11E. |
+| `"\\uD834\\uDD1E"` | The literal text `\uD834\uDD1E`. |
+| `"line one\nline two"` | Two lines separated by a newline. |
+| `"say \"ready\""` | The text `say "ready"`. |
+
+Strings are decoded once. Literal backslashes remain literal, adjacent
+characters keep their order, and prompt text is preserved without Unicode
+normalisation, stripping or replacement.
+
+### Recipe example
+
+Save the following document as `unicode-review.json`:
+
+```json
+{
+  "name": "unicode-review",
+  "description": "Preserve \uD834\uDD1E\uD800\uDF48 exactly.",
+  "context": {
+    "sample": "\uD834\uDD1E\uD800\uDF48"
+  },
+  "steps": [
+    {
+      "id": "review",
+      "agent": "reviewer",
+      "prompt": "Compare \uD834\uDD1E\uD800\uDF48 exactly.",
+      "context": {
+        "sample": "\uD834\uDD1E\uD800\uDF48"
+      }
+    }
+  ]
+}
+```
+
+The decoded description is `Preserve 𝄞𐍈 exactly.`, the prompt is
+`Compare 𝄞𐍈 exactly.`, and both context values are `𝄞𐍈`. Writing those
+characters directly in UTF-8 produces identical values.
+
+```bash
+recipe-runner-rs ./unicode-review.json --validate-only
+```
+
+The command reports that `unicode-review` is valid with one step and exits
+with status `0`. Validation does not execute the agent step.
+
+### Validation and limits
+
+Lone, reversed, truncated or malformed surrogate escapes are rejected,
+including those in ignored fields and nested values. The JSON fallback accepts
+one complete document, rejects trailing content and retains deserialiser
+nesting limits. Failed fallback decoding preserves the original YAML parse
+diagnostic.
+
+Input is limited to 1,000,000 source bytes, including whitespace and escape
+sequences. Input exactly at the limit is eligible for parsing. Longer input is
+rejected even if its decoded strings would be shorter. File parsing also checks
+the file size before reading it.
+
+Required fields, field types, duplicate-key rejections, unique step IDs and
+sub-recipe reference checks apply to JSON input. YAML comments, aliases,
+quoting and block text retain their existing behaviour.
+
+### Library parsing and warnings
+
+`recipe_runner_rs::parser::RecipeParser::parse` accepts a document string;
+`parse_file` accepts a file path. Both return the same `Recipe` values for
+equivalent escaped-pair and UTF-8 documents.
+
+Unknown top-level fields produce validation warnings. Unknown step fields
+and the retired `max_env_value_bytes` step field produce both parse-time and
+validation warnings. The retired field retains its removal warning.
+
+Diagnostic escaping and text length limits also apply to JSON documents.
+Step-field warnings are capped at 100 per recipe, followed by a summary of
+any remaining fields. Each distinct parse-time step-field warning is printed
+once per process. The cap and per-process suppression apply to step fields;
+unknown top-level fields are reported during validation. See
+[field warnings](yaml-format.md#unknown-and-retired-step-fields).
+
+[`--validate-only`](cli-reference.md#--validate-only) reports warnings once on
+standard output without duplicating them on standard error. `--dry-run` retains
+parse-time step-field warnings on standard error, subject to the existing logger
+routing. Library callers can suppress parse-time step-field warnings with
+`without_field_warnings()` and obtain validation warnings through
+`validate_with_yaml(&recipe, Some(document))`, including for JSON documents.
 
 ## Sub-recipe references
 
