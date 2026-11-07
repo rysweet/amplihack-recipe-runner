@@ -2956,6 +2956,11 @@ mod tests {
     #[test]
     fn bash_step_sees_only_allowed_parent_variables() {
         let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // Other tests inject a tiny env byte budget under ENV_BUDGET_TEST_LOCK,
+        // which would drop both variables from the child environment.
+        let _seam = crate::context::ENV_BUDGET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tag = unique_tag();
         let named = format!("ENVALLOW_NAMED_{tag}");
         let unnamed = format!("ENVALLOW_UNNAMED_{tag}");

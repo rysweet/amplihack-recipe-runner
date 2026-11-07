@@ -571,14 +571,14 @@ RecipeRunner::execute(recipe, user_context)
   │  │  1. should_skip_by_tags(step) ──► skip if filtered out      │
   │  │  2. run_hook(pre_step)                                      │
   │  │  3. evaluate condition ──► Skipped if false                 │
-  │  │  4. render templates in command/prompt                      │
+  │  │  4. render templates in command/prompt and working_dir      │
   │  │  5. dispatch:                                               │
   │  │     ├─ Bash  → adapter.execute_bash_step()                  │
   │  │     ├─ Agent → resolve agent, adapter.execute_agent_step()  │
   │  │     └─ Recipe → execute_sub_recipe() (recursive)            │
   │  │  6. parse JSON output (if parse_json, with retry)           │
   │  │  7. store output in context                                 │
-  │  │  8. maybe_auto_stage (git add -A for agent steps)           │
+  │  │  8. maybe_auto_stage (git add -A in rendered working_dir)   │
   │  │  9. run_hook(post_step) or run_hook(on_error)               │
   │  │ 10. write JSONL audit entry                                 │
   │  │ 11. fail-fast unless continue_on_error                      │
