@@ -2621,6 +2621,19 @@ steps:
         // An empty fallback directory, so no code path can stage this checkout.
         let scratch = tempfile::tempdir().unwrap();
         let plain = tempfile::tempdir().unwrap();
+        // If the temporary directory sits inside a repository, `git add -A`
+        // would stage files there and this test would pass for the wrong reason.
+        let enclosing = git_for_given_dir()
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(plain.path())
+            .output()
+            .unwrap();
+        assert!(
+            !enclosing.status.success(),
+            "temporary directory {} is inside the repository at {}; set TMPDIR to a path outside any repository",
+            plain.path().display(),
+            String::from_utf8_lossy(&enclosing.stdout).trim()
+        );
         std::fs::write(plain.path().join("work.txt"), "agent output\n").unwrap();
         let runner = RecipeRunner::new(MockAdapter).with_working_dir(&path_str(scratch.path()));
         assert!(
@@ -2638,7 +2651,18 @@ steps:
         let fallback = repo_with_untracked_file();
         let recipe = agent_step_recipe("    working_dir: \"{{repo_path}}\"\n    output: result\n");
         let runner = RecipeRunner::new(MockAdapter).with_working_dir(&path_str(fallback.path()));
+        let capture = crate::adapters::test_log::LogCapture::start();
         let result = runner.execute(&recipe, Some(repo_path_context(&missing)));
+        let logged = capture.this_thread();
+        drop(capture);
+        assert!(
+            logged
+                .iter()
+                .any(|(level, message)| *level == log::Level::Error
+                    && message.starts_with("auto-stage failed:")
+                    && message.contains(&missing)),
+            "auto-stage error was not logged at error level: {logged:?}"
+        );
         assert!(result.success, "{result:?}");
         assert_eq!(result.step_results.len(), 1);
         assert_eq!(result.step_results[0].status, StepStatus::Completed);

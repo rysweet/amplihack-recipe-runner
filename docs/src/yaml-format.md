@@ -58,7 +58,7 @@ step.
 | `parse_json`          | bool            | no       | `false` | Extract JSON from step output                            |
 | `parse_json_required` | bool            | no       | `false` | Fail the step if JSON extraction fails (see below)       |
 | `mode`              | string          | no       | —       | Execution mode                                           |
-| `working_dir`       | string          | no       | —       | Override working directory for this step; may use `{{var}}` templates, rendered once before the step runs (exceptions in [Where `working_dir` is not rendered](#where-working_dir-is-not-rendered)) |
+| `working_dir`       | string          | no       | —       | Override working directory for this step; may use `{{var}}` templates, rendered once before the step runs (exceptions in [Known limitation: `working_dir` not rendered](#known-limitation-working_dir-not-rendered)) |
 | `timeout`           | int             | no       | —       | Step timeout in seconds                                  |
 | `auto_stage`        | bool            | no       | `true`  | Git auto-stage after agent steps, in the step's rendered `working_dir`; `false` opts the step out, and `--no-auto-stage` turns staging off for every step (see [Auto-Staging](#auto-staging-auto_stage)) |
 | `model`             | string          | no       | —       | Model override for agent steps (e.g., "haiku", "sonnet") |
@@ -363,16 +363,18 @@ happens in the directory the agent ran in, not in a path the agent returned:
 Relative paths are resolved against the runner's process working directory,
 both for the agent and for staging.
 
-### Where `working_dir` is not rendered
+### Known limitation: `working_dir` not rendered
 
-Two cases use the `working_dir` text as written, without rendering
-templates:
+In two cases the runner currently uses the `working_dir` text as written,
+without rendering templates:
 
 - bash steps that run inside a `parallel_group`;
 - the recovery agent that a sub-recipe step starts when
   `recovery_on_failure: true` and the sub-recipe fails.
 
-Use a literal path in these cases. Neither is auto-staged.
+This is current behaviour, not intended behaviour, and is tracked in
+[#204](https://github.com/rysweet/amplihack-recipe-runner/issues/204). Until
+it is fixed, use a literal path in these cases. Neither is auto-staged.
 
 ### When staging is skipped
 
