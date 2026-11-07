@@ -267,6 +267,8 @@ recipe-runner-rs deploy.yaml --dry-run --progress
 
 Disable automatic git staging of file changes made during recipe execution. This applies to every step, including a step that sets `auto_stage: true`.
 
+Without this flag, the runner stages changes after each agent step in the step's rendered `working_dir`. A rendered path that is empty or is not an existing directory is logged as an error. See [Auto-Staging](yaml-format.md#auto-staging-auto_stage).
+
 ```bash
 recipe-runner-rs codegen.yaml --no-auto-stage
 

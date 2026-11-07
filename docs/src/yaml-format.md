@@ -58,9 +58,9 @@ step.
 | `parse_json`          | bool            | no       | `false` | Extract JSON from step output                            |
 | `parse_json_required` | bool            | no       | `false` | Fail the step if JSON extraction fails (see below)       |
 | `mode`              | string          | no       | —       | Execution mode                                           |
-| `working_dir`       | string          | no       | —       | Override working directory for this step                 |
+| `working_dir`       | string          | no       | —       | Override working directory for this step; may use `{{var}}` templates, rendered once before the step runs (exceptions in [Where `working_dir` is not rendered](#where-working_dir-is-not-rendered)) |
 | `timeout`           | int             | no       | —       | Step timeout in seconds                                  |
-| `auto_stage`        | bool            | no       | `true`  | Git auto-stage after agent steps; `false` opts the step out, and `--no-auto-stage` turns staging off for every step |
+| `auto_stage`        | bool            | no       | `true`  | Git auto-stage after agent steps, in the step's rendered `working_dir`; `false` opts the step out, and `--no-auto-stage` turns staging off for every step (see [Auto-Staging](#auto-staging-auto_stage)) |
 | `model`             | string          | no       | —       | Model override for agent steps (e.g., "haiku", "sonnet") |
 | `recipe`            | string          | no       | —       | Sub-recipe name (recipe steps)                           |
 | `recovery_on_failure` | bool            | no       | `false` | Attempt agentic recovery if sub-recipe fails (see below) |
@@ -313,6 +313,129 @@ the Claude examples below are not portable Codex model names. See
   prompt: "Thorough security review of {{file_path}}"
   model: sonnet  # more capable model for complex analysis
 ```
+
+---
+
+## Auto-Staging (`auto_stage`)
+
+After an agent step finishes, the runner runs `git add -A` in the directory
+the agent ran in, so that the agent's changes are staged for the next step.
+Bash and sub-recipe steps are never auto-staged.
+
+```yaml
+- id: implement
+  agent: amplihack:core:builder
+  prompt: "Implement the change described in {{task}}"
+  working_dir: "{{worktree_setup.worktree_path}}"
+```
+
+Here the agent runs in the directory that `{{worktree_setup.worktree_path}}`
+resolves to, and the same directory is staged afterwards.
+
+Quote a templated `working_dir` in YAML. Unquoted, `{{repo_path}}` is parsed
+as a YAML mapping and the recipe fails to load.
+
+### Which directory is staged
+
+The runner renders `working_dir` once per step execution, after the
+condition check and before the step runs. That single rendered path is used
+to run the agent, to run the JSON repair call if `parse_json` needs one, and
+to stage the changes. Staging never uses the unrendered template text.
+
+| Step declares                  | Directory used for the agent and for staging            |
+|--------------------------------|---------------------------------------------------------|
+| No `working_dir`               | The recipe working directory (`-C`, or the process cwd) |
+| A literal path                 | That path                                               |
+| A template, e.g. `"{{repo_path}}"` | The template rendered with the context at the start of the step |
+
+The path is rendered before the step's `output` is stored. If an agent step
+writes its output to the same variable its `working_dir` uses, staging still
+happens in the directory the agent ran in, not in a path the agent returned:
+
+```yaml
+- id: implement
+  agent: amplihack:core:builder
+  prompt: "Make the change"
+  working_dir: "{{repo_path}}"
+  output: repo_path   # does not redirect auto-staging
+```
+
+Relative paths are resolved against the runner's process working directory,
+both for the agent and for staging.
+
+### Where `working_dir` is not rendered
+
+Two cases use the `working_dir` text as written, without rendering
+templates:
+
+- bash steps that run inside a `parallel_group`;
+- the recovery agent that a sub-recipe step starts when
+  `recovery_on_failure: true` and the sub-recipe fails.
+
+Use a literal path in these cases. Neither is auto-staged.
+
+### When staging is skipped
+
+Staging is turned off, and the path is not checked, when either of these
+holds:
+
+- the runner was started with
+  [`--no-auto-stage`](cli-reference.md#--no-auto-stage);
+- the step sets `auto_stage: false`.
+
+`--no-auto-stage` takes precedence over a step that sets `auto_stage: true`.
+
+### Rendered path errors
+
+When staging is enabled, the rendered path must be an existing directory.
+The runner reports an error, and does not call git, when the rendered path:
+
+- is empty or only whitespace, for example a `working_dir` that is only a
+  template, such as `"{{repo_path}}"`, whose variable is unset or `null`;
+- does not exist;
+- exists but is not a directory, for example a regular file.
+
+An unset variable renders as empty text only where the template appears, so
+`"{{missing}}/sub"` renders to `/sub`, which is then checked as a path. The
+renderer also logs a `warn` line for each unset variable.
+
+The runner does not fall back to the recipe working directory, the process
+working directory or `.` in these cases. It logs the error at `error` level,
+with the step id and the rendered path quoted:
+
+```text
+auto-stage failed: step 'implement': rendered working_dir "/tmp/wt/missing" is not an existing directory
+auto-stage failed: step 'implement': rendered working_dir "" is empty
+```
+
+An auto-stage error does not change the step's result. The step keeps the
+status the agent run produced, its output is stored as usual, and the recipe
+continues. The CLI prints `error` level messages to stderr by default, so
+these errors are visible without setting `RUST_LOG`.
+
+A directory that exists but is not inside a Git repository, or a repository
+with nothing to stage, is not an error. Nothing is staged and nothing is
+logged at `info` level.
+
+### Successful staging
+
+When git stages files, the runner logs at `info` level, which is shown with
+`RUST_LOG=info`:
+
+```text
+Auto-staged 2 file(s) after step 'implement'
+```
+
+The count is the number of files in the index that differ from `HEAD` after
+staging. The runner removes `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE`
+from git's environment, so the staged repository is the one that contains
+the rendered directory. Other Git variables, such as `GIT_OBJECT_DIRECTORY`
+and `GIT_COMMON_DIR`, are passed through unchanged.
+
+`git add -A` stages every file in the repository that is not ignored,
+including files the agent did not write. Point `working_dir` at the
+repository or worktree the agent is meant to change, and keep secrets such
+as `.env` files in `.gitignore`.
 
 ---
 

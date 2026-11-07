@@ -787,8 +787,13 @@ impl<A: Adapter> RecipeRunner<A> {
             }
         }
 
+        // Render working_dir once, before the step's output is stored, so the
+        // agent run, any JSON repair call and auto-staging all use the same
+        // directory (for example {{worktree_setup.worktree_path}}).
+        let working_dir = ctx.render(step.working_dir.as_deref().unwrap_or(&self.working_dir));
+
         // Execute the step
-        let output = match self.dispatch_step(step, ctx) {
+        let output = match self.dispatch_step(step, ctx, &working_dir) {
             Ok(o) => {
                 if o.len() > MAX_STEP_OUTPUT_BYTES
                     && self.adapter.name() == "codex"
@@ -862,15 +867,17 @@ impl<A: Adapter> RecipeRunner<A> {
                         "Step '{}': parse_json failed on first attempt. Retrying with JSON reminder.",
                         diagnostic_identifier(&step.id)
                     );
-                    let retry_result = self.retry_for_json(step, ctx).and_then(|retry_output| {
-                        parse_json_output(&retry_output, &step.id).map(|parsed| {
-                            info!(
-                                "Step '{}': parse_json succeeded on retry.",
-                                diagnostic_identifier(&step.id)
-                            );
-                            serde_json::to_string(&parsed).unwrap_or(retry_output)
-                        })
-                    });
+                    let retry_result =
+                        self.retry_for_json(step, ctx, &working_dir)
+                            .and_then(|retry_output| {
+                                parse_json_output(&retry_output, &step.id).map(|parsed| {
+                                    info!(
+                                        "Step '{}': parse_json succeeded on retry.",
+                                        diagnostic_identifier(&step.id)
+                                    );
+                                    serde_json::to_string(&parsed).unwrap_or(retry_output)
+                                })
+                            });
 
                     if let Some(diagnostic) = self.terminal.diagnostic().as_ref() {
                         return StepResult {
@@ -925,8 +932,10 @@ impl<A: Adapter> RecipeRunner<A> {
         }
 
         // Auto-stage git changes after agent steps
-        if step.effective_type() == StepType::Agent {
-            self.maybe_auto_stage(step);
+        if step.effective_type() == StepType::Agent
+            && let Err(e) = self.maybe_auto_stage(step, &working_dir)
+        {
+            error!("auto-stage failed: {e:#}");
         }
 
         StepResult {
@@ -942,6 +951,7 @@ impl<A: Adapter> RecipeRunner<A> {
         &self,
         step: &Step,
         ctx: &mut RecipeContext,
+        working_dir: &str,
     ) -> Result<String, StepExecutionError> {
         log::debug!(
             "dispatch_step: step='{}', type={:?}",
@@ -954,10 +964,6 @@ impl<A: Adapter> RecipeRunner<A> {
                 message,
             });
         }
-        // Render working_dir through template engine so {{worktree_setup.worktree_path}} resolves
-        let raw_working_dir = step.working_dir.as_deref().unwrap_or(&self.working_dir);
-        let working_dir_rendered = ctx.render(raw_working_dir);
-        let working_dir = working_dir_rendered.as_str();
         let st = step.effective_type();
 
         match st {
@@ -1380,7 +1386,15 @@ impl<A: Adapter> RecipeRunner<A> {
     }
 
     /// Retry an agent step with an explicit JSON-only instruction.
-    fn retry_for_json(&self, step: &Step, ctx: &mut RecipeContext) -> Option<String> {
+    ///
+    /// `working_dir` is the path `execute_step` rendered for the first call,
+    /// so the repair call runs in the same directory.
+    fn retry_for_json(
+        &self,
+        step: &Step,
+        ctx: &mut RecipeContext,
+        working_dir: &str,
+    ) -> Option<String> {
         log::debug!("retry_for_json: step='{}'", diagnostic_identifier(&step.id));
         if self.terminal.is_terminal() || step.effective_type() != StepType::Agent {
             return None; // No pending repair after terminal observation
@@ -1397,7 +1411,7 @@ impl<A: Adapter> RecipeRunner<A> {
         let result = if self.adapter.name() == "codex" {
             let mut repair_step = step.clone();
             repair_step.prompt = Some(retry_prompt);
-            self.dispatch_step(&repair_step, ctx)
+            self.dispatch_step(&repair_step, ctx, working_dir)
                 .map_err(anyhow::Error::new)
         } else {
             // The repair call keeps the step's model, as the Codex path above
@@ -1407,7 +1421,7 @@ impl<A: Adapter> RecipeRunner<A> {
                 None,
                 None,
                 None,
-                step.working_dir.as_deref().unwrap_or(&self.working_dir),
+                working_dir,
                 step.model.as_deref(),
                 None,
             )
@@ -1426,20 +1440,46 @@ impl<A: Adapter> RecipeRunner<A> {
         }
     }
 
-    fn maybe_auto_stage(&self, step: &Step) {
+    /// Stage all changes in `working_dir` after an agent step.
+    ///
+    /// `working_dir` must be the path the agent ran in, already rendered by
+    /// `execute_step`. This function does not render it again, so an agent
+    /// that writes to its own output key cannot redirect staging.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when staging is enabled and the rendered path is
+    /// empty or is not an existing directory. It never falls back to another
+    /// directory.
+    fn maybe_auto_stage(&self, step: &Step, working_dir: &str) -> anyhow::Result<()> {
         log::debug!(
-            "maybe_auto_stage: step='{}', auto_stage={:?}",
+            "maybe_auto_stage: step='{}', auto_stage={:?}, working_dir={:?}",
             diagnostic_identifier(&step.id),
-            step.auto_stage
+            step.auto_stage,
+            working_dir
         );
         // A step can opt out of staging, but cannot opt in when the runner has
         // staging turned off (for example with --no-auto-stage).
         let should_stage = self.auto_stage && step.auto_stage.unwrap_or(true);
         if !should_stage {
-            return;
+            return Ok(());
         }
 
-        let working_dir = step.working_dir.as_deref().unwrap_or(&self.working_dir);
+        if working_dir.trim().is_empty() {
+            anyhow::bail!(
+                "step '{}': rendered working_dir {:?} is empty",
+                diagnostic_identifier(&step.id),
+                working_dir
+            );
+        }
+        if !Path::new(working_dir).is_dir() {
+            anyhow::bail!(
+                "step '{}': rendered working_dir {:?} is not an existing directory",
+                diagnostic_identifier(&step.id),
+                working_dir
+            );
+        }
+
         if let Some(staged) = git_stage_all(working_dir) {
             let count = staged.lines().count();
             info!(
@@ -1448,6 +1488,7 @@ impl<A: Adapter> RecipeRunner<A> {
                 diagnostic_identifier(&step.id)
             );
         }
+        Ok(())
     }
 
     /// Execute a group of steps that share the same `parallel_group`.
@@ -2379,6 +2420,279 @@ steps:
                 "runner auto_stage {runner_stages}"
             );
         }
+    }
+
+    // ---- Issue #201: auto-staging uses the rendered working_dir ----
+
+    /// Agent adapter that records the working_dir of every agent call and
+    /// returns the queued responses in order (the last one repeats).
+    struct RecordingAdapter {
+        responses: Vec<String>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingAdapter {
+        fn new(responses: &[&str]) -> Self {
+            Self {
+                responses: responses.iter().map(|r| r.to_string()).collect(),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn working_dirs(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Adapter for RecordingAdapter {
+        fn execute_agent_step(
+            &self,
+            _prompt: &str,
+            _agent_name: Option<&str>,
+            _system_prompt: Option<&str>,
+            _mode: Option<&str>,
+            working_dir: &str,
+            _model: Option<&str>,
+            _timeout: Option<u64>,
+        ) -> Result<String, anyhow::Error> {
+            let mut calls = self.calls.lock().unwrap();
+            let index = calls.len().min(self.responses.len() - 1);
+            calls.push(working_dir.to_string());
+            Ok(self.responses[index].clone())
+        }
+
+        fn execute_bash_step(
+            &self,
+            command: &str,
+            _working_dir: &str,
+            _timeout: Option<u64>,
+            _extra_env: &std::collections::HashMap<String, String>,
+        ) -> Result<String, anyhow::Error> {
+            Ok(format!("Bash output for: {}", command))
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "recording"
+        }
+    }
+
+    fn path_str(path: &std::path::Path) -> String {
+        path.to_str().unwrap().to_string()
+    }
+
+    /// One agent step with id `work`; `extra` is appended as further YAML
+    /// fields of that step.
+    fn agent_step_recipe(extra: &str) -> crate::models::Recipe {
+        let yaml = format!(
+            "name: stage\nsteps:\n  - id: work\n    type: agent\n    prompt: do work\n{extra}"
+        );
+        RecipeParser::new().parse(&yaml).unwrap()
+    }
+
+    fn agent_step(extra: &str) -> Step {
+        agent_step_recipe(extra).steps.remove(0)
+    }
+
+    fn repo_path_context(path: &str) -> HashMap<String, Value> {
+        HashMap::from([("repo_path".to_string(), Value::String(path.to_string()))])
+    }
+
+    #[test]
+    fn templated_working_dir_is_auto_staged() {
+        let repo = repo_with_untracked_file();
+        // The runner's own directory is a different repository, so a fallback
+        // to it cannot make the test pass.
+        let fallback = repo_with_untracked_file();
+        let recipe = agent_step_recipe("    working_dir: \"{{repo_path}}\"\n");
+        let runner = RecipeRunner::new(RecordingAdapter::new(&["done"]))
+            .with_working_dir(&path_str(fallback.path()));
+        let result = runner.execute(&recipe, Some(repo_path_context(&path_str(repo.path()))));
+        assert!(result.success, "{result:?}");
+        // The agent ran in the directory that was staged.
+        assert_eq!(runner.adapter.working_dirs(), vec![path_str(repo.path())]);
+        assert_eq!(staged_files(repo.path()), "work.txt");
+        assert_eq!(staged_files(fallback.path()), "");
+    }
+
+    #[test]
+    fn literal_working_dir_is_auto_staged() {
+        let repo = repo_with_untracked_file();
+        let fallback = repo_with_untracked_file();
+        let recipe = agent_step_recipe(&format!("    working_dir: {:?}\n", path_str(repo.path())));
+        let runner = RecipeRunner::new(MockAdapter).with_working_dir(&path_str(fallback.path()));
+        let result = runner.execute(&recipe, None);
+        assert!(result.success, "{result:?}");
+        assert_eq!(staged_files(repo.path()), "work.txt");
+        assert_eq!(staged_files(fallback.path()), "");
+    }
+
+    #[test]
+    fn auto_stage_errors_when_rendered_dir_is_missing() {
+        let gone = tempfile::tempdir().unwrap();
+        let missing = path_str(&gone.path().join("missing"));
+        drop(gone);
+        let fallback = repo_with_untracked_file();
+        let runner = RecipeRunner::new(MockAdapter).with_working_dir(&path_str(fallback.path()));
+        let err = runner
+            .maybe_auto_stage(&agent_step(""), &missing)
+            .expect_err("a missing rendered working_dir must be an error");
+        assert_eq!(
+            format!("{err:#}"),
+            format!("step 'work': rendered working_dir {missing:?} is not an existing directory")
+        );
+        // No fallback to the runner's directory.
+        assert_eq!(staged_files(fallback.path()), "");
+    }
+
+    #[test]
+    fn auto_stage_errors_when_rendered_dir_is_empty() {
+        let fallback = repo_with_untracked_file();
+        let runner = RecipeRunner::new(MockAdapter).with_working_dir(&path_str(fallback.path()));
+        let step = agent_step("");
+        for empty in ["", "   ", "\t\n"] {
+            let err = runner
+                .maybe_auto_stage(&step, empty)
+                .expect_err("an empty rendered working_dir must be an error");
+            assert_eq!(
+                format!("{err:#}"),
+                format!("step 'work': rendered working_dir {empty:?} is empty")
+            );
+        }
+        // No fallback to the runner's directory, the process cwd or ".".
+        assert_eq!(staged_files(fallback.path()), "");
+    }
+
+    #[test]
+    fn auto_stage_errors_when_rendered_path_is_a_file() {
+        let repo = repo_with_untracked_file();
+        let file = path_str(&repo.path().join("work.txt"));
+        let runner = RecipeRunner::new(MockAdapter).with_working_dir(&path_str(repo.path()));
+        let err = runner
+            .maybe_auto_stage(&agent_step(""), &file)
+            .expect_err("a rendered working_dir that is a file must be an error");
+        assert_eq!(
+            format!("{err:#}"),
+            format!("step 'work': rendered working_dir {file:?} is not an existing directory")
+        );
+        assert_eq!(staged_files(repo.path()), "");
+    }
+
+    #[test]
+    fn auto_stage_error_quotes_control_characters_in_path() {
+        // An empty fallback directory, so no code path can stage this checkout.
+        let scratch = tempfile::tempdir().unwrap();
+        let runner = RecipeRunner::new(MockAdapter).with_working_dir(&path_str(scratch.path()));
+        let forged = "/nonexistent\nINFO forged log line";
+        let err = runner
+            .maybe_auto_stage(&agent_step(""), forged)
+            .expect_err("missing path must be an error");
+        let message = format!("{err:#}");
+        assert!(!message.contains('\n'), "{message}");
+        assert!(message.contains(&format!("{forged:?}")), "{message}");
+    }
+
+    #[test]
+    fn auto_stage_opt_out_skips_path_check() {
+        // An empty fallback directory, so no code path can stage this checkout.
+        let scratch = tempfile::tempdir().unwrap();
+        let gone = tempfile::tempdir().unwrap();
+        let missing = path_str(&gone.path().join("missing"));
+        drop(gone);
+        // Step-level opt-out.
+        let runner = RecipeRunner::new(MockAdapter).with_working_dir(&path_str(scratch.path()));
+        let step = agent_step("    auto_stage: false\n");
+        assert!(runner.maybe_auto_stage(&step, &missing).is_ok());
+        assert!(runner.maybe_auto_stage(&step, "").is_ok());
+        // Runner-level opt-out wins over a step that asks for staging.
+        let runner = RecipeRunner::new(MockAdapter)
+            .with_working_dir(&path_str(scratch.path()))
+            .with_auto_stage(false);
+        let step = agent_step("    auto_stage: true\n");
+        assert!(runner.maybe_auto_stage(&step, &missing).is_ok());
+        assert!(runner.maybe_auto_stage(&step, "").is_ok());
+    }
+
+    #[test]
+    fn auto_stage_in_directory_outside_repository_is_ok() {
+        // An empty fallback directory, so no code path can stage this checkout.
+        let scratch = tempfile::tempdir().unwrap();
+        let plain = tempfile::tempdir().unwrap();
+        std::fs::write(plain.path().join("work.txt"), "agent output\n").unwrap();
+        let runner = RecipeRunner::new(MockAdapter).with_working_dir(&path_str(scratch.path()));
+        assert!(
+            runner
+                .maybe_auto_stage(&agent_step(""), &path_str(plain.path()))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn missing_rendered_dir_does_not_fail_step() {
+        let gone = tempfile::tempdir().unwrap();
+        let missing = path_str(&gone.path().join("missing"));
+        drop(gone);
+        let fallback = repo_with_untracked_file();
+        let recipe = agent_step_recipe("    working_dir: \"{{repo_path}}\"\n    output: result\n");
+        let runner = RecipeRunner::new(MockAdapter).with_working_dir(&path_str(fallback.path()));
+        let result = runner.execute(&recipe, Some(repo_path_context(&missing)));
+        assert!(result.success, "{result:?}");
+        assert_eq!(result.step_results.len(), 1);
+        assert_eq!(result.step_results[0].status, StepStatus::Completed);
+        assert!(result.step_results[0].error.is_empty());
+        assert!(
+            result.context.contains_key("result"),
+            "{:?}",
+            result.context
+        );
+        assert_eq!(staged_files(fallback.path()), "");
+    }
+
+    #[test]
+    fn auto_stage_uses_dir_rendered_before_output_is_set() {
+        let original = repo_with_untracked_file();
+        let decoy = repo_with_untracked_file();
+        let fallback = tempfile::tempdir().unwrap();
+        // The agent writes the decoy path into the variable its working_dir
+        // uses. Staging must still happen where the agent ran.
+        let recipe =
+            agent_step_recipe("    working_dir: \"{{repo_path}}\"\n    output: repo_path\n");
+        let decoy_path = path_str(decoy.path());
+        let runner = RecipeRunner::new(RecordingAdapter::new(&[&decoy_path]))
+            .with_working_dir(&path_str(fallback.path()));
+        let result = runner.execute(&recipe, Some(repo_path_context(&path_str(original.path()))));
+        assert!(result.success, "{result:?}");
+        assert_eq!(staged_files(original.path()), "work.txt");
+        assert_eq!(staged_files(decoy.path()), "");
+    }
+
+    #[test]
+    fn json_repair_call_uses_rendered_working_dir() {
+        let repo = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        let recipe = agent_step_recipe(
+            "    working_dir: \"{{repo_path}}\"\n    parse_json: true\n    auto_stage: false\n",
+        );
+        let runner = RecipeRunner::new(RecordingAdapter::new(&[
+            "not json at all",
+            "{\"ok\": true}",
+        ]))
+        .with_working_dir(&path_str(fallback.path()));
+        let result = runner.execute(&recipe, Some(repo_path_context(&path_str(repo.path()))));
+        assert!(result.success, "{result:?}");
+        let dirs = runner.adapter.working_dirs();
+        assert_eq!(
+            dirs.len(),
+            2,
+            "expected the original call and one repair call"
+        );
+        assert!(
+            dirs.iter().all(|d| d == &path_str(repo.path())),
+            "every agent call must use the rendered working_dir: {dirs:?}"
+        );
     }
 
     /// Set only in the child process that
