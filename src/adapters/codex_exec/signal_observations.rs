@@ -49,6 +49,9 @@ pub(super) extern "C" fn publish(signal: libc::c_int) {
     } else {
         &TERMINATE
     };
+    // The downstream Kani compiler predates the try_update rename. Keep the
+    // equivalent stable API until that supported proof toolchain advances.
+    #[allow(deprecated)]
     let _ = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
         Some(value.saturating_add(1))
     });
