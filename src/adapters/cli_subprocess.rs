@@ -832,7 +832,7 @@ impl CLISubprocessAdapter {
     /// already exists is left as it is). The log files themselves are created
     /// readable only by the owner. Without it the output log is
     /// removed with the step's temporary directory and the stderr log is kept
-    /// under `/tmp/amplihack-agent-stderr` only when the step fails. The
+    /// under the configured temporary directory’s `amplihack-agent-stderr/` only when the step fails. The
     /// Codex adapter's private output is not copied.
     ///
     /// Nonempty stdout from failed bash steps is retained byte-for-byte in a
@@ -983,6 +983,15 @@ impl CLISubprocessAdapter {
         // below (session tree, PATH/HOME) are always small and are added after
         // this filter, so they are never affected.
         let mut child_env = filter_inherited_env(env::vars());
+        child_env.remove("AMPLIHACK_RECOVERY_DESCRIPTOR");
+        child_env.remove("AMPLIHACK_RECOVERY_ATTACHMENT");
+        #[cfg(unix)]
+        if let Some(attachment) =
+            crate::recovery::ipc::current_environment().expect("attachment serialization")
+        {
+            child_env.insert(crate::recovery::ipc::ATTACHMENT_ENV.into(), attachment);
+        }
+
         if let Some(allow) = allow {
             child_env = restrict_to_allowlist(child_env, allow);
         }
@@ -1457,13 +1466,15 @@ impl CLISubprocessAdapter {
 
             let log_fh = self.create_log_file(&output_file)?;
 
-            // Capture stderr to a persistent file in /tmp so that on failure
+            // Capture stderr in the caller's configured temporary storage so a
+            // private admitted runtime does not spill into a shared /tmp quota.
+            // On failure
             // we can include the agent's actual error output in the bail message
             // (the temp_dir gets cleaned up before the error is reported).
             let stderr_persist_dir = self
                 .log_dir
                 .clone()
-                .unwrap_or_else(|| std::path::PathBuf::from("/tmp/amplihack-agent-stderr"));
+                .unwrap_or_else(|| std::env::temp_dir().join("amplihack-agent-stderr"));
             if let Err(e) = std::fs::create_dir_all(&stderr_persist_dir) {
                 log::warn!(
                     "Failed to create stderr persist dir {}: {}",
@@ -1776,6 +1787,9 @@ impl Adapter for CLISubprocessAdapter {
         child_env.insert("AMPLIHACK_AGENT_BINARY".to_string(), self.cli.clone());
         // Merge caller-supplied step vars (they override inherited/base values).
         for (k, v) in extra_env {
+            if k.starts_with("AMPLIHACK_RECOVERY_") {
+                continue;
+            }
             child_env.insert(k.clone(), v.clone());
         }
         // #130: move recipe values that can't travel as env strings (over the

@@ -29,6 +29,7 @@ const KNOWN_TOP_FIELDS: &[&str] = &[
 
 /// Step-level fields recognized by the parser.
 const KNOWN_STEP_FIELDS: &[&str] = &[
+    "recovery",
     "id",
     "type",
     "agent",
@@ -1241,6 +1242,7 @@ steps:
         // Exhaustive literal: adding a Step field without updating this test
         // (and KNOWN_STEP_FIELDS) is a compile error, not a false warning.
         let step = Step {
+            recovery: None,
             id: "x".into(),
             step_type: Some(StepType::Bash),
             command: Some("c".into()),

@@ -144,3 +144,9 @@ steps:
 ## License
 
 MIT
+
+## Durable relaunch recovery
+
+Hosts can admit identified launches and replay compatible completed steps after
+a usage-limit stop. See [the recovery contract](RECOVERY.md) for persistence
+policies, resource declarations, delegation, storage, and limitations.

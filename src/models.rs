@@ -58,6 +58,8 @@ fn default_fatal() -> bool {
 /// A single step in a recipe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
+    #[serde(default)]
+    pub recovery: Option<crate::recovery::model::StepPolicy>,
     pub id: String,
     #[serde(rename = "type", default)]
     pub step_type: Option<StepType>,
@@ -177,6 +179,8 @@ pub struct RecipeHooks {
 /// A parsed recipe definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Recipe {
+    #[serde(default)]
+    pub recovery: Option<crate::recovery::model::RecipePolicy>,
     pub name: String,
     #[serde(default)]
     pub steps: Vec<Step>,
@@ -227,8 +231,17 @@ where
     }
 }
 
+fn deserialize_duration_secs<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Duration>, D::Error> {
+    let value = Option::<f64>::deserialize(d)?;
+    value
+        .map(|v| Duration::try_from_secs_f64(v).map_err(serde::de::Error::custom))
+        .transpose()
+}
+
 /// Result of executing a single step.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepResult {
     pub step_id: String,
     pub status: StepStatus,
@@ -237,6 +250,8 @@ pub struct StepResult {
     /// Wall-clock duration of this step.
     #[serde(
         serialize_with = "serialize_duration_secs",
+        deserialize_with = "deserialize_duration_secs",
+        default,
         skip_serializing_if = "Option::is_none"
     )]
     pub duration: Option<Duration>,
@@ -363,6 +378,7 @@ mod tests {
     #[test]
     fn test_effective_type_explicit_bash() {
         let step = Step {
+            recovery: None,
             id: "s1".into(),
             step_type: Some(StepType::Bash),
             command: None,
@@ -392,6 +408,7 @@ mod tests {
     #[test]
     fn test_effective_type_infers_recipe() {
         let step = Step {
+            recovery: None,
             id: "s1".into(),
             step_type: None,
             command: None,
@@ -420,6 +437,7 @@ mod tests {
     #[test]
     fn test_effective_type_infers_agent_from_agent_field() {
         let step = Step {
+            recovery: None,
             id: "s1".into(),
             step_type: None,
             command: None,
@@ -448,6 +466,7 @@ mod tests {
     #[test]
     fn test_effective_type_infers_agent_from_prompt_only() {
         let step = Step {
+            recovery: None,
             id: "s1".into(),
             step_type: None,
             command: None,
@@ -476,6 +495,7 @@ mod tests {
     #[test]
     fn test_effective_type_infers_bash_with_command_and_prompt() {
         let step = Step {
+            recovery: None,
             id: "s1".into(),
             step_type: None,
             command: Some("echo hello".into()),
@@ -505,6 +525,7 @@ mod tests {
     #[test]
     fn test_effective_type_defaults_to_bash() {
         let step = Step {
+            recovery: None,
             id: "s1".into(),
             step_type: None,
             command: None,
