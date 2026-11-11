@@ -122,6 +122,12 @@ pub struct Probe {
     pub resources: Vec<Observation>,
     pub settings: String,
 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContextChange {
+    Assign { value: Value },
+    Remove,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Record {
@@ -129,7 +135,7 @@ pub struct Record {
     pub child_definitions: BTreeMap<String, String>,
     pub probe: Probe,
     pub result: StepResult,
-    pub delta: BTreeMap<String, Option<Value>>,
+    pub delta: BTreeMap<String, ContextChange>,
     pub descendants: Vec<Location>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]

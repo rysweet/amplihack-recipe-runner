@@ -91,10 +91,13 @@ pub fn probe(
 pub fn apply(ctx: &mut RecipeContext, record: &Record) {
     let mut data = ctx.to_map();
     for (k, v) in &record.delta {
-        if let Some(value) = v {
-            data.insert(k.clone(), value.clone());
-        } else {
-            data.remove(k);
+        match v {
+            ContextChange::Assign { value } => {
+                data.insert(k.clone(), value.clone());
+            }
+            ContextChange::Remove => {
+                data.remove(k);
+            }
         }
     }
     *ctx = RecipeContext::new(data);
@@ -122,7 +125,12 @@ pub fn finalize(
             if !allowed.is_some_and(|a| a.contains(key)) {
                 probe.permitted = false;
             } else {
-                delta.insert(key.clone(), Some(value.clone()));
+                delta.insert(
+                    key.clone(),
+                    ContextChange::Assign {
+                        value: value.clone(),
+                    },
+                );
             }
         }
     }
@@ -131,7 +139,7 @@ pub fn finalize(
             if !allowed.is_some_and(|a| a.contains(key)) {
                 probe.permitted = false;
             } else {
-                delta.insert(key.clone(), None);
+                delta.insert(key.clone(), ContextChange::Remove);
             }
         }
     }

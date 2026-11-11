@@ -255,7 +255,9 @@ impl Store {
                         .display()
                         .to_string(),
                 );
-                record.delta.insert(key.clone(), Some(value));
+                record
+                    .delta
+                    .insert(key.clone(), ContextChange::Assign { value });
             }
         }
         if !self.tree.report.restored_steps.contains(&probe.location) {

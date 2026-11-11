@@ -169,9 +169,14 @@ fn typed_context_delta_preserves_null_and_removal() {
             error: "".into(),
             duration: None,
         },
-        delta: BTreeMap::from([("remove".into(), None), ("null".into(), Some(Value::Null))]),
+        delta: BTreeMap::from([
+            ("remove".into(), ContextChange::Remove),
+            ("null".into(), ContextChange::Assign { value: Value::Null }),
+        ]),
         descendants: vec![],
     };
+    let record: Record =
+        parse(&recipe_runner_rs::recovery::private_fs::serialize(&record).unwrap()).unwrap();
     recipe_runner_rs::recovery::replay::apply(&mut ctx, &record);
     assert!(!ctx.data().contains_key("remove"));
     assert_eq!(ctx.data()["null"], Value::Null);
