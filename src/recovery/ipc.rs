@@ -45,6 +45,9 @@ enum Operation {
     },
     Fresh,
     Renew,
+    Retire {
+        prefix: String,
+    },
     Close,
     Finalize {
         recipe: String,
@@ -252,6 +255,10 @@ impl Client {
     pub fn report(&self) -> Result<Report> {
         Ok(serde_json::from_value(self.call(Operation::Report)?)?)
     }
+    /// Retire the delegated invocation's credential when its process returns.
+    pub fn invocation_guard(&self) -> InvocationGuard {
+        InvocationGuard(self.clone())
+    }
     pub fn enter_invocation(&self, recipe: String, discriminator: String) -> Result<Self> {
         Ok(serde_json::from_value(self.call(Operation::Enter {
             recipe,
@@ -264,6 +271,10 @@ impl Client {
     }
     pub fn renew(&self) -> Result<Self> {
         Ok(serde_json::from_value(self.call(Operation::Renew)?)?)
+    }
+    pub fn retire(&self, prefix: String) -> Result<()> {
+        self.call(Operation::Retire { prefix })?;
+        Ok(())
     }
     pub fn close(&self) -> Result<()> {
         self.call(Operation::Close)?;
@@ -452,6 +463,17 @@ fn serve(
                     store.retry_subtree(&client.prefix)?;
                     Ok(serde_json::to_value(client)?)
                 }
+                Operation::Retire { prefix } => {
+                    ensure!(
+                        authorized(grant, &prefix) && store.attachment_admitted(&prefix),
+                        "outside admitted retirement subtree"
+                    );
+                    grants.retain(|_, g| {
+                        g.root
+                            || !(g.prefix == prefix || g.prefix.starts_with(&format!("{prefix}/")))
+                    });
+                    Ok(serde_json::Value::Null)
+                }
                 Operation::Close => {
                     ensure!(!grant.root, "root cannot be closed by child protocol");
                     let prefix = grant.prefix.clone();
@@ -505,19 +527,27 @@ thread_local! {static CURRENT:std::cell::RefCell<Option<Client>>=const {std::cel
 pub struct Scope {
     previous: Option<Client>,
     active: Option<Client>,
+    owner: Option<Client>,
 }
 pub fn enter(client: Option<Client>) -> Scope {
+    enter_owned(client, None)
+}
+pub fn enter_owned(client: Option<Client>, owner: Option<Client>) -> Scope {
     let previous = CURRENT.with(|c| c.replace(client.clone()));
     Scope {
         previous,
         active: client,
+        owner,
     }
 }
 impl Drop for Scope {
     fn drop(&mut self) {
         CURRENT.with(|c| c.replace(self.previous.take()));
         if let Some(client) = &self.active
-            && let Err(error) = client.close()
+            && let Err(error) = match &self.owner {
+                Some(owner) => owner.retire(client.prefix.clone()),
+                None => client.close(),
+            }
         {
             log::warn!("recovery attachment already retired or unavailable: {error}");
         }
@@ -544,4 +574,14 @@ fn connect(socket: &PathBuf) -> std::io::Result<UnixStream> {
         )?);
     }
     UnixStream::connect(socket)
+}
+
+/// A delegated process must not leave its subtree credential live after return.
+pub struct InvocationGuard(Client);
+impl Drop for InvocationGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.close() {
+            log::warn!("delegated recovery attachment already retired or unavailable: {error}");
+        }
+    }
 }

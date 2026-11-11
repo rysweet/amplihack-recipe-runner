@@ -766,6 +766,7 @@ impl<A: Adapter> RecipeRunner<A> {
         }
         let settings = crate::recovery::model::fingerprint(&(
             &self.recovery_settings,
+            &self.working_dir,
             self.auto_stage,
             &self.active_tags,
             &self.exclude_tags,
@@ -831,7 +832,10 @@ impl<A: Adapter> RecipeRunner<A> {
             .as_ref()
             .map(|c| c.attach(format!("{}/{}", self.invocation_path.borrow(), step.id)))
             .transpose()?;
-        Ok(crate::recovery::ipc::enter(client))
+        Ok(crate::recovery::ipc::enter_owned(
+            client,
+            self.recovery.clone(),
+        ))
     }
     #[cfg(unix)]
     fn execute_recoverable_group(
@@ -1845,10 +1849,12 @@ impl<A: Adapter> RecipeRunner<A> {
                         .as_ref()
                         .map(|c| c.attach(format!("{}/{}", self.invocation_path.borrow(), step.id)))
                         .transpose();
+                    #[cfg(unix)]
+                    let recovery_owner = self.recovery.clone();
                     let handle = s.spawn(move || {
                         #[cfg(unix)]
                         let _scope = match recovery_client {
-                            Ok(client) => crate::recovery::ipc::enter(client),
+                            Ok(client) => crate::recovery::ipc::enter_owned(client, recovery_owner),
                             Err(error) => return recovery_failure(step, error).into(),
                         };
                         Self::execute_bash_step_parallel(

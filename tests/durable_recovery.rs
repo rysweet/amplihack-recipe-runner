@@ -519,3 +519,19 @@ fn current_live_admission_does_not_discard_compatible_semantic_progress() {
     assert_eq!(f.events(), ["first", "second", "third", "first", "third"]);
     assert_eq!(result["recovery"]["restart"]["step_id"], "third");
 }
+
+#[test]
+fn step_owner_retires_the_renewed_generation_when_the_step_ends() {
+    use recipe_runner_rs::recovery::ipc::{Server, enter_owned};
+    let f = Fixture::new();
+    let a = f.admit("a", false);
+    let server = Server::start(Store::open(a.descriptor.clone()).unwrap()).unwrap();
+    let root = server.client();
+    root.begin(probe("workflow", "agent", 0)).unwrap();
+    let child = root.attach("workflow/agent".into()).unwrap();
+    let scope = enter_owned(Some(child.clone()), Some(root));
+    let renewed = child.renew().unwrap();
+    drop(scope);
+    assert!(renewed.outcome(Outcome::UsageLimit).is_err());
+    server.finish(Outcome::Success).unwrap();
+}

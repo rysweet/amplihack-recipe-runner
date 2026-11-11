@@ -568,6 +568,8 @@ fn run() -> i32 {
         .with_tags(cli.include_tags, cli.exclude_tags);
 
     #[cfg(unix)]
+    let mut _delegated_lease = None;
+    #[cfg(unix)]
     if let Some(client) = recovery_client {
         let client = if client.prefix.is_empty() {
             client
@@ -592,6 +594,9 @@ fn run() -> i32 {
                 }
             }
         };
+        if !client.prefix.is_empty() {
+            _delegated_lease = Some(client.invocation_guard());
+        }
         if cli.fresh
             && let Err(error) = client.fresh_subtree()
         {
