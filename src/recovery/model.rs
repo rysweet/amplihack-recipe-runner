@@ -167,7 +167,24 @@ pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 pub fn fingerprint<T: Serialize>(value: &T) -> anyhow::Result<String> {
-    // serde_json's default map is a BTreeMap, so recursively converting to Value
-    // gives a deterministic encoding even when the input uses HashMap.
-    Ok(digest(&serde_json::to_vec(&serde_json::to_value(value)?)?))
+    fn canonical(value: Value) -> Value {
+        match value {
+            Value::Object(object) => {
+                let mut entries: Vec<_> = object.into_iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key, canonical(value)))
+                        .collect(),
+                )
+            }
+            Value::Array(values) => Value::Array(values.into_iter().map(canonical).collect()),
+            scalar => scalar,
+        }
+    }
+    // Sort explicitly, including when a host enables serde_json/preserve_order.
+    Ok(digest(&serde_json::to_vec(&canonical(
+        serde_json::to_value(value)?,
+    ))?))
 }

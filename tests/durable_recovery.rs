@@ -535,3 +535,17 @@ fn step_owner_retires_the_renewed_generation_when_the_step_ends() {
     assert!(renewed.outcome(Outcome::UsageLimit).is_err());
     server.finish(Outcome::Success).unwrap();
 }
+
+#[test]
+fn canonical_fingerprints_ignore_map_order_and_preserve_scalar_and_list_types() {
+    let a: Value =
+        serde_json::from_str(r#"{"outer":{"b":true,"a":null},"list":[1,"two"]}"#).unwrap();
+    let b: Value =
+        serde_json::from_str(r#"{"list":[1,"two"],"outer":{"a":null,"b":true}}"#).unwrap();
+    assert_eq!(fingerprint(&a).unwrap(), fingerprint(&b).unwrap());
+    assert_ne!(fingerprint(&true).unwrap(), fingerprint(&"true").unwrap());
+    assert_ne!(
+        fingerprint(&json!([1, 2])).unwrap(),
+        fingerprint(&json!([2, 1])).unwrap()
+    );
+}
