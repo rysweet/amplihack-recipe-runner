@@ -242,3 +242,5 @@ mod tests {
         assert_eq!(safe_tail("🦀", 3), ""); // can't fit partial emoji from the tail side
     }
 }
+
+pub mod recovery;

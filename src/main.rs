@@ -51,6 +51,13 @@ struct Cli {
     #[arg(long)]
     capabilities: bool,
 
+    /// Private launch descriptor supplied by an admitting host.
+    #[arg(long, hide = true)]
+    recovery_descriptor: Option<PathBuf>,
+    /// Bypass inherited replay in the current invocation subtree.
+    #[arg(long)]
+    fresh: bool,
+
     /// Make no update check at startup: no network request and no update
     /// cache file (the same as RECIPE_RUNNER_NO_UPDATE_CHECK=1 for one run).
     /// Accepted before or after a subcommand.
@@ -230,7 +237,11 @@ fn main() {
             std::process::exit(2);
         }
         use std::io::Write;
-        let capabilities: &[&str] = if cfg!(unix) { &["codex_exec"] } else { &[] };
+        let capabilities: &[&str] = if cfg!(unix) {
+            &["codex_exec", "durable_recovery_v1"]
+        } else {
+            &[]
+        };
         let report = serde_json::json!({"schema_version":1,"version":env!("CARGO_PKG_VERSION"),"capabilities":capabilities});
         if let Err(error) = writeln!(std::io::stdout().lock(), "{report}") {
             eprintln!("Failed to write capability report: {error}");
@@ -489,6 +500,65 @@ fn run() -> i32 {
     if !cli.env_allow.is_empty() {
         adapter = adapter.with_env_allow(cli.env_allow.iter().cloned());
     }
+    #[cfg(unix)]
+    let recovery_settings = recipe_runner_rs::recovery::model::fingerprint(&serde_json::json!({
+        "agent_binary":cli.agent_binary,"launcher":cli.launcher,"allow_all_tools":!cli.no_allow_all_tools,
+        "working_dir_grant":!cli.no_add_dir,"env_allow":cli.env_allow,"timeout_action":format!("{:?}",cli.timeout_action as u8),
+        "step_timeout":std::env::var("AMPLIHACK_STEP_TIMEOUT").ok(),"require_audit":cli.require_audit,
+        "engine_version":env!("CARGO_PKG_VERSION"),
+        "execution_environment":(["AMPLIHACK_LAUNCHER_BINARY","AMPLIHACK_AGENT_BINARY","AMPLIHACK_BASH","AMPLIHACK_NO_ALLOW_ALL_TOOLS","AMPLIHACK_HOME","AMPLIHACK_CLAUDE_PROFILE","AMPLIHACK_CLAUDE_PROFILE_ROOT","AMPLIHACK_MAX_DEPTH","AMPLIHACK_MAX_SESSIONS"].map(|k|(k,std::env::var(k).ok()))),
+        "agent_dirs":cli.agent_dirs,"recipe_dirs":cli.recipe_dirs,"no_default_search":cli.no_default_search,
+    })).expect("serializable execution settings");
+    #[cfg(unix)]
+    let recovery = if !cli.dry_run {
+        (|| -> anyhow::Result<_> {
+            use recipe_runner_rs::recovery::{
+                ipc::{Client, Server},
+                model::Descriptor,
+                private_fs::{Directory, parse},
+                store::Store,
+            };
+            let inherited = Client::from_environment()?;
+            if let Some(path) = &cli.recovery_descriptor {
+                anyhow::ensure!(
+                    inherited.is_none(),
+                    "root recovery descriptor conflicts with delegated attachment"
+                );
+                let parent = Directory::open(
+                    path.parent()
+                        .ok_or_else(|| anyhow::anyhow!("invalid recovery descriptor path"))?,
+                    false,
+                )?;
+                let d: Descriptor = parse(
+                    &parent.read(
+                        path.file_name()
+                            .and_then(|n| n.to_str())
+                            .ok_or_else(|| anyhow::anyhow!("invalid descriptor name"))?,
+                    )?,
+                )?;
+                let settings = recipe_runner_rs::recovery::model::fingerprint(&(
+                    &d.settings,
+                    &recovery_settings,
+                ))?;
+                let server = Server::start(Store::open(d)?)?;
+                let client = server.client();
+                Ok((Some(server), Some(client), settings))
+            } else {
+                Ok((None, inherited, recovery_settings))
+            }
+        })()
+    } else {
+        Ok((None, None, recovery_settings))
+    };
+    #[cfg(unix)]
+    let (recovery_server, recovery_client, recovery_settings) = match recovery {
+        Ok(v) => v,
+        Err(error) => {
+            eprintln!("durable recovery admission failed: {error}");
+            return exit_codes::RECIPE_FAILED;
+        }
+    };
+
     let mut runner = RecipeRunner::new(adapter)
         .with_working_dir(&cli.working_dir)
         .with_dry_run(cli.dry_run)
@@ -496,6 +566,42 @@ fn run() -> i32 {
         .with_recipe_search_dirs(cli.recipe_dirs.into_iter().map(PathBuf::from).collect())
         .with_default_search(!cli.no_default_search)
         .with_tags(cli.include_tags, cli.exclude_tags);
+
+    #[cfg(unix)]
+    if let Some(client) = recovery_client {
+        let client = if client.prefix.is_empty() {
+            client
+        } else {
+            let identity: std::collections::BTreeMap<_, _> =
+                ["issue_number", "workstream", "workstream_id", "iteration"]
+                    .into_iter()
+                    .filter_map(|k| {
+                        user_context
+                            .get(k)
+                            .or_else(|| recipe.context.get(k))
+                            .map(|v| (k, v))
+                    })
+                    .collect();
+            let discriminator = recipe_runner_rs::recovery::model::fingerprint(&identity)
+                .expect("serializable invocation identity");
+            match client.enter_invocation(recipe.name.clone(), discriminator) {
+                Ok(c) => c,
+                Err(error) => {
+                    eprintln!("delegated recovery attachment failed: {error}");
+                    return exit_codes::RECIPE_FAILED;
+                }
+            }
+        };
+        if cli.fresh
+            && let Err(error) = client.fresh_subtree()
+        {
+            eprintln!("cannot start fresh recovery subtree: {error}");
+            return exit_codes::RECIPE_FAILED;
+        }
+        runner = runner
+            .with_recovery(client, recovery_settings)
+            .with_recipe_file(resolved_path.clone());
+    }
 
     if !cli.agent_dirs.is_empty() || cli.no_default_search {
         runner = runner.with_agent_resolver(AgentResolver::from_dirs(
@@ -545,6 +651,21 @@ fn run() -> i32 {
     );
     let result = runner.execute(&recipe, ctx);
 
+    #[cfg(unix)]
+    let (recovery_report, failure_cause) = if let Some(server) = recovery_server {
+        match server.finish_result(&result) {
+            Ok((report, cause)) => (
+                Some(report),
+                cause.map(|origin| serde_json::json!({"class":"usage_limit","origin":origin})),
+            ),
+            Err(error) => {
+                eprintln!("durable recovery final publication failed: {error}");
+                return exit_codes::RECIPE_FAILED;
+            }
+        }
+    } else {
+        (None, None)
+    };
     let diagnostics = runner.diagnostic_artifacts();
     // Keep CLI-only diagnostics outside RecipeResult: its Display is also used
     // for nested recipe output, and context is exported to subsequent steps.
@@ -556,12 +677,22 @@ fn run() -> i32 {
             skip_serializing_if = "<[recipe_runner_rs::runner::DiagnosticArtifact]>::is_empty"
         )]
         diagnostic_artifacts: &'a [recipe_runner_rs::runner::DiagnosticArtifact],
+        #[cfg(unix)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recovery: &'a Option<recipe_runner_rs::recovery::model::Report>,
+        #[cfg(unix)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        failure_cause: &'a Option<serde_json::Value>,
     }
     // Output
     if cli.output_format == "json" {
         match serde_json::to_string_pretty(&CliResult {
             result: &result,
             diagnostic_artifacts: &diagnostics,
+            #[cfg(unix)]
+            recovery: &recovery_report,
+            #[cfg(unix)]
+            failure_cause: &failure_cause,
         }) {
             Ok(json) => println!("{}", json),
             Err(e) => eprintln!("Error: Failed to serialize result: {}", e),

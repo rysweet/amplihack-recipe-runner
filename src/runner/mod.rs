@@ -102,6 +102,14 @@ pub struct RecipeRunner<A: Adapter> {
     resume_completed: Vec<String>,
     /// Whether to save checkpoints after each step.
     save_checkpoints: bool,
+    #[cfg(unix)]
+    recovery: Option<crate::recovery::ipc::Client>,
+    #[cfg(unix)]
+    recovery_settings: String,
+    #[cfg(unix)]
+    invocation_path: std::cell::RefCell<String>,
+    #[cfg(unix)]
+    recovery_source: std::cell::RefCell<Option<PathBuf>>,
 }
 
 impl<A: Adapter> RecipeRunner<A> {
@@ -129,7 +137,30 @@ impl<A: Adapter> RecipeRunner<A> {
             listener: Box::new(NullListener),
             resume_completed: Vec::new(),
             save_checkpoints: false,
+            #[cfg(unix)]
+            recovery: None,
+            #[cfg(unix)]
+            recovery_settings: String::new(),
+            #[cfg(unix)]
+            invocation_path: std::cell::RefCell::new(String::new()),
+            #[cfg(unix)]
+            recovery_source: std::cell::RefCell::new(None),
         }
+    }
+
+    /// Attach an admitted launch to the runner-owned durable writer.
+    #[cfg(unix)]
+    pub fn with_recovery(mut self, client: crate::recovery::ipc::Client, settings: String) -> Self {
+        self.recovery = Some(client);
+        self.recovery_settings = settings;
+        self
+    }
+
+    /// Exact source file for durable delegated definition coverage.
+    #[cfg(unix)]
+    pub fn with_recipe_file(self, path: PathBuf) -> Self {
+        *self.recovery_source.borrow_mut() = Some(path);
+        self
     }
 
     pub fn with_working_dir(mut self, dir: &str) -> Self {
@@ -334,6 +365,14 @@ impl<A: Adapter> RecipeRunner<A> {
             }
         }
 
+        #[cfg(unix)]
+        if let Some(client) = &self.recovery {
+            *self.invocation_path.borrow_mut() = if client.prefix.is_empty() {
+                recipe.name.clone()
+            } else {
+                format!("{}/{}", client.prefix, recipe.name)
+            };
+        }
         self.run_steps(&recipe, user_context)
     }
 
@@ -434,6 +473,23 @@ impl<A: Adapter> RecipeRunner<A> {
                     });
                     success = false;
                     break;
+                }
+
+                #[cfg(unix)]
+                if self.recovery.is_some() && !self.dry_run {
+                    let (results, failed) = self.execute_recoverable_group(
+                        &group_steps,
+                        recipe,
+                        group_start,
+                        &mut ctx,
+                        &audit_file,
+                    );
+                    step_results.extend(results);
+                    if failed {
+                        success = false;
+                        break;
+                    }
+                    continue;
                 }
 
                 let mut pre_hook_failure = None;
@@ -556,24 +612,89 @@ impl<A: Adapter> RecipeRunner<A> {
                     continue;
                 }
 
+                #[cfg(unix)]
+                let before = ctx.clone();
+                #[cfg(unix)]
+                let recovery_probe = match self.recovery_probe(recipe, step, step_idx, &ctx) {
+                    Ok(probe) => probe,
+                    Err(error) => {
+                        step_results.push(recovery_failure(step, error));
+                        success = false;
+                        break;
+                    }
+                };
+                #[cfg(unix)]
+                if let (Some(client), Some(probe)) = (&self.recovery, &recovery_probe) {
+                    match client.begin(probe.clone()) {
+                        Ok(Some(record)) => {
+                            crate::recovery::replay::apply(&mut ctx, &record);
+                            self.total_steps
+                                .set(self.total_steps.get() + 1 + record.descendants.len() as u32);
+                            step_results.push(record.result);
+                            step_idx += 1;
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            step_results.push(recovery_failure(step, error));
+                            success = false;
+                            break;
+                        }
+                    }
+                }
+                #[cfg(unix)]
+                let _recovery_scope = match self.recovery_scope(step) {
+                    Ok(scope) => scope,
+                    Err(error) => {
+                        step_results.push(recovery_failure(step, error));
+                        success = false;
+                        break;
+                    }
+                };
                 self.listener.on_step_start(&step.id, step.effective_type());
-                self.run_hook(&recipe.hooks.pre_step, "pre_step", &step.id, &ctx);
+                let _pre_hook_ok =
+                    self.run_hook(&recipe.hooks.pre_step, "pre_step", &step.id, &ctx);
 
                 let mut result = self.execute_step(step, &mut ctx);
                 self.total_steps.set(self.total_steps.get() + 1);
 
                 let failed = result.status == StepStatus::Failed;
 
-                if failed {
-                    self.run_hook(&recipe.hooks.on_error, "on_error", &step.id, &ctx);
+                let _post_hook_ok = if failed {
+                    self.run_hook(&recipe.hooks.on_error, "on_error", &step.id, &ctx)
                 } else {
-                    self.run_hook(&recipe.hooks.post_step, "post_step", &step.id, &ctx);
-                }
+                    self.run_hook(&recipe.hooks.post_step, "post_step", &step.id, &ctx)
+                };
 
                 self.terminal.apply(&mut result);
                 let audit_failed = self.audit_entry_failed(&audit_file, &mut result);
                 let failed = result.status == StepStatus::Failed;
                 self.listener.on_step_complete(&result);
+
+                #[cfg(unix)]
+                if !failed
+                    && !self.dry_run
+                    && let (Some(client), Some(probe)) = (
+                        &self.recovery,
+                        recovery_probe.map(|mut probe| {
+                            probe.permitted &= _pre_hook_ok && _post_hook_ok;
+                            probe
+                        }),
+                    )
+                    && let Err(error) = crate::recovery::replay::finalize(
+                        client,
+                        (recipe, step),
+                        probe,
+                        &before,
+                        &ctx,
+                        &result,
+                        &self.working_dir,
+                    )
+                {
+                    step_results.push(recovery_failure(step, error));
+                    success = false;
+                    break;
+                }
 
                 // Save checkpoint after each step for resume-on-failure
                 if self.save_checkpoints && !failed {
@@ -621,6 +742,199 @@ impl<A: Adapter> RecipeRunner<A> {
         }
     }
 
+    #[cfg(unix)]
+    fn recovery_probe(
+        &self,
+        recipe: &Recipe,
+        step: &Step,
+        index: usize,
+        ctx: &RecipeContext,
+    ) -> anyhow::Result<Option<crate::recovery::model::Probe>> {
+        if self.recovery.is_none() || self.dry_run {
+            return Ok(None);
+        }
+        let mut coverage = serde_json::Value::Null;
+        if let Some(agent) = &step.agent {
+            coverage = serde_json::json!({"agent_definition":self.agent_resolver.resolve(agent).ok().map(|s|crate::recovery::model::digest(s.as_bytes()))});
+        }
+        if let Some(name) = &step.recipe {
+            let name = ctx.render(name);
+            coverage = match self.find_recipe_path(&name) {
+                Some(path) => self.recovery_coverage(Path::new(&path), 0)?,
+                None => serde_json::json!({"missing":name}),
+            };
+        }
+        let settings = crate::recovery::model::fingerprint(&(
+            &self.recovery_settings,
+            self.auto_stage,
+            &self.active_tags,
+            &self.exclude_tags,
+            self.default_search,
+            self.max_depth.get(),
+            self.max_total_steps.get(),
+            self.adapter.name(),
+        ))?;
+        let mut probe = crate::recovery::replay::probe(
+            recipe,
+            step,
+            index,
+            &self.invocation_path.borrow(),
+            ctx,
+            &self.working_dir,
+            &settings,
+            coverage,
+        )?;
+        if let Some(path) = self.recovery_source.borrow().as_ref() {
+            probe.definitions.insert(
+                path.display().to_string(),
+                crate::recovery::model::digest(&crate::recovery::resources::read_file(path)?),
+            );
+        }
+        Ok(Some(probe))
+    }
+    #[cfg(unix)]
+    fn recovery_coverage(&self, path: &Path, depth: u32) -> anyhow::Result<Value> {
+        anyhow::ensure!(
+            depth <= self.max_depth.get(),
+            "recovery child coverage recursion exceeded"
+        );
+        let bytes = crate::recovery::resources::read_file(path)?;
+        let recipe = RecipeParser::new().parse_file(path)?;
+        let mut children = Vec::new();
+        if let Some(base) = &recipe.extends
+            && let Some(path) = self.find_recipe_path(base)
+        {
+            children.push(self.recovery_coverage(Path::new(&path), depth + 1)?);
+        }
+        for step in &recipe.steps {
+            if let Some(name) = &step.recipe {
+                if crate::context::contains_template_expression(name) {
+                    return Ok(
+                        serde_json::json!({"unverifiable":uuid::Uuid::new_v4().to_string()}),
+                    );
+                }
+                if let Some(path) = self.find_recipe_path(name) {
+                    children.push(self.recovery_coverage(Path::new(&path), depth + 1)?);
+                }
+            }
+        }
+        Ok(
+            serde_json::json!({"definition":crate::recovery::model::digest(&bytes),"children":children}),
+        )
+    }
+    #[cfg(unix)]
+    fn recovery_scope(&self, step: &Step) -> anyhow::Result<crate::recovery::ipc::Scope> {
+        let client = self
+            .recovery
+            .as_ref()
+            .map(|c| c.attach(format!("{}/{}", self.invocation_path.borrow(), step.id)))
+            .transpose()?;
+        Ok(crate::recovery::ipc::enter(client))
+    }
+    #[cfg(unix)]
+    fn execute_recoverable_group(
+        &self,
+        steps: &[&Step],
+        recipe: &Recipe,
+        start: usize,
+        ctx: &mut RecipeContext,
+        audit: &Option<std::fs::File>,
+    ) -> (Vec<StepResult>, bool) {
+        let base = ctx.clone();
+        let mut results = Vec::new();
+        let mut failed = false;
+        // Recipe adapters already execute non-bash members sequentially. Bash
+        // members retain the original concurrent execution path below.
+        let mut pending = Vec::new();
+        let mut probes = Vec::new();
+        let mut restored = std::collections::BTreeMap::new();
+        let client = self.recovery.as_ref().expect("recovery group");
+        for (idx, step) in steps.iter().enumerate() {
+            let probe = match self.recovery_probe(recipe, step, start + idx, &base) {
+                Ok(Some(p)) => p,
+                Ok(None) => unreachable!("recovery group is admitted"),
+                Err(e) => return (vec![recovery_failure(step, e)], true),
+            };
+            match client.begin(probe.clone()) {
+                Ok(Some(record)) => {
+                    restored.insert(idx, record);
+                }
+                Ok(None) => {
+                    pending.push((idx, *step));
+                    probes.push(probe);
+                }
+                Err(e) => return (vec![recovery_failure(step, e)], true),
+            }
+        }
+        let mut pre_hooks = std::collections::BTreeMap::new();
+        for (idx, step) in &pending {
+            self.listener.on_step_start(&step.id, step.effective_type());
+            pre_hooks.insert(
+                *idx,
+                self.run_hook(&recipe.hooks.pre_step, "pre_step", &step.id, &base),
+            );
+        }
+        // Each bash worker gets its own server-bound invocation capability.
+        let group_steps: Vec<_> = pending.iter().map(|(_, s)| *s).collect();
+        let group_results =
+            self.execute_parallel_group(&group_steps, recipe, &base, &*self.listener);
+        let mut newly = std::collections::BTreeMap::new();
+        for (pending_idx, result) in group_results {
+            newly.insert(
+                pending[pending_idx].0,
+                (result, probes[pending_idx].clone()),
+            );
+        }
+        for (idx, step) in steps.iter().enumerate() {
+            self.total_steps.set(self.total_steps.get() + 1);
+            if let Some(record) = restored.remove(&idx) {
+                crate::recovery::replay::apply(ctx, &record);
+                results.push(record.result);
+                continue;
+            }
+            let Some((mut result, mut probe)) = newly.remove(&idx) else {
+                failed = true;
+                continue;
+            };
+            let post_hook_ok = if result.status == StepStatus::Failed {
+                self.run_hook(&recipe.hooks.on_error, "on_error", &step.id, ctx)
+            } else {
+                self.run_hook(&recipe.hooks.post_step, "post_step", &step.id, ctx)
+            };
+            probe.permitted &= post_hook_ok && pre_hooks.get(&idx) == Some(&true);
+            self.terminal.apply(&mut result);
+            self.audit_entry_failed(audit, &mut result);
+            let mut after = base.clone();
+            if result.status != StepStatus::Failed
+                && let Some(key) = &step.output
+            {
+                let value = serde_json::from_str(&result.output)
+                    .unwrap_or_else(|_| Value::String(result.output.clone()));
+                after.set(key, value.clone());
+                ctx.set(key, value);
+            }
+            if matches!(result.status, StepStatus::Completed | StepStatus::Skipped)
+                && let Err(e) = crate::recovery::replay::finalize(
+                    client,
+                    (recipe, step),
+                    probe,
+                    &base,
+                    &after,
+                    &result,
+                    &self.working_dir,
+                )
+            {
+                result = recovery_failure(step, e);
+            }
+            if result.status == StepStatus::Failed && !step.is_nonfatal() {
+                failed = true;
+            }
+            self.listener.on_step_complete(&result);
+            results.push(result);
+        }
+        (results, failed || self.terminal.is_terminal())
+    }
+
     fn should_skip_by_tags(&self, step: &Step) -> bool {
         log::debug!(
             "should_skip_by_tags: step='{}', when_tags={:?}",
@@ -645,9 +959,15 @@ impl<A: Adapter> RecipeRunner<A> {
         false
     }
 
-    fn run_hook(&self, hook: &Option<String>, hook_name: &str, step_id: &str, ctx: &RecipeContext) {
+    fn run_hook(
+        &self,
+        hook: &Option<String>,
+        hook_name: &str,
+        step_id: &str,
+        ctx: &RecipeContext,
+    ) -> bool {
         if self.terminal.is_terminal() {
-            return;
+            return false;
         }
         if let Some(cmd) = hook {
             // A dry run executes nothing, hooks included: they are arbitrary
@@ -658,7 +978,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     hook_name,
                     diagnostic_identifier(step_id)
                 );
-                return;
+                return true;
             }
             let rendered = ctx.render_shell(cmd);
             let env_vars = ctx.shell_env_for_step();
@@ -678,8 +998,10 @@ impl<A: Adapter> RecipeRunner<A> {
                     diagnostic_identifier(step_id),
                     e
                 );
+                return false;
             }
         }
+        true
     }
 
     fn open_audit_log(&self, recipe_name: &str) -> Option<std::fs::File> {
@@ -1117,7 +1439,21 @@ impl<A: Adapter> RecipeRunner<A> {
 
         // Increment depth, execute, then restore
         self.depth.set(current_depth + 1);
+        #[cfg(unix)]
+        let previous_path = self.invocation_path.borrow().clone();
+        #[cfg(unix)]
+        let previous_source = self.recovery_source.replace(Some(PathBuf::from(&path)));
+        #[cfg(unix)]
+        if self.recovery.is_some() {
+            *self.invocation_path.borrow_mut() =
+                format!("{}/{}/{}", previous_path, step.id, sub_recipe.name);
+        }
         let sub_result = self.execute_with_depth(&sub_recipe, Some(merged));
+        #[cfg(unix)]
+        {
+            *self.invocation_path.borrow_mut() = previous_path;
+            *self.recovery_source.borrow_mut() = previous_source;
+        }
         self.depth.set(current_depth);
 
         if !sub_result.success {
@@ -1501,7 +1837,18 @@ impl<A: Adapter> RecipeRunner<A> {
 
                 if step.effective_type() == StepType::Bash && handles.len() < MAX_PARALLEL_STEPS {
                     let ctx_clone = ctx.clone();
+                    #[cfg(unix)]
+                    let recovery_client = self
+                        .recovery
+                        .as_ref()
+                        .map(|c| c.attach(format!("{}/{}", self.invocation_path.borrow(), step.id)))
+                        .transpose();
                     let handle = s.spawn(move || {
+                        #[cfg(unix)]
+                        let _scope = match recovery_client {
+                            Ok(client) => crate::recovery::ipc::enter(client),
+                            Err(error) => return recovery_failure(step, error).into(),
+                        };
                         Self::execute_bash_step_parallel(
                             step,
                             &ctx_clone,
@@ -1516,6 +1863,14 @@ impl<A: Adapter> RecipeRunner<A> {
                 } else {
                     // Non-bash steps or excess parallel steps fall back to sequential
                     let mut ctx_clone = ctx.clone();
+                    #[cfg(unix)]
+                    let _scope = match self.recovery_scope(step) {
+                        Ok(scope) => scope,
+                        Err(error) => {
+                            results[idx] = Some(recovery_failure(step, error));
+                            continue;
+                        }
+                    };
                     let result = self.execute_step(step, &mut ctx_clone);
                     results[idx] = Some(result);
                 }
@@ -1822,6 +2177,17 @@ fn chrono_now() -> String {
     let mins = (secs / 60) % 60;
     let s = secs % 60;
     format!("{:02}:{:02}:{:02}Z", hours, mins, s)
+}
+
+#[cfg(unix)]
+fn recovery_failure(step: &Step, error: anyhow::Error) -> StepResult {
+    StepResult {
+        step_id: step.id.clone(),
+        status: StepStatus::Failed,
+        output: String::new(),
+        error: format!("durable recovery failed: {error}"),
+        duration: None,
+    }
 }
 
 #[cfg(test)]
