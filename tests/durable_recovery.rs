@@ -211,7 +211,7 @@ fn duplicate_properties_at_any_depth_are_rejected() {
 fn private_storage_rejects_links_special_files_and_insecure_modes() {
     use std::os::unix::fs::{PermissionsExt, symlink};
     let tmp = tempfile::tempdir().unwrap();
-    let root = Directory::open(tmp.path(), false).unwrap();
+    let root = Directory::open(&tmp.path().join("private"), true).unwrap();
     root.publish("valid", b"{}").unwrap();
     symlink(root.path.join("valid"), root.path.join("link")).unwrap();
     assert!(root.read("link").is_err());
