@@ -101,6 +101,23 @@ fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>> {
     stream.read_exact(&mut b)?;
     Ok(b)
 }
+// Filesystem socket addresses have a small platform limit. Keep this private,
+// ephemeral endpoint under the canonical system temporary directory even when
+// the admitted runtime's TMPDIR is much longer than a sockaddr_un can hold.
+#[cfg(any(test, not(target_os = "linux")))]
+fn private_socket() -> Result<(UnixListener, PathBuf, Option<tempfile::TempDir>)> {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::Builder::new()
+        .prefix("rr-")
+        .tempdir_in(std::fs::canonicalize("/tmp")?)?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    private_fs::Directory::open(directory.path(), false)?;
+    let socket = directory.path().join("s");
+    let listener = UnixListener::bind(&socket)?;
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    Ok((listener, socket, Some(directory)))
+}
+
 impl Server {
     pub fn start(store: Store) -> Result<Self> {
         // TMPDIR is supplied by the caller's private runtime; a short basename
@@ -117,15 +134,7 @@ impl Server {
             )
         };
         #[cfg(not(target_os = "linux"))]
-        let (listener, socket, directory) = {
-            let directory = tempfile::Builder::new().prefix("rr-").tempdir()?;
-            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
-            Directory::open(directory.path(), false)?;
-            let socket = directory.path().join("s");
-            let listener = UnixListener::bind(&socket)?;
-            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
-            (listener, socket, Some(directory))
-        };
+        let (listener, socket, directory) = private_socket()?;
         let client = Client {
             socket: socket.clone(),
             token: uuid::Uuid::new_v4().to_string(),
@@ -583,5 +592,32 @@ impl Drop for InvocationGuard {
         if let Err(error) = self.0.close() {
             log::warn!("delegated recovery attachment already retired or unavailable: {error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn portable_socket_is_private_short_and_connectable() {
+        use std::os::unix::fs::PermissionsExt;
+        let (listener, path, directory) = super::private_socket().unwrap();
+        assert!(path.as_os_str().len() < 100);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(directory.as_ref().unwrap().path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let _client = super::connect(&path).unwrap();
+        let _accepted = listener.accept().unwrap();
+        drop(listener);
+        drop(directory);
+        assert!(!path.exists());
     }
 }
