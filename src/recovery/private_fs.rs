@@ -45,7 +45,7 @@ fn directory(file: File, path: PathBuf, private: bool) -> Result<Directory> {
         );
     } else {
         ensure!(
-            m.mode() & 0o022 == 0 || m.mode() & libc::S_ISVTX != 0,
+            m.mode() & 0o022 == 0 || m.mode() & 0o1000 != 0,
             "unsafe recovery ancestor"
         );
     }
