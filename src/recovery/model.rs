@@ -111,6 +111,7 @@ pub struct Observation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Probe {
+    pub rebind: bool,
     pub definitions: BTreeMap<String, String>,
     pub location: Location,
     pub index: usize,

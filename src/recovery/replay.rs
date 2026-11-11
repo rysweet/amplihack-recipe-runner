@@ -55,6 +55,10 @@ pub fn probe(
     }
     let header = json!({"name":recipe.name,"version":recipe.version,"hooks":recipe.hooks,"recursion":recipe.recursion,"validation":recipe.context_validation,"policy":recipe.recovery});
     Ok(Probe {
+        rebind: step
+            .recovery
+            .as_ref()
+            .is_some_and(|p| p.replay == Replay::Rebind),
         definitions: BTreeMap::new(),
         location: Location {
             invocation_path: path.into(),

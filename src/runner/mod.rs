@@ -785,9 +785,10 @@ impl<A: Adapter> RecipeRunner<A> {
             coverage,
         )?;
         if let Some(path) = self.recovery_source.borrow().as_ref() {
+            let path = path.canonicalize()?;
             probe.definitions.insert(
                 path.display().to_string(),
-                crate::recovery::model::digest(&crate::recovery::resources::read_file(path)?),
+                crate::recovery::model::digest(&crate::recovery::resources::read_file(&path)?),
             );
         }
         Ok(Some(probe))
@@ -798,7 +799,8 @@ impl<A: Adapter> RecipeRunner<A> {
             depth <= self.max_depth.get(),
             "recovery child coverage recursion exceeded"
         );
-        let bytes = crate::recovery::resources::read_file(path)?;
+        let canonical = path.canonicalize()?;
+        let bytes = crate::recovery::resources::read_file(&canonical)?;
         let recipe = RecipeParser::new().parse_file(path)?;
         let mut children = Vec::new();
         if let Some(base) = &recipe.extends

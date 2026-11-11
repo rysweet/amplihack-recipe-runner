@@ -55,6 +55,27 @@ pub fn validate_tree(tree: &Tree) -> Result<()> {
             "duplicate completion identity"
         );
     }
+    let records: BTreeSet<_> = tree
+        .records
+        .iter()
+        .map(|r| (&r.probe.location.invocation_path, &r.probe.location.step_id))
+        .collect();
+    for record in &tree.records {
+        let prefix = format!(
+            "{}/{}/",
+            record.probe.location.invocation_path, record.probe.location.step_id
+        );
+        let mut children = BTreeSet::new();
+        for child in &record.descendants {
+            validate_location(child)?;
+            ensure!(
+                child.invocation_path.starts_with(&prefix)
+                    && records.contains(&(&child.invocation_path, &child.step_id))
+                    && children.insert((&child.invocation_path, &child.step_id)),
+                "invalid recovery child relationship"
+            );
+        }
+    }
     Ok(())
 }
 pub fn validate_location(l: &Location) -> Result<()> {
@@ -161,6 +182,13 @@ impl Store {
             self.started.insert(key.clone()),
             "duplicate step invocation"
         );
+        if probe.rebind {
+            // Current authorization/session admission runs before semantic replay.
+            // Later steps still compare every input they actually consume. A new
+            // live receipt alone does not discard independent semantic progress.
+            self.publish()?;
+            return Ok(None);
+        }
         let candidate = self
             .candidates
             .iter()
@@ -316,7 +344,9 @@ impl Store {
                 .insert((location.invocation_path.clone(), location.step_id.clone()));
             // Child completions remain candidates: they perform their own definition,
             // input and resource checks when the parent has to execute again.
-            self.tree.records.retain(|r| r.probe.location != location);
+            self.tree
+                .records
+                .retain(|r| r.probe.location != location && !r.descendants.contains(&location));
         }
         self.tree.report.invalidated_steps.push(Invalidation {
             location: probe.location.clone(),
@@ -476,6 +506,10 @@ impl Store {
                     .location
                     .invocation_path
                     .starts_with(&format!("{prefix}/"))
+                && !r
+                    .descendants
+                    .iter()
+                    .any(|l| l.invocation_path.starts_with(&format!("{prefix}/")))
         };
         self.candidates.retain(keep);
         self.tree.records.retain(keep);

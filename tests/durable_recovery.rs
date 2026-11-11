@@ -178,6 +178,7 @@ fn typed_context_delta_preserves_null_and_removal() {
 }
 fn probe(path: &str, step: &str, index: usize) -> Probe {
     Probe {
+        rebind: false,
         definitions: Default::default(),
         location: Location {
             invocation_path: path.into(),
@@ -494,4 +495,22 @@ fn surviving_writer_prevents_recovery_after_the_host_owner_disappears() {
     assert!(b.descriptor.source.is_none());
     assert_eq!(b.descriptor.reason, "owner_active");
     drop(writer);
+}
+
+#[test]
+fn current_live_admission_does_not_discard_compatible_semantic_progress() {
+    let f = Fixture::new();
+    let mut recipe: Value = serde_yaml::from_str(&fs::read_to_string(&f.recipe).unwrap()).unwrap();
+    recipe["steps"][0]["recovery"]["replay"] = json!("rebind");
+    fs::write(&f.recipe, serde_yaml::to_string(&recipe).unwrap()).unwrap();
+    fs::write(f.root.join("limit-third"), "").unwrap();
+    let a = f.admit("a", false);
+    f.run(&a);
+    drop(a);
+    fs::remove_file(f.root.join("limit-third")).unwrap();
+    let b = f.admit("b", false);
+    let result = f.run(&b);
+    assert_eq!(result["success"], true);
+    assert_eq!(f.events(), ["first", "second", "third", "first", "third"]);
+    assert_eq!(result["recovery"]["restart"]["step_id"], "third");
 }
