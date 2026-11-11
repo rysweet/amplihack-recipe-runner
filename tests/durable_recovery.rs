@@ -549,3 +549,6 @@ fn canonical_fingerprints_ignore_map_order_and_preserve_scalar_and_list_types() 
         fingerprint(&json!([2, 1])).unwrap()
     );
 }
+
+#[path = "durable_recovery/review.rs"]
+mod review;

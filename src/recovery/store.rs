@@ -98,6 +98,9 @@ pub struct Store {
     pub tree: Tree,
     directory: Directory,
     candidates: Vec<Record>,
+    // Historical observations never acquire authority from a new completion.
+    source_repositories: BTreeMap<String, String>,
+    attempt_repositories: BTreeMap<String, String>,
     invalid: BTreeSet<(String, String)>,
     started: BTreeSet<(String, String)>,
     pub descriptor: Descriptor,
@@ -142,8 +145,10 @@ impl Store {
         }
         let mut result = Self {
             _writer: writer,
+            source_repositories: tree.repositories.clone(),
             tree,
             directory,
+            attempt_repositories: BTreeMap::new(),
             candidates,
             invalid: BTreeSet::new(),
             started: BTreeSet::new(),
@@ -170,6 +175,7 @@ impl Store {
     }
     pub fn begin(&mut self, probe: &Probe) -> Result<Option<Record>> {
         validate_location(&probe.location)?;
+        self.invalidate_repository_candidates(&probe.resources, false);
         self.clear_blockage(&format!(
             "{}/{}",
             probe.location.invocation_path, probe.location.step_id
@@ -294,7 +300,7 @@ impl Store {
                     if new.digest.is_empty() {
                         return Some("resource_unavailable");
                     }
-                    if self.tree.repositories.get(&old.path) != Some(&new.digest) {
+                    if self.expected_repository(&old.path) != Some(&new.digest) {
                         return Some("repository_changed");
                     }
                 }
@@ -327,28 +333,92 @@ impl Store {
         }
         None
     }
+    fn expected_repository(&self, path: &str) -> Option<&String> {
+        self.attempt_repositories
+            .get(path)
+            .or_else(|| self.source_repositories.get(path))
+    }
+    /// Compare the checkout on entry, before legitimate workflow mutations can
+    /// advance the attempt baseline. Remove incompatible inherited children now,
+    /// including from the durable tree, even if their parent has not been entered.
+    fn invalidate_repository_candidates(
+        &mut self,
+        observations: &[Observation],
+        unstarted_only: bool,
+    ) {
+        for observation in observations.iter().filter(|r| r.kind == "repository") {
+            if self.expected_repository(&observation.path) == Some(&observation.digest)
+                && !observation.digest.is_empty()
+            {
+                continue;
+            }
+            let affected: Vec<_> = self
+                .candidates
+                .iter()
+                .filter(|r| {
+                    (!unstarted_only
+                        || !self.started.contains(&(
+                            r.probe.location.invocation_path.clone(),
+                            r.probe.location.step_id.clone(),
+                        )))
+                        && !self.invalid.contains(&(
+                            r.probe.location.invocation_path.clone(),
+                            r.probe.location.step_id.clone(),
+                        ))
+                        && r.probe
+                            .resources
+                            .iter()
+                            .chain(&r.child_resources)
+                            .any(|old| old.kind == "repository" && old.path == observation.path)
+                })
+                .map(|r| r.probe.clone())
+                .collect();
+            for probe in affected {
+                self.invalidate(
+                    &probe,
+                    if observation.digest.is_empty() {
+                        "resource_unavailable"
+                    } else {
+                        "repository_changed"
+                    },
+                );
+            }
+        }
+    }
     fn invalidate(&mut self, probe: &Probe, reason: &str) {
-        let invocation = &probe.location.invocation_path;
-        let affected: Vec<_> = self
-            .candidates
-            .iter()
-            .filter(|r| {
-                r.probe.location.invocation_path == *invocation
-                    && r.probe.index >= probe.index
-                    && (r.probe.location == probe.location
-                        || probe.group.is_none()
-                        || r.probe.group != probe.group)
-            })
-            .map(|r| r.probe.location.clone())
-            .collect();
-        for location in affected {
-            self.invalid
-                .insert((location.invocation_path.clone(), location.step_id.clone()));
-            // Child completions remain candidates: they perform their own definition,
-            // input and resource checks when the parent has to execute again.
-            self.tree
-                .records
-                .retain(|r| r.probe.location != location && !r.descendants.contains(&location));
+        let mut pending = vec![probe.clone()];
+        while let Some(probe) = pending.pop() {
+            let affected: Vec<_> = self
+                .candidates
+                .iter()
+                .filter(|r| {
+                    r.probe.location.invocation_path == probe.location.invocation_path
+                        && r.probe.index >= probe.index
+                        && (r.probe.location == probe.location
+                            || probe.group.is_none()
+                            || r.probe.group != probe.group)
+                })
+                .map(|r| r.probe.location.clone())
+                .collect();
+            for location in affected {
+                if !self
+                    .invalid
+                    .insert((location.invocation_path.clone(), location.step_id.clone()))
+                {
+                    continue;
+                }
+                pending.extend(
+                    self.candidates
+                        .iter()
+                        .filter(|r| r.descendants.contains(&location))
+                        .map(|r| r.probe.clone()),
+                );
+                // Compatible children of an incomplete parent still check their
+                // own dependencies; only the affected suffix and containers go.
+                self.tree
+                    .records
+                    .retain(|r| r.probe.location != location && !r.descendants.contains(&location));
+            }
         }
         self.tree.report.invalidated_steps.push(Invalidation {
             location: probe.location.clone(),
@@ -384,6 +454,10 @@ impl Store {
             )),
             "completion was not admitted"
         );
+        // A newly executed step may itself change the checkout. Unentered
+        // inherited work must be checked before that completion advances the
+        // baseline; already consumed compatible prefixes retain their results.
+        self.invalidate_repository_candidates(&record.probe.resources, true);
         let prefix = format!(
             "{}/{}/",
             record.probe.location.invocation_path, record.probe.location.step_id
@@ -452,6 +526,8 @@ impl Store {
         resources::capture(&mut record.probe.resources, &self.directory)?;
         for resource in &record.probe.resources {
             if resource.kind == "repository" {
+                self.attempt_repositories
+                    .insert(resource.path.clone(), resource.digest.clone());
                 self.tree
                     .repositories
                     .insert(resource.path.clone(), resource.digest.clone());
