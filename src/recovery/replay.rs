@@ -28,11 +28,18 @@ pub fn probe(
             .as_ref()
             .is_some_and(|p| p.replay == Replay::Reuse)
         && policy.is_some_and(|p| p.persist.outputs.contains(&step.id));
+    // Shell helpers can inspect the entire environment, use indirect expansion,
+    // or read a context transport. Syntax alone cannot prove non-consumption.
+    let opaque_shell = step.effective_type() == StepType::Bash
+        || recipe.hooks.pre_step.is_some()
+        || recipe.hooks.post_step.is_some();
     for (key, value) in ctx.data() {
-        let used = text.contains(&format!("{{{{{key}"))
+        let used = opaque_shell
+            || text.contains(&format!("{{{{{key}"))
             || text.contains(&format!("${}", key.to_uppercase()))
             || text.contains(&format!("${{{}", key.to_uppercase()))
             || text.contains(&format!("$RECIPE_VAR_{key}"))
+            || text.contains(&format!("${{RECIPE_VAR_{key}"))
             || step.condition.as_ref().is_some_and(|c| c.contains(key))
             || step.effective_type() == StepType::Recipe;
         if used {
@@ -66,7 +73,9 @@ pub fn probe(
         },
         index,
         group: step.parallel_group.clone(),
-        definition: fingerprint(&(header, step, coverage))?,
+        // Version the coverage rule: older records cannot prove complete
+        // shell dependencies, even when their recorded values happen to match.
+        definition: fingerprint(&("semantic-input-coverage-v2", header, step, coverage))?,
         inputs,
         permitted,
         resources,

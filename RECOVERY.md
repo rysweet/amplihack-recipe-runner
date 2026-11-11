@@ -10,7 +10,13 @@ Admission serializes latest-attempt selection and sequence allocation. It checks
 only the latest matching attempt, requires its durable `usage_limit` outcome,
 and rejects an active owner through a held advisory lock. Registering a new
 attempt writes a durable running record before advancing the latest marker.
-Keep the marker even when deleting historical run directories.
+A separate durable `ordering.json` high-water registration precedes atomic
+publication of `latest.json`. Corrupt latest-marker contents admit fresh work
+without selecting older history; an interrupted latest publication also bars
+older replay. On migration, existing durable descriptors establish the maximum
+sequence but never select a replay source. Keep both index files when deleting
+historical run directories. Unsafe current storage and unverifiable current
+ordering still stop admission, including with an explicit fresh request.
 
 The existing step executor uses the recovery writer before hooks and after
 finalization. Replayed results retain their original typed context deltas,
@@ -57,10 +63,24 @@ resource (`name` required) always prevents replay. Hosts must perform admission
 before replaying any dependent steps. Recovery does not invent an authorization
 service or reuse old session receipts.
 
+Shell steps and steps with shell hooks conservatively depend on every semantic
+context input, including values consumed by helpers or indirect expansion.
+Direct references include `${RECIPE_VAR_input:-}`. Typed values, missing keys,
+and explicit null remain distinct. Every present dependency must have existing
+persistence permission; otherwise the work executes without a replayable
+completion. The runner never adds permissions automatically. The input coverage
+fingerprint changed, so older records without proven coverage rerun once.
+
 Resources are `file` or `repository` with `path`, `artifact` with `path` and
 `context_key`, or `live` with `name`. The active Git checkout is automatically
 observed. Git revisions and worktree contents are compared with the cumulative
 state after completed work, allowing the workflow’s own commits and branches.
+Source repository observations remain separate from observations accumulated
+by the new attempt. On step entry, an incompatible checkout invalidates inherited
+repository-dependent candidates, their ordered suffixes and enclosing results
+before a new completion can advance the baseline. This removal is durable even
+if the attempt stops before entering an affected child. Compatible child prefixes
+and independent resource paths remain eligible.
 Artifacts are copied before publication, verified on import, and rebound only
 at their explicit context key. A parent containing child artifacts is re-entered
 so the child can rebind them. Opaque output strings are never rewritten.
