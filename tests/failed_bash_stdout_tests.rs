@@ -20,7 +20,7 @@ impl Fixture {
     fn new() -> Self {
         let root = tempfile::Builder::new()
             .prefix("rr190-cli-")
-            .tempdir()
+            .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
             .unwrap();
         for name in ["home", "tmp", "config", "cache", "work"] {
             std::fs::create_dir(root.path().join(name)).unwrap();
@@ -244,6 +244,8 @@ fn unusable_configured_location_reports_retention_failure_without_fallback() {
     );
 }
 
+// APFS rejects these path bytes with EILSEQ; Linux exercises this contract.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn retention_problem_identifies_non_utf8_directory_losslessly() {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -348,6 +350,7 @@ fn artifact_pointer_quotes_and_escapes_control_characters() {
     assert_eq!(std::fs::read(paths[0].path()).unwrap(), b"private bytes");
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn non_utf8_pointer_round_trips_every_original_path_byte() {
     use std::os::unix::ffi::OsStringExt;
