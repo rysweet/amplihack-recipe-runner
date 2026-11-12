@@ -40,6 +40,7 @@ fn rate_limit_retry_has_fresh_output_and_keeps_explicit_model() {
     );
 }
 
+#[cfg(target_os = "linux")]
 fn assert_tree_cleanup(scenario: &str) {
     let (root, result, _) = run(scenario, "task", None, "codex");
     let pid: i32 = fs::read_to_string(root.path().join("descendant.pid"))
@@ -59,10 +60,12 @@ fn assert_tree_cleanup(scenario: &str) {
     );
     assert_eq!(result.get("error").is_some(), scenario == "tree_timeout");
 }
+#[cfg(target_os = "linux")]
 #[test]
 fn timeout_terminates_owned_descendants() {
     assert_tree_cleanup("tree_timeout");
 }
+#[cfg(target_os = "linux")]
 #[test]
 fn nominal_exit_terminates_lingering_descendants() {
     assert_tree_cleanup("tree_success");
@@ -79,6 +82,7 @@ fn both_diagnostic_streams_are_drained_without_timeout() {
     assert_eq!(result["ok"], "  FINAL\n\0Unicode: λ\n\n");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn writing_descendant_stops_before_final_extraction() {
     let (root, result, _) = run("writer", "task", None, "codex");

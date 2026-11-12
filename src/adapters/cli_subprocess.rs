@@ -393,6 +393,51 @@ impl std::fmt::Debug for BashFailure {
 }
 impl std::error::Error for BashFailure {}
 
+/// Describe the child's actual wait status, without fabricating an exit code.
+fn bash_failure_status(status: std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return signal_status(signal);
+        }
+    }
+    "termination status unavailable".to_owned()
+}
+
+#[cfg(unix)]
+fn signal_status(signal: i32) -> String {
+    // libc supplies the host's numbers: SIGBUS, for example, differs on macOS.
+    let name = match signal {
+        libc::SIGHUP => Some("SIGHUP"),
+        libc::SIGINT => Some("SIGINT"),
+        libc::SIGQUIT => Some("SIGQUIT"),
+        libc::SIGILL => Some("SIGILL"),
+        libc::SIGTRAP => Some("SIGTRAP"),
+        libc::SIGABRT => Some("SIGABRT"),
+        libc::SIGBUS => Some("SIGBUS"),
+        libc::SIGFPE => Some("SIGFPE"),
+        libc::SIGKILL => Some("SIGKILL"),
+        libc::SIGSEGV => Some("SIGSEGV"),
+        libc::SIGPIPE => Some("SIGPIPE"),
+        libc::SIGALRM => Some("SIGALRM"),
+        libc::SIGTERM => Some("SIGTERM"),
+        libc::SIGUSR1 => Some("SIGUSR1"),
+        libc::SIGUSR2 => Some("SIGUSR2"),
+        libc::SIGXCPU => Some("SIGXCPU"),
+        libc::SIGXFSZ => Some("SIGXFSZ"),
+        libc::SIGSYS => Some("SIGSYS"),
+        _ => None,
+    };
+    match name {
+        Some(name) => format!("killed by signal {signal} ({name})"),
+        None => format!("killed by signal {signal}"),
+    }
+}
+
 /// Quote controls for safe text output, without filtering classifier keywords.
 fn quote_diagnostic(text: &str) -> String {
     let quoted = serde_json::to_string(text).expect("string serialisation cannot fail");
@@ -1904,8 +1949,8 @@ impl Adapter for CLISubprocessAdapter {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(BashFailure {
                 message: format!(
-                    "Command failed (exit {}): {}",
-                    output.status.code().unwrap_or(-1),
+                    "Command failed ({}): {}",
+                    bash_failure_status(output.status),
                     stderr.trim()
                 ),
                 diagnostic,
@@ -5835,6 +5880,38 @@ mod failed_bash_stdout_contract_tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     #[test]
+    fn sigsegv_without_stderr_has_named_platform_status() {
+        let fixture = Fixture::new();
+        let logs = fixture.path().join("unused");
+        let error = fixture
+            .execute("ulimit -c 0; kill -SEGV $$", &logs)
+            .unwrap_err();
+        assert_eq!(
+            chain(&error),
+            vec![format!(
+                "Command failed (killed by signal {} (SIGSEGV)): ",
+                libc::SIGSEGV
+            )]
+        );
+        assert!(!logs.exists());
+    }
+
+    #[test]
+    fn platform_signal_names_and_unknown_numbers() {
+        assert_eq!(
+            signal_status(libc::SIGBUS),
+            format!("killed by signal {} (SIGBUS)", libc::SIGBUS)
+        );
+        assert_eq!(signal_status(999), "killed by signal 999");
+        // A normal exit 139 remains an exit, irrespective of shell conventions.
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            bash_failure_status(std::process::ExitStatus::from_raw(139 << 8)),
+            "exit 139"
+        );
+    }
+
+    #[test]
     fn typed_failure_metadata_is_not_an_error_chain_cause() {
         let fixture = Fixture::new();
         let logs = fixture.path().join("connection reset by peer");
@@ -5885,7 +5962,7 @@ mod failed_bash_stdout_contract_tests {
         fn new() -> Self {
             let root = tempfile::Builder::new()
                 .prefix("rr190-adapter-")
-                .tempdir()
+                .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
                 .unwrap();
             for name in ["home", "tmp", "config", "cache"] {
                 std::fs::create_dir(root.path().join(name)).unwrap();
@@ -6104,18 +6181,21 @@ mod failed_bash_stdout_contract_tests {
     }
 
     #[test]
-    fn stdout_retention_preserves_lossy_trimmed_stderr_and_signal_exit_fallback() {
+    fn stdout_retention_preserves_lossy_trimmed_stderr_and_signal_status() {
         let fixture = Fixture::new();
         for (index, tail, expected) in [
             (
                 0,
                 "exit 7",
-                "Command failed (exit 7): \u{fffd}\0  original diagnostic",
+                "Command failed (exit 7): \u{fffd}\0  original diagnostic".to_owned(),
             ),
             (
                 1,
                 "kill -TERM $$",
-                "Command failed (exit -1): \u{fffd}\0  original diagnostic",
+                format!(
+                    "Command failed (killed by signal {} (SIGTERM)): \u{fffd}\0  original diagnostic",
+                    libc::SIGTERM
+                ),
             ),
         ] {
             let logs = fixture.path().join(format!("logs-{index}"));
@@ -6123,7 +6203,7 @@ mod failed_bash_stdout_contract_tests {
                 &format!("printf 'private stdout'; printf '\\377\\000  original diagnostic\\n\\t' >&2; {tail}"),
                 &logs,
             ).unwrap_err();
-            assert_eq!(chain(&error), vec![expected]);
+            assert_eq!(chain(&error), vec![expected.as_str()]);
             assert_eq!(
                 std::fs::read(only_artifact(&logs)).unwrap(),
                 b"private stdout"
