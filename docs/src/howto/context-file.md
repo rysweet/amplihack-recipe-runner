@@ -72,8 +72,11 @@ Changing it after loading does not change the running recipe.
 Use file transport for values that must stay off the runner's command line.
 Values supplied with `--set` still appear there. Intentional step output and
 JSON results can contain file-loaded values, as this example demonstrates.
-Agent prompt transport has its own contract; file context alone does not keep
-rendered prompts off launcher command lines.
+Bash steps execute from owner-only temporary script files, including when
+quoted heredocs inline context. These scripts are removed when the step returns.
+Agent instructions travel through private prompt files (Codex uses stdin).
+Agent working directories are set as the child process cwd; directory grants use
+`--add-dir .`, keeping context-rendered directory paths off launcher argv.
 
 Runner diagnostics omit rendered step working directories and sub-recipe lookup
 names, including at DEBUG level. Directory and lookup failures remain visible

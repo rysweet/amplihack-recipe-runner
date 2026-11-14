@@ -419,54 +419,25 @@ fn quote_diagnostic_path(path: &Path) -> String {
     escaped
 }
 
-/// What bash should execute for one step.
-#[derive(Clone, Copy)]
-pub(crate) enum BashInvocation<'a> {
-    /// A script spilled to a tempfile, past `BASH_INLINE_LIMIT`.
-    File(&'a Path),
-    /// The command passed inline via `-c`.
-    Inline(&'a str),
-}
-
-/// #143: the complete argv for one bash step; `argv[0]` is the program.
-///
-/// One builder for all four shapes is what makes "every arm runs the same
-/// interpreter" structural rather than merely asserted — there is exactly one
-/// place the interpreter can enter the vector.
-///
-/// `OsString` rather than `&str`: a script path that is not valid UTF-8 passes
-/// through intact instead of being lossily collapsed to an empty argument.
-pub(crate) fn bash_command_argv(
-    bash: &Path,
-    inv: BashInvocation<'_>,
-    timeout: Option<u64>,
-) -> Vec<OsString> {
-    let mut argv: Vec<OsString> = Vec::with_capacity(5);
+/// #143: the complete argv for one file-backed bash step; `argv[0]` is the program.
+/// The resolved interpreter is shared by timed and untimed execution.
+/// `OsString` preserves script paths that are not valid UTF-8.
+pub(crate) fn bash_command_argv(bash: &Path, script: &Path, timeout: Option<u64>) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = Vec::with_capacity(4);
     if let Some(secs) = timeout {
         argv.push(OsString::from("timeout"));
         argv.push(OsString::from(secs.to_string()));
     }
     argv.push(bash.as_os_str().to_os_string());
-    match inv {
-        BashInvocation::File(script) => argv.push(script.as_os_str().to_os_string()),
-        BashInvocation::Inline(command) => {
-            argv.push(OsString::from("-c"));
-            argv.push(OsString::from(command));
-        }
-    }
+    argv.push(script.as_os_str().to_os_string());
     argv
 }
 
-/// The spawn-failure `with_context` message for this arm, preserved verbatim
-/// from the four pre-#143 match arms so operator-facing text does not regress.
-pub(crate) fn bash_spawn_context(inv: &BashInvocation<'_>, timeout: Option<u64>) -> &'static str {
-    match (inv, timeout) {
-        (BashInvocation::File(_), Some(_)) => {
-            "Failed to execute file-backed bash step with timeout"
-        }
-        (BashInvocation::File(_), None) => "Failed to execute file-backed bash step",
-        (BashInvocation::Inline(_), Some(_)) => "Failed to execute bash step with timeout",
-        (BashInvocation::Inline(_), None) => "Failed to execute bash step",
+/// Spawn-failure context without including rendered script contents.
+pub(crate) fn bash_spawn_context(timeout: Option<u64>) -> &'static str {
+    match timeout {
+        Some(_) => "Failed to execute file-backed bash step with timeout",
+        None => "Failed to execute file-backed bash step",
     }
 }
 
@@ -738,7 +709,7 @@ pub struct CLISubprocessAdapter {
     launcher: Option<std::path::PathBuf>,
     /// Whether to pass `--allow-all-tools` to the Copilot CLI. Default `true`.
     allow_all_tools: bool,
-    /// Whether to pass `--add-dir <working directory>` to the agent CLI.
+    /// Whether to pass `--add-dir .` from the effective agent working directory.
     /// Default `true`.
     add_working_dir: bool,
     /// When `Some`, only these parent variables reach agent and shell
@@ -1131,6 +1102,7 @@ impl CLISubprocessAdapter {
                 .into(),
         };
         let mut cmd = std::process::Command::new(launcher);
+        cmd.current_dir(resolved_cwd);
         cmd.arg(&self.cli);
         // All subsequent flags (-p, --model, --add-dir, --system-prompt, etc.)
         // are passthrough args for the underlying CLI (claude, copilot, codex).
@@ -1172,7 +1144,9 @@ impl CLISubprocessAdapter {
         cmd.args(["-p", &request]);
 
         if self.add_working_dir {
-            cmd.args(["--add-dir", &resolved_cwd.to_string_lossy()]);
+            // The child already runs in resolved_cwd. Grant the same access
+            // without exposing a context-rendered path on wrapper/agent argv.
+            cmd.args(["--add-dir", "."]);
         }
         if let Some(m) = model {
             cmd.args(["--model", m]);
@@ -1216,11 +1190,8 @@ impl CLISubprocessAdapter {
             }
         };
 
-        // Canonicalize to an absolute path so downstream args like --add-dir
-        // are not re-resolved against the child process cwd. Without this,
-        // a relative resolved_cwd like "./worktrees/foo" gets passed to
-        // copilot's --add-dir, which copilot then joins to its cwd
-        // (already <worktree>) producing a doubled path that doesn't exist.
+        // Resolve the child working directory before launch, independently of
+        // the parent's cwd. Directory grants use `.` relative to this child cwd.
         let resolved_cwd = match resolved_cwd.canonicalize() {
             Ok(p) => p,
             Err(_) => {
@@ -1421,7 +1392,6 @@ impl CLISubprocessAdapter {
                 effective_model,
             )?;
             let mut child = cmd
-                .current_dir(&resolved_cwd)
                 .env_clear()
                 .envs(bounded_child.iter().map(|(k, v)| (k, v)))
                 .stdout(log_fh)
@@ -1695,7 +1665,7 @@ impl Adapter for CLISubprocessAdapter {
         // `RECIPE_VAR_*`) over the top, so resolving above that merge is what
         // makes it impossible for recipe YAML to choose the interpreter. It also
         // means a misconfigured AMPLIHACK_BASH aborts before any env-budget work
-        // and before the >64 KiB script tempfile — nothing to clean up.
+        // and before the private script tempfile — nothing to clean up.
         let bash = resolve_bash_interpreter()?;
         let mut child_env = Self::build_child_env_with(self.env_allow.as_deref());
         // Propagate agent binary preference so scripts spawning nested agents
@@ -1733,36 +1703,24 @@ impl Adapter for CLISubprocessAdapter {
             working_dir
         };
 
-        // Issue #80: argv + env must fit in ARG_MAX (~128 KiB on Linux). For
-        // large bash scripts (e.g. cleanup-helper / complete-session steps that
-        // accumulate round-results across multiple parallel workstreams), the
-        // inline `-c` form fails with `Argument list too long (os error 7)`.
-        // Spill the script to a tempfile and execute it as a script file.
-        const BASH_INLINE_LIMIT: usize = 64 * 1024;
-        let script_file: Option<tempfile::NamedTempFile> = if command.len() > BASH_INLINE_LIMIT {
-            let mut tf = tempfile::Builder::new()
-                .prefix("recipe-bash-step-")
-                .suffix(".sh")
-                .tempfile()
-                .with_context(|| "Failed to create tempfile for large bash step")?;
-            tf.write_all(command.as_bytes())
-                .with_context(|| "Failed to write large bash step to tempfile")?;
-            tf.flush()
-                .with_context(|| "Failed to flush large bash step tempfile")?;
-            Some(tf)
-        } else {
-            None
-        };
+        // #211: quoted heredocs can inline context even in small scripts.
+        // Always execute a private file so rendered source never enters argv.
+        // This also avoids ARG_MAX failures for large scripts (#80). NamedTempFile
+        // creates mode 0600 files and removes them on every return path.
+        let mut script_file = tempfile::Builder::new()
+            .prefix("recipe-bash-step-")
+            .suffix(".sh")
+            .tempfile()
+            .context("Failed to create private bash step tempfile")?;
+        script_file
+            .write_all(command.as_bytes())
+            .context("Failed to write bash step to private tempfile")?;
+        script_file
+            .flush()
+            .context("Failed to flush private bash step tempfile")?;
 
-        // #143: one spawn site for all four shapes. Previously the two `timeout`
-        // arms handed the interpreter to `timeout`'s own `execvp` while the two
-        // bare arms let Rust's `Command` resolve it — two mechanisms against two
-        // different `PATH`s, so a timed and an untimed step in the same recipe
-        // could run different interpreters. One builder, one absolute path.
-        let invocation = match &script_file {
-            Some(tf) => BashInvocation::File(tf.path()),
-            None => BashInvocation::Inline(command),
-        };
+        // #143: use one resolved interpreter and one spawn site for both
+        // timeout modes and untimed execution.
         // With `--timeout-action report` the `timeout` utility is not used:
         // the overrun is reported and the step keeps running, nothing is killed.
         let report_secs = match (self.timeout_action, timeout) {
@@ -1770,7 +1728,7 @@ impl Adapter for CLISubprocessAdapter {
             _ => None,
         };
         let kill_timeout = if report_secs.is_some() { None } else { timeout };
-        let argv = bash_command_argv(&bash, invocation, kill_timeout);
+        let argv = bash_command_argv(&bash, script_file.path(), kill_timeout);
         let mut shell_cmd = Command::new(&argv[0]);
         shell_cmd
             .args(&argv[1..])
@@ -1781,7 +1739,7 @@ impl Adapter for CLISubprocessAdapter {
             Some(secs) => output_reporting_overrun(shell_cmd, secs, "Shell step"),
             None => shell_cmd.output(),
         }
-        .with_context(|| bash_spawn_context(&invocation, kill_timeout))?;
+        .with_context(|| bash_spawn_context(kill_timeout))?;
 
         // Drop the tempfiles (auto-clean on drop) only AFTER bash completed.
         drop(script_file);
@@ -2770,7 +2728,9 @@ mod tests {
             .unwrap();
         let args = command_args(&default);
         let pos = args.iter().position(|a| a == "--add-dir").unwrap();
-        assert_eq!(args[pos + 1], cwd_text);
+        assert_eq!(args[pos + 1], ".");
+        assert_eq!(default.get_current_dir(), Some(cwd.as_path()));
+        assert!(!args.contains(&cwd_text), "{args:?}");
 
         let without = CLISubprocessAdapter::new()
             .with_binary("claude")
@@ -3094,7 +3054,7 @@ mod tests {
 
     #[test]
     fn test_execute_bash_step_large_script_uses_tempfile() {
-        // Issue #80: scripts > BASH_INLINE_LIMIT (64 KiB) must be spilled to a
+        // Issue #80: scripts > 64 KiB must execute through a
         // tempfile to avoid `Argument list too long (os error 7)`. Generate a
         // ~96 KiB script that prints a sentinel — the inline `-c` form would
         // crash on a system already near ARG_MAX, while the file-backed path
@@ -3112,7 +3072,7 @@ mod tests {
         large_script.push_str("echo SENTINEL_OK\n");
         assert!(
             large_script.len() > 64 * 1024,
-            "test script must exceed BASH_INLINE_LIMIT, got {}",
+            "test script must exceed 64 KiB, got {}",
             large_script.len()
         );
 
@@ -3127,7 +3087,7 @@ mod tests {
 
     #[test]
     fn test_execute_bash_step_large_script_with_timeout() {
-        // Same as above but exercising the (Some(tf), Some(secs)) match arm.
+        // Same as above with the timeout wrapper.
         let adapter = CLISubprocessAdapter::new();
         let empty_env = std::collections::HashMap::new();
         let mut large_script = String::with_capacity(100 * 1024);
@@ -5287,44 +5247,23 @@ mod tests {
 
     // ── Argv construction (R10) ───────────────────────────────────────
 
-    /// All four legacy arms, argv-identical to today when the interpreter is
-    /// `/bin/bash`. If this passes, the four-arm collapse is a pure refactor
-    /// for every input that works today.
+    /// Timed and untimed steps carry only the interpreter and script path.
     #[test]
-    fn test_bash_command_argv_matches_legacy_four_arms() {
+    fn test_bash_command_argv_uses_script_file() {
         let bash = Path::new("/bin/bash");
         let script = Path::new("/tmp/recipe-bash-step-abc.sh");
-
         assert_eq!(
-            bash_command_argv(bash, BashInvocation::File(script), Some(30)),
+            bash_command_argv(bash, script, Some(30)),
             vec![
                 os("timeout"),
                 os("30"),
                 os("/bin/bash"),
-                os("/tmp/recipe-bash-step-abc.sh")
-            ],
-            "(Some(tf), Some(secs)) arm"
+                script.as_os_str().to_os_string()
+            ]
         );
         assert_eq!(
-            bash_command_argv(bash, BashInvocation::File(script), None),
-            vec![os("/bin/bash"), os("/tmp/recipe-bash-step-abc.sh")],
-            "(Some(tf), None) arm"
-        );
-        assert_eq!(
-            bash_command_argv(bash, BashInvocation::Inline("echo hi"), Some(30)),
-            vec![
-                os("timeout"),
-                os("30"),
-                os("/bin/bash"),
-                os("-c"),
-                os("echo hi")
-            ],
-            "(None, Some(secs)) arm"
-        );
-        assert_eq!(
-            bash_command_argv(bash, BashInvocation::Inline("echo hi"), None),
-            vec![os("/bin/bash"), os("-c"), os("echo hi")],
-            "(None, None) arm"
+            bash_command_argv(bash, script, None),
+            vec![os("/bin/bash"), script.as_os_str().to_os_string()]
         );
     }
 
@@ -5377,50 +5316,16 @@ mod tests {
         }
     }
 
-    /// **R10, the regression gate for #143.** All four execution arms must
-    /// receive the SAME resolved absolute interpreter. Today they do not agree
-    /// on a mechanism: arms 2 and 4 resolve through Rust's `Command` against the
-    /// child env, arms 1 and 3 through `timeout`'s own `execvp` — two rules on
-    /// two PATHs. One resolved absolute path at every arm is what retires that.
+    /// #143: every execution mode receives the same absolute interpreter.
     #[test]
-    fn test_all_four_arms_receive_the_same_resolved_interpreter() {
+    fn test_all_modes_receive_the_same_resolved_interpreter() {
         let resolved = PathBuf::from("/opt/homebrew/bin/bash");
         let script = Path::new("/tmp/recipe-bash-step-xyz.sh");
-
-        let arms: Vec<(&str, Vec<OsString>, Option<u64>)> = vec![
-            (
-                "file+timeout",
-                bash_command_argv(&resolved, BashInvocation::File(script), Some(30)),
-                Some(30),
-            ),
-            (
-                "file",
-                bash_command_argv(&resolved, BashInvocation::File(script), None),
-                None,
-            ),
-            (
-                "inline+timeout",
-                bash_command_argv(&resolved, BashInvocation::Inline("echo hi"), Some(30)),
-                Some(30),
-            ),
-            (
-                "inline",
-                bash_command_argv(&resolved, BashInvocation::Inline("echo hi"), None),
-                None,
-            ),
-        ];
-
-        for (name, argv, timeout) in &arms {
-            let interp = interpreter_element(argv, *timeout);
-            assert_eq!(
-                interp,
-                resolved.as_os_str(),
-                "arm {name} must carry the resolved interpreter, got {interp:?}"
-            );
-            assert!(
-                Path::new(interp).is_absolute(),
-                "arm {name} must carry an ABSOLUTE interpreter"
-            );
+        for timeout in [None, Some(30)] {
+            let argv = bash_command_argv(&resolved, script, timeout);
+            let interp = interpreter_element(&argv, timeout);
+            assert_eq!(interp, resolved.as_os_str());
+            assert!(Path::new(interp).is_absolute());
         }
     }
 
@@ -5429,10 +5334,10 @@ mod tests {
     #[test]
     fn test_bash_command_argv_renders_timeout_seconds() {
         let bash = Path::new("/bin/bash");
-        let argv = bash_command_argv(bash, BashInvocation::Inline("true"), Some(1));
+        let argv = bash_command_argv(bash, Path::new("/tmp/s.sh"), Some(1));
         assert_eq!(argv[1], os("1"));
 
-        let argv = bash_command_argv(bash, BashInvocation::Inline("true"), Some(3600));
+        let argv = bash_command_argv(bash, Path::new("/tmp/s.sh"), Some(3600));
         assert_eq!(argv[1], os("3600"));
     }
 
@@ -5448,7 +5353,7 @@ mod tests {
         let script = Path::new(raw);
         let bash = Path::new("/bin/bash");
 
-        let argv = bash_command_argv(bash, BashInvocation::File(script), None);
+        let argv = bash_command_argv(bash, script, None);
         assert_eq!(argv, vec![os("/bin/bash"), raw.to_os_string()]);
         assert_ne!(
             argv[1],
@@ -5456,54 +5361,19 @@ mod tests {
             "non-UTF-8 path must not become an empty arg"
         );
 
-        let argv = bash_command_argv(bash, BashInvocation::File(script), Some(30));
+        let argv = bash_command_argv(bash, script, Some(30));
         assert_eq!(argv[3], raw.to_os_string());
     }
 
-    /// An inline command containing shell metacharacters is passed as ONE argv
-    /// element after `-c`; no quoting, splitting or escaping is applied.
     #[test]
-    fn test_bash_command_argv_passes_inline_command_verbatim() {
-        let bash = Path::new("/bin/bash");
-        let cmd = "echo 'a b'; echo \"$HOME\" | cat # trailing";
-
-        let argv = bash_command_argv(bash, BashInvocation::Inline(cmd), None);
-        assert_eq!(argv, vec![os("/bin/bash"), os("-c"), os(cmd)]);
-        assert_eq!(argv.len(), 3, "the command must stay a single argv element");
-    }
-
-    /// An empty inline command still produces the `-c ""` form (today's
-    /// `test_execute_bash_step_empty_command` depends on this succeeding).
-    #[test]
-    fn test_bash_command_argv_empty_inline_command() {
-        let bash = Path::new("/bin/bash");
-        let argv = bash_command_argv(bash, BashInvocation::Inline(""), None);
-        assert_eq!(argv, vec![os("/bin/bash"), os("-c"), os("")]);
-    }
-
-    // ── Spawn-failure context strings ─────────────────────────────────
-
-    /// All four operator-facing `with_context` strings preserved verbatim, so
-    /// spawn-failure text does not regress with the refactor.
-    #[test]
-    fn test_bash_spawn_context_preserves_all_four_messages() {
-        let script = Path::new("/tmp/s.sh");
-
+    fn test_bash_spawn_context_reports_timeout_mode() {
         assert_eq!(
-            bash_spawn_context(&BashInvocation::File(script), Some(30)),
+            bash_spawn_context(Some(30)),
             "Failed to execute file-backed bash step with timeout"
         );
         assert_eq!(
-            bash_spawn_context(&BashInvocation::File(script), None),
+            bash_spawn_context(None),
             "Failed to execute file-backed bash step"
-        );
-        assert_eq!(
-            bash_spawn_context(&BashInvocation::Inline("echo hi"), Some(30)),
-            "Failed to execute bash step with timeout"
-        );
-        assert_eq!(
-            bash_spawn_context(&BashInvocation::Inline("echo hi"), None),
-            "Failed to execute bash step"
         );
     }
 

@@ -46,6 +46,8 @@ mod unix {
     use std::fs::{self, File};
     use std::io::{BufRead, BufReader, Write};
     use std::os::fd::AsRawFd;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::os::unix::process::CommandExt;
@@ -1058,18 +1060,25 @@ mod unix {
     #[test]
     fn live_agent_wrappers_keep_prompt_and_file_context_off_argv() {
         const PROMPT: &str = "PRIVATE_AGENT_PROMPT_211_🦀";
+        const PRIVATE_CWD: &str = "PRIVATE_CWD_211";
         for cli in ["claude", "launch", "RustyClawd", "copilot", "codex"] {
             for size in [0, 40 * 1024] {
                 let prompt = format!("{PROMPT} {} {{{{secret}}}}", "x".repeat(size));
                 let f = Fixture::new(json!({"name":"agent-privacy", "steps":[
-                    {"id":"agent", "prompt":prompt, "auto_stage":false}
+                    {"id":"agent", "prompt":prompt, "auto_stage":false,
+                     "working_dir":"{{private_dir}}"}
                 ]}));
-                f.write(&json!({"secret":SENTINEL}));
+                let private_dir = f.dir.path().join(PRIVATE_CWD);
+                fs::create_dir(&private_dir).unwrap();
+                fs::write(private_dir.join("cwd-proof"), "directory-access-ok").unwrap();
+                f.write(&json!({"secret":SENTINEL, "private_dir":private_dir}));
                 let launcher = f.dir.path().join("launcher");
                 fs::write(&launcher, r#"#!/bin/bash
 set -eu
 provider=$1
 shift
+pwd > "$DELIVERED_CWD"
+cat cwd-proof > "$CWD_ACCESS"
 prompt_file=
 final=
 while (( $# )); do
@@ -1101,20 +1110,32 @@ fi
                 cmd.env("AMPLIHACK_AGENT_BINARY", cli)
                     .env("AMPLIHACK_LAUNCHER_BINARY", &launcher)
                     .env("DELIVERED_PROMPT", &delivered)
-                    .env("PROMPT_PATH", &prompt_path);
+                    .env("PROMPT_PATH", &prompt_path)
+                    .env("DELIVERED_CWD", f.dir.path().join("delivered-cwd"))
+                    .env("CWD_ACCESS", f.dir.path().join("cwd-access"));
                 let mut live = LiveRun::start(&f, cmd);
                 let wrapper_pid = live.ready();
                 let runner_pid = live.child.as_ref().unwrap().id();
                 for pid in [runner_pid, wrapper_pid] {
                     let cmdline = fs::read(format!("/proc/{pid}/cmdline")).unwrap();
                     let args = String::from_utf8_lossy(&cmdline);
-                    for marker in [PROMPT, SENTINEL] {
+                    for marker in [PROMPT, SENTINEL, PRIVATE_CWD] {
                         assert!(
                             !args.contains(marker),
                             "{cli}: private content on argv for PID {pid}"
                         );
                     }
                 }
+                assert_eq!(
+                    fs::read_to_string(f.dir.path().join("delivered-cwd"))
+                        .unwrap()
+                        .trim(),
+                    private_dir.canonicalize().unwrap().to_str().unwrap()
+                );
+                assert_eq!(
+                    fs::read_to_string(f.dir.path().join("cwd-access")).unwrap(),
+                    "directory-access-ok"
+                );
                 let content = fs::read_to_string(&delivered).unwrap();
                 assert!(
                     content.contains(&prompt.replace("{{secret}}", SENTINEL)),
@@ -1141,6 +1162,61 @@ fi
                     );
                 }
             }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_quoted_heredoc_keeps_context_off_bash_and_timeout_argv() {
+        for timeout_action in [None, Some("kill"), Some("report")] {
+            let f = Fixture::new(json!({"name":"heredoc-privacy", "steps":[
+                {"id":"heredoc", "timeout":timeout_action.map(|_| 30), "command":
+                 "cat <<'PRIVATE_INPUT' > delivered\n{{secret}}\nPRIVATE_INPUT\nprintf '%s\\n' \"$BASHPID\" >&198\nIFS= read -r release <&198\nprintf ok"}
+            ]}));
+            f.write(&json!({"secret":SENTINEL}));
+            let mut cmd = f.file_command();
+            if let Some(action) = timeout_action {
+                cmd.args(["--timeout-action", action]);
+            }
+            let mut live = LiveRun::start(&f, cmd);
+            let bash_pid = live.ready();
+            let runner_pid = live.child.as_ref().unwrap().id();
+            let mut pids = vec![runner_pid, bash_pid];
+            if timeout_action == Some("kill") {
+                let status = fs::read_to_string(format!("/proc/{bash_pid}/status")).unwrap();
+                let parent = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("PPid:"))
+                    .unwrap();
+                pids.push(parent.trim().parse::<u32>().unwrap());
+            }
+            for pid in pids {
+                let cmdline = fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+                assert!(
+                    !String::from_utf8_lossy(&cmdline).contains(SENTINEL),
+                    "quoted heredoc context appeared on argv for PID {pid} ({timeout_action:?})"
+                );
+            }
+            assert_eq!(
+                fs::read_to_string(f.dir.path().join("delivered")).unwrap(),
+                format!("{SENTINEL}\n")
+            );
+            let cmdline = fs::read(format!("/proc/{bash_pid}/cmdline")).unwrap();
+            let script = cmdline
+                .split(|b| *b == 0)
+                .rfind(|arg| !arg.is_empty())
+                .unwrap();
+            let script = PathBuf::from(std::ffi::OsStr::from_bytes(script));
+            assert_eq!(
+                fs::metadata(&script).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert!(fs::read_to_string(&script).unwrap().contains(SENTINEL));
+            assert_eq!(live.finish()["step_results"][0]["output"], "ok");
+            assert!(
+                !script.exists(),
+                "private script must be removed after execution"
+            );
         }
     }
 

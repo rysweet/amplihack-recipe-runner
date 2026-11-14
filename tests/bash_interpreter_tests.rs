@@ -2,7 +2,7 @@
 //!
 //! These tests exercise the part the in-file unit tests deliberately cannot:
 //! the env READ, through a real spawn, all the way past `env_clear()` +
-//! `bounded_env`, at every one of the four bash execution arms.
+//! `bounded_env`, for short and large scripts, with and without timeouts.
 //!
 //! `AMPLIHACK_BASH` is set on a CHILD process (`Command::env`) and never on this
 //! one. Under edition 2024 `std::env::set_var` is `unsafe` and unsound
@@ -31,8 +31,7 @@ fn write_executable(path: &Path, body: &str) {
 }
 
 /// A stand-in bash: touches `marker`, then hands off to the real `/bin/bash`
-/// with the argv it was given. Works for both the `-c <cmd>` and the
-/// `<script-file>` forms, so one wrapper covers all four arms.
+/// with the argv it was given. Records execution before handing off the private script file.
 fn write_wrapper_bash(path: &Path, marker: &Path) {
     write_executable(
         path,
@@ -96,8 +95,7 @@ fn combined(out: &Output) -> String {
     )
 }
 
-/// ~96 KiB of padding, forcing the step past `BASH_INLINE_LIMIT` (64 KiB) and
-/// onto the tempfile-backed arms.
+/// ~96 KiB of padding to verify large scripts also use file-backed execution.
 fn large_script(tail: &str) -> String {
     let mut s = String::with_capacity(100 * 1024);
     for i in 0..1300 {
@@ -147,28 +145,25 @@ fn assert_override_reaches_arm(command: &str, timeout: Option<u64>, arm: &str) {
     );
 }
 
-/// Arm 4: inline `-c`, no timeout.
+/// A short script without a timeout.
 #[test]
-fn test_amplihack_bash_override_used_for_inline_step() {
-    assert_override_reaches_arm("touch step.ran", None, "inline");
+fn test_amplihack_bash_override_used_for_short_step() {
+    assert_override_reaches_arm("touch step.ran", None, "short");
 }
 
-/// Arm 3: inline `-c` under `timeout`. Today the interpreter here is resolved
-/// by `timeout`'s own `execvp` against the CHILD's PATH — a different mechanism
-/// and a different PATH from arm 4. After the fix both receive one absolute
-/// path, so this must behave identically to the test above.
+/// A short script under `timeout` uses the same resolved interpreter.
 #[test]
-fn test_amplihack_bash_override_used_for_timed_inline_step() {
-    assert_override_reaches_arm("touch step.ran", Some(60), "inline+timeout");
+fn test_amplihack_bash_override_used_for_timed_short_step() {
+    assert_override_reaches_arm("touch step.ran", Some(60), "short+timeout");
 }
 
-/// Arm 2: tempfile-backed script (> 64 KiB), no timeout.
+/// A large script without a timeout.
 #[test]
 fn test_amplihack_bash_override_used_for_large_script_step() {
     assert_override_reaches_arm(&large_script("touch step.ran"), None, "file");
 }
 
-/// Arm 1: tempfile-backed script under `timeout` — the other `execvp` site.
+/// A large script under `timeout`.
 #[test]
 fn test_amplihack_bash_override_used_for_large_script_with_timeout() {
     assert_override_reaches_arm(&large_script("touch step.ran"), Some(60), "file+timeout");
@@ -387,7 +382,7 @@ fn test_bad_amplihack_bash_is_rejected_before_env_budget_work() {
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
-    // Over BASH_INLINE_LIMIT: the tempfile arm, which must never be reached.
+    // A large script: interpreter rejection must happen before tempfile creation.
     let recipe = write_recipe(tmp.path(), &large_script("touch step.ran"), None);
 
     let out = run_recipe(&recipe, &work, Some(Path::new("/nonexistent/bash")));

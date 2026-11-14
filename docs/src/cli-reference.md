@@ -135,8 +135,9 @@ suppressed, a step that needs a tool the CLI would ask about fails instead.
 ### `--no-add-dir`
 
 Do not grant the step's working directory to the agent CLI with `--add-dir`. Without the option every Claude-family
-and Copilot agent step is given `--add-dir <working directory>`. With it, that grant is not made. The directory
-that holds an overflow prompt file is still granted to a CLI that reads the file through `--add-dir`, because that
+and Copilot agent step is given `--add-dir .` from its effective working directory, keeping rendered paths off argv.
+With it, that grant is not made. The directory that holds an overflow prompt file is still granted to a CLI that
+reads the file through `--add-dir`, because that
 CLI cannot read its prompt without it. The Codex adapter passes no `--add-dir` and is unaffected.
 
 ### `-C, --working-dir <DIR>`
