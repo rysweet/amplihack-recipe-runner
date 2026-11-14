@@ -42,10 +42,11 @@ with an explicit cleanup error. Wrapper reaping and the absence of remaining own
 children are checked separately.
 
 The existing `tests/qa/prompt-file-transport.sh` entry point and its scenario run
-this suite. Run it directly with:
+this suite plus the context-file and standalone capability contracts. Run them
+directly with:
 
 ```bash
-cargo test --test prompt_transport
+cargo test --test prompt_transport --test context_file_tests --test codex_capabilities_tests
 ```
 
 After `STARTED`, the controller inspects the acknowledged live wrapper PID's
@@ -58,6 +59,8 @@ names or command-line patterns never select processes for termination.
 
 | Area | Verified behavior |
 |---|---|
+| Runner CLI | The actual runner receives small and large context through `--context-file`, renders an agent prompt, and holds each provider's wrapper alive. Both the recorded runner PID and acknowledged wrapper PID are inspected for context, task, and system sentinels; the wrapper receives the complete bytes. |
+| Context compatibility | JSON types and whitespace survive file input; recipe defaults, file values, and `--set` precedence are checked. Legacy `--set` is exercised separately. Invalid or non-private files fail with code 4 without echoing content, and the probe advertises `context_file_v1`. |
 | Claude | Bare `-p`, complete task on stdin followed by EOF, effective system instructions in `--system-prompt-file`, and neither supplied input in wrapper argv. |
 | Codex | `exec -`, complete system/task envelope on stdin followed by EOF, neither supplied input in argv, and no temporary prompt file. Existing final-message behavior remains covered. |
 | Copilot | Only fixed pointer wording and a generated absolute path carry instructions in argv. The file contains both complete inputs, including small personas. Its directory is granted even when the working-directory grant is disabled. |

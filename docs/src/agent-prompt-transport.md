@@ -9,6 +9,9 @@ last_updated: 2026-11-14
 
 Agent steps deliver complete task and system instructions without putting their
 contents in the Amplihack wrapper's command-line arguments, for every prompt size.
+Callers can also keep context out of the runner's own arguments with
+[`--context-file PATH`](cli-reference.md#--context-file-path), a caller-owned
+private JSON object file. Legacy `--set KEY=VALUE` remains available.
 
 ## Contents
 
@@ -158,14 +161,17 @@ completion or cancellation. See [timeout options](cli-reference.md) and the
 
 ## Privacy boundary
 
-On Linux, the live wrapper's `/proc/<pid>/cmdline` contains neither supplied
-brief nor system-prompt contents. Transport diagnostics and debug representations
+On Linux, the live runner and wrapper `/proc/<pid>/cmdline` contain neither
+private context nor supplied brief or system-prompt contents when context is
+delivered with `--context-file`. Transport diagnostics and debug representations
 do not copy payloads. The runner uses typed command arguments; instruction bytes
 are not interpolated into shell commands.
 
-This contract covers agent-to-wrapper prompt transport. It does not change
-runner command-line context options, bash command transport, agent-generated
-output, or log retention. File permissions do not isolate prompts from other
+This contract covers runner context-file input and agent-to-wrapper prompt
+transport. Legacy `--set` still exposes its values in the runner's argv.
+Bash command transport, context exported to step environments, recipe JSON
+output, agent-generated output, and log retention remain separate concerns.
+File permissions do not isolate prompts from other
 processes running as the same user or privileged processes. SIGKILL and host
 failure prevent executable cleanup and can leave private files behind.
 

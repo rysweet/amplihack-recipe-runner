@@ -117,7 +117,7 @@ graph TD
       │                           Recipe (models.rs)
       ▼
  ┌──────────┐   merge recipe.context
- │ runner.rs │   + user overrides (--set)
+ │ runner.rs │   + user overrides (--context-file, then --set)
  └──────────┘
       │
       │  for each step:
@@ -168,8 +168,9 @@ invocations fail before execution or update effects. See the
 
 ### Execute Phase
 
-`RecipeRunner::execute` merges the recipe's `context` map with any user-supplied
-`--set KEY=VALUE` overrides, then iterates steps sequentially:
+The CLI reads the private JSON object supplied by `--context-file`, then applies
+`--set KEY=VALUE` overrides. `RecipeRunner::execute` merges those user-supplied
+values over the recipe's `context` map, then iterates steps sequentially:
 
 1. **Tag filter** — `should_skip_by_tags` checks `when_tags` against
    `active_tags` / `exclude_tags`.
@@ -271,6 +272,7 @@ Options:
   -C, --working-dir <DIR>        Working directory (default: ".")
   -R, --recipe-dir <DIR>         Additional recipe search directories (repeatable)
       --set <KEY=VALUE>           Context variable overrides (repeatable)
+      --context-file <PATH>       Private JSON object context input
       --dry-run                   Log steps without executing
       --validate-only             Parse and validate, then exit
       --explain                   Print step plan without executing

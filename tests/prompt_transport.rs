@@ -3,6 +3,8 @@
 //! Small and large prompts share the same private transport.
 #![cfg(target_os = "linux")]
 
+#[path = "support/prompt_transport_cli.rs"]
+mod cli;
 #[path = "support/prompt_transport_worker.rs"]
 mod worker;
 
@@ -350,7 +352,10 @@ impl Fixture {
         if let Some(pid) = self.wrapper_pid {
             assert!(
                 !Path::new(&format!("/proc/{pid}")).exists(),
-                "the recorded wrapper must be retired and reaped before adapter return"
+                "the recorded wrapper must be retired and reaped before adapter return: \
+                 provider={}, pid={pid}, proc_stat={:?}, result={value}",
+                self.provider,
+                fs::read_to_string(format!("/proc/{pid}/stat"))
             );
         }
         value

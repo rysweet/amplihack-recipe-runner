@@ -47,8 +47,9 @@ recipe-runner-rs list --recipe-dir ./team-recipes --recipe-dir ./personal-recipe
 ### `--capabilities`
 
 Standalone compatibility probe. Emits one JSON object with `schema_version: 1`,
-the compiled package `version`, and `capabilities: ["codex_exec"]` on Unix
-(an empty capability list on non-Unix), then exits zero.
+the compiled package `version`, and `capabilities`, then exits zero. Unix builds
+advertise `codex_exec`, `durable_recovery_v1`, and `context_file_v1`;
+non-Unix builds advertise `context_file_v1`.
 It performs no update, cache-write, network, or agent-startup work. Do not combine
 it with other arguments. See the [capability API](codex-exec.md#compatibility-probe-api).
 
@@ -225,9 +226,40 @@ restricts only what children receive.
 recipe-runner-rs deploy.yaml --env-allow PATH --env-allow HOME --env-allow ANTHROPIC_API_KEY
 ```
 
+### `--context-file <PATH>`
+
+Read context overrides from a UTF-8 JSON object file without putting its contents
+in the runner's arguments. Values retain their JSON types, including strings,
+numbers, booleans, arrays, objects, and null. String whitespace is preserved.
+The file overrides recipe defaults; `--set` overrides file values regardless of
+argument order. Repeated `--set` entries retain their existing last-value behavior.
+
+```bash
+# Prepare context.json using an editor or a producer that writes directly to it.
+# Its contents might be: {"task_description":"Add auth","replicas":3}
+chmod 600 /private/work/context.json
+recipe-runner-rs recipe.yaml --context-file /private/work/context.json
+```
+
+On Unix the file must be a regular file owned by the current user with no group
+or other permissions (for example `0600` or read-only `0400`); symlinks are rejected.
+Use a private directory (`0700`) and a filename containing no private text.
+Paths are resolved relative to the invocation directory, independently of `-C`.
+Unreadable files, invalid JSON, and non-object JSON exit with code 4 before recipe
+execution. Diagnostics do not echo context keys, values, or excerpts.
+The caller owns the input file and removes it when no longer needed; the runner
+reads it once and does not modify or delete it. On non-Unix systems the caller
+must configure private access using the platform's file permissions.
+
+The standalone capability probe advertises `context_file_v1` for this contract.
+This option protects context delivery in argv. Context may still appear in recipe
+output, logs, or step environments; see the [privacy boundary](agent-prompt-transport.md#privacy-boundary).
+
 ### `--set <KEY=VALUE>`
 
 Override a context variable. Can be specified multiple times to set several variables. Values are automatically typed using smart parsing (see [Smart Context Value Parsing](#smart-context-value-parsing---set)).
+
+These values appear in process arguments. Use `--context-file` for private inputs.
 
 ```bash
 # String value

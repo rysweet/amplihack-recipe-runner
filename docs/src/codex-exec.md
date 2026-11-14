@@ -170,13 +170,13 @@ coverage of these boundaries.
 recipe-runner-rs --capabilities
 ```
 
-The standalone probe exits zero and writes exactly one JSON object, optionally followed by a newline, with empty stderr. For a Unix build with package version 0.5.0:
+The standalone probe exits zero and writes exactly one JSON object, optionally followed by a newline, with empty stderr. For a Unix build with package version 0.6.0:
 
 ```json
-{"capabilities":["codex_exec"],"schema_version":1,"version":"0.5.0"}
+{"capabilities":["codex_exec","durable_recovery_v1","context_file_v1"],"schema_version":1,"version":"0.6.0"}
 ```
 
-`version` is the compiled Cargo package version. The producer emits exactly these three keys. Unix builds advertise `codex_exec`; non-Unix builds emit an empty capability list because execution is unsupported. The probe runs before logging initialization, update checks, update-cache writes, network access, or agent startup, regardless of ambient logging/update settings. Mixed recipe/subcommand/option invocations with `--capabilities` are rejected before execution or update effects. Failed stdout writes report failure.
+`version` is the compiled Cargo package version. The producer emits exactly these three keys. Unix builds advertise `codex_exec`, `durable_recovery_v1`, and `context_file_v1`; non-Unix builds advertise only `context_file_v1`. The context capability promises the [private JSON context-file input](cli-reference.md#--context-file-path), including `--set` precedence and bad-input failures. The probe runs before logging initialization, update checks, update-cache writes, network access, or agent startup, regardless of ambient logging/update settings. Mixed recipe/subcommand/option invocations with `--capabilities` are rejected before execution or update effects. Failed stdout writes report failure.
 
 Consumers require numeric `schema_version: 1` and membership of `codex_exec`. Compatible newer/custom builds may pass; an exact source SHA is a separate delivery pin, not part of this JSON. `codex_exec` promises full stdin instructions, final-message-only results, explicit failure propagation, and no implicit model.
 
