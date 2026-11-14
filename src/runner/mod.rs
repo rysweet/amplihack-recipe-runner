@@ -2093,24 +2093,22 @@ fn validate_context(rules: &HashMap<String, String>, ctx: &HashMap<String, Value
                     path.clone()
                 };
                 if !std::path::Path::new(&resolved).is_dir() {
-                    errors.push(format!("  ✗ '{}' path '{}' does not exist", var_name, path));
+                    errors.push(format!("  ✗ '{}' path does not exist", var_name));
                 } else if !std::path::Path::new(&resolved).join(".git").exists()
                     && git_for_given_dir()
-                        .args(["-C", &resolved, "rev-parse", "--git-dir"])
+                        .current_dir(&resolved)
+                        .args(["rev-parse", "--git-dir"])
                         .output()
                         .map(|o| !o.status.success())
                         .unwrap_or(true)
                 {
-                    errors.push(format!(
-                        "  ✗ '{}' path '{}' is not a git repository",
-                        var_name, path
-                    ));
+                    errors.push(format!("  ✗ '{}' path is not a git repository", var_name));
                 }
             }
             "path" => match value {
                 Some(Value::String(s)) if !s.is_empty() => {
                     if !std::path::Path::new(s.as_str()).exists() {
-                        errors.push(format!("  ✗ '{}' path '{}' does not exist", var_name, s));
+                        errors.push(format!("  ✗ '{}' path does not exist", var_name));
                     }
                 }
                 _ => {

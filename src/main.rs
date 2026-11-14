@@ -12,7 +12,7 @@ use recipe_runner_rs::parser::RecipeParser;
 use recipe_runner_rs::runner::{FileLogListener, RecipeRunner, StderrListener};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod update;
 
@@ -79,6 +79,11 @@ struct Cli {
     /// Use --set 'key={"a":1}' for JSON objects.
     #[arg(short, long = "set", value_name = "KEY=VALUE")]
     context: Vec<String>,
+
+    /// Load a JSON context object once at startup (Unix). --set overrides its keys.
+    /// The caller owns the file; the runner reads it without modifying it.
+    #[arg(long, value_name = "PATH")]
+    context_file: Option<PathBuf>,
 
     /// Directory to search for sub-recipes (can be specified multiple times)
     #[arg(short = 'R', long = "recipe-dir")]
@@ -193,7 +198,6 @@ enum Commands {
 
 /// Parse a context value string, auto-detecting type.
 fn parse_context_value(raw: &str) -> Value {
-    debug!("parse_context_value: raw={:?}", raw);
     // Try JSON first (handles objects, arrays, booleans, numbers)
     if let Ok(v) = serde_json::from_str::<Value>(raw)
         && !v.is_string()
@@ -224,9 +228,73 @@ fn parse_context_value(raw: &str) -> Value {
 ///
 /// Returns `None` if there is no `=` (malformed pair).
 fn parse_context_pair(pair: &str) -> Option<(String, Value)> {
-    debug!("parse_context_pair: pair={:?}", pair);
     let (key, val) = pair.split_once('=')?;
     Some((key.to_string(), parse_context_value(val)))
+}
+
+/// Controlled categories intentionally contain neither OS errors nor JSON excerpts.
+#[derive(Debug, thiserror::Error)]
+enum ContextFileError {
+    #[cfg(unix)]
+    #[error("cannot open file")]
+    Open,
+    #[cfg(unix)]
+    #[error("cannot inspect file")]
+    Inspect,
+    #[cfg(unix)]
+    #[error("not a regular file")]
+    NotRegular,
+    #[cfg(unix)]
+    #[error("cannot read file")]
+    Read,
+    #[cfg(unix)]
+    #[error("invalid JSON")]
+    InvalidJson,
+    #[cfg(unix)]
+    #[error("expected JSON object")]
+    NotObject,
+    #[cfg(not(unix))]
+    #[error("unsupported platform")]
+    Unsupported,
+}
+
+/// Ingest caller-owned context through one descriptor, closing it before execution.
+#[cfg(unix)]
+fn load_context_file(path: &Path) -> Result<HashMap<String, Value>, ContextFileError> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| ContextFileError::Open)?;
+    let metadata = file.metadata().map_err(|_| ContextFileError::Inspect)?;
+    if !metadata.is_file() {
+        return Err(ContextFileError::NotRegular);
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|_| ContextFileError::Read)?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| ContextFileError::InvalidJson)?;
+    let Value::Object(object) = value else {
+        return Err(ContextFileError::NotObject);
+    };
+    Ok(object
+        .into_iter()
+        .map(|(key, value)| {
+            let value = match value {
+                Value::String(raw) => parse_context_value(&raw),
+                native => native,
+            };
+            (key, value)
+        })
+        .collect())
+}
+
+#[cfg(not(unix))]
+fn load_context_file(_path: &Path) -> Result<HashMap<String, Value>, ContextFileError> {
+    Err(ContextFileError::Unsupported)
 }
 
 fn main() {
@@ -238,7 +306,7 @@ fn main() {
         }
         use std::io::Write;
         let capabilities: &[&str] = if cfg!(unix) {
-            &["codex_exec", "durable_recovery_v1"]
+            &["codex_exec", "durable_recovery_v1", "context_file_v1"]
         } else {
             &[]
         };
@@ -321,13 +389,22 @@ fn run() -> i32 {
         return exit_codes::BAD_ARGS;
     }
 
-    // Parse context overrides with type detection
-    let mut user_context: HashMap<String, Value> = HashMap::new();
+    // File context overrides recipe defaults; --set always overrides file keys.
+    let mut user_context = match cli.context_file.as_deref() {
+        Some(path) => match load_context_file(path) {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("invalid context file '{}': {error}", path.display());
+                return exit_codes::BAD_ARGS;
+            }
+        },
+        None => HashMap::new(),
+    };
     for pair in &cli.context {
         if let Some((key, val)) = parse_context_pair(pair) {
             user_context.insert(key, val);
         } else {
-            eprintln!("Warning: ignoring malformed context override: {}", pair);
+            eprintln!("Warning: ignoring malformed context override (expected KEY=VALUE)");
         }
     }
 

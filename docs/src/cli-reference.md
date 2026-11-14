@@ -2,6 +2,7 @@
 title: CLI Reference
 description: Command-line options, output and failure diagnostics for recipe-runner-rs.
 doc_type: reference
+last_updated: 2026-11-14
 ---
 
 # CLI Reference
@@ -13,6 +14,7 @@ Complete reference for the `recipe-runner-rs` command-line interface.
 - [Synopsis](#synopsis)
 - [Subcommands](#subcommands)
 - [Global options](#global-options)
+- [Context file](#--context-file-path)
 - [JSON recipe input](#json-recipe-input)
 - [Sub-recipe references](#sub-recipe-references)
 - [Failed bash stdout](#failed-bash-stdout)
@@ -46,7 +48,8 @@ recipe-runner-rs list --recipe-dir ./team-recipes --recipe-dir ./personal-recipe
 ### `--capabilities`
 
 Standalone compatibility probe. Emits one JSON object with `schema_version: 1`,
-the compiled package `version`, and `capabilities: ["codex_exec"]` on Unix
+the compiled package `version`, and
+`capabilities: ["codex_exec", "durable_recovery_v1", "context_file_v1"]` on Unix
 (an empty capability list on non-Unix), then exits zero.
 It performs no update, cache-write, network, or agent-startup work. Do not combine
 it with other arguments. See the [capability API](codex-exec.md#compatibility-probe-api).
@@ -221,9 +224,99 @@ restricts only what children receive.
 recipe-runner-rs deploy.yaml --env-allow PATH --env-allow HOME --env-allow ANTHROPIC_API_KEY
 ```
 
+### `--context-file <PATH>`
+
+Load context from one UTF-8 JSON object at startup. The runner's command line
+contains the path instead of the file's context values. This option is supported
+on Unix builds advertising the exact `context_file_v1` capability. For a complete
+example, see [Pass context through a file](howto/context-file.md).
+
+Context sources merge by key in this order, with later sources winning:
+
+1. Recipe defaults.
+2. Context file.
+3. `--set` pairs, regardless of where `--context-file` appears in the command.
+
+Merging replaces the entire value for a key; it does not recursively merge objects.
+Without `--context-file`, existing defaults and `--set` behavior are unchanged.
+
+#### JSON values
+
+The root must be exactly one object. An empty object (`{}`) and trailing whitespace
+are valid. Additional JSON values after the object are invalid. Duplicate object
+keys follow the existing JSON parser behavior: the last value wins.
+
+Top-level string values use the same [smart parsing](#smart-context-value-parsing---set)
+as `--set`. Native JSON values retain their types, and strings inside arrays or
+objects remain strings.
+
+| File member | Loaded value |
+|-------------|--------------|
+| `"task_description": "Fix the widget"` | String `Fix the widget` |
+| `"is_critical_code": "true"` | Boolean `true` |
+| `"count": "42"` | Number `42` |
+| `"ratio": "0.75"` | Number `0.75` |
+| `"optional": "null"` | Null |
+| `"settings": "{\"enabled\":true}"` | Object `{"enabled":true}` |
+| `"tags": "[\"web\",\"api\"]"` | Array `["web","api"]` |
+| `"enabled": false` | Boolean `false` |
+| `"replicas": 3` | Number `3` |
+| `"threshold": 0.5` | Number `0.5` |
+| `"missing": null` | Null |
+| `"items": ["true", "42"]` | Array containing two strings |
+| `"nested": {"count": "42"}` | Object whose `count` remains a string |
+
+#### Opening and lifetime
+
+On Unix, the runner opens the file read-only with `O_NOFOLLOW | O_NONBLOCK`,
+checks metadata through the opened descriptor, and accepts only a regular file.
+A final-component symbolic link is invalid; parent-directory symbolic links are
+permitted. Directories, FIFOs and other special files are invalid. A FIFO cannot
+block startup while waiting for a writer.
+
+The file is read and parsed once during initialization, then closed before step
+execution. Later changes have no effect on the running recipe. The runner never
+deletes, writes, renames, changes permissions on, locks or watches the file. The
+caller owns its creation and cleanup. There are no additional ownership,
+permission-mode or size restrictions. Memory use grows with the file size;
+concurrent writes during ingestion have no snapshot guarantee.
+
+#### Errors and value exposure
+
+All context-file failures exit with `BAD_ARGS` (code `4`). The diagnostic names
+the supplied path and one controlled category:
+
+```text
+invalid context file '/run/example/context/context.json': invalid JSON
+```
+
+| Category | Meaning |
+|----------|---------|
+| `cannot open file` | Opening failed, including a missing or unreadable path or a final-component symbolic link |
+| `cannot inspect file` | Descriptor metadata could not be read |
+| `not a regular file` | The opened descriptor identifies a directory or other nonregular file |
+| `cannot read file` | Reading the opened file failed |
+| `invalid JSON` | Malformed JSON, invalid UTF-8 or additional JSON after the object |
+| `expected JSON object` | The JSON root is an array, scalar or null |
+| `unsupported platform` | The build does not implement secure context-file opening |
+
+Diagnostics never include file contents, context values, parser excerpts or raw
+operating-system errors. Loading, parsing and condition evaluation do not log
+file-loaded values, including at trace level.
+
+File context reaches bash and agent steps through the existing `RECIPE_VAR_*`
+environment mirror and `{{placeholder}}` substitution. The loader adds no child
+arguments carrying those values. Intentional recipe output and JSON results can
+still contain context, and recipes can explicitly pass values to commands.
+Agent prompt transport is a separate contract: `context_file_v1` alone does not
+promise that rendered agent prompts stay off launcher command lines.
+
 ### `--set <KEY=VALUE>`
 
 Override a context variable. Can be specified multiple times to set several variables. Values are automatically typed using smart parsing (see [Smart Context Value Parsing](#smart-context-value-parsing---set)).
+`--set` overrides [file context](#--context-file-path) regardless of argument order.
+For repeated `--set` keys, the last pair wins. Values supplied with `--set` remain
+visible in the runner's command line.
 
 ```bash
 # String value
@@ -752,6 +845,7 @@ trailing whitespace in retained output.
 | `0` | Success | Recipe completed successfully; all steps passed |
 | `1` | Failure | Recipe failed; at least one step failed during execution |
 | `2` | Parse/validation error | Invalid YAML syntax, missing required fields, or other parse errors. Unknown step fields are warnings, not errors. |
+| `4` | Invalid arguments (`BAD_ARGS`) | Invalid context file, unsupported context-file platform, or invalid CLI configuration |
 
 ```bash
 # Check exit code in scripts
@@ -773,12 +867,14 @@ recipe-runner-rs deploy.yaml --validate-only && recipe-runner-rs deploy.yaml
 
 ## Smart Context Value Parsing (`--set`)
 
-When using `--set KEY=VALUE`, the runner automatically determines the value type by attempting each parse strategy in order:
+When using `--set KEY=VALUE`, or loading a top-level string from
+[`--context-file`](#--context-file-path), the runner determines the value type
+by attempting each parse strategy in order:
 
 | Priority | Type | Detection | Example |
 |----------|------|-----------|---------|
-| 1 | JSON | Valid JSON object/array | `--set data='{"key": "val"}'` |
-| 2 | Boolean | Literal `true` or `false` | `--set verbose=true` |
+| 1 | JSON | Any valid JSON value except a JSON string, including objects, arrays, booleans, numbers and `null` | `--set data='{"key": "val"}'` |
+| 2 | Boolean | Literal `True` or `False` (lowercase forms parse as JSON) | `--set verbose=True` |
 | 3 | Integer | Digits only (with optional sign) | `--set count=5` |
 | 4 | Float | Numeric with decimal point | `--set ratio=0.5` |
 | 5 | String | Everything else (fallback) | `--set name=hello` |

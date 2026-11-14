@@ -29,7 +29,7 @@ fn standalone_probe_is_exact_and_has_no_update_side_effects() {
         serde_json::from_slice(&out.stdout).expect("exactly one JSON object");
     assert_eq!(
         value,
-        json!({"schema_version":1,"version":env!("CARGO_PKG_VERSION"),"capabilities":if cfg!(unix) { vec!["codex_exec", "durable_recovery_v1"] } else { vec![] }})
+        json!({"schema_version":1,"version":env!("CARGO_PKG_VERSION"),"capabilities":if cfg!(unix) { vec!["codex_exec", "durable_recovery_v1", "context_file_v1"] } else { vec![] }})
     );
     assert_eq!(std::fs::read_to_string(cache).unwrap(), sentinel);
 }
@@ -57,4 +57,25 @@ fn mixed_probe_rejects_before_recipe_execution() {
     assert!(!out.status.success());
     assert!(out.stdout.is_empty());
     assert!(!marker.exists());
+}
+
+#[test]
+fn mixed_context_file_probe_exits_before_filesystem_access() {
+    let home = tempfile::tempdir().unwrap();
+    let missing = home.path().join("missing-context.json");
+    let out = Command::new(env!("CARGO_BIN_EXE_recipe-runner-rs"))
+        .args(["--capabilities", "--context-file"])
+        .arg(&missing)
+        .env("HOME", home.path())
+        .env("RUST_LOG", "trace")
+        .env("RECIPE_RUNNER_NO_UPDATE_CHECK", "1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "--capabilities must be used alone"
+    );
+    assert!(!missing.exists());
 }
