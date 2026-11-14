@@ -19,7 +19,7 @@ contents in the Amplihack wrapper's command-line arguments, for every prompt siz
 - [Delivery, cancellation, and failures](#delivery-cancellation-and-failures)
 - [Privacy boundary](#privacy-boundary)
 
-## backend transport
+## Backend transport
 
 | Backend | Wrapper arguments for instructions | Input delivery |
 |---|---|---|
@@ -38,7 +38,7 @@ that option suppresses the working-directory grant. The grant covers the prompt
 directory, not its parent. Codex retains its
 [exec options and final-message output](codex-exec.md#provider-and-configuration).
 
-## content preservation
+## Content preservation
 
 The runner preserves supplied task and system text exactly, including leading
 and trailing whitespace, whitespace-only personas, tabs, blank lines, Unicode,
@@ -56,7 +56,7 @@ Preservation applies to inputs received by the adapter after recipe parsing,
 template rendering, and agent resolution. YAML scalar rules still determine
 the input text; see the [recipe format](yaml-format.md).
 
-## configuration and usage
+## Configuration and usage
 
 Transport is automatic. No recipe field, environment switch, or public adapter
 parameter selects inline delivery. Existing model, launcher, working-directory,
@@ -89,7 +89,7 @@ authentication and launcher setup; see [Quick Start](quickstart.md) and
 [Codex agent steps](codex-exec.md). Persona references use the existing `agent`
 field. The public Rust `Adapter` and `StepResult` interfaces are unchanged.
 
-## private resources
+## Private resources
 
 Each attempt owns fresh temporary prompt resources, separate from retained logs.
 The platform temporary-directory configuration, including `TMPDIR` on Unix,
@@ -109,7 +109,7 @@ Codex still owns private final-message resources; those are output resources,
 not prompt files. Resource creation, writing, or removal failures are reported.
 A cleanup failure does not establish that every resource was removed.
 
-## delivery, cancellation, and failures
+## Delivery, cancellation, and failures
 
 Claude and Codex require complete stdin delivery and EOF. Nonblocking delivery
 remains responsive to cancellation and existing execution deadlines even when
@@ -131,7 +131,7 @@ before returning. A report-only timeout keeps waiting and retains resources unti
 completion or cancellation. See [timeout options](cli-reference.md) and the
 [terminal cleanup contract](codex-exec.md#terminal-cleanup-failures).
 
-## privacy boundary
+## Privacy boundary
 
 On Linux, the live wrapper's `/proc/<pid>/cmdline` contains neither supplied
 brief nor system-prompt contents. Transport diagnostics and debug representations

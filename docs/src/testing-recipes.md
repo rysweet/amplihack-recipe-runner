@@ -56,7 +56,7 @@ names or command-line patterns never select processes for termination.
 | Cleanup | Prompt files and directories disappear after success, nonzero exit, command construction/startup failure, delivery failure, terminating timeout, and cancellation. Retained logs do not retain prompts. Report-only timeouts keep resources available until actual completion. |
 | Delivery failure | A successful child exit before complete large-stdin delivery fails the attempt. Transport errors bypass rate-limit recovery. |
 | Cancellation | Real SIGINT/SIGTERM during delivery and after input receipt stop owned work and remove resources. Backpressure uses pipe-capacity information and acknowledgments. Typed interruption stops later steps under nonfatal and JSON-enabled policies. |
-| Combined failures | Cleanup errors preserve typed `CleanupFailure`, and the primary execution error. Signal handlers are restored explicitly after cleanup. A removal error is reported without claiming resources are absent. |
+| Combined failures | Cleanup errors preserve typed `CleanupFailure` and the primary execution error. Signal handlers are restored explicitly after cleanup. A removal error is reported without claiming resources are absent. |
 | Compatibility | Launcher overrides, passthrough separators, model options, working directory, permission opt-outs, output handling, and existing timeout policies remain effective. |
 
 These checks cover every prompt size and verify the wrapper process itself; inspecting
