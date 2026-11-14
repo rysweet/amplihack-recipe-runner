@@ -28,7 +28,17 @@ stdin = sys.stdin.buffer.read() if os.environ.get("QA_PROVIDER") == "codex" else
 final = None
 if "--output-last-message" in args:
     final = pathlib.Path(args[args.index("--output-last-message") + 1])
+payload = ""
+if os.environ.get("QA_PROVIDER") != "codex":
+    if "--append-system-prompt-file" in args:
+        prompt_file = pathlib.Path(args[args.index("--append-system-prompt-file") + 1])
+    else:
+        prompt_file = next(pathlib.Path(args[i + 1]) / "agent-system-prompt.md"
+                           for i, arg in enumerate(args[:-1])
+                           if arg == "--add-dir" and (pathlib.Path(args[i + 1]) / "agent-system-prompt.md").is_file())
+    payload = prompt_file.read_text()
 record = {
+    "payload": payload,
     "args": args,
     "provider": os.environ["QA_PROVIDER"],
     "attempt": attempt,
@@ -158,15 +168,16 @@ assert result["success"] is True, result
 assert result["step_results"][0]["output"] == "LEGACY_RESULT_SENTINEL"
 records = list(root.glob("attempt-*.json"))
 assert len(records) == 1, [p.name for p in records]
-args = json.loads(records[0].read_text())["args"]
+record = json.loads(records[0].read_text())
+args = record["args"]
 assert args[:2] == [provider, "--"], args
 assert "exec" not in args, args
 assert "--output-last-message" not in args, args
 assert "-p" in args, args
-assert any("TASK_SENTINEL" in arg for arg in args), args
-if provider == "claude":
-    index = args.index("--system-prompt")
-    assert "PERSONA_SENTINEL" in args[index + 1], args
+for marker in ("TASK_SENTINEL", "PERSONA_SENTINEL"):
+    assert all(marker not in arg for arg in args), args
+    assert marker in record["payload"], record
+assert "Do not invoke /dev" in record["payload"]
 PY
 }
 

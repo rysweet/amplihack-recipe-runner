@@ -93,7 +93,7 @@ assert result["step_results"][0]["output"] == "FAKE_AGENT_OK", result
 rec = json.loads((root / "record.json").read_text())
 args, snaps = rec["args"], rec["snapshots"]
 p_value = args[args.index("-p") + 1]
-assert "HEAD_SENTINEL" in p_value
+assert "HEAD_SENTINEL" not in p_value, "task head must not be inline"
 assert "OVERFLOW_TAIL_SENTINEL_159" not in p_value, "tail must not be inline"
 assert len(p_value.encode()) < 32 * 1024, len(p_value)
 assert "--system-prompt" not in args, args[:6]
@@ -102,11 +102,12 @@ if provider == "claude":
     snap = snaps["--append-system-prompt-file"]
     assert snap["is_file"], snap
     content = snap["content"]
+    assert "HEAD_SENTINEL" in content
     assert content.startswith("System/persona fixture text: PERSONA_SENTINEL."), content[:200]
     assert "Do not invoke /dev" in content           # RECIPE_CHILD_NO_REENTRY guard
-    assert "# Continued task instructions" in content
+    assert "# Task instructions" in content
     assert "OVERFLOW_TAIL_SENTINEL_159: the end of the task." in content, content[-200:]
-    assert content.index("# Continued task instructions") < content.index("OVERFLOW_TAIL_SENTINEL_159")
+    assert content.index("# Task instructions") < content.index("OVERFLOW_TAIL_SENTINEL_159")
     print(f"claude: --append-system-prompt-file {snap['path']} ({len(content)} bytes, tail + no-reentry guard present)")
 else:
     assert "--append-system-prompt-file" not in args and "--append-system-prompt" not in args
@@ -115,7 +116,9 @@ else:
     assert snap["path"] in p_value, "inline note must name the prompt file path"
     assert "the appended system prompt" not in p_value
     assert "OVERFLOW_TAIL_SENTINEL_159" in snap["content"]
-    note = p_value[p_value.index("IMPORTANT:"):]
+    assert "HEAD_SENTINEL" in snap["content"]
+    assert "PERSONA_SENTINEL" in snap["content"]
+    note = p_value
     print(f"{provider}: --add-dir; inline note -> {note[:160]}...")
 PY
 }

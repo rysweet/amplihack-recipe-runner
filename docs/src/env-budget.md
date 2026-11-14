@@ -308,9 +308,13 @@ See [Migration to 0.6.0](migration-v0.6.md#amplihack_context_file-is-no-longer-s
 ## Agent steps
 
 Agent subprocesses don't receive `RECIPE_VAR_*` values. Recipe data reaches an
-agent through its prompt, and prompts over `MAX_INLINE_AGENT_PROMPT_BYTES`
-already go through a file. An agent child's environment is the sanitized
-inherited environment plus `AMPLIHACK_AGENT_BINARY`.
+agent through its rendered prompt. Prompt and system content never go on the
+launcher or agent argv, regardless of size: Codex receives them on stdin;
+Claude-family CLIs read a private file via `--append-system-prompt-file`;
+Copilot receives a request to read the complete private file and an `--add-dir`
+grant for its directory. The runner removes that file when the step finishes.
+An agent child's environment is the sanitized inherited environment plus
+`AMPLIHACK_AGENT_BINARY`.
 
 That inherited environment is filtered before any step-specific variable is
 added. A variable is dropped, with a warning naming it and giving its size, when

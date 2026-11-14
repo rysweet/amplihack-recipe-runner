@@ -884,7 +884,19 @@ mod unix {
                 fs::create_dir(&private_path).unwrap();
             }
             f.write(&json!({"private_path":private_path}));
-            let out = f.file_command().env("RUST_LOG", "trace").output().unwrap();
+            // A real Git could discover the repository above TMPDIR. Force
+            // the non-repository response independently of the fixture location.
+            let bin = f.dir.path().join("bin");
+            fs::create_dir(&bin).unwrap();
+            let git = bin.join("git");
+            fs::write(&git, "#!/bin/sh\nexit 1\n").unwrap();
+            fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).unwrap();
+            let out = f
+                .file_command()
+                .env("PATH", bin)
+                .env("RUST_LOG", "trace")
+                .output()
+                .unwrap();
             assert_eq!(out.status.code(), Some(1));
             let diagnostics = String::from_utf8_lossy(&out.stderr);
             assert!(diagnostics.contains("private_path"));
@@ -1040,6 +1052,96 @@ mod unix {
         }
         assert_eq!(actual["context"]["secret"], SENTINEL);
         assert_eq!(fs::read(&f.context).unwrap(), replacement);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_agent_wrappers_keep_prompt_and_file_context_off_argv() {
+        const PROMPT: &str = "PRIVATE_AGENT_PROMPT_211_🦀";
+        for cli in ["claude", "launch", "RustyClawd", "copilot", "codex"] {
+            for size in [0, 40 * 1024] {
+                let prompt = format!("{PROMPT} {} {{{{secret}}}}", "x".repeat(size));
+                let f = Fixture::new(json!({"name":"agent-privacy", "steps":[
+                    {"id":"agent", "prompt":prompt, "auto_stage":false}
+                ]}));
+                f.write(&json!({"secret":SENTINEL}));
+                let launcher = f.dir.path().join("launcher");
+                fs::write(&launcher, r#"#!/bin/bash
+set -eu
+provider=$1
+shift
+prompt_file=
+final=
+while (( $# )); do
+    case "$1" in
+        --append-system-prompt-file) prompt_file=$2; shift ;;
+        --add-dir) if [[ -f "$2/agent-system-prompt.md" ]]; then prompt_file=$2/agent-system-prompt.md; fi; shift ;;
+        --output-last-message) final=$2; shift ;;
+    esac
+    shift
+done
+if [[ "$provider" == codex ]]; then
+    cat > "$DELIVERED_PROMPT"
+else
+    cat -- "$prompt_file" > "$DELIVERED_PROMPT"
+    printf '%s' "$prompt_file" > "$PROMPT_PATH"
+fi
+printf '%s\n' "$BASHPID" >&198
+IFS= read -r release <&198
+if [[ "$provider" == codex ]]; then
+    printf 'agent-ok' > "$final"
+else
+    printf 'agent-ok'
+fi
+"#).unwrap();
+                fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+                let delivered = f.dir.path().join("delivered");
+                let prompt_path = f.dir.path().join("prompt-path");
+                let mut cmd = f.file_command();
+                cmd.env("AMPLIHACK_AGENT_BINARY", cli)
+                    .env("AMPLIHACK_LAUNCHER_BINARY", &launcher)
+                    .env("DELIVERED_PROMPT", &delivered)
+                    .env("PROMPT_PATH", &prompt_path);
+                let mut live = LiveRun::start(&f, cmd);
+                let wrapper_pid = live.ready();
+                let runner_pid = live.child.as_ref().unwrap().id();
+                for pid in [runner_pid, wrapper_pid] {
+                    let cmdline = fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+                    let args = String::from_utf8_lossy(&cmdline);
+                    for marker in [PROMPT, SENTINEL] {
+                        assert!(
+                            !args.contains(marker),
+                            "{cli}: private content on argv for PID {pid}"
+                        );
+                    }
+                }
+                let content = fs::read_to_string(&delivered).unwrap();
+                assert!(
+                    content.contains(&prompt.replace("{{secret}}", SENTINEL)),
+                    "{cli}: full rendered prompt must reach the wrapper"
+                );
+                assert!(content.contains("Do not invoke /dev"));
+                assert!(content.contains("Proceed autonomously. Do not ask questions."));
+                let private_file = if cli == "codex" {
+                    None
+                } else {
+                    let path = PathBuf::from(fs::read_to_string(&prompt_path).unwrap());
+                    assert_eq!(
+                        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                        0o600
+                    );
+                    Some(path)
+                };
+                let actual = live.finish();
+                assert_eq!(actual["step_results"][0]["output"], "agent-ok");
+                if let Some(path) = private_file {
+                    assert!(
+                        !path.exists(),
+                        "{cli}: private prompt must be removed after execution"
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
