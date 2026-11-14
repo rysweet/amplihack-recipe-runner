@@ -2622,7 +2622,8 @@ mod tests {
     }
 
     /// A launcher stand-in that sleeps past the step timeout, then writes to
-    /// stdout and stderr and exits 0.
+    /// stdout and stderr and exits 0. Tests using this launcher select Claude
+    /// explicitly because Codex reads its final response from a separate file.
     fn slow_launcher(dir: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("slow-launcher");
@@ -2650,7 +2651,7 @@ mod tests {
         let _guard = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
         let tmp = tempfile::tempdir().unwrap();
         use_launcher(&slow_launcher(tmp.path()));
-        let adapter = CLISubprocessAdapter::new();
+        let adapter = CLISubprocessAdapter::new().with_binary("claude");
         let err = adapter
             .execute_agent_step_impl("p", None, None, tmp.path().to_str().unwrap(), Some(1))
             .unwrap_err();
@@ -2663,7 +2664,9 @@ mod tests {
         let _guard = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
         let tmp = tempfile::tempdir().unwrap();
         use_launcher(&slow_launcher(tmp.path()));
-        let adapter = CLISubprocessAdapter::new().with_timeout_action(TimeoutAction::Report);
+        let adapter = CLISubprocessAdapter::new()
+            .with_binary("claude")
+            .with_timeout_action(TimeoutAction::Report);
         let out = adapter
             .execute_agent_step_impl("p", None, None, tmp.path().to_str().unwrap(), Some(1))
             .expect("a reported overrun must not fail the step");
@@ -2693,7 +2696,9 @@ mod tests {
         std::fs::create_dir(&logs).unwrap();
         std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let adapter = CLISubprocessAdapter::new().with_log_dir(&logs);
+        let adapter = CLISubprocessAdapter::new()
+            .with_binary("claude")
+            .with_log_dir(&logs);
         adapter
             .execute_agent_step_impl("p", None, None, tmp.path().to_str().unwrap(), None)
             .unwrap();
@@ -2718,7 +2723,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         use_launcher(&slow_launcher(tmp.path()));
         let logs = tmp.path().join("logs").join("nested");
-        let adapter = CLISubprocessAdapter::new().with_log_dir(&logs);
+        let adapter = CLISubprocessAdapter::new()
+            .with_binary("claude")
+            .with_log_dir(&logs);
         let out = adapter
             .execute_agent_step_impl("p", None, None, tmp.path().to_str().unwrap(), None)
             .unwrap();
@@ -2838,6 +2845,7 @@ mod tests {
         let cwd_text = cwd.to_string_lossy().into_owned();
 
         let default = CLISubprocessAdapter::new()
+            .with_binary("claude")
             .build_agent_command(tmp.path(), &cwd, "hello", None, None)
             .unwrap();
         let args = command_args(&default);
@@ -2845,6 +2853,7 @@ mod tests {
         assert_eq!(args[pos + 1], cwd_text);
 
         let without = CLISubprocessAdapter::new()
+            .with_binary("claude")
             .without_working_dir_grant()
             .build_agent_command(tmp.path(), &cwd, "hello", None, None)
             .unwrap();
