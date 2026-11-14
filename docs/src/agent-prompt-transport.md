@@ -125,12 +125,13 @@ Transport failures do not enter rate-limit recovery.
 Shared scoped SIGINT/SIGTERM ownership starts before prompt preparation and
 continues through child shutdown, I/O completion, resource removal, and explicit
 restoration of prior signal handlers. Application cancellation and handled SIGINT
-or SIGTERM request the wrapper's supported SIGTERM shutdown. Each file-backed
-invocation starts in a dedicated process group. A retained group anchor preserves
-authority to signal that invocation even if the wrapper exits first. The wrapper
-gets up to four seconds to finish its shutdown path (including its three-second
-backend grace period); group cleanup then sends TERM,
-allows a bounded grace period, escalates to KILL, and confirms backend retirement.
+or SIGTERM begin shutdown by sending SIGTERM to the owned process group. Each
+file-backed invocation starts in a dedicated process group. A retained group anchor preserves
+authority to signal that invocation even if the wrapper exits first. Group cleanup
+uses the existing TERM/grace/KILL policy and confirms backend retirement.
+Startup waits for the anchor acknowledgment without an additional
+startup deadline. A startup failure communicates its retirement result to prompt
+ownership: confirmed retirement permits removal; uncertainty preserves the files.
 The runner never signals its inherited process group.
 
 Cancellation completes only after the invocation's backend processes have stopped

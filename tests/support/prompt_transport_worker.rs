@@ -151,6 +151,12 @@ pub fn run(root: &Path) {
         }
     };
     let mut value = value;
+    if config["anchor_gate"] == true {
+        let result = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+        value["children_retired"] = json!(
+            result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+        );
+    }
     value["signals_restored"] = json!(dispositions() == before);
     writeln!(wire, "RESULT {value}").unwrap();
     SIGNAL_SOCKET.store(-1, Ordering::Relaxed);

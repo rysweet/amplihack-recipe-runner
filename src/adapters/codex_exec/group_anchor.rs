@@ -49,12 +49,19 @@ impl GroupAnchor {
         deadline: Option<Instant>,
         lifetime_ms: Option<u64>,
     ) -> anyhow::Result<Self> {
-        let group = i32::try_from(launcher.id()).context("Invalid Codex launcher identity")?;
-        let result = Self::start(group, deadline, lifetime_ms);
-        match result {
-            Ok(anchor) => Ok(anchor),
-            Err(error) => Err(startup_failure(launcher, error)),
-        }
+        Self::establish_with_retirement(launcher, deadline, lifetime_ms)
+            .map_err(|failure| failure.error)
+    }
+    /// Startup errors include the result of retiring the owned invocation.
+    pub(super) fn establish_with_retirement(
+        launcher: &mut Child,
+        deadline: Option<Instant>,
+        lifetime_ms: Option<u64>,
+    ) -> Result<Self, StartupFailure> {
+        let result = i32::try_from(launcher.id())
+            .context("Invalid Codex launcher identity")
+            .and_then(|group| Self::start(group, deadline, lifetime_ms));
+        result.map_err(|error| startup_failure_with_retirement(launcher, error))
     }
     fn start(
         group: i32,
@@ -255,36 +262,77 @@ fn retained_launcher(pid: i32) -> anyhow::Result<()> {
 #[path = "tests/anchor_state.rs"]
 pub(super) mod tests;
 
+/// Retirement evidence remains separate from the primary startup error.
+pub(super) struct StartupFailure {
+    pub(super) error: anyhow::Error,
+    pub(super) retirement_confirmed: bool,
+}
+
 /// Startup unwind while the unreaped launcher still anchors the original group.
 pub(super) fn startup_failure(launcher: &mut Child, error: anyhow::Error) -> anyhow::Error {
+    startup_failure_with_retirement(launcher, error).error
+}
+
+fn startup_failure_with_retirement(launcher: &mut Child, error: anyhow::Error) -> StartupFailure {
     let group = launcher.id() as i32;
-    let mut failures = vec![format!("Codex anchor establishment: {error:#}")];
+    let mut failures = Vec::new();
     let authority = validate_reaper().and_then(|_| retained_launcher(group));
     let held = authority.is_ok();
     if let Err(error) = authority {
         failures.push(format!("Codex anchor startup authority lost: {error:#}"));
-    } else {
-        for signal in [libc::SIGTERM, libc::SIGKILL] {
-            if let Err(error) = signal_group(group, signal) {
-                failures.push(format!("{error:#}"));
-            }
-        }
     }
-    if let Err(error) = super::launcher_cleanup::reap_launcher(
-        launcher,
-        |child| {
-            if !held {
-                return Err(std::io::Error::other(
-                    "Codex launcher startup authority unavailable",
-                ));
+    // Reuse ordinary group cleanup, including liveness confirmation. Keep the
+    // direct child unreaped until destructive access to its group has ended.
+    super::group_cleanup::shutdown_bounded(
+        |signal, _| {
+            anyhow::ensure!(held, "Codex launcher startup authority unavailable");
+            validate_reaper()?;
+            retained_launcher(group)?;
+            let signaled = signal_group(group, signal);
+            if signal == libc::SIGKILL {
+                // The last group operation has ended. Kill the still-unreaped
+                // direct child now, before liveness confirmation spends the
+                // shared budget if the group signal failed. Reaping stays last.
+                let direct = if unsafe { libc::kill(group, libc::SIGKILL) } == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                        .context("Failed to kill agent wrapper during startup unwind")
+                };
+                super::combine_result(signaled, direct)
+            } else {
+                signaled
             }
-            validate_reaper().map_err(|error| std::io::Error::other(format!("{error:#}")))?;
-            child.kill()
         },
-        Duration::from_secs(2),
-    ) {
-        failures.push(format!("{error:#}"));
+        || super::process::group_live(group),
+        |deadline| {
+            super::launcher_cleanup::reap_until(
+                launcher,
+                |child| {
+                    if !held {
+                        return Err(std::io::Error::other(
+                            "Codex launcher startup authority unavailable",
+                        ));
+                    }
+                    validate_reaper()
+                        .map_err(|error| std::io::Error::other(format!("{error:#}")))?;
+                    child.kill()
+                },
+                deadline,
+            )
+        },
+        &mut failures,
+    );
+    let retirement_confirmed = failures.is_empty();
+    let diagnostic = format!("Codex anchor establishment: {error:#}");
+    let error = error.context(diagnostic);
+    let error = if retirement_confirmed {
+        error
+    } else {
+        error.context(failures.join("; "))
+    };
+    StartupFailure {
+        error: error.context(super::CleanupFailure("Codex anchor startup failed".into())),
+        retirement_confirmed,
     }
-    anyhow::anyhow!(failures.join("; "))
-        .context(super::CleanupFailure("Codex anchor startup failed".into()))
 }

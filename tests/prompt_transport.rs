@@ -56,6 +56,30 @@ fn launcher_bytes() -> &'static [u8] {
     })
 }
 
+fn startup_interposer_bytes() -> &'static [u8] {
+    static LIBRARY: OnceLock<Vec<u8>> = OnceLock::new();
+    LIBRARY.get_or_init(|| {
+        let build = tempfile::tempdir().unwrap();
+        let output = build.path().join("startup.so");
+        let result = Command::new("rustc")
+            .args(["--edition=2024", "--crate-type=cdylib"])
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/support/prompt_startup_interpose.rs"),
+            )
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        fs::read(output).unwrap()
+    })
+}
+
 fn receive(wire: &mut BufReader<UnixStream>) -> String {
     let mut text = String::new();
     assert_ne!(
@@ -67,6 +91,7 @@ fn receive(wire: &mut BufReader<UnixStream>) -> String {
 }
 
 fn accept(listener: &UnixListener) -> BufReader<UnixStream> {
+    // A harness watchdog bounds failures; acknowledgments establish ordering.
     let mut ready = libc::pollfd {
         fd: listener.as_raw_fd(),
         events: libc::POLLIN,
@@ -113,6 +138,7 @@ impl Drop for OwnedWorker {
 struct Fixture {
     // Declared first so controller disconnection releases the wrapper on unwind.
     agent: Option<BufReader<UnixStream>>,
+    startup_wire: Option<BufReader<UnixStream>>,
     worker_wire: BufReader<UnixStream>,
     worker: OwnedWorker,
     root: tempfile::TempDir,
@@ -148,14 +174,28 @@ impl Fixture {
         fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
         let workers = UnixListener::bind(root.path().join("worker.sock")).unwrap();
         let agents = UnixListener::bind(root.path().join("agent.sock")).unwrap();
-        let child = Command::new(std::env::current_exe().unwrap())
+        let gate = (config["anchor_gate"] == true).then(|| {
+            let library = root.path().join("startup.so");
+            fs::write(&library, startup_interposer_bytes()).unwrap();
+            UnixListener::bind(root.path().join("startup.sock")).unwrap()
+        });
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.env_clear();
+        if gate.is_some() {
+            command
+                .env("LD_PRELOAD", root.path().join("startup.so"))
+                .env("PROMPT_STARTUP_GATE", root.path().join("startup.sock"));
+            if config["deny_group_signals"] == true {
+                command.env("PROMPT_DENY_GROUP_SIGNALS", "1");
+            }
+        }
+        let child = command
             .args([
                 "--exact",
                 "prompt_transport_worker",
                 "--ignored",
                 "--nocapture",
             ])
-            .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", root.path())
             .env("TMPDIR", root.path().join("scratch"))
@@ -171,12 +211,18 @@ impl Fixture {
         let worker = OwnedWorker(child);
         let mut worker_wire = accept(&workers);
         assert_eq!(receive(&mut worker_wire), "WORKER_STARTED");
+        let startup_wire = gate.as_ref().map(|listener| {
+            let mut wire = accept(listener);
+            assert!(receive(&mut wire).starts_with("ANCHOR_FORKED "));
+            wire
+        });
         // Startup-error and zero-timeout cases must return without readiness.
         let expect_wrapper =
             config["startup"].is_null() && (config["timeout"] != 0 || config["report"] == true);
         let (agent, args, wrapper_pid) = if expect_wrapper {
             // Wait for either explicit readiness or an early adapter result.
-            // A deadline bounds fixture failure; readiness establishes ordering.
+            // Readiness or an early result establishes ordering; the harness
+            // watchdog only bounds a broken fixture.
             let mut ready = [
                 libc::pollfd {
                     fd: agents.as_raw_fd(),
@@ -218,6 +264,7 @@ impl Fixture {
             root,
             worker,
             worker_wire,
+            startup_wire,
             agent,
             provider: provider.into(),
             task: task.into(),
@@ -586,6 +633,57 @@ fn command_construction_and_spawn_failures_remove_prepared_prompts() {
             let result = fixture.result(None);
             assert!(result["error"].is_string(), "{result}");
             fixture.assert_cleaned();
+        }
+    }
+}
+
+#[test]
+fn startup_cancellation_cleans_prompts_only_after_confirmed_retirement() {
+    for provider in ["claude", "copilot"] {
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            for deny_group_signals in [false, true] {
+                let mut fixture = Fixture::start(
+                    provider,
+                    TASK,
+                    Some(SYSTEM),
+                    json!({
+                        "anchor_gate": true,
+                        "deny_group_signals": deny_group_signals,
+                    }),
+                );
+                assert_eq!(fixture.prompt_files.len(), 1);
+                assert_eq!(fixture.modes, [(0o600, 0o700)]);
+                // The parent is held after fork, before accepting readiness.
+                // Snapshot and signal precede explicit release of that boundary.
+                assert_eq!(
+                    unsafe { libc::kill(fixture.worker.0.id() as i32, signal) },
+                    0
+                );
+                send(fixture.startup_wire.as_mut().unwrap(), "CONTINUE");
+                let result = fixture.result(None);
+                assert_eq!(result["children_retired"], true, "{result}");
+                let error = result["error"].as_str().unwrap();
+                assert!(
+                    error.contains(&format!("cancelled by signal {signal}")),
+                    "{result}"
+                );
+                fixture.assert_secrecy();
+                if deny_group_signals {
+                    assert!(error.contains("retirement unconfirmed"), "{result}");
+                    assert!(error.contains("Operation not permitted"), "{result}");
+                    // The fallback reaped this simple wrapper, but failed group
+                    // signals cannot certify retirement of arbitrary descendants.
+                    // Prompt ownership must therefore remain conservative.
+                    assert_payload(
+                        &fs::read(&fixture.prompt_files[0]).unwrap(),
+                        fixture.live_system.as_ref().unwrap(),
+                    );
+                    fs::remove_dir_all(fixture.prompt_files[0].parent().unwrap()).unwrap();
+                } else {
+                    assert!(!error.contains("retirement unconfirmed"), "{result}");
+                }
+                fixture.assert_cleaned();
+            }
         }
     }
 }

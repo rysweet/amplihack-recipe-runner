@@ -7,7 +7,7 @@ use std::{
     os::unix::net::UnixStream,
     path::PathBuf,
     process::{Command, Stdio},
-    sync::atomic::{AtomicI32, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, Ordering},
 };
 
 unsafe extern "C" {
@@ -18,6 +18,7 @@ unsafe extern "C" {
 }
 
 static SIGNAL_SOCKET: AtomicI32 = AtomicI32::new(-1);
+static BACKEND_NOTIFIED: AtomicBool = AtomicBool::new(false);
 static BACKEND_PID: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn wrapper_shutdown(_: i32) {
@@ -36,6 +37,10 @@ extern "C" fn wrapper_shutdown(_: i32) {
 }
 
 extern "C" fn backend_shutdown(_: i32) {
+    // Group TERM and the wrapper's forwarded TERM can both reach the backend.
+    if BACKEND_NOTIFIED.swap(true, Ordering::Relaxed) {
+        return;
+    }
     let bytes = b"BACKEND_SHUTDOWN\n";
     unsafe {
         write(

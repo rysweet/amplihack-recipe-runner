@@ -21,6 +21,7 @@ pub(super) fn observe_launcher(child: &mut Child, deadline: Instant) -> anyhow::
         std::thread::sleep(remaining.min(Duration::from_millis(5)));
     }
 }
+#[cfg(test)]
 pub(super) fn reap_launcher(
     child: &mut Child,
     kill: impl FnOnce(&mut Child) -> std::io::Result<()>,

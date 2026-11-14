@@ -18,13 +18,42 @@ cat > "$fixture/bin/launcher" <<'LAUNCHER'
 import json
 import os
 import pathlib
+import stat
 import sys
 
 root = pathlib.Path(os.environ["QA_RECORD_DIR"])
 root.mkdir(parents=True, exist_ok=True)
 attempt = len(list(root.glob("attempt-*.json"))) + 1
 args = sys.argv[1:]
-stdin = sys.stdin.buffer.read() if os.environ.get("QA_PROVIDER") == "codex" else b""
+provider = os.environ["QA_PROVIDER"]
+stdin = sys.stdin.buffer.read() if provider in ("codex", "claude") else b""
+prompt = None
+if provider == "claude":
+    prompt = pathlib.Path(args[args.index("--system-prompt-file") + 1])
+elif provider == "copilot":
+    pointer = args[args.index("-p") + 1]
+    prefix = "Read the complete system and task instructions in "
+    suffix = " and follow them fully."
+    assert pointer.startswith(prefix) and pointer.endswith(suffix)
+    prompt = pathlib.Path(pointer[len(prefix):-len(suffix)])
+    assert any(
+        flag == "--add-dir" and pathlib.Path(value) == prompt.parent
+        for flag, value in zip(args, args[1:])
+    ), "private prompt directory not granted"
+if prompt is not None:
+    assert prompt.is_absolute() and prompt.is_file(), "prompt unavailable to child"
+    assert stat.S_IMODE(prompt.stat().st_mode) == 0o600
+    assert stat.S_IMODE(prompt.parent.stat().st_mode) == 0o700
+    content = prompt.read_text()
+    assert "PERSONA_SENTINEL" in content, "missing persona"
+    assert "SYSTEM_SENTINEL" in content, "missing system instructions"
+    if provider == "copilot":
+        assert "TASK_SENTINEL" in content, "missing task instructions"
+    else:
+        assert "TASK_SENTINEL" in stdin.decode(), "missing task on stdin"
+    assert not any(marker in arg for arg in args for marker in (
+        "SYSTEM_SENTINEL", "PERSONA_SENTINEL", "TASK_SENTINEL"
+    )), "private prompt text in arguments"
 final = None
 if "--output-last-message" in args:
     final = pathlib.Path(args[args.index("--output-last-message") + 1])
@@ -34,6 +63,7 @@ record = {
     "attempt": attempt,
     "stdin_file": f"attempt-{attempt}.stdin",
     "final_absent_before": final is None or not final.exists(),
+    "prompt_file": str(prompt) if prompt is not None else None,
 }
 (root / record["stdin_file"]).write_bytes(stdin)
 (root / f"attempt-{attempt}.json").write_text(json.dumps(record))
@@ -47,6 +77,8 @@ if record["provider"] == "codex":
         sys.exit(90)
     final.write_bytes(b"  CODEX_FINAL\n\x00Unicode: \xce\xbb\n\n")
 else:
+    # Check availability through the child's final use, without recording content.
+    assert prompt.read_text() == content, "prompt changed while child was running"
     print("LEGACY_RESULT_SENTINEL", flush=True)
 LAUNCHER
 chmod 755 "$fixture/bin/launcher"
@@ -144,7 +176,7 @@ for path in attempts:
 PY
 }
 
-validate_legacy_case() {
+validate_file_case() {
     local provider=$1 record_dir=$2
     /usr/bin/python3 - "$provider" "$record_dir" <<'PY'
 import json
@@ -154,19 +186,19 @@ import sys
 provider, directory = sys.argv[1:]
 root = pathlib.Path(directory)
 result = json.loads((root / "result.json").read_text())
-assert result["success"] is True, result
+assert result["success"] is True
 assert result["step_results"][0]["output"] == "LEGACY_RESULT_SENTINEL"
 records = list(root.glob("attempt-*.json"))
-assert len(records) == 1, [p.name for p in records]
-args = json.loads(records[0].read_text())["args"]
-assert args[:2] == [provider, "--"], args
-assert "exec" not in args, args
-assert "--output-last-message" not in args, args
-assert "-p" in args, args
-assert any("TASK_SENTINEL" in arg for arg in args), args
-if provider == "claude":
-    index = args.index("--system-prompt")
-    assert "PERSONA_SENTINEL" in args[index + 1], args
+assert len(records) == 1
+record = json.loads(records[0].read_text())
+args = record["args"]
+assert args[:2] == [provider, "--"]
+for forbidden in ("exec", "--output-last-message", "--system-prompt"):
+    assert forbidden not in args
+assert "-p" in args
+prompt = pathlib.Path(record["prompt_file"])
+assert not prompt.exists(), "private prompt retained after child completion"
+assert not prompt.parent.exists(), "private prompt directory retained"
 PY
 }
 
@@ -175,7 +207,7 @@ validate_codex_case default "$fixture/codex-default"
 run_case codex caller-model "$fixture/codex-explicit-model"
 validate_codex_case explicit "$fixture/codex-explicit-model"
 run_case claude "" "$fixture/claude"
-validate_legacy_case claude "$fixture/claude"
+validate_file_case claude "$fixture/claude"
 run_case copilot "" "$fixture/copilot"
-validate_legacy_case copilot "$fixture/copilot"
-printf 'PASS: Codex stdin/final-output/model contract and Claude/Copilot controls\n'
+validate_file_case copilot "$fixture/copilot"
+printf 'PASS: candidate Codex stdin/final-output/model contract and Claude/Copilot private-transport controls\n'

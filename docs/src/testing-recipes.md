@@ -35,6 +35,12 @@ worker use explicit `STARTED`, `INPUT_RECEIVED`, and `RELEASE` acknowledgments.
 Descendant scenarios launch a separate backend and acknowledge its PID, prompt
 receipt, and shutdown. A control request makes the still-live backend reread its
 prompt during shutdown before it is released or retired by escalation.
+Startup cancellation uses a Rust fork gate to acknowledge the boundary before the
+parent accepts anchor readiness. Both signals and both file-backed providers must
+remove prompts after confirmed retirement; denied group signals must retain them
+with an explicit cleanup error. Wrapper reaping and the absence of remaining owned
+children are checked separately.
+
 The existing `tests/qa/prompt-file-transport.sh` entry point and its scenario run
 this suite. Run it directly with:
 
@@ -68,6 +74,12 @@ These checks cover every prompt size and verify the wrapper process itself; insp
 only the downstream model process does not establish argv secrecy.
 
 ## Codex verification
+
+`tests/qa/codex-exec.sh` exercises the supplied candidate binary for all three
+providers. Its Claude and Copilot controls read the referenced private prompt
+file while the child is running, check the required content and permissions
+without logging prompt text, and verify removal after completion. The behavior
+suite above covers cancellation during startup and execution.
 
 The [Codex agent-step contract](codex-exec.md) requires both deterministic
 regression tests and production integration evidence. The following checks guide
