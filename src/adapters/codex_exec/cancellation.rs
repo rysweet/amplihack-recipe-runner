@@ -1,4 +1,4 @@
-//! Reference-counted scoped ownership and immutable, locked retirement observations.
+//! Shared CLI-backend reference-counted scoped ownership and immutable, locked retirement observations.
 #[cfg(unix)]
 use super::{
     finish_resources,
@@ -174,7 +174,7 @@ pub(in crate::adapters) fn check_cancellation() -> anyhow::Result<()> {
 
 /// Terminal user interruption, retained through contextual cleanup errors.
 #[derive(Debug, thiserror::Error)]
-#[error("Codex exec cancelled by signal {signal}")]
+#[error("Agent step cancelled by signal {signal}")]
 pub(crate) struct Interruption {
     pub(crate) signal: i32,
 }

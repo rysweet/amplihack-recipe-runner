@@ -164,7 +164,7 @@ struct Cli {
     no_allow_all_tools: bool,
 
     /// Do not grant the working directory to the agent CLI with --add-dir.
-    /// The directory that holds an overflow prompt file is still granted to
+    /// The directory that holds a private prompt file is still granted to
     /// CLIs that read the file through --add-dir (such as Copilot).
     #[arg(long)]
     no_add_dir: bool,

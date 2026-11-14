@@ -2,6 +2,7 @@
 title: CLI Reference
 description: Command-line options, output and failure diagnostics for recipe-runner-rs.
 doc_type: reference
+last_updated: 2026-11-14
 ---
 
 # CLI Reference
@@ -133,8 +134,11 @@ suppressed, a step that needs a tool the CLI would ask about fails instead.
 
 Do not grant the step's working directory to the agent CLI with `--add-dir`. Without the option every Claude-family
 and Copilot agent step is given `--add-dir <working directory>`. With it, that grant is not made. The directory
-that holds an overflow prompt file is still granted to a CLI that reads the file through `--add-dir`, because that
+that holds a private prompt file is still granted to a CLI that reads the file through `--add-dir`, because that
 CLI cannot read its prompt without it. The Codex adapter passes no `--add-dir` and is unaffected.
+
+Copilot receives a private prompt-directory grant for every prompt
+size, limited to that directory. See [agent prompt transport](agent-prompt-transport.md).
 
 ### `-C, --working-dir <DIR>`
 

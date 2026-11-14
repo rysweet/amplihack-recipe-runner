@@ -138,7 +138,10 @@ pub(super) fn retryable(error: &anyhow::Error) -> bool {
             .is_some_and(|e| e.rate_limited)
 }
 
-fn combine_result<T>(result: anyhow::Result<T>, cleanup: anyhow::Result<()>) -> anyhow::Result<T> {
+pub(super) fn combine_result<T>(
+    result: anyhow::Result<T>,
+    cleanup: anyhow::Result<()>,
+) -> anyhow::Result<T> {
     match (result, cleanup) {
         (result, Ok(())) => result,
         (Ok(_), Err(error)) => {

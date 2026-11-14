@@ -73,7 +73,7 @@ fn log_dir_keeps_the_agent_logs() {
     let launcher = dir.path().join("launcher");
     std::fs::write(
         &launcher,
-        "#!/bin/sh\necho agent-said-this\necho agent-err-said-this >&2\n",
+        "#!/bin/sh\ncat >/dev/null\necho agent-said-this\necho agent-err-said-this >&2\n",
     )
     .unwrap();
     std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();

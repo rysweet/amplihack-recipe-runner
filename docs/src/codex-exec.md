@@ -2,12 +2,12 @@
 title: Codex agent steps
 description: Codex execution, configuration, results, and terminal failure contracts.
 doc_type: reference
-last_updated: 2026-11-03
+last_updated: 2026-11-14
 ---
 
 # Codex agent steps
 
-The runner executes Codex agent steps through Amplihack using modern noninteractive `codex exec`. Claude remains the default provider; selecting Codex leaves Claude and Copilot invocation and result contracts unchanged.
+The runner executes Codex agent steps through Amplihack using modern noninteractive `codex exec`. Claude remains the default provider. Codex keeps its instruction envelope out of wrapper argv. Claude and Copilot also keep supplied instructions out of argv; see [agent prompt transport](agent-prompt-transport.md).
 
 ## Contents
 
@@ -79,7 +79,7 @@ The command creates an owner-only runtime directory and removes it after success
 
 ## Instructions, results, and failures
 
-Every prompt size uses the same deterministic UTF-8 stdin envelope: effective system instructions, resolved persona, recipe leaf/no-reentry instructions, task, and autonomy footer. The full envelope is written and stdin closed. Leading dashes, newlines, Unicode, and large prompts do not change transport. Instructions are not placed in `AGENTS.md`.
+Every prompt size uses the same deterministic UTF-8 stdin envelope: effective system instructions, resolved persona, recipe leaf/no-reentry instructions, task, and autonomy footer. The full envelope is written and stdin closed. Supplied system text is [preserved exactly](agent-prompt-transport.md#content-preservation), including whitespace-only personas. Leading dashes, Unicode, and large prompts do not change transport. Neither input appears in wrapper argv, and Codex needs no temporary prompt file. Instructions are not placed in `AGENTS.md`.
 
 Successful raw output is only the content of the final-message file. Whitespace, trailing newlines, and empty content are preserved verbatim. An existing zero-byte file is a valid empty response; a missing file is an error. Progress stdout/stderr never substitutes for a final response. Explicit recipe JSON parsing retains its documented extraction/transformation semantics.
 
@@ -108,6 +108,8 @@ Bounded rate-limit retries and JSON repair retries retain the effective instruct
 The runner has no generic Codex argument passthrough API. Use recipe fields for task, model, working directory, and timeout.
 
 ## Cancellation and ownership
+
+Shared scoped SIGINT/SIGTERM ownership covers all CLI backends from before prompt preparation through cleanup and explicit handler restoration. Codex retains its executor and process containment. See [delivery and cancellation](agent-prompt-transport.md#delivery-cancellation-and-failures).
 
 SIGINT and SIGTERM observed during active Codex ownership stop stdin delivery and use bounded process, reader and resource cleanup. Cancellation remains effective during last-owner signal restoration, including SIGTERM delivered while its product handler remains installed after SIGINT restoration. The adapter captures the immutable interruption and restoration result under the ownership mutex before an independent owner can begin a new epoch.
 

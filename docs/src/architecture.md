@@ -2,7 +2,7 @@
 title: Recipe runner architecture
 description: Module boundaries, execution flow and subprocess ownership.
 doc_type: explanation
-last_updated: 2026-10-07
+last_updated: 2026-11-14
 ---
 
 # Architecture — amplihack-recipe-runner
@@ -91,7 +91,7 @@ graph TD
 | `adapters/mod.rs`    | `Adapter` trait definition                             |
 | `adapters/cli_subprocess.rs` | Provider dispatch, subprocess execution and rate-limit retries |
 | `adapters/codex_exec/mod.rs` | Private attempt coordination and typed error composition |
-| `adapters/codex_exec/cancellation.rs` | Shared signal epochs, full disposition restoration and cancellation snapshot before ownership unlock |
+| `adapters/codex_exec/cancellation.rs` | Codex signal epochs, full disposition restoration and cancellation snapshot before ownership unlock |
 | `adapters/codex_exec/signal_observations.rs` | Persistent per-signal observable-entry publication without epoch resets |
 | `adapters/codex_exec/process.rs` | Owned child/group, complete stdin delivery, deadline and bounded shutdown |
 | `adapters/codex_exec/group_anchor.rs` | Non-cloneable retained group authority through final destructive access |
@@ -327,11 +327,33 @@ The production adapter spawns subprocesses:
   (`pre_step`, `post_step`, `on_error`) take the same path, with a fixed 30 s
   timeout.
 - **Agent steps** — dispatch by selected provider through `amplihack`.
-  Claude/Copilot retain their existing transport and result contracts. Codex uses
+  Claude uses stdin and a private system file; Copilot uses a fixed pointer
+  to a private system/task file. Codex uses
   `amplihack codex -- exec --output-last-message UNIQUE_FINAL_PATH
   [--model EXPLICIT_MODEL] -` in the effective workspace, without implicit
-  `--add-dir` or model selection. Full system/persona, leaf/no-reentry, task and
-  autonomy instructions are delivered through stdin for every prompt size.
+  `--add-dir` or model selection. Its system/persona, leaf/no-reentry, task and
+  autonomy envelope is delivered through stdin for every prompt size. Supplied
+  system text is preserved exactly for every provider.
+
+### Prompt transport
+
+The private `adapters::prompt_transport` module prepares input and owns temporary
+prompt resources. The command builder consumes transport metadata instead of raw
+instructions. Claude uses bare `-p` with the complete task on stdin and effective
+system instructions in a private `--system-prompt-file`. Copilot uses a fixed pointer
+to a private file containing both inputs and a grant for that file's directory.
+Codex retains stdin delivery and its existing executor.
+
+Each attempt receives fresh prompt resources with Unix directory mode `0700` and
+exclusively created file mode `0600`, written and closed before spawn. Ownership
+is independent of retained logs, with explicit cleanup and destructor fallback.
+Claude's monitor delivers stdin nonblockingly while observing cancellation and
+timeout policy, then closes stdin after complete delivery. Partial delivery fails
+even if the wrapper exits zero. Shared scoped signal ownership covers all backends
+through child retirement, I/O completion, prompt cleanup, result composition, and
+explicit handler restoration. Finalization removes prompt resources before retry
+delays or return, preserving typed interruption and cleanup failures alongside
+primary execution errors. See [agent prompt transport](agent-prompt-transport.md).
 
 ### Private Codex execution ownership
 
