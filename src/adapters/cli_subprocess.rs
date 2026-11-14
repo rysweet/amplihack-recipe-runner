@@ -952,7 +952,7 @@ impl CLISubprocessAdapter {
     }
 
     pub fn with_working_dir(mut self, dir: &str) -> Self {
-        log::debug!("CLISubprocessAdapter::with_working_dir: dir={:?}", dir);
+        log::debug!("CLISubprocessAdapter::with_working_dir: configuring directory");
         self.working_dir = dir.to_string();
         self
     }
@@ -1275,11 +1275,10 @@ impl CLISubprocessAdapter {
         timeout: Option<u64>,
     ) -> Result<String, anyhow::Error> {
         log::debug!(
-            "execute_agent_step_impl: prompt_len={}, has_system_prompt={}, model={:?}, working_dir={:?}",
+            "execute_agent_step_impl: prompt_len={}, has_system_prompt={}, model={:?}",
             prompt.len(),
             system_prompt.is_some(),
-            model,
-            working_dir
+            model
         );
         // Resolve the actual working directory for the agent.
         // Use the recipe's working_dir so agents operate against the real repo,
@@ -1316,9 +1315,8 @@ impl CLISubprocessAdapter {
         // the amplihack binary itself, masking the real error.
         if !resolved_cwd.is_dir() {
             anyhow::bail!(
-                "Agent working directory does not exist: {}. \
-                 Check that step-04 created the worktree successfully.",
-                resolved_cwd.display()
+                "Agent working directory does not exist. \
+                 Check that the configured working directory was created successfully."
             );
         }
 
@@ -1752,11 +1750,10 @@ impl Adapter for CLISubprocessAdapter {
         timeout: Option<u64>,
     ) -> Result<String, anyhow::Error> {
         log::debug!(
-            "CLISubprocessAdapter::execute_agent_step: prompt_len={}, model={:?}, timeout={:?}, working_dir={:?}",
+            "CLISubprocessAdapter::execute_agent_step: prompt_len={}, model={:?}, timeout={:?}",
             prompt.len(),
             model,
-            timeout,
-            working_dir
+            timeout
         );
         self.execute_agent_step_impl(prompt, system_prompt, model, working_dir, timeout)
     }
@@ -1769,9 +1766,8 @@ impl Adapter for CLISubprocessAdapter {
         extra_env: &std::collections::HashMap<String, String>,
     ) -> Result<String, anyhow::Error> {
         log::debug!(
-            "CLISubprocessAdapter::execute_bash_step: command_len={}, working_dir={:?}, timeout={:?}",
+            "CLISubprocessAdapter::execute_bash_step: command_len={}, timeout={:?}",
             command.len(),
-            working_dir,
             timeout
         );
         // #143: resolve the interpreter FIRST, from the PARENT environment.

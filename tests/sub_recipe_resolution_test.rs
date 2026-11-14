@@ -245,7 +245,7 @@ mod reference_validation {
     }
 
     #[test]
-    fn resolved_name_diagnostic_escapes_step_id_and_reference() {
+    fn resolved_name_diagnostic_escapes_step_id_and_omits_reference() {
         let dir = tempfile::tempdir().unwrap();
         let mut recipe = raw_recipe(json!([
             {"id": "dispatch\nstep", "recipe": "{{selected}}"}
@@ -258,7 +258,7 @@ mod reference_validation {
             .execute(&recipe, None);
         let error = diagnostic(&result, "dispatch\nstep");
         assert!(error.contains("dispatch\\nstep"), "{error:?}");
-        assert!(error.contains("bad\\nname"), "{error:?}");
+        assert!(!error.contains("bad\\nname"), "{error:?}");
         assert!(!error.contains("dispatch\nstep"), "{error:?}");
         assert!(!error.contains("bad\nname"), "{error:?}");
         assert!(error.contains("resolved"), "{error:?}");
@@ -280,9 +280,10 @@ mod reference_validation {
             .execute(&recipe, None);
         let error = diagnostic(&result, "dispatch");
         assert!(
-            error.contains("{{other}}"),
-            "report the once-rendered name: {error}"
+            error.contains("Invalid resolved sub-recipe name"),
+            "{error}"
         );
+        assert!(!error.contains("{{other}}"), "{error}");
         assert!(adapter.0.lock().unwrap().is_empty());
     }
 
@@ -303,8 +304,19 @@ mod reference_validation {
             vec!["PARENT_EXECUTED"],
             "{result:?}"
         );
-        let error = diagnostic(&result, "dispatch");
-        assert!(error.contains("invalid-child-dispatch"), "{error}");
+        assert!(!result.success);
+        let step = result
+            .step_results
+            .iter()
+            .find(|s| s.step_id == "dispatch")
+            .unwrap();
+        assert_eq!(step.status, StepStatus::Failed);
+        assert!(
+            step.error.contains("Failed to parse sub-recipe"),
+            "{}",
+            step.error
+        );
+        assert!(!step.error.contains("../escape"), "{}", step.error);
     }
 
     #[test]
@@ -491,8 +503,8 @@ fn missing_sub_recipe_diagnostic_lists_all_search_dirs() {
         .expect("dispatch step result missing");
     let err = dispatch.error.as_str();
     assert!(
-        err.contains("Sub-recipe 'child-step' not found"),
-        "diagnostic must name the missing sub-recipe; got: {err}"
+        err.contains("Sub-recipe could not be found"),
+        "diagnostic must identify the lookup failure; got: {err}"
     );
     assert!(
         err.contains("Searched the following directories"),

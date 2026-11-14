@@ -483,6 +483,265 @@ mod unix {
         assert_eq!(actual["context"]["secret"], SENTINEL);
     }
 
+    fn assert_private_diagnostics(out: &Output, sentinel: &str, debug: bool) {
+        let diagnostics = String::from_utf8_lossy(&out.stderr);
+        assert!(!diagnostics.contains(sentinel), "context value disclosed");
+        if debug {
+            assert!(
+                diagnostics.contains("DEBUG"),
+                "debug logging must be active"
+            );
+        }
+    }
+
+    fn failed_step(out: &Output, category: &str) -> Value {
+        assert_eq!(out.status.code(), Some(1));
+        let diagnostics = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            diagnostics.contains(category),
+            "failure must remain visible: {diagnostics}"
+        );
+        let actual: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(actual["success"], false);
+        assert_eq!(actual["step_results"][0]["status"], "failed");
+        assert!(
+            actual["step_results"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains(category)
+        );
+        actual
+    }
+
+    #[test]
+    fn rendered_bash_working_directory_is_used_without_disclosing_it_in_debug_logs() {
+        let f = Fixture::new(json!({"name":"bash-directory", "steps":[
+            {"id":"one", "working_dir":"{{private_dir}}", "command":"pwd -P; printf ran > bash-marker"}
+        ]}));
+        let private_dir = f.dir.path().join(SENTINEL);
+        fs::create_dir(&private_dir).unwrap();
+        f.write(&json!({"private_dir":private_dir}));
+        let out = f.file_command().env("RUST_LOG", "debug").output().unwrap();
+        assert_private_diagnostics(&out, SENTINEL, true);
+        let actual = result(out);
+        assert_eq!(
+            actual["step_results"][0]["output"].as_str().unwrap().trim(),
+            private_dir.canonicalize().unwrap().to_str().unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(private_dir.join("bash-marker")).unwrap(),
+            "ran"
+        );
+        assert!(!f.dir.path().join("bash-marker").exists());
+    }
+
+    #[test]
+    fn missing_rendered_bash_working_directory_fails_without_disclosing_it() {
+        let f = Fixture::new(json!({"name":"bash-directory", "steps":[
+            {"id":"one", "working_dir":"{{private_dir}}", "command":"printf ran > bash-marker"}
+        ]}));
+        f.write(&json!({"private_dir":f.dir.path().join(SENTINEL)}));
+        for debug in [false, true] {
+            let mut cmd = f.file_command();
+            if debug {
+                cmd.env("RUST_LOG", "debug");
+            }
+            let out = cmd.output().unwrap();
+            assert_private_diagnostics(&out, SENTINEL, debug);
+            let actual = failed_step(&out, "bash step failed");
+            assert!(
+                !actual["step_results"][0]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains(SENTINEL)
+            );
+            assert!(!f.dir.path().join("bash-marker").exists());
+        }
+    }
+
+    // Exercises both the ordinary subprocess and Codex launch paths locally.
+    // The marker records cwd independently of the runner's intentional output.
+    fn directory_launcher(f: &Fixture) -> PathBuf {
+        let launcher = f.dir.path().join("launcher");
+        fs::write(&launcher, "#!/bin/sh\npwd -P > \"${0%/*}/agent-cwd\"\nfinal=\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = --output-last-message ]; then shift; final=$1; fi\n  shift\ndone\nif [ -n \"$final\" ]; then\n  cat > /dev/null\n  printf launched > \"$final\"\nelse\n  printf launched\nfi\n").unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+        launcher
+    }
+
+    #[test]
+    fn rendered_agent_working_directory_is_used_without_disclosing_it_in_debug_logs() {
+        let f = Fixture::new(json!({"name":"agent-directory", "steps":[
+            {"id":"one", "type":"agent", "working_dir":"{{private_dir}}", "prompt":"Run the controlled launcher"}
+        ]}));
+        let private_dir = f.dir.path().join(SENTINEL);
+        fs::create_dir(&private_dir).unwrap();
+        f.write(&json!({"private_dir":private_dir}));
+        let launcher = directory_launcher(&f);
+        let marker = f.dir.path().join("agent-cwd");
+        for agent in ["claude", "codex"] {
+            let out = f
+                .file_command()
+                .arg("--launcher")
+                .arg(&launcher)
+                .args(["--agent-binary", agent])
+                .env("RUST_LOG", "debug")
+                .output()
+                .unwrap();
+            assert_private_diagnostics(&out, SENTINEL, true);
+            let actual = result(out);
+            assert_eq!(actual["step_results"][0]["output"], "launched");
+            assert_eq!(
+                fs::read_to_string(&marker).unwrap().trim(),
+                private_dir.canonicalize().unwrap().to_str().unwrap()
+            );
+            fs::remove_file(&marker).unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_rendered_agent_working_directory_fails_privately_before_launch() {
+        let f = Fixture::new(json!({"name":"agent-directory", "steps":[
+            {"id":"one", "type":"agent", "working_dir":"{{private_dir}}", "prompt":"Must not launch"}
+        ]}));
+        f.write(&json!({"private_dir":f.dir.path().join(SENTINEL)}));
+        let launcher = directory_launcher(&f);
+        for agent in ["claude", "codex"] {
+            for debug in [false, true] {
+                let mut cmd = f.file_command();
+                cmd.arg("--launcher")
+                    .arg(&launcher)
+                    .args(["--agent-binary", agent]);
+                if debug {
+                    cmd.env("RUST_LOG", "debug");
+                }
+                let out = cmd.output().unwrap();
+                assert_private_diagnostics(&out, SENTINEL, debug);
+                let actual = failed_step(&out, "working directory does not exist");
+                assert!(
+                    !actual["step_results"][0]["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains(SENTINEL)
+                );
+                assert!(!f.dir.path().join("agent-cwd").exists(), "agent launched");
+            }
+        }
+    }
+
+    const PRIVATE_RECIPE: &str = "CONTEXT_FILE_PRIVATE_RECIPE_211";
+
+    fn sub_recipe_fixture() -> Fixture {
+        let f = Fixture::new(json!({"name":"parent", "steps":[
+            {"id":"dispatch", "recipe":"{{private_name}}"}
+        ]}));
+        f.write(&json!({"private_name":PRIVATE_RECIPE}));
+        f
+    }
+
+    #[test]
+    fn rendered_sub_recipe_lookup_succeeds_without_disclosing_its_name_in_debug_logs() {
+        let f = sub_recipe_fixture();
+        fs::write(f.dir.path().join(format!("{PRIVATE_RECIPE}.yaml")),
+            "name: child\nsteps:\n  - id: child-step\n    command: 'printf child-ok > child-marker; printf child-ok'\n"
+        ).unwrap();
+        let out = f.file_command().env("RUST_LOG", "debug").output().unwrap();
+        assert_private_diagnostics(&out, PRIVATE_RECIPE, true);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("find_recipe_path"));
+        let actual = result(out);
+        assert_eq!(actual["step_results"][0]["status"], "completed");
+        assert_eq!(
+            fs::read_to_string(f.dir.path().join("child-marker")).unwrap(),
+            "child-ok"
+        );
+    }
+
+    #[test]
+    fn missing_rendered_sub_recipe_fails_without_disclosing_its_name() {
+        let f = sub_recipe_fixture();
+        for debug in [false, true] {
+            let mut cmd = f.file_command();
+            if debug {
+                cmd.env("RUST_LOG", "debug");
+            }
+            let out = cmd.output().unwrap();
+            assert_private_diagnostics(&out, PRIVATE_RECIPE, debug);
+            let actual = failed_step(&out, "Sub-recipe could not be found");
+            assert!(
+                !actual["step_results"][0]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains(PRIVATE_RECIPE)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_rendered_sub_recipe_name_fails_without_disclosing_it() {
+        let f = sub_recipe_fixture();
+        f.write(&json!({"private_name":format!("../{PRIVATE_RECIPE}")}));
+        let out = f.file_command().env("RUST_LOG", "debug").output().unwrap();
+        assert_private_diagnostics(&out, PRIVATE_RECIPE, true);
+        let actual = failed_step(&out, "Invalid resolved sub-recipe name");
+        assert!(
+            !actual["step_results"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains(PRIVATE_RECIPE)
+        );
+    }
+
+    #[test]
+    fn rejected_sub_recipe_symlink_does_not_disclose_the_candidate_filename() {
+        let f = sub_recipe_fixture();
+        let outside = tempfile::tempdir().unwrap();
+        let child = outside.path().join("child.yaml");
+        fs::write(
+            &child,
+            "name: child\nsteps:\n  - id: one\n    command: 'printf ran > child-marker'\n",
+        )
+        .unwrap();
+        symlink(&child, f.dir.path().join(format!("{PRIVATE_RECIPE}.yaml"))).unwrap();
+        let out = f.file_command().env("RUST_LOG", "debug").output().unwrap();
+        assert_private_diagnostics(&out, PRIVATE_RECIPE, true);
+        let diagnostics = String::from_utf8_lossy(&out.stderr);
+        assert!(diagnostics.contains("outside anchored search roots"));
+        failed_step(&out, "Sub-recipe could not be found");
+        assert!(!f.dir.path().join("child-marker").exists());
+        assert!(!outside.path().join("child-marker").exists());
+    }
+
+    #[test]
+    fn rendered_sub_recipe_parse_extends_and_execution_failures_keep_names_private() {
+        let f = sub_recipe_fixture();
+        for (yaml, category) in [
+            (
+                format!("name: child\nsteps: [{PRIVATE_RECIPE}"),
+                "Failed to parse sub-recipe",
+            ),
+            (
+                format!(
+                    "name: child\nextends: {PRIVATE_RECIPE}-missing\nsteps:\n  - id: one\n    command: true\n"
+                ),
+                "Failed to resolve extends for sub-recipe",
+            ),
+            (
+                "name: child\nsteps:\n  - id: one\n    command: 'exit 1'\n".to_string(),
+                "Sub-recipe failed",
+            ),
+        ] {
+            fs::write(f.dir.path().join(format!("{PRIVATE_RECIPE}.yaml")), yaml).unwrap();
+            let out = f.file_command().env("RUST_LOG", "debug").output().unwrap();
+            assert_private_diagnostics(&out, PRIVATE_RECIPE, true);
+            let actual = failed_step(&out, category);
+            assert!(
+                !actual["step_results"][0]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains(PRIVATE_RECIPE)
+            );
+        }
+    }
+
     #[test]
     fn condition_type_errors_do_not_print_the_loaded_value_in_diagnostics() {
         for condition in ["structured.strip()", "int(secret)", "float(secret)"] {

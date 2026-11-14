@@ -200,7 +200,7 @@ fn a_sub_recipe_resolves_only_from_explicit_directories() {
         assert_eq!(out.status.code(), Some(1), "{child}: {}", text(&out));
         let error = step_error(&out, "call");
         assert!(
-            error.contains(&format!("Sub-recipe '{child}' not found"))
+            error.contains("Sub-recipe could not be found")
                 && error.contains("default search is off"),
             "{child}: {error}"
         );

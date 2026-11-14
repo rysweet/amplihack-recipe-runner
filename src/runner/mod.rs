@@ -1361,9 +1361,8 @@ impl<A: Adapter> RecipeRunner<A> {
         ctx: &mut RecipeContext,
     ) -> Result<String, StepExecutionError> {
         log::debug!(
-            "execute_sub_recipe: step='{}', recipe={:?}, depth={}",
+            "execute_sub_recipe: step='{}', depth={}",
             diagnostic_identifier(&step.id),
-            step.recipe,
             self.depth.get()
         );
         let current_depth = self.depth.get();
@@ -1389,7 +1388,7 @@ impl<A: Adapter> RecipeRunner<A> {
             StepExecutionError {
                 step_id: step.id.clone(),
                 message: format!(
-                    "Invalid resolved sub-recipe name {recipe_name:?}: {reason}. {}",
+                    "Invalid resolved sub-recipe name: {reason}. {}",
                     sub_recipe_paths::RECIPE_NAME_GUIDANCE
                 ),
             }
@@ -1401,30 +1400,27 @@ impl<A: Adapter> RecipeRunner<A> {
             .ok_or_else(|| StepExecutionError {
                 step_id: step.id.clone(),
                 message: format!(
-                    "Sub-recipe '{}' not found. Searched the following directories (in order):\n{}",
-                    recipe_name,
+                    "Sub-recipe could not be found. Searched the following directories (in order):\n{}",
                     self.sub_recipe_search_diagnostic()
                 ),
             })?;
 
         let parser = RecipeParser::new();
-        let mut sub_recipe =
-            parser
-                .parse_file(Path::new(&path))
-                .map_err(|e| StepExecutionError {
-                    step_id: step.id.clone(),
-                    message: format!("Failed to parse sub-recipe '{}': {}", recipe_name, e),
-                })?;
+        let mut sub_recipe = parser
+            .parse_file(Path::new(&path))
+            // Parser errors can carry the selected filename or YAML payload.
+            // Keep the failure visible without exposing rendered context.
+            .map_err(|_| StepExecutionError {
+                step_id: step.id.clone(),
+                message: "Failed to parse sub-recipe".to_string(),
+            })?;
 
         // Resolve extends (single-level inheritance) if the sub-recipe uses it
         if sub_recipe.extends.is_some() {
-            resolve_extends(&mut sub_recipe, &self.recipe_search_dirs).map_err(|e| {
+            resolve_extends(&mut sub_recipe, &self.recipe_search_dirs).map_err(|_| {
                 StepExecutionError {
                     step_id: step.id.clone(),
-                    message: format!(
-                        "Failed to resolve extends for sub-recipe '{}': {}",
-                        recipe_name, e
-                    ),
+                    message: "Failed to resolve extends for sub-recipe".to_string(),
                 }
             })?;
         }
@@ -1493,13 +1489,13 @@ impl<A: Adapter> RecipeRunner<A> {
                             && (output.to_lowercase().contains("status: complete")
                                 || output.to_lowercase().contains("recovered")) =>
                     {
-                        info!("Sub-recipe '{}' recovered via agent", recipe_name);
+                        info!("Sub-recipe recovered via agent");
                         return Ok(output);
                     }
                     _ => {
                         let mut message = format!(
-                            "Sub-recipe '{}' failed and agentic recovery was unsuccessful.\n{}",
-                            recipe_name, failure_summary
+                            "Sub-recipe failed and agentic recovery was unsuccessful.\n{}",
+                            failure_summary
                         );
                         if let Some(diagnostic) = self.terminal.diagnostic().as_ref() {
                             message.push('\n');
@@ -1515,7 +1511,7 @@ impl<A: Adapter> RecipeRunner<A> {
 
             return Err(StepExecutionError {
                 step_id: step.id.clone(),
-                message: format!("Sub-recipe '{}' failed.\n{}", recipe_name, failure_summary),
+                message: format!("Sub-recipe failed.\n{}", failure_summary),
             });
         }
 
@@ -1525,8 +1521,7 @@ impl<A: Adapter> RecipeRunner<A> {
         }
 
         info!(
-            "Sub-recipe '{}' completed successfully (depth {})",
-            recipe_name,
+            "Sub-recipe completed successfully (depth {})",
             current_depth + 1
         );
         Ok(format!("{}", sub_result))
@@ -1599,14 +1594,13 @@ impl<A: Adapter> RecipeRunner<A> {
     }
 
     fn find_recipe_path(&self, name: &str) -> Option<String> {
-        log::debug!("find_recipe_path: name={:?}", name);
+        log::debug!("find_recipe_path: searching for recipe");
         // Security: reject names with path separators / parent-dir markers
         // before any filesystem resolution. Failures bubble up as part of
         // the Zero-BS diagnostic emitted by the caller.
         if let Err(reason) = sub_recipe_paths::validate_sub_recipe_name(name) {
             log::warn!(
-                "find_recipe_path: rejecting unsafe sub-recipe name {:?}: {}",
-                name,
+                "find_recipe_path: rejecting unsafe sub-recipe name: {}",
                 reason
             );
             return None;
@@ -1642,10 +1636,7 @@ impl<A: Adapter> RecipeRunner<A> {
             if sub_recipe_paths::is_within_any(&path, &anchored) {
                 return Some(path.display().to_string());
             }
-            log::warn!(
-                "find_recipe_path: rejecting candidate {} — resolves outside anchored search roots",
-                path.display()
-            );
+            log::warn!("find_recipe_path: rejecting candidate outside anchored search roots");
         }
 
         // 3. Fall back to discovery module's default search dirs
@@ -3011,7 +3002,7 @@ steps:
         assert!(!result.success);
         let error = &result.step_results[0].error;
         assert!(
-            error.contains("Sub-recipe 'child' not found")
+            error.contains("Sub-recipe could not be found")
                 && error.contains("default search is off"),
             "{error}"
         );

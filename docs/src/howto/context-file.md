@@ -75,5 +75,11 @@ JSON results can contain file-loaded values, as this example demonstrates.
 Agent prompt transport has its own contract; file context alone does not keep
 rendered prompts off launcher command lines.
 
+Runner diagnostics omit rendered step working directories and sub-recipe lookup
+names, including at DEBUG level. Directory and lookup failures remain visible
+through operation categories without the rendered values. Sub-recipe parse and
+inheritance failures also omit nested error details that could disclose selected
+filenames or recipe content.
+
 See the [context-file reference](../cli-reference.md#--context-file-path) for
 all JSON types, secure opening behavior and exit-code `4` diagnostics.

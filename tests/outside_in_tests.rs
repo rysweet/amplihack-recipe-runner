@@ -302,7 +302,7 @@ steps:
     let sub = find_step(&json, "run-sub").expect("run-sub step should exist");
     let error = sub["error"].as_str().unwrap();
     assert!(
-        error.contains("Sub-recipe 'sub-recipe-fail' failed"),
+        error.contains("Sub-recipe failed"),
         "error should mention the failed sub-recipe, got: {error}"
     );
     assert!(
