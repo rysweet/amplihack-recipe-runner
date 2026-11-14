@@ -68,6 +68,9 @@ impl Fixture {
             ])
             .env_remove("RECIPE_RUNNER_LOG_DIR")
             .env_remove("RECIPE_RUNNER_REQUIRE_AUDIT")
+            // These independent CLI runs must not join the host workflow's
+            // recovery journal when cargo test runs inside a recipe step.
+            .env_remove("AMPLIHACK_RECOVERY_ATTACHMENT")
             .env_remove("RUST_LOG");
         if validate_only {
             command.arg("--validate-only");

@@ -2,7 +2,7 @@
 title: Codex agent steps
 description: Codex execution, configuration, results, and terminal failure contracts.
 doc_type: reference
-last_updated: 2026-11-03
+last_updated: 2026-11-14
 ---
 
 # Codex agent steps
@@ -168,15 +168,40 @@ coverage of these boundaries.
 recipe-runner-rs --capabilities
 ```
 
-The standalone probe exits zero and writes exactly one JSON object, optionally followed by a newline, with empty stderr. For a Unix build with package version 0.5.0:
+The standalone probe exits zero and writes exactly one JSON object, optionally followed by a newline, with empty stderr. For a Unix build with package version 0.7.0:
 
 ```json
-{"capabilities":["codex_exec"],"schema_version":1,"version":"0.5.0"}
+{"capabilities":["codex_exec","durable_recovery_v1","context_file_v1","agent_prompt_file_v1"],"schema_version":1,"version":"0.7.0"}
 ```
 
-`version` is the compiled Cargo package version. The producer emits exactly these three keys. Unix builds advertise `codex_exec`; non-Unix builds emit an empty capability list because execution is unsupported. The probe runs before logging initialization, update checks, update-cache writes, network access, or agent startup, regardless of ambient logging/update settings. Mixed recipe/subcommand/option invocations with `--capabilities` are rejected before execution or update effects. Failed stdout writes report failure.
+`version` is the compiled Cargo package version. The producer emits exactly these three keys. Unix builds advertise `codex_exec`, `durable_recovery_v1`, `context_file_v1` and `agent_prompt_file_v1`; non-Unix builds emit an empty capability list. The probe runs before logging initialization, context-file loading, update checks, update-cache writes, network access, or agent startup, regardless of ambient logging/update settings. Mixed recipe/subcommand/option invocations with `--capabilities` are rejected before execution or update effects. Failed stdout writes report failure.
 
 Consumers require numeric `schema_version: 1` and membership of `codex_exec`. Compatible newer/custom builds may pass; an exact source SHA is a separate delivery pin, not part of this JSON. `codex_exec` promises full stdin instructions, final-message-only results, explicit failure propagation, and no implicit model.
+
+For file context, consumers check for the exact member `context_file_v1` separately.
+It promises the [`--context-file` contract](cli-reference.md#--context-file-path):
+secure startup ingestion, top-level string normalization, `--set` precedence,
+caller-owned file lifetime and controlled diagnostics. Builds without secure
+opening support omit the member; using the option on those builds exits `4`
+with the supplied path and the category `unsupported platform`.
+
+Amplihack uses this member to select file transport: it writes a `0600` context
+file in a `0700` directory under the run's private runtime folder, passes
+`--context-file` and removes the file when the run ends. Without the member,
+it retains `--set` transport. These permissions are the caller's policy; the
+runner imposes no permission-mode requirement on the context file.
+
+`context_file_v1` does not advertise agent prompt transport. Consumers requiring
+that separate contract check for the exact member `agent_prompt_file_v1`. It
+promises the [agent prompt transport](cli-reference.md#agent-prompt-transport):
+no rendered task or system prompt on the launcher's or agent's command line for
+any provider. Claude-family CLIs receive the system prompt through
+`--system-prompt-file`, which replaces their default system prompt, and the task
+on stdin behind a bare `-p`. Copilot receives a request to read a private file
+holding both. Codex keeps its stdin envelope. Private files are `0600` in a
+`0700` directory and are removed when the step returns, including after SIGINT
+or SIGTERM cancellation. Its presence cannot be inferred from file-context
+support, nor file-context support from it.
 
 A stale runner that rejects the probe is incompatible. Managed Amplihack installations can upgrade to their corrected immutable runner revision and re-probe. An incompatible explicit `RECIPE_RUNNER_RS_PATH` override must be replaced or unset by the operator; it is not silently replaced. Check the runner capability and launcher exec support separately.
 

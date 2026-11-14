@@ -24,11 +24,26 @@ root = pathlib.Path(os.environ["QA_RECORD_DIR"])
 root.mkdir(parents=True, exist_ok=True)
 attempt = len(list(root.glob("attempt-*.json"))) + 1
 args = sys.argv[1:]
-stdin = sys.stdin.buffer.read() if os.environ.get("QA_PROVIDER") == "codex" else b""
+# Codex and Claude read stdin; Copilot inherits it and must not be read.
+stdin = sys.stdin.buffer.read() if os.environ.get("QA_PROVIDER") in ("codex", "claude") else b""
 final = None
 if "--output-last-message" in args:
     final = pathlib.Path(args[args.index("--output-last-message") + 1])
+payload = ""
+if os.environ.get("QA_PROVIDER") == "claude":
+    # #205: system prompt from the file, task from stdin behind a bare -p.
+    prompt_file = pathlib.Path(args[args.index("--system-prompt-file") + 1])
+    payload = prompt_file.read_text() + "\n" + stdin.decode()
+elif os.environ.get("QA_PROVIDER") == "copilot":
+    # Follow the -p request by reading the file it names, as the model does.
+    request = args[args.index("-p") + 1]
+    # amplihack's FILE_REFERENCE_TEMPLATE, which `amplihack copilot` passes through.
+    prefix = "Read and follow the complete instructions in the file "
+    suffix = ". Its contents are the task prompt."
+    assert request.startswith(prefix) and request.endswith(suffix), request
+    payload = pathlib.Path(request[len(prefix):-len(suffix)]).read_text()
 record = {
+    "payload": payload,
     "args": args,
     "provider": os.environ["QA_PROVIDER"],
     "attempt": attempt,
@@ -158,15 +173,22 @@ assert result["success"] is True, result
 assert result["step_results"][0]["output"] == "LEGACY_RESULT_SENTINEL"
 records = list(root.glob("attempt-*.json"))
 assert len(records) == 1, [p.name for p in records]
-args = json.loads(records[0].read_text())["args"]
+record = json.loads(records[0].read_text())
+args = record["args"]
 assert args[:2] == [provider, "--"], args
 assert "exec" not in args, args
 assert "--output-last-message" not in args, args
 assert "-p" in args, args
-assert any("TASK_SENTINEL" in arg for arg in args), args
+for flag in ("--system-prompt", "--append-system-prompt", "--append-system-prompt-file"):
+    assert flag not in args, args
 if provider == "claude":
-    index = args.index("--system-prompt")
-    assert "PERSONA_SENTINEL" in args[index + 1], args
+    assert "--system-prompt-file" in args, args
+    after = args[args.index("-p") + 1:]
+    assert not after or after[0].startswith("-"), args
+for marker in ("TASK_SENTINEL", "PERSONA_SENTINEL"):
+    assert all(marker not in arg for arg in args), args
+    assert marker in record["payload"], record
+assert "Do not invoke /dev" in record["payload"]
 PY
 }
 

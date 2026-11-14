@@ -30,6 +30,7 @@ fn json_repair_passes_the_step_model_to_the_launcher() {
              c=$(cat '{count}' 2>/dev/null || echo 0)\n\
              c=$((c+1))\n\
              echo \"$c\" > '{count}'\n\
+             cat >/dev/null\n\
              : > '{dir}/argv-'\"$c\"\n\
              for a in \"$@\"; do printf '%s\\0' \"$a\" >> '{dir}/argv-'\"$c\"; done\n\
              if [ \"$c\" = 1 ]; then echo 'not json'; else echo '{{\"ok\":true}}'; fi\n",

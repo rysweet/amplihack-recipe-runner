@@ -104,7 +104,8 @@ impl RecipeParser {
 
     /// Parse a recipe YAML file from disk.
     pub fn parse_file(&self, path: &Path) -> Result<Recipe, ParseError> {
-        info!("RecipeParser::parse_file: parsing {:?}", path);
+        // The path may be selected by confidential, rendered context.
+        info!("RecipeParser::parse_file: parsing recipe file");
         if !path.is_file() {
             return Err(ParseError::FileNotFound(path.display().to_string()));
         }

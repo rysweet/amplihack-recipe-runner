@@ -245,7 +245,7 @@ mod reference_validation {
     }
 
     #[test]
-    fn resolved_name_diagnostic_escapes_step_id_and_reference() {
+    fn resolved_name_diagnostic_escapes_step_id_and_omits_reference() {
         let dir = tempfile::tempdir().unwrap();
         let mut recipe = raw_recipe(json!([
             {"id": "dispatch\nstep", "recipe": "{{selected}}"}
@@ -258,7 +258,7 @@ mod reference_validation {
             .execute(&recipe, None);
         let error = diagnostic(&result, "dispatch\nstep");
         assert!(error.contains("dispatch\\nstep"), "{error:?}");
-        assert!(error.contains("bad\\nname"), "{error:?}");
+        assert!(!error.contains("bad\\nname"), "{error:?}");
         assert!(!error.contains("dispatch\nstep"), "{error:?}");
         assert!(!error.contains("bad\nname"), "{error:?}");
         assert!(error.contains("resolved"), "{error:?}");
@@ -280,9 +280,10 @@ mod reference_validation {
             .execute(&recipe, None);
         let error = diagnostic(&result, "dispatch");
         assert!(
-            error.contains("{{other}}"),
-            "report the once-rendered name: {error}"
+            error.contains("Invalid resolved sub-recipe name"),
+            "{error}"
         );
+        assert!(!error.contains("{{other}}"), "{error}");
         assert!(adapter.0.lock().unwrap().is_empty());
     }
 
@@ -303,7 +304,13 @@ mod reference_validation {
             vec!["PARENT_EXECUTED"],
             "{result:?}"
         );
+        // A fixed sub-recipe name keeps the parser's detail (#211 redacts
+        // only names rendered from context).
         let error = diagnostic(&result, "dispatch");
+        assert!(
+            error.contains("Failed to parse sub-recipe 'child'"),
+            "{error}"
+        );
         assert!(error.contains("invalid-child-dispatch"), "{error}");
     }
 

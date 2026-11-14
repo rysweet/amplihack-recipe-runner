@@ -320,14 +320,17 @@ pub trait Adapter: Sync {
 
 The production adapter spawns subprocesses:
 
-- **Bash steps** — `<bash> -c <command>`, or `<bash> <script-file>` when the
-  command exceeds 64 KiB, optionally wrapped with `timeout`. `<bash>` is a
+- **Bash steps** — `<bash> <script-file>`, where the private script file holds
+  the rendered command at every size, optionally wrapped with `timeout`. `<bash>` is a
   single absolute path resolved in the parent process (see
   [Bash interpreter resolution](#bash-interpreter-resolution)). Lifecycle hooks
   (`pre_step`, `post_step`, `on_error`) take the same path, with a fixed 30 s
   timeout.
 - **Agent steps** — dispatch by selected provider through `amplihack`.
-  Claude/Copilot retain their existing transport and result contracts. Codex uses
+  Claude-family CLIs get the system prompt through `--system-prompt-file` and
+  the task on stdin behind a bare `-p`; Copilot gets a request to read a private
+  file holding both (see
+  [Agent prompt transport](cli-reference.md#agent-prompt-transport)). Codex uses
   `amplihack codex -- exec --output-last-message UNIQUE_FINAL_PATH
   [--model EXPLICIT_MODEL] -` in the effective workspace, without implicit
   `--add-dir` or model selection. Full system/persona, leaf/no-reentry, task and
@@ -493,8 +496,8 @@ step `env:` blocks and `RECIPE_VAR_*` values — over the top, so a recipe *can*
 put `AMPLIHACK_BASH` and `PATH` into the child environment. Resolving above that
 merge makes it structurally impossible for recipe YAML to choose the interpreter.
 The cheap side benefits follow from the same placement: a misconfigured
-`AMPLIHACK_BASH` aborts before any env-budget computation and before the >64 KiB
-tempfile spill, so it costs nothing and leaves nothing behind, and the
+`AMPLIHACK_BASH` aborts before any env-budget computation and before the step's
+private script file is written, so it costs nothing and leaves nothing behind, and the
 interpreter log line lands next to the step-entry line an operator is reading.
 
 The validation predicate is a **fail-fast diagnostic, not a security control**.
@@ -519,15 +522,14 @@ in the parent makes the question vacuous, because `execvp` never searches
 `PATH` for an argument containing `/`.
 
 That guarantee only holds if there is exactly one place the interpreter can
-enter the argument vector, so all four shapes are produced by one pure builder
-and spawned from one call site:
+enter the argument vector, so both shapes are produced by one pure builder and
+spawned from one call site. The command itself is never an argument: every step
+runs from a private script file, so rendered source stays off argv (#211).
 
-| Script file | Timeout | argv |
-|---|---|---|
-| no  | no  | `[<bash>, -c, <command>]` |
-| no  | yes | `[timeout, <secs>, <bash>, -c, <command>]` |
-| yes | no  | `[<bash>, <script-file>]` |
-| yes | yes | `[timeout, <secs>, <bash>, <script-file>]` |
+| Timeout | argv |
+|---|---|
+| no  | `[<bash>, <script-file>]` |
+| yes | `[timeout, <secs>, <bash>, <script-file>]` |
 
 argv is built as `OsString`s, so a script path that is not valid UTF-8 is passed
 through intact rather than being lossily collapsed.

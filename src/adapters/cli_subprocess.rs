@@ -41,9 +41,27 @@ const RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT: &str = "You are already inside an a
      /dev, dev-orchestrator, ultrathink, smart-orchestrator, or any other workflow or recipe \
      runner. Execute the requested step directly and return only the output requested by this \
      step.";
-const MAX_INLINE_AGENT_PROMPT_BYTES: usize = 32 * 1024;
-const FILE_BACKED_INLINE_PROMPT_BYTES: usize = 8 * 1024;
-const FILE_BACKED_PROMPT_CONTINUATION_NOTE: &str = "\n\nIMPORTANT: Additional task instructions, output requirements, and context continue in the appended system prompt. Treat that appended content as part of this same request and follow it fully.";
+/// Name of the private prompt file inside each attempt's 0700 temporary
+/// directory. Claude-family CLIs receive it with `--system-prompt-file`;
+/// Copilot is asked to read it.
+const AGENT_PROMPT_FILE: &str = "agent-system-prompt.md";
+/// How long the runner waits, after an agent exits, for the stdin writer to
+/// report how the write ended (#205). The result is only logged; a writer
+/// still blocked after this is left detached.
+const TASK_DELIVERY_GRACE: Duration = Duration::from_secs(2);
+/// amplihack's pointer sentence for Copilot, split around the file path.
+///
+/// Source: amplihack-rs `crates/amplihack-utils/src/prompt_delivery.rs`,
+/// `FILE_REFERENCE_TEMPLATE` ("Read and follow the complete instructions in
+/// the file {path}. Its contents are the task prompt.") and
+/// `FILE_REFERENCE_PREFIX`, identical in v1.2.157, v1.2.158 and v1.2.161.
+/// `amplihack copilot` passes a `-p` value that starts with
+/// `FILE_REFERENCE_PREFIX` through unchanged (`codex_copilot_rewrite.rs`).
+/// Any other value it writes into a second private file and points Copilot at
+/// that file, so the task would sit two model-driven file reads away.
+const AMPLIHACK_FILE_REFERENCE_PREFIX: &str =
+    "Read and follow the complete instructions in the file ";
+const AMPLIHACK_FILE_REFERENCE_SUFFIX: &str = ". Its contents are the task prompt.";
 
 /// Read at most `max_bytes + 1` bytes from `path`, returning UTF-8 (lossy).
 ///
@@ -420,55 +438,115 @@ fn quote_diagnostic_path(path: &Path) -> String {
     escaped
 }
 
-/// What bash should execute for one step.
-#[derive(Clone, Copy)]
-pub(crate) enum BashInvocation<'a> {
-    /// A script spilled to a tempfile, past `BASH_INLINE_LIMIT`.
-    File(&'a Path),
-    /// The command passed inline via `-c`.
-    Inline(&'a str),
-}
-
-/// #143: the complete argv for one bash step; `argv[0]` is the program.
-///
-/// One builder for all four shapes is what makes "every arm runs the same
-/// interpreter" structural rather than merely asserted — there is exactly one
-/// place the interpreter can enter the vector.
-///
-/// `OsString` rather than `&str`: a script path that is not valid UTF-8 passes
-/// through intact instead of being lossily collapsed to an empty argument.
-pub(crate) fn bash_command_argv(
-    bash: &Path,
-    inv: BashInvocation<'_>,
-    timeout: Option<u64>,
-) -> Vec<OsString> {
-    let mut argv: Vec<OsString> = Vec::with_capacity(5);
+/// #143: the complete argv for one file-backed bash step; `argv[0]` is the program.
+/// The resolved interpreter is shared by timed and untimed execution.
+/// `OsString` preserves script paths that are not valid UTF-8.
+pub(crate) fn bash_command_argv(bash: &Path, script: &Path, timeout: Option<u64>) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = Vec::with_capacity(4);
     if let Some(secs) = timeout {
         argv.push(OsString::from("timeout"));
         argv.push(OsString::from(secs.to_string()));
     }
     argv.push(bash.as_os_str().to_os_string());
-    match inv {
-        BashInvocation::File(script) => argv.push(script.as_os_str().to_os_string()),
-        BashInvocation::Inline(command) => {
-            argv.push(OsString::from("-c"));
-            argv.push(OsString::from(command));
-        }
-    }
+    argv.push(script.as_os_str().to_os_string());
     argv
 }
 
-/// The spawn-failure `with_context` message for this arm, preserved verbatim
-/// from the four pre-#143 match arms so operator-facing text does not regress.
-pub(crate) fn bash_spawn_context(inv: &BashInvocation<'_>, timeout: Option<u64>) -> &'static str {
-    match (inv, timeout) {
-        (BashInvocation::File(_), Some(_)) => {
-            "Failed to execute file-backed bash step with timeout"
-        }
-        (BashInvocation::File(_), None) => "Failed to execute file-backed bash step",
-        (BashInvocation::Inline(_), Some(_)) => "Failed to execute bash step with timeout",
-        (BashInvocation::Inline(_), None) => "Failed to execute bash step",
+/// Spawn-failure context without including rendered script contents.
+pub(crate) fn bash_spawn_context(timeout: Option<u64>) -> &'static str {
+    match timeout {
+        Some(_) => "Failed to execute file-backed bash step with timeout",
+        None => "Failed to execute file-backed bash step",
     }
+}
+
+/// #205: write an agent's task to its stdin on a separate thread, then close
+/// stdin. A task larger than the pipe buffer, or an agent slow to read it,
+/// then cannot block the timeout and cancellation checks.
+fn spawn_task_writer(
+    mut stdin: std::process::ChildStdin,
+    task: String,
+) -> std::thread::JoinHandle<std::io::Result<()>> {
+    std::thread::spawn(move || {
+        stdin.write_all(task.as_bytes())?;
+        stdin.flush()
+        // Dropping `stdin` closes the pipe, so the agent sees EOF.
+    })
+}
+
+/// How the stdin write ended once the agent had exited (#205).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskDelivery {
+    /// Every byte was accepted by the pipe and stdin was closed. A pipe
+    /// accepts up to its capacity (64 KiB by default on Linux) whether or not
+    /// anyone reads it, so this does not show that the agent read the task.
+    Written,
+    /// The write failed, usually with `BrokenPipe` because every reader had
+    /// closed stdin before the whole task was written.
+    Failed(std::io::ErrorKind),
+    /// The writer was still blocked after the grace period: a process still
+    /// holds stdin open without reading it. The writer is left detached and
+    /// ends when that process closes stdin.
+    StillBlocked,
+    /// The writer thread panicked.
+    Panicked,
+}
+
+impl TaskDelivery {
+    /// Fixed-text warning for an incomplete write; never contains task text.
+    fn warning(self) -> Option<String> {
+        let what = match self {
+            TaskDelivery::Written => return None,
+            TaskDelivery::Failed(kind) => format!("the stdin write failed ({kind:?})"),
+            TaskDelivery::StillBlocked => {
+                "the stdin write was still blocked after the agent exited".to_string()
+            }
+            TaskDelivery::Panicked => "the stdin writer panicked".to_string(),
+        };
+        Some(format!(
+            "Agent exited 0 before its whole task was written to stdin: {what}. \
+             The step keeps the agent's result."
+        ))
+    }
+}
+
+/// Wait up to `grace` for the stdin writer to finish after the agent has
+/// exited, and say how the write ended.
+///
+/// The result is diagnostic only. Whether a write below the pipe capacity
+/// fails depends on whether the agent closed stdin before the writer ran,
+/// which is a matter of scheduling, so it cannot decide a step's outcome:
+/// the agent's exit status does.
+fn finish_task_delivery(
+    writer: std::thread::JoinHandle<std::io::Result<()>>,
+    grace: Duration,
+) -> TaskDelivery {
+    let deadline = Instant::now() + grace;
+    while !writer.is_finished() {
+        if Instant::now() >= deadline {
+            return TaskDelivery::StillBlocked;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    match writer.join() {
+        Ok(Ok(())) => TaskDelivery::Written,
+        Ok(Err(error)) => TaskDelivery::Failed(error.kind()),
+        Err(_) => TaskDelivery::Panicked,
+    }
+}
+
+/// Rate-limit backoff that still honours SIGINT/SIGTERM while waiting.
+fn sleep_unless_cancelled(wait: Duration) -> Result<(), anyhow::Error> {
+    let started = Instant::now();
+    while started.elapsed() < wait {
+        #[cfg(unix)]
+        super::codex_exec::check_cancellation()?;
+        std::thread::sleep(
+            wait.saturating_sub(started.elapsed())
+                .min(Duration::from_millis(100)),
+        );
+    }
+    Ok(())
 }
 
 /// Captured child output as a trimmed `String`, reusing the capture buffer.
@@ -505,7 +583,7 @@ fn into_trimmed_string(bytes: Vec<u8>) -> String {
 /// `Display`, and `Debug` without leaking secrets (R1).
 #[derive(Debug, Clone)]
 pub(crate) struct EnvBudgetError {
-    /// Names of the protected variables that cannot be dropped. Names only.
+    /// Diagnostic names of protected variables; nested recipe names are masked.
     offending: Vec<String>,
     /// Total bytes required by all protected variables (a size, not a value).
     protected_bytes: usize,
@@ -514,7 +592,7 @@ pub(crate) struct EnvBudgetError {
 }
 
 impl EnvBudgetError {
-    /// The protected variable names (never values) that overflowed the budget.
+    /// Diagnostic names (never values) of variables that overflowed the budget.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn offending_vars(&self) -> &[String] {
         &self.offending
@@ -568,7 +646,10 @@ pub(crate) fn bounded_env(
     // (names only) lets the operator move the payload out of the environment
     // rather than hitting an opaque E2BIG.
     if protected_bytes > budget {
-        let offending: Vec<String> = protected.iter().map(|(k, _)| k.clone()).collect();
+        let offending: Vec<String> = protected
+            .iter()
+            .map(|(k, _)| env_spill::diagnostic_name(k).to_string())
+            .collect();
         log::error!(
             "bounded_env: protected env var(s) exceed measured budget ({} > {} bytes); \
              refusing to spawn. Offending (names only): {:?}. Move large inherited or \
@@ -736,7 +817,7 @@ pub struct CLISubprocessAdapter {
     launcher: Option<std::path::PathBuf>,
     /// Whether to pass `--allow-all-tools` to the Copilot CLI. Default `true`.
     allow_all_tools: bool,
-    /// Whether to pass `--add-dir <working directory>` to the agent CLI.
+    /// Whether to pass `--add-dir .` from the effective agent working directory.
     /// Default `true`.
     add_working_dir: bool,
     /// When `Some`, only these parent variables reach agent and shell
@@ -952,7 +1033,7 @@ impl CLISubprocessAdapter {
     }
 
     pub fn with_working_dir(mut self, dir: &str) -> Self {
-        log::debug!("CLISubprocessAdapter::with_working_dir: dir={:?}", dir);
+        log::debug!("CLISubprocessAdapter::with_working_dir: configuring directory");
         self.working_dir = dir.to_string();
         self
     }
@@ -1035,23 +1116,6 @@ impl CLISubprocessAdapter {
         child_env
     }
 
-    fn supports_file_backed_prompt_transport(&self) -> bool {
-        // Claude-family CLIs support --append-system-prompt-file for overflow.
-        // Copilot CLI does not, but we still need to avoid E2BIG.
-        // For Copilot: truncate -p and write overflow to a prompt file
-        // in the working dir that the agent can read via --add-dir.
-        true
-    }
-
-    fn should_use_file_backed_prompt_transport(
-        &self,
-        prompt: &str,
-        system_prompt: Option<&str>,
-    ) -> bool {
-        self.supports_file_backed_prompt_transport()
-            && prompt.len() + system_prompt.map_or(0, str::len) > MAX_INLINE_AGENT_PROMPT_BYTES
-    }
-
     fn build_effective_system_prompt(system_prompt: Option<&str>) -> String {
         match system_prompt.map(str::trim).filter(|s| !s.is_empty()) {
             Some(existing) => format!("{existing}\n\n{RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT}"),
@@ -1094,69 +1158,22 @@ impl CLISubprocessAdapter {
         Ok(())
     }
 
-    fn clamp_char_boundary(text: &str, max_bytes: usize) -> usize {
-        let mut boundary = max_bytes.min(text.len());
-        while boundary > 0 && !text.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        boundary
+    /// Claude-family CLIs (`claude`, `launch`, `RustyClawd`) read the task
+    /// from stdin behind a bare `-p` and the system prompt from
+    /// `--system-prompt-file` (#205).
+    fn reads_task_from_stdin(&self) -> bool {
+        matches!(self.cli.as_str(), "claude" | "launch" | "RustyClawd")
     }
 
-    fn build_file_backed_prompt_payload(
-        &self,
-        output_dir: &std::path::Path,
-        prompt: &str,
-        system_prompt: Option<&str>,
-    ) -> Result<(String, Option<std::path::PathBuf>), anyhow::Error> {
-        let prompt_file_path = output_dir.join("agent-system-prompt.md");
-        let preview_boundary = Self::clamp_char_boundary(prompt, FILE_BACKED_INLINE_PROMPT_BYTES);
-        let prompt_overflow = if preview_boundary < prompt.len() {
-            &prompt[preview_boundary..]
-        } else {
-            ""
-        };
-
-        let mut inline_prompt = if preview_boundary > 0 {
-            prompt[..preview_boundary].to_string()
-        } else {
-            String::new()
-        };
-        if !prompt_overflow.is_empty() {
-            if matches!(self.cli.as_str(), "claude" | "launch" | "RustyClawd") {
-                inline_prompt.push_str(FILE_BACKED_PROMPT_CONTINUATION_NOTE);
-            } else {
-                // Non-Claude CLIs only see the file via --add-dir, so name it.
-                inline_prompt.push_str(&format!(
-                    "\n\nIMPORTANT: Additional task instructions, output requirements, and \
-                     context continue in the file {}. Read that file and treat its content \
-                     as part of this same request and follow it fully.",
-                    prompt_file_path.display()
-                ));
-            }
-        }
-
-        let mut appended_prompt = String::new();
-        if let Some(sp) = system_prompt
-            && !sp.is_empty()
-        {
-            appended_prompt.push_str(sp);
-        }
-        if !prompt_overflow.is_empty() {
-            if !appended_prompt.is_empty() {
-                appended_prompt.push_str("\n\n");
-            }
-            appended_prompt.push_str("# Continued task instructions\n\n");
-            appended_prompt.push_str(prompt_overflow);
-        }
-
-        let prompt_file = if appended_prompt.is_empty() {
-            None
-        } else {
-            Self::write_private_prompt_file(&prompt_file_path, &appended_prompt)?;
-            Some(prompt_file_path)
-        };
-
-        Ok((inline_prompt, prompt_file))
+    /// Copilot's only prompt argument: amplihack's own pointer sentence
+    /// naming the private prompt file, so `amplihack copilot` passes it
+    /// through unchanged and Copilot reads the task in one file read. The
+    /// path is a random temporary path, not recipe content.
+    fn copilot_prompt_request(prompt_file: &Path) -> String {
+        format!(
+            "{AMPLIHACK_FILE_REFERENCE_PREFIX}{}{AMPLIHACK_FILE_REFERENCE_SUFFIX}",
+            prompt_file.display()
+        )
     }
 
     fn build_agent_command(
@@ -1188,8 +1205,9 @@ impl CLISubprocessAdapter {
                 .into(),
         };
         let mut cmd = std::process::Command::new(launcher);
+        cmd.current_dir(resolved_cwd);
         cmd.arg(&self.cli);
-        // All subsequent flags (-p, --model, --add-dir, --system-prompt, etc.)
+        // All subsequent flags (-p, --model, --add-dir, --system-prompt-file, etc.)
         // are passthrough args for the underlying CLI (claude, copilot, codex).
         // The `amplihack <agent>` subcommand requires `--` to separate its own
         // flags from passthrough args (#4342).
@@ -1217,42 +1235,35 @@ impl CLISubprocessAdapter {
         }
         let effective_system_prompt = Self::build_effective_system_prompt(system_prompt);
 
-        if self.should_use_file_backed_prompt_transport(prompt, Some(&effective_system_prompt)) {
-            let (inline_prompt, prompt_file) = self.build_file_backed_prompt_payload(
-                output_dir,
-                prompt,
-                Some(&effective_system_prompt),
-            )?;
-            log::info!(
-                "Using file-backed prompt transport for '{}' (prompt={} bytes, system_prompt={} bytes)",
-                self.cli,
-                prompt.len(),
-                effective_system_prompt.len()
-            );
-            if let Some(ref pf) = prompt_file {
-                // Claude-family CLIs read the file via --append-system-prompt-file.
-                // (--append-system-prompt takes TEXT: passing the path there
-                // dropped the overflow and the no-reentry guard, #159.)
-                // Copilot CLI does not — use --add-dir so the agent can read the file.
-                if matches!(self.cli.as_str(), "claude" | "launch" | "RustyClawd") {
-                    cmd.args(["--append-system-prompt-file", &pf.to_string_lossy()]);
-                } else {
-                    // For Copilot and others: make the prompt file accessible via --add-dir
-                    // and include a note in the inline prompt pointing to it.
-                    cmd.args(["--add-dir", &output_dir.to_string_lossy()]);
-                }
-            }
-            cmd.args(["-p", &inline_prompt]);
+        // #205/#211: no rendered prompt or system text goes on the wrapper or
+        // agent argv, whatever its size.
+        let prompt_file = output_dir.join(AGENT_PROMPT_FILE);
+        if self.reads_task_from_stdin() {
+            // `--system-prompt-file` replaces the CLI's default system prompt,
+            // as `--system-prompt <text>` did before; it is not the appending
+            // `--append-system-prompt-file`. The task stays the user turn: the
+            // caller writes it to stdin, which a bare `-p` reads. Whatever
+            // follows `-p` is another flag (`--add-dir`, `--model`) or
+            // nothing, so neither a wrapper nor the CLI takes it as the
+            // prompt.
+            Self::write_private_prompt_file(&prompt_file, &effective_system_prompt)?;
+            cmd.arg("--system-prompt-file").arg(&prompt_file);
+            cmd.arg("-p");
         } else {
-            cmd.args(["-p", prompt]);
-            // Only pass --system-prompt for CLIs that support it
-            if matches!(self.cli.as_str(), "claude" | "launch" | "RustyClawd") {
-                cmd.args(["--system-prompt", &effective_system_prompt]);
-            }
+            // Copilot has no system-prompt or stdin prompt input here: the
+            // file holds both parts and the model reads it with its file tool,
+            // through the `--add-dir` grant for the file's directory.
+            let content = format!("{effective_system_prompt}\n\n# Task instructions\n\n{prompt}");
+            Self::write_private_prompt_file(&prompt_file, &content)?;
+            cmd.arg("--add-dir").arg(output_dir);
+            cmd.arg("-p")
+                .arg(Self::copilot_prompt_request(&prompt_file));
         }
 
         if self.add_working_dir {
-            cmd.args(["--add-dir", &resolved_cwd.to_string_lossy()]);
+            // The child already runs in resolved_cwd. Grant the same access
+            // without exposing a context-rendered path on wrapper/agent argv.
+            cmd.args(["--add-dir", "."]);
         }
         if let Some(m) = model {
             cmd.args(["--model", m]);
@@ -1275,11 +1286,10 @@ impl CLISubprocessAdapter {
         timeout: Option<u64>,
     ) -> Result<String, anyhow::Error> {
         log::debug!(
-            "execute_agent_step_impl: prompt_len={}, has_system_prompt={}, model={:?}, working_dir={:?}",
+            "execute_agent_step_impl: prompt_len={}, has_system_prompt={}, model={:?}",
             prompt.len(),
             system_prompt.is_some(),
-            model,
-            working_dir
+            model
         );
         // Resolve the actual working directory for the agent.
         // Use the recipe's working_dir so agents operate against the real repo,
@@ -1297,11 +1307,8 @@ impl CLISubprocessAdapter {
             }
         };
 
-        // Canonicalize to an absolute path so downstream args like --add-dir
-        // are not re-resolved against the child process cwd. Without this,
-        // a relative resolved_cwd like "./worktrees/foo" gets passed to
-        // copilot's --add-dir, which copilot then joins to its cwd
-        // (already <worktree>) producing a doubled path that doesn't exist.
+        // Resolve the child working directory before launch, independently of
+        // the parent's cwd. Directory grants use `.` relative to this child cwd.
         let resolved_cwd = match resolved_cwd.canonicalize() {
             Ok(p) => p,
             Err(_) => {
@@ -1316,9 +1323,8 @@ impl CLISubprocessAdapter {
         // the amplihack binary itself, masking the real error.
         if !resolved_cwd.is_dir() {
             anyhow::bail!(
-                "Agent working directory does not exist: {}. \
-                 Check that step-04 created the worktree successfully.",
-                resolved_cwd.display()
+                "Agent working directory does not exist. \
+                 Check that the configured working directory was created successfully."
             );
         }
 
@@ -1403,11 +1409,34 @@ impl CLISubprocessAdapter {
             return result;
         }
 
-        // Create a temp directory for the output log file only.
+        // #205: own SIGINT/SIGTERM while the step runs, as Codex steps do, so a
+        // cancelled step stops its agent and removes the private prompt file
+        // instead of the runner dying with the file left behind. The attempts
+        // own the temporary directory, so it is removed before the signal
+        // dispositions are restored.
+        #[cfg(unix)]
+        let cancellation = super::codex_exec::Cancellation::install()?;
+        let result = self.run_agent_attempts(prompt, system_prompt, model, &resolved_cwd, timeout);
+        #[cfg(unix)]
+        let result = super::codex_exec::finish_resources(result, cancellation.close());
+        result
+    }
+
+    /// Claude-family and Copilot attempts, with bounded rate-limit retries.
+    fn run_agent_attempts(
+        &self,
+        prompt: &str,
+        system_prompt: Option<&str>,
+        model: Option<&str>,
+        resolved_cwd: &Path,
+        timeout: Option<u64>,
+    ) -> Result<String, anyhow::Error> {
+        // Own the private prompt and output files until all attempts finish.
         // The agent process itself runs from the resolved repo cwd.
         let temp_dir = tempfile::tempdir()
             .with_context(|| "Failed to create temp directory for agent output")?;
         let output_log_dir = temp_dir.path();
+        let stdin_task = self.reads_task_from_stdin();
 
         // Append non-interactive footer so nested sessions never hang (#2464)
         let full_prompt = format!("{}{}", prompt, NON_INTERACTIVE_FOOTER);
@@ -1445,7 +1474,8 @@ impl CLISubprocessAdapter {
             // Create output log file in temp dir (not in repo to avoid polluting it).
             // The attempt number keeps per-attempt filenames unique.
             let output_dir = output_log_dir.join(".recipe-output");
-            std::fs::create_dir_all(&output_dir)?;
+            // 0700, so the 0600 prompt file sits in a private directory (#205).
+            create_private_log_dir(&output_dir)?;
             let output_name = format!(
                 "agent-step-{}-{}.log",
                 attempt,
@@ -1497,19 +1527,26 @@ impl CLISubprocessAdapter {
             // The agent runs from the real repo/worktree cwd, not a temp dir.
             let mut cmd = self.build_agent_command(
                 &output_dir,
-                &resolved_cwd,
+                resolved_cwd,
                 &full_prompt,
                 system_prompt,
                 effective_model,
             )?;
+            if stdin_task {
+                cmd.stdin(std::process::Stdio::piped());
+            }
             let mut child = cmd
-                .current_dir(&resolved_cwd)
                 .env_clear()
                 .envs(bounded_child.iter().map(|(k, v)| (k, v)))
                 .stdout(log_fh)
                 .stderr(stderr_fh)
                 .spawn()
                 .with_context(|| format!("Failed to execute 'amplihack {}'", self.cli))?;
+            // #205: the task reaches Claude-family CLIs on stdin, never argv.
+            let task_writer = child
+                .stdin
+                .take()
+                .map(|stdin| spawn_task_writer(stdin, full_prompt.clone()));
 
             // Background heartbeat thread for progress reporting.
             // Monitors the output log file for growth and prints status updates
@@ -1606,6 +1643,20 @@ impl CLISubprocessAdapter {
                                 pid
                             );
                         }
+                        // #205: a SIGINT/SIGTERM delivered to the runner stops
+                        // this attempt; returning drops the private prompt file.
+                        #[cfg(unix)]
+                        if let Err(interrupted) = super::codex_exec::check_cancellation() {
+                            let pid = child.id();
+                            child.kill().ok();
+                            if let Ok(killed) = child.wait() {
+                                publish_exit(&exit_slot, &killed);
+                            }
+                            stop.store(true, Ordering::SeqCst);
+                            let _ = heartbeat.join();
+                            log::warn!("Agent step cancelled by signal; killed pid {pid}");
+                            return Err(interrupted);
+                        }
                         std::thread::sleep(Duration::from_millis(250));
                     }
                 }
@@ -1614,6 +1665,10 @@ impl CLISubprocessAdapter {
             if let Err(e) = heartbeat.join() {
                 log::warn!("Heartbeat thread panicked: {:?}", e);
             }
+            // Joined only after the agent exits: the writer may still be
+            // blocked on a full pipe while the agent runs.
+            let delivery =
+                task_writer.map(|writer| finish_task_delivery(writer, TASK_DELIVERY_GRACE));
 
             // Read agent output with retry and graceful fallback (#3740).
             // The output file can be missing if: the temp dir was cleaned by the OS,
@@ -1658,11 +1713,21 @@ impl CLISubprocessAdapter {
             // temp_dir is dropped after the loop exits, cleaning up automatically.
 
             if status.success() {
+                // The exit status decides the step. An incomplete stdin write
+                // is reported, not enforced: below the pipe capacity the write
+                // succeeds or fails according to which thread ran first, not
+                // according to whether the agent read the task (#205).
+                if let Some(warning) = delivery.and_then(TaskDelivery::warning) {
+                    log::warn!("{warning}");
+                }
                 // On success, remove the persistent stderr file (unless logs
                 // are kept with --log-dir).
                 self.discard_stderr_log(&stderr_file);
                 return Ok(stdout.trim().to_string());
             }
+            // A failed agent may exit before reading stdin. Its exit status and
+            // stderr, including rate-limit detection, explain more than the
+            // broken pipe does.
 
             // Non-zero exit: read the stderr tail for diagnostics + detection.
             let stderr_tail = std::fs::read_to_string(&stderr_file)
@@ -1698,9 +1763,7 @@ impl CLISubprocessAdapter {
                     // Remove this failed attempt's stderr file before retrying
                     // so transient files don't leak across attempts.
                     self.discard_stderr_log(&stderr_file);
-                    if !wait.is_zero() {
-                        std::thread::sleep(wait);
-                    }
+                    sleep_unless_cancelled(wait)?;
                     attempt += 1;
                     continue;
                 }
@@ -1752,11 +1815,10 @@ impl Adapter for CLISubprocessAdapter {
         timeout: Option<u64>,
     ) -> Result<String, anyhow::Error> {
         log::debug!(
-            "CLISubprocessAdapter::execute_agent_step: prompt_len={}, model={:?}, timeout={:?}, working_dir={:?}",
+            "CLISubprocessAdapter::execute_agent_step: prompt_len={}, model={:?}, timeout={:?}",
             prompt.len(),
             model,
-            timeout,
-            working_dir
+            timeout
         );
         self.execute_agent_step_impl(prompt, system_prompt, model, working_dir, timeout)
     }
@@ -1769,9 +1831,8 @@ impl Adapter for CLISubprocessAdapter {
         extra_env: &std::collections::HashMap<String, String>,
     ) -> Result<String, anyhow::Error> {
         log::debug!(
-            "CLISubprocessAdapter::execute_bash_step: command_len={}, working_dir={:?}, timeout={:?}",
+            "CLISubprocessAdapter::execute_bash_step: command_len={}, timeout={:?}",
             command.len(),
-            working_dir,
             timeout
         );
         // #143: resolve the interpreter FIRST, from the PARENT environment.
@@ -1779,7 +1840,7 @@ impl Adapter for CLISubprocessAdapter {
         // `RECIPE_VAR_*`) over the top, so resolving above that merge is what
         // makes it impossible for recipe YAML to choose the interpreter. It also
         // means a misconfigured AMPLIHACK_BASH aborts before any env-budget work
-        // and before the >64 KiB script tempfile — nothing to clean up.
+        // and before the private script tempfile — nothing to clean up.
         let bash = resolve_bash_interpreter()?;
         let mut child_env = Self::build_child_env_with(self.env_allow.as_deref());
         // Propagate agent binary preference so scripts spawning nested agents
@@ -1817,36 +1878,24 @@ impl Adapter for CLISubprocessAdapter {
             working_dir
         };
 
-        // Issue #80: argv + env must fit in ARG_MAX (~128 KiB on Linux). For
-        // large bash scripts (e.g. cleanup-helper / complete-session steps that
-        // accumulate round-results across multiple parallel workstreams), the
-        // inline `-c` form fails with `Argument list too long (os error 7)`.
-        // Spill the script to a tempfile and execute it as a script file.
-        const BASH_INLINE_LIMIT: usize = 64 * 1024;
-        let script_file: Option<tempfile::NamedTempFile> = if command.len() > BASH_INLINE_LIMIT {
-            let mut tf = tempfile::Builder::new()
-                .prefix("recipe-bash-step-")
-                .suffix(".sh")
-                .tempfile()
-                .with_context(|| "Failed to create tempfile for large bash step")?;
-            tf.write_all(command.as_bytes())
-                .with_context(|| "Failed to write large bash step to tempfile")?;
-            tf.flush()
-                .with_context(|| "Failed to flush large bash step tempfile")?;
-            Some(tf)
-        } else {
-            None
-        };
+        // #211: quoted heredocs can inline context even in small scripts.
+        // Always execute a private file so rendered source never enters argv.
+        // This also avoids ARG_MAX failures for large scripts (#80). NamedTempFile
+        // creates mode 0600 files and removes them on every return path.
+        let mut script_file = tempfile::Builder::new()
+            .prefix("recipe-bash-step-")
+            .suffix(".sh")
+            .tempfile()
+            .context("Failed to create private bash step tempfile")?;
+        script_file
+            .write_all(command.as_bytes())
+            .context("Failed to write bash step to private tempfile")?;
+        script_file
+            .flush()
+            .context("Failed to flush private bash step tempfile")?;
 
-        // #143: one spawn site for all four shapes. Previously the two `timeout`
-        // arms handed the interpreter to `timeout`'s own `execvp` while the two
-        // bare arms let Rust's `Command` resolve it — two mechanisms against two
-        // different `PATH`s, so a timed and an untimed step in the same recipe
-        // could run different interpreters. One builder, one absolute path.
-        let invocation = match &script_file {
-            Some(tf) => BashInvocation::File(tf.path()),
-            None => BashInvocation::Inline(command),
-        };
+        // #143: use one resolved interpreter and one spawn site for both
+        // timeout modes and untimed execution.
         // With `--timeout-action report` the `timeout` utility is not used:
         // the overrun is reported and the step keeps running, nothing is killed.
         let report_secs = match (self.timeout_action, timeout) {
@@ -1854,7 +1903,7 @@ impl Adapter for CLISubprocessAdapter {
             _ => None,
         };
         let kill_timeout = if report_secs.is_some() { None } else { timeout };
-        let argv = bash_command_argv(&bash, invocation, kill_timeout);
+        let argv = bash_command_argv(&bash, script_file.path(), kill_timeout);
         let mut shell_cmd = Command::new(&argv[0]);
         shell_cmd
             .args(&argv[1..])
@@ -1865,7 +1914,7 @@ impl Adapter for CLISubprocessAdapter {
             Some(secs) => output_reporting_overrun(shell_cmd, secs, "Shell step"),
             None => shell_cmd.output(),
         }
-        .with_context(|| bash_spawn_context(&invocation, kill_timeout))?;
+        .with_context(|| bash_spawn_context(kill_timeout))?;
 
         // Drop the tempfiles (auto-clean on drop) only AFTER bash completed.
         drop(script_file);
@@ -2626,13 +2675,14 @@ mod tests {
     }
 
     /// A launcher stand-in that sleeps past the step timeout, then writes to
-    /// stdout and stderr and exits 0.
+    /// stdout and stderr and exits 0. Tests using this launcher select Claude
+    /// explicitly because Codex reads its final response from a separate file.
     fn slow_launcher(dir: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("slow-launcher");
         std::fs::write(
             &path,
-            "#!/bin/sh\nsleep 2\necho agent-said-this\necho agent-err-said-this >&2\n",
+            "#!/bin/sh\ncat >/dev/null\nsleep 2\necho agent-said-this\necho agent-err-said-this >&2\n",
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2654,7 +2704,7 @@ mod tests {
         let _guard = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
         let tmp = tempfile::tempdir().unwrap();
         use_launcher(&slow_launcher(tmp.path()));
-        let adapter = CLISubprocessAdapter::new();
+        let adapter = CLISubprocessAdapter::new().with_binary("claude");
         let err = adapter
             .execute_agent_step_impl("p", None, None, tmp.path().to_str().unwrap(), Some(1))
             .unwrap_err();
@@ -2667,7 +2717,9 @@ mod tests {
         let _guard = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
         let tmp = tempfile::tempdir().unwrap();
         use_launcher(&slow_launcher(tmp.path()));
-        let adapter = CLISubprocessAdapter::new().with_timeout_action(TimeoutAction::Report);
+        let adapter = CLISubprocessAdapter::new()
+            .with_binary("claude")
+            .with_timeout_action(TimeoutAction::Report);
         let out = adapter
             .execute_agent_step_impl("p", None, None, tmp.path().to_str().unwrap(), Some(1))
             .expect("a reported overrun must not fail the step");
@@ -2697,7 +2749,9 @@ mod tests {
         std::fs::create_dir(&logs).unwrap();
         std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let adapter = CLISubprocessAdapter::new().with_log_dir(&logs);
+        let adapter = CLISubprocessAdapter::new()
+            .with_binary("claude")
+            .with_log_dir(&logs);
         adapter
             .execute_agent_step_impl("p", None, None, tmp.path().to_str().unwrap(), None)
             .unwrap();
@@ -2722,7 +2776,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         use_launcher(&slow_launcher(tmp.path()));
         let logs = tmp.path().join("logs").join("nested");
-        let adapter = CLISubprocessAdapter::new().with_log_dir(&logs);
+        let adapter = CLISubprocessAdapter::new()
+            .with_binary("claude")
+            .with_log_dir(&logs);
         let out = adapter
             .execute_agent_step_impl("p", None, None, tmp.path().to_str().unwrap(), None)
             .unwrap();
@@ -2842,13 +2898,17 @@ mod tests {
         let cwd_text = cwd.to_string_lossy().into_owned();
 
         let default = CLISubprocessAdapter::new()
+            .with_binary("claude")
             .build_agent_command(tmp.path(), &cwd, "hello", None, None)
             .unwrap();
         let args = command_args(&default);
         let pos = args.iter().position(|a| a == "--add-dir").unwrap();
-        assert_eq!(args[pos + 1], cwd_text);
+        assert_eq!(args[pos + 1], ".");
+        assert_eq!(default.get_current_dir(), Some(cwd.as_path()));
+        assert!(!args.contains(&cwd_text), "{args:?}");
 
         let without = CLISubprocessAdapter::new()
+            .with_binary("claude")
             .without_working_dir_grant()
             .build_agent_command(tmp.path(), &cwd, "hello", None, None)
             .unwrap();
@@ -2858,19 +2918,18 @@ mod tests {
     }
 
     #[test]
-    fn without_working_dir_grant_keeps_the_overflow_prompt_directory_grant() {
-        // A CLI that reads an overflow prompt through --add-dir cannot do so
-        // without the output directory, so that grant stays.
+    fn without_working_dir_grant_keeps_the_copilot_prompt_directory_grant() {
+        // Copilot reads its prompt file through --add-dir and cannot do so
+        // without the prompt file's directory, so that grant stays.
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("out");
         let cwd = tmp.path().join("work");
         std::fs::create_dir(&out).unwrap();
         std::fs::create_dir(&cwd).unwrap();
-        let prompt = "p".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1);
         let cmd = CLISubprocessAdapter::new()
             .with_binary("copilot")
             .without_working_dir_grant()
-            .build_agent_command(&out, &cwd, &prompt, None, None)
+            .build_agent_command(&out, &cwd, "hello", None, None)
             .unwrap();
         let args = command_args(&cmd);
         let grants: Vec<&String> = args
@@ -3169,7 +3228,7 @@ mod tests {
 
     #[test]
     fn test_execute_bash_step_large_script_uses_tempfile() {
-        // Issue #80: scripts > BASH_INLINE_LIMIT (64 KiB) must be spilled to a
+        // Issue #80: scripts > 64 KiB must execute through a
         // tempfile to avoid `Argument list too long (os error 7)`. Generate a
         // ~96 KiB script that prints a sentinel — the inline `-c` form would
         // crash on a system already near ARG_MAX, while the file-backed path
@@ -3187,7 +3246,7 @@ mod tests {
         large_script.push_str("echo SENTINEL_OK\n");
         assert!(
             large_script.len() > 64 * 1024,
-            "test script must exceed BASH_INLINE_LIMIT, got {}",
+            "test script must exceed 64 KiB, got {}",
             large_script.len()
         );
 
@@ -3202,7 +3261,7 @@ mod tests {
 
     #[test]
     fn test_execute_bash_step_large_script_with_timeout() {
-        // Same as above but exercising the (Some(tf), Some(secs)) match arm.
+        // Same as above with the timeout wrapper.
         let adapter = CLISubprocessAdapter::new();
         let empty_env = std::collections::HashMap::new();
         let mut large_script = String::with_capacity(100 * 1024);
@@ -3252,19 +3311,21 @@ mod tests {
 
     #[test]
     fn test_build_agent_command_always_includes_system_prompt() {
-        // Claude CLI gets --system-prompt; Copilot does not
-        let adapter = CLISubprocessAdapter::new().with_binary("claude");
-        let tmp = tempfile::tempdir().unwrap();
-        let cmd = adapter
-            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
-            .unwrap();
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        assert!(args.windows(2).any(|w| {
-            w[0] == "--system-prompt" && w[1].contains(RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT)
-        }));
+        for cli in ["claude", "copilot"] {
+            let adapter = CLISubprocessAdapter::new().with_binary(cli);
+            let tmp = tempfile::tempdir().unwrap();
+            adapter
+                .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+                .unwrap();
+            let content = std::fs::read_to_string(tmp.path().join(AGENT_PROMPT_FILE)).unwrap();
+            assert!(content.contains(RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT));
+            if cli == "claude" {
+                // The task goes to stdin, not into the system prompt.
+                assert_eq!(content, RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT);
+            } else {
+                assert!(content.ends_with("hello"));
+            }
+        }
     }
 
     #[test]
@@ -3281,160 +3342,53 @@ mod tests {
     }
 
     #[test]
-    fn test_should_use_file_backed_prompt_transport_for_large_claude_prompt() {
-        let adapter = CLISubprocessAdapter::new().with_binary("claude");
-        let large_prompt = "x".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1);
-        assert!(adapter.should_use_file_backed_prompt_transport(&large_prompt, None));
-    }
-
-    #[test]
-    fn test_prompt_at_exact_inline_limit_stays_inline() {
-        // Exactly MAX bytes (prompt + system prompt combined) stays inline;
-        // one byte more switches to file-backed transport.
-        let adapter = CLISubprocessAdapter::new().with_binary("claude");
-        let system = "s".repeat(16);
-        let prompt = "x".repeat(MAX_INLINE_AGENT_PROMPT_BYTES - system.len());
-        assert_eq!(prompt.len() + system.len(), MAX_INLINE_AGENT_PROMPT_BYTES);
-        assert!(!adapter.should_use_file_backed_prompt_transport(&prompt, Some(&system)));
-        assert!(
-            adapter.should_use_file_backed_prompt_transport(&format!("{prompt}x"), Some(&system))
-        );
-    }
-
-    #[test]
-    fn test_uses_file_backed_prompt_transport_for_copilot() {
-        // Copilot now also uses file-backed transport for large prompts
-        let adapter = CLISubprocessAdapter::new().with_binary("copilot");
-        let large_prompt = "x".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1);
-        assert!(adapter.should_use_file_backed_prompt_transport(&large_prompt, None));
-    }
-
-    #[test]
-    fn test_build_agent_command_inlines_small_prompts() {
-        let tmp = tempfile::tempdir().unwrap();
-        let output_dir = tmp.path().join(".recipe-output");
-        std::fs::create_dir_all(&output_dir).unwrap();
-
-        let adapter = CLISubprocessAdapter::new().with_binary("claude");
-        let cmd = adapter
-            .build_agent_command(
-                &output_dir,
-                tmp.path(),
-                "short prompt",
-                Some("system"),
-                None,
-            )
-            .unwrap();
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-
-        assert!(args.iter().any(|arg| arg == "-p"));
-        assert!(args.iter().any(|arg| arg == "--system-prompt"));
-        assert!(!args.iter().any(|arg| arg == "--append-system-prompt"));
-        assert!(!args.iter().any(|arg| arg == "--append-system-prompt-file"));
-    }
-
-    #[test]
-    fn test_build_agent_command_uses_file_transport_for_large_claude_prompt() {
-        let tmp = tempfile::tempdir().unwrap();
-        let output_dir = tmp.path().join(".recipe-output");
-        std::fs::create_dir_all(&output_dir).unwrap();
-
-        let adapter = CLISubprocessAdapter::new().with_binary("claude");
-        let large_prompt = format!(
-            "Task: implement prompt transport.\nOutput: json.\n\n{}",
-            "x".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1)
-        );
-        let prompt_with_footer = format!("{}{}", large_prompt, NON_INTERACTIVE_FOOTER);
-        let cmd = adapter
-            .build_agent_command(
-                &output_dir,
-                tmp.path(),
-                &prompt_with_footer,
-                Some("system"),
-                None,
-            )
-            .unwrap();
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-
-        // #159: the overflow file must go to the FILE flag, never the TEXT flag.
-        assert!(args.iter().any(|arg| arg == "--append-system-prompt-file"));
-        assert!(!args.iter().any(|arg| arg == "--append-system-prompt"));
-        assert!(!args.iter().any(|arg| arg == "--system-prompt"));
-
-        let prompt_arg_index = args.iter().position(|arg| arg == "-p").unwrap();
-        let inline_prompt = &args[prompt_arg_index + 1];
-        assert!(inline_prompt.starts_with("Task: implement prompt transport."));
-        assert!(inline_prompt.contains(FILE_BACKED_PROMPT_CONTINUATION_NOTE));
-        assert!(inline_prompt.len() < prompt_with_footer.len());
-
-        let prompt_file_index = args
-            .iter()
-            .position(|arg| arg == "--append-system-prompt-file")
-            .expect("--append-system-prompt-file must be present (#159)");
-        let prompt_file = std::path::PathBuf::from(&args[prompt_file_index + 1]);
-        let prompt_file_contents = std::fs::read_to_string(&prompt_file).unwrap();
-        assert!(prompt_file_contents.contains("system"));
-        assert!(prompt_file_contents.contains("# Continued task instructions"));
-        assert!(prompt_file_contents.contains(NON_INTERACTIVE_FOOTER));
-        assert!(prompt_file_contents.contains(&"x".repeat(1024)));
-        assert!(prompt_file_contents.contains(NON_INTERACTIVE_FOOTER));
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let mode = std::fs::metadata(&prompt_file)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o600);
+    fn all_prompt_sizes_keep_task_and_system_content_in_private_files() {
+        for cli in ["claude", "launch", "RustyClawd", "copilot"] {
+            for size in [0, 8 * 1024 - 1, 32 * 1024, 32 * 1024 + 1, 256 * 1024] {
+                let tmp = tempfile::tempdir().unwrap();
+                let adapter = CLISubprocessAdapter::new().with_binary(cli);
+                let prompt = format!(
+                    "PRIVATE_TASK_🦀{}{}",
+                    "x".repeat(size),
+                    NON_INTERACTIVE_FOOTER
+                );
+                let system = format!("PRIVATE_SYSTEM_λ{}", "s".repeat(size));
+                let cmd = adapter
+                    .build_agent_command(tmp.path(), tmp.path(), &prompt, Some(&system), None)
+                    .unwrap();
+                let args = args_of(&cmd);
+                for arg in &args {
+                    assert!(!arg.contains("PRIVATE_TASK_"), "{cli}: task on argv");
+                    assert!(!arg.contains("PRIVATE_SYSTEM_"), "{cli}: system on argv");
+                }
+                assert!(!args.iter().any(|a| a == "--system-prompt"
+                    || a == "--append-system-prompt"
+                    || a == "--append-system-prompt-file"));
+                let path = tmp.path().join(AGENT_PROMPT_FILE);
+                let content = std::fs::read_to_string(&path).unwrap();
+                let effective = CLISubprocessAdapter::build_effective_system_prompt(Some(&system));
+                if adapter.reads_task_from_stdin() {
+                    // #205: the system prompt alone; the task goes to stdin.
+                    assert_eq!(content, effective);
+                } else {
+                    assert_eq!(
+                        content,
+                        format!("{effective}\n\n# Task instructions\n\n{prompt}")
+                    );
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(
+                        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                        0o600
+                    );
+                }
+            }
         }
     }
 
-    #[test]
-    fn test_large_system_prompt_keeps_full_user_prompt_inline() {
-        let tmp = tempfile::tempdir().unwrap();
-        let output_dir = tmp.path().join(".recipe-output");
-        std::fs::create_dir_all(&output_dir).unwrap();
-
-        let adapter = CLISubprocessAdapter::new().with_binary("claude");
-        let prompt = "Task: audit this workflow.";
-        let large_system_prompt = "s".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1);
-        let cmd = adapter
-            .build_agent_command(
-                &output_dir,
-                tmp.path(),
-                prompt,
-                Some(&large_system_prompt),
-                None,
-            )
-            .unwrap();
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-
-        let prompt_arg_index = args.iter().position(|arg| arg == "-p").unwrap();
-        assert_eq!(args[prompt_arg_index + 1], prompt);
-
-        let prompt_file_index = args
-            .iter()
-            .position(|arg| arg == "--append-system-prompt-file")
-            .expect("--append-system-prompt-file must be present (#159)");
-        let prompt_file = std::path::PathBuf::from(&args[prompt_file_index + 1]);
-        let prompt_file_contents = std::fs::read_to_string(&prompt_file).unwrap();
-        assert!(prompt_file_contents.starts_with(&large_system_prompt));
-        assert!(prompt_file_contents.contains(RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT));
-    }
-
-    // ── #159: overflow prompt file must be passed via --append-system-prompt-file ──
+    // ── #205: Claude-family system prompt by file, task on stdin ──
 
     fn args_of(cmd: &std::process::Command) -> Vec<String> {
         cmd.get_args()
@@ -3442,139 +3396,100 @@ mod tests {
             .collect()
     }
 
-    /// (a) Claude-family CLIs pass the overflow file with the FILE flag, as its
-    /// own argv element, pointing at an existing absolute 0600 file — and never
-    /// pass anything to the TEXT flag `--append-system-prompt` (#159).
+    /// (a) Claude-family CLIs get `--system-prompt-file` (which replaces the
+    /// default system prompt, as `--system-prompt` did) pointing at an
+    /// existing absolute 0600 file, and a bare `-p`. No TEXT prompt flag and
+    /// no appending flag is used, whatever the prompt size (#159, #205).
     #[test]
-    fn test_claude_family_large_prompt_uses_append_system_prompt_file() {
+    fn claude_family_uses_system_prompt_file_and_bare_print_flag() {
         for cli in ["claude", "launch", "RustyClawd"] {
-            let tmp = tempfile::tempdir().unwrap();
-            let output_dir = tmp.path().join(".recipe-output");
-            std::fs::create_dir_all(&output_dir).unwrap();
+            for size in [5, (32 * 1024) + 1] {
+                let tmp = tempfile::tempdir().unwrap();
+                let output_dir = tmp.path().join(".recipe-output");
+                std::fs::create_dir_all(&output_dir).unwrap();
 
-            let adapter = CLISubprocessAdapter::new().with_binary(cli);
-            let prompt = "y".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1);
-            let cmd = adapter
-                .build_agent_command(&output_dir, tmp.path(), &prompt, Some("system"), None)
-                .unwrap();
-            let args = args_of(&cmd);
+                let adapter = CLISubprocessAdapter::new().with_binary(cli);
+                let prompt = "y".repeat(size);
+                let cmd = adapter
+                    .build_agent_command(
+                        &output_dir,
+                        tmp.path(),
+                        &prompt,
+                        Some("system"),
+                        Some("m"),
+                    )
+                    .unwrap();
+                let args = args_of(&cmd);
 
-            assert!(
-                !args.iter().any(|arg| arg == "--append-system-prompt"),
-                "{cli}: --append-system-prompt takes TEXT; passing a path loses the overflow (#159): {:?}",
-                args.iter()
-                    .map(|a| &a[..a.len().min(80)])
-                    .collect::<Vec<_>>()
-            );
-            let flag_index = args
-                .iter()
-                .position(|arg| arg == "--append-system-prompt-file")
-                .unwrap_or_else(|| panic!("{cli}: --append-system-prompt-file missing"));
-            let prompt_file = std::path::PathBuf::from(
-                args.get(flag_index + 1)
-                    .unwrap_or_else(|| panic!("{cli}: flag has no value")),
-            );
-            assert!(prompt_file.is_absolute(), "{cli}: path must be absolute");
-            assert!(prompt_file.exists(), "{cli}: prompt file must exist");
-            assert_eq!(prompt_file, output_dir.join("agent-system-prompt.md"));
-            assert_eq!(
-                args.iter()
-                    .filter(|arg| *arg == "--append-system-prompt-file")
-                    .count(),
-                1,
-                "{cli}: flag must appear exactly once"
-            );
+                for flag in [
+                    "--system-prompt",
+                    "--append-system-prompt",
+                    "--append-system-prompt-file",
+                ] {
+                    assert!(!args.iter().any(|a| a == flag), "{cli}: {flag}: {args:?}");
+                }
+                assert!(
+                    !args.iter().any(|a| a.contains(&prompt)),
+                    "{cli}: task on argv"
+                );
+                let flag_index = args
+                    .iter()
+                    .position(|arg| arg == "--system-prompt-file")
+                    .unwrap_or_else(|| panic!("{cli}: --system-prompt-file missing"));
+                assert_eq!(
+                    args.iter()
+                        .filter(|arg| *arg == "--system-prompt-file")
+                        .count(),
+                    1,
+                    "{cli}: flag must appear exactly once"
+                );
+                let prompt_file = std::path::PathBuf::from(&args[flag_index + 1]);
+                assert!(prompt_file.is_absolute(), "{cli}: path must be absolute");
+                assert_eq!(prompt_file, output_dir.join(AGENT_PROMPT_FILE));
+                assert_eq!(
+                    std::fs::read_to_string(&prompt_file).unwrap(),
+                    CLISubprocessAdapter::build_effective_system_prompt(Some("system"))
+                );
+                let p = args.iter().position(|a| a == "-p").unwrap();
+                assert!(p > flag_index, "{cli}: system file must precede -p");
+                assert!(
+                    args.get(p + 1).is_none_or(|next| next.starts_with('-')),
+                    "{cli}: -p must be bare: {args:?}"
+                );
 
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = std::fs::metadata(&prompt_file)
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777;
-                assert_eq!(mode, 0o600, "{cli}: prompt file must be private");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = std::fs::metadata(&prompt_file)
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777;
+                    assert_eq!(mode, 0o600, "{cli}: prompt file must be private");
+                }
             }
         }
     }
 
-    /// (b) The prompt file holds effective system prompt + overflow byte-for-byte.
-    /// (Already green before the fix: the content was right, only the flag was wrong.)
+    /// (b) A bare `-p` as the last argument, with no directory grant and no
+    /// model, is still a print flag with nothing after it.
     #[test]
-    fn test_file_backed_prompt_file_is_byte_exact() {
+    fn claude_print_flag_is_bare_when_it_is_the_last_argument() {
         let tmp = tempfile::tempdir().unwrap();
-        let adapter = CLISubprocessAdapter::new().with_binary("claude");
-        let prompt = format!(
-            "HEAD{}UNIQUE_OVERFLOW_TAIL_159",
-            "x".repeat(MAX_INLINE_AGENT_PROMPT_BYTES)
-        );
-        let effective = CLISubprocessAdapter::build_effective_system_prompt(Some("system"));
-
-        let (inline_prompt, prompt_file) = adapter
-            .build_file_backed_prompt_payload(tmp.path(), &prompt, Some(&effective))
+        let cmd = CLISubprocessAdapter::new()
+            .with_binary("claude")
+            .without_working_dir_grant()
+            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
             .unwrap();
-        let prompt_file = prompt_file.expect("overflow must produce a prompt file");
-
-        let boundary =
-            CLISubprocessAdapter::clamp_char_boundary(&prompt, FILE_BACKED_INLINE_PROMPT_BYTES);
-        assert_eq!(boundary, FILE_BACKED_INLINE_PROMPT_BYTES);
-        let expected = format!(
-            "{}\n\n# Continued task instructions\n\n{}",
-            effective,
-            &prompt[boundary..]
-        );
-        let contents = std::fs::read_to_string(&prompt_file).unwrap();
-        assert_eq!(contents, expected);
-        assert!(contents.contains(RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT));
-        assert!(contents.ends_with("UNIQUE_OVERFLOW_TAIL_159"));
-        assert_eq!(
-            inline_prompt,
-            format!(
-                "{}{}",
-                &prompt[..boundary],
-                FILE_BACKED_PROMPT_CONTINUATION_NOTE
-            )
-        );
+        assert_eq!(args_of(&cmd).last().map(String::as_str), Some("-p"));
     }
 
-    /// (b') A multibyte char straddling the 8 KiB boundary is split on a char
-    /// boundary (no panic), and inline head + file overflow == original prompt.
-    #[test]
-    fn test_file_backed_prompt_file_is_byte_exact_multibyte_boundary() {
-        let tmp = tempfile::tempdir().unwrap();
-        let adapter = CLISubprocessAdapter::new().with_binary("claude");
-        let prompt = format!(
-            "{}🦀{}",
-            "a".repeat(FILE_BACKED_INLINE_PROMPT_BYTES - 1),
-            "x".repeat(MAX_INLINE_AGENT_PROMPT_BYTES)
-        );
-        let effective = CLISubprocessAdapter::build_effective_system_prompt(Some("system"));
-
-        let boundary =
-            CLISubprocessAdapter::clamp_char_boundary(&prompt, FILE_BACKED_INLINE_PROMPT_BYTES);
-        assert_eq!(boundary, FILE_BACKED_INLINE_PROMPT_BYTES - 1);
-
-        let (inline_prompt, prompt_file) = adapter
-            .build_file_backed_prompt_payload(tmp.path(), &prompt, Some(&effective))
-            .unwrap();
-        let contents = std::fs::read_to_string(prompt_file.unwrap()).unwrap();
-        let header = format!("{effective}\n\n# Continued task instructions\n\n");
-        assert!(contents.starts_with(&header));
-        let overflow = &contents[header.len()..];
-        assert!(overflow.starts_with('🦀'));
-
-        let inline_head = inline_prompt
-            .strip_suffix(FILE_BACKED_PROMPT_CONTINUATION_NOTE)
-            .expect("claude inline prompt must end with the continuation note");
-        assert_eq!(format!("{inline_head}{overflow}"), prompt);
-    }
-
-    /// (c) End-to-end: a fake `claude` launcher recording its argv receives the
-    /// overflow via `--append-system-prompt-file`, and the file it reads during
-    /// the run contains the overflow tail and the no-reentry guard (#159).
+    /// (c) End-to-end: a fake `claude` launcher receives the system prompt
+    /// through `--system-prompt-file` and the whole task, footer included,
+    /// on stdin; neither is on its argv (#205).
     #[cfg(unix)]
     #[test]
-    fn test_fake_claude_receives_overflow_via_file_flag() {
+    fn test_fake_claude_receives_system_file_and_task_on_stdin() {
         let script_dir = tempfile::tempdir().unwrap();
         let capture_dir = tempfile::tempdir().unwrap();
         let work_dir = tempfile::tempdir().unwrap();
@@ -3582,9 +3497,9 @@ mod tests {
         let counter_file = capture_dir.path().join("count");
         let argv_capture = capture_dir.path().join("argv.bin");
         let file_capture = capture_dir.path().join("prompt-file.txt");
+        let stdin_capture = capture_dir.path().join("stdin.txt");
 
-        // argv is recorded NUL-separated because the -p value contains newlines.
-        // The prompt file is copied while the child runs: the step's tempdir
+        // The system file is copied while the child runs: the step's tempdir
         // (and the file) is removed once execute_agent_step_impl returns.
         write_fake_launcher(
             &launcher,
@@ -3593,17 +3508,20 @@ mod tests {
                  prev=''\n\
                  for a in \"$@\"; do\n\
                  printf '%s\\0' \"$a\" >> '{argv}'\n\
-                 if [ \"$prev\" = \"--append-system-prompt-file\" ]; then cat -- \"$a\" > '{file}'; fi\n\
+                 if [ \"$prev\" = \"--system-prompt-file\" ]; then cat -- \"$a\" > '{file}'; fi\n\
                  prev=\"$a\"\n\
                  done\n\
+                 cat > '{stdin}'\n\
                  echo AGENT_OK\n\
                  exit 0",
                 argv = argv_capture.display(),
                 file = file_capture.display(),
+                stdin = stdin_capture.display(),
             ),
         );
 
-        let prompt = format!("HEAD{}UNIQUE_OVERFLOW_TAIL_159", "x".repeat(40 * 1024));
+        // Larger than a Linux pipe buffer, so delivery needs the writer thread.
+        let prompt = format!("HEAD{}UNIQUE_TASK_TAIL_205", "x".repeat(200 * 1024));
         // Run with env overridden, then release the env guards and ENV_MUTEX
         // BEFORE asserting, so a failure here can't poison the mutex for the
         // other env-mutating tests.
@@ -3622,13 +3540,13 @@ mod tests {
             }
             CLISubprocessAdapter::new().execute_agent_step_impl(
                 &prompt,
-                Some("system"),
+                Some("PERSONA_205"),
                 None,
                 work_dir.path().to_str().unwrap(),
                 Some(60),
             )
         };
-        assert!(result.is_ok(), "fake claude step must succeed: {result:?}");
+        assert_eq!(result.unwrap(), "AGENT_OK");
 
         let raw = std::fs::read(&argv_capture).expect("fake launcher must record argv");
         let argv: Vec<String> = raw
@@ -3636,31 +3554,144 @@ mod tests {
             .filter(|s| !s.is_empty())
             .map(|s| String::from_utf8_lossy(s).into_owned())
             .collect();
-        assert!(
-            !argv.iter().any(|a| a == "--append-system-prompt"),
-            "child must never get the overflow path as system-prompt TEXT (#159)"
-        );
+        assert!(!argv.iter().any(|a| a.contains("UNIQUE_TASK_TAIL_205")));
+        assert!(!argv.iter().any(|a| a.contains("PERSONA_205")));
         let flag_index = argv
             .iter()
-            .position(|a| a == "--append-system-prompt-file")
-            .expect("child argv must contain --append-system-prompt-file (#159)");
+            .position(|a| a == "--system-prompt-file")
+            .expect("child argv must contain --system-prompt-file (#205)");
         assert!(
             argv.get(flag_index + 1)
-                .is_some_and(|p| p.ends_with("agent-system-prompt.md")),
+                .is_some_and(|p| p.ends_with(AGENT_PROMPT_FILE)),
             "flag must be followed by the prompt file path"
         );
 
-        let delivered = std::fs::read_to_string(&file_capture)
-            .expect("child must have been able to read the prompt file during the run");
-        assert!(delivered.contains("UNIQUE_OVERFLOW_TAIL_159"));
-        assert!(delivered.contains(RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT));
-        assert!(delivered.contains("system"));
-        assert!(delivered.contains(NON_INTERACTIVE_FOOTER));
+        let system = std::fs::read_to_string(&file_capture)
+            .expect("child must have been able to read the system file during the run");
+        assert!(system.starts_with("PERSONA_205"));
+        assert!(system.contains(RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT));
+        assert!(!system.contains("UNIQUE_TASK_TAIL_205"));
+        let task = std::fs::read_to_string(&stdin_capture).unwrap();
+        assert_eq!(task, format!("{prompt}{NON_INTERACTIVE_FOOTER}"));
     }
 
-    /// (d) Non-Claude CLIs can't take a system-prompt file, so the inline note
-    /// must name the overflow file's absolute path instead of pointing at an
-    /// "appended system prompt" the CLI never receives (#159).
+    /// (d) The agent's exit status decides a Claude-family step, not the stdin
+    /// write (#205). A task far larger than the pipe buffer, which the agent
+    /// never reads, makes the write fail on every schedule; the step still
+    /// returns the agent's output, and the diagnostic is only logged.
+    #[cfg(unix)]
+    #[test]
+    fn claude_step_keeps_its_result_when_the_agent_does_not_read_its_task() {
+        let script_dir = tempfile::tempdir().unwrap();
+        let work_dir = tempfile::tempdir().unwrap();
+        let launcher = script_dir.path().join("fake-launcher.sh");
+        let counter_file = script_dir.path().join("count");
+        write_fake_launcher(&launcher, "exec 0<&-\necho AGENT_OK\nexit 0");
+        let prompt = "z".repeat(512 * 1024);
+        let result = {
+            let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let _g_launcher = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
+            let _g_counter = EnvGuard::new("AMPLIHACK_TEST_RL_COUNTER");
+            let _g_retries = EnvGuard::new("AMPLIHACK_RATELIMIT_MAX_RETRIES");
+            // SAFETY: test holds ENV_MUTEX to serialize env var access
+            unsafe {
+                env::set_var("AMPLIHACK_LAUNCHER_BINARY", launcher.to_str().unwrap());
+                env::set_var("AMPLIHACK_TEST_RL_COUNTER", counter_file.to_str().unwrap());
+                env::set_var("AMPLIHACK_RATELIMIT_MAX_RETRIES", "0");
+            }
+            CLISubprocessAdapter::new()
+                .with_binary("claude")
+                .execute_agent_step_impl(
+                    &prompt,
+                    None,
+                    None,
+                    work_dir.path().to_str().unwrap(),
+                    Some(60),
+                )
+        };
+        assert_eq!(result.unwrap(), "AGENT_OK");
+    }
+
+    /// A writer thread that finishes with `outcome`, for
+    /// `finish_task_delivery` tests that must not depend on scheduling.
+    fn finished_writer(
+        outcome: std::io::Result<()>,
+    ) -> std::thread::JoinHandle<std::io::Result<()>> {
+        let writer = std::thread::spawn(move || outcome);
+        while !writer.is_finished() {
+            std::thread::yield_now();
+        }
+        writer
+    }
+
+    #[test]
+    fn task_delivery_reports_a_complete_write_without_a_warning() {
+        let delivery = finish_task_delivery(finished_writer(Ok(())), Duration::ZERO);
+        assert_eq!(delivery, TaskDelivery::Written);
+        assert_eq!(delivery.warning(), None);
+    }
+
+    #[test]
+    fn task_delivery_reports_a_broken_pipe_as_a_warning_only() {
+        let broken = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        let delivery = finish_task_delivery(finished_writer(Err(broken)), Duration::ZERO);
+        assert_eq!(
+            delivery,
+            TaskDelivery::Failed(std::io::ErrorKind::BrokenPipe)
+        );
+        let warning = delivery.warning().unwrap();
+        assert!(warning.contains("BrokenPipe"), "{warning}");
+        assert!(warning.contains("keeps the agent's result"), "{warning}");
+    }
+
+    #[test]
+    fn task_delivery_detaches_a_writer_still_blocked_after_the_grace_period() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let writer = std::thread::spawn(move || {
+            let _ = blocked.recv();
+            Ok(())
+        });
+        let started = Instant::now();
+        let delivery = finish_task_delivery(writer, Duration::from_millis(50));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(delivery, TaskDelivery::StillBlocked);
+        assert!(delivery.warning().unwrap().contains("still blocked"));
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn task_delivery_reports_a_panicked_writer() {
+        let writer = std::thread::spawn(|| -> std::io::Result<()> {
+            panic!("writer test panic");
+        });
+        let delivery = finish_task_delivery(writer, Duration::from_secs(5));
+        assert_eq!(delivery, TaskDelivery::Panicked);
+        assert!(delivery.warning().is_some());
+    }
+
+    /// `amplihack copilot` (amplihack-rs v1.2.157, v1.2.158 and v1.2.161)
+    /// passes a `-p` value through unchanged only when it starts with
+    /// `FILE_REFERENCE_PREFIX` from
+    /// `crates/amplihack-utils/src/prompt_delivery.rs`; otherwise it wraps the
+    /// value in a second file. The literals below are copied from that file,
+    /// not from this crate, so a change to the runner's sentence fails here.
+    #[test]
+    fn copilot_request_is_amplihacks_own_pointer_sentence() {
+        const FILE_REFERENCE_TEMPLATE: &str = "Read and follow the complete instructions in the file {path}. Its contents are the task prompt.";
+        const FILE_REFERENCE_PREFIX: &str =
+            "Read and follow the complete instructions in the file ";
+        let path = Path::new("/tmp/.tmpAbC123/.recipe-output/agent-system-prompt.md");
+        let request = CLISubprocessAdapter::copilot_prompt_request(path);
+        assert!(request.starts_with(FILE_REFERENCE_PREFIX), "{request}");
+        assert_eq!(
+            request,
+            FILE_REFERENCE_TEMPLATE.replace("{path}", &path.display().to_string())
+        );
+    }
+
+    /// (e) Copilot takes no system-prompt file, so its only prompt argument
+    /// names the private prompt file's absolute path instead of pointing at
+    /// an "appended system prompt" the CLI never receives (#159, #205).
     #[test]
     fn test_copilot_large_prompt_note_names_prompt_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3668,10 +3699,7 @@ mod tests {
         std::fs::create_dir_all(&output_dir).unwrap();
 
         let adapter = CLISubprocessAdapter::new().with_binary("copilot");
-        let prompt = format!(
-            "Task: copilot overflow.\n{}",
-            "z".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1)
-        );
+        let prompt = format!("Task: copilot overflow.\n{}", "z".repeat((32 * 1024) + 1));
         let cmd = adapter
             .build_agent_command(&output_dir, tmp.path(), &prompt, Some("system"), None)
             .unwrap();
@@ -3683,7 +3711,12 @@ mod tests {
 
         let p_index = args.iter().position(|arg| arg == "-p").unwrap();
         let inline_prompt = &args[p_index + 1];
-        assert!(inline_prompt.starts_with("Task: copilot overflow."));
+        assert!(!inline_prompt.contains("Task: copilot overflow."));
+        assert!(
+            std::fs::read_to_string(&prompt_file)
+                .unwrap()
+                .contains(&prompt)
+        );
         assert!(
             inline_prompt.contains(&prompt_file.display().to_string()),
             "copilot note must name the prompt file path"
@@ -3692,13 +3725,13 @@ mod tests {
             !inline_prompt.contains("appended system prompt"),
             "copilot never receives an appended system prompt"
         );
-        assert!(!inline_prompt.contains(FILE_BACKED_PROMPT_CONTINUATION_NOTE));
-        assert!(inline_prompt.ends_with(&format!(
-            "\n\nIMPORTANT: Additional task instructions, output requirements, and context \
-             continue in the file {}. Read that file and treat its content as part of this \
-             same request and follow it fully.",
-            prompt_file.display()
-        )));
+        assert_eq!(
+            inline_prompt,
+            &format!(
+                "Read and follow the complete instructions in the file {}. Its contents are the task prompt.",
+                prompt_file.display()
+            )
+        );
 
         let output_dir_str = output_dir.to_string_lossy().into_owned();
         assert!(
@@ -4169,7 +4202,8 @@ mod tests {
         write_fake_launcher(
             &launcher,
             &format!(
-                "if [ \"$c\" -le 2 ]; then\n\
+                "cat >/dev/null\n\
+                 if [ \"$c\" -le 2 ]; then\n\
                  echo \"{RATE_LIMIT_MSG}\" 1>&2\n\
                  exit 1\n\
                  fi\n\
@@ -4231,7 +4265,7 @@ mod tests {
         // Always throttle.
         write_fake_launcher(
             &launcher,
-            &format!("echo \"{RATE_LIMIT_MSG}\" 1>&2\nexit 1"),
+            &format!("cat >/dev/null\necho \"{RATE_LIMIT_MSG}\" 1>&2\nexit 1"),
         );
 
         // SAFETY: test holds ENV_MUTEX to serialize env var access
@@ -4287,7 +4321,7 @@ mod tests {
         // Generic, non-rate-limit failure (e.g. an auth error).
         write_fake_launcher(
             &launcher,
-            "echo \"error: authentication failed (401 Unauthorized)\" 1>&2\nexit 2",
+            "cat >/dev/null\necho \"error: authentication failed (401 Unauthorized)\" 1>&2\nexit 2",
         );
 
         // SAFETY: test holds ENV_MUTEX to serialize env var access
@@ -4345,7 +4379,8 @@ mod tests {
         write_fake_launcher(
             &launcher,
             &format!(
-                "has_auto=0\n\
+                "cat >/dev/null\n\
+                 has_auto=0\n\
                  for a in \"$@\"; do if [ \"$a\" = \"auto\" ]; then has_auto=1; fi; done\n\
                  if [ \"$has_auto\" = \"1\" ]; then\n\
                  echo \"AGENT_OK_AUTO\"\n\
@@ -5541,44 +5576,23 @@ mod tests {
 
     // ── Argv construction (R10) ───────────────────────────────────────
 
-    /// All four legacy arms, argv-identical to today when the interpreter is
-    /// `/bin/bash`. If this passes, the four-arm collapse is a pure refactor
-    /// for every input that works today.
+    /// Timed and untimed steps carry only the interpreter and script path.
     #[test]
-    fn test_bash_command_argv_matches_legacy_four_arms() {
+    fn test_bash_command_argv_uses_script_file() {
         let bash = Path::new("/bin/bash");
         let script = Path::new("/tmp/recipe-bash-step-abc.sh");
-
         assert_eq!(
-            bash_command_argv(bash, BashInvocation::File(script), Some(30)),
+            bash_command_argv(bash, script, Some(30)),
             vec![
                 os("timeout"),
                 os("30"),
                 os("/bin/bash"),
-                os("/tmp/recipe-bash-step-abc.sh")
-            ],
-            "(Some(tf), Some(secs)) arm"
+                script.as_os_str().to_os_string()
+            ]
         );
         assert_eq!(
-            bash_command_argv(bash, BashInvocation::File(script), None),
-            vec![os("/bin/bash"), os("/tmp/recipe-bash-step-abc.sh")],
-            "(Some(tf), None) arm"
-        );
-        assert_eq!(
-            bash_command_argv(bash, BashInvocation::Inline("echo hi"), Some(30)),
-            vec![
-                os("timeout"),
-                os("30"),
-                os("/bin/bash"),
-                os("-c"),
-                os("echo hi")
-            ],
-            "(None, Some(secs)) arm"
-        );
-        assert_eq!(
-            bash_command_argv(bash, BashInvocation::Inline("echo hi"), None),
-            vec![os("/bin/bash"), os("-c"), os("echo hi")],
-            "(None, None) arm"
+            bash_command_argv(bash, script, None),
+            vec![os("/bin/bash"), script.as_os_str().to_os_string()]
         );
     }
 
@@ -5631,50 +5645,16 @@ mod tests {
         }
     }
 
-    /// **R10, the regression gate for #143.** All four execution arms must
-    /// receive the SAME resolved absolute interpreter. Today they do not agree
-    /// on a mechanism: arms 2 and 4 resolve through Rust's `Command` against the
-    /// child env, arms 1 and 3 through `timeout`'s own `execvp` — two rules on
-    /// two PATHs. One resolved absolute path at every arm is what retires that.
+    /// #143: every execution mode receives the same absolute interpreter.
     #[test]
-    fn test_all_four_arms_receive_the_same_resolved_interpreter() {
+    fn test_all_modes_receive_the_same_resolved_interpreter() {
         let resolved = PathBuf::from("/opt/homebrew/bin/bash");
         let script = Path::new("/tmp/recipe-bash-step-xyz.sh");
-
-        let arms: Vec<(&str, Vec<OsString>, Option<u64>)> = vec![
-            (
-                "file+timeout",
-                bash_command_argv(&resolved, BashInvocation::File(script), Some(30)),
-                Some(30),
-            ),
-            (
-                "file",
-                bash_command_argv(&resolved, BashInvocation::File(script), None),
-                None,
-            ),
-            (
-                "inline+timeout",
-                bash_command_argv(&resolved, BashInvocation::Inline("echo hi"), Some(30)),
-                Some(30),
-            ),
-            (
-                "inline",
-                bash_command_argv(&resolved, BashInvocation::Inline("echo hi"), None),
-                None,
-            ),
-        ];
-
-        for (name, argv, timeout) in &arms {
-            let interp = interpreter_element(argv, *timeout);
-            assert_eq!(
-                interp,
-                resolved.as_os_str(),
-                "arm {name} must carry the resolved interpreter, got {interp:?}"
-            );
-            assert!(
-                Path::new(interp).is_absolute(),
-                "arm {name} must carry an ABSOLUTE interpreter"
-            );
+        for timeout in [None, Some(30)] {
+            let argv = bash_command_argv(&resolved, script, timeout);
+            let interp = interpreter_element(&argv, timeout);
+            assert_eq!(interp, resolved.as_os_str());
+            assert!(Path::new(interp).is_absolute());
         }
     }
 
@@ -5683,10 +5663,10 @@ mod tests {
     #[test]
     fn test_bash_command_argv_renders_timeout_seconds() {
         let bash = Path::new("/bin/bash");
-        let argv = bash_command_argv(bash, BashInvocation::Inline("true"), Some(1));
+        let argv = bash_command_argv(bash, Path::new("/tmp/s.sh"), Some(1));
         assert_eq!(argv[1], os("1"));
 
-        let argv = bash_command_argv(bash, BashInvocation::Inline("true"), Some(3600));
+        let argv = bash_command_argv(bash, Path::new("/tmp/s.sh"), Some(3600));
         assert_eq!(argv[1], os("3600"));
     }
 
@@ -5702,7 +5682,7 @@ mod tests {
         let script = Path::new(raw);
         let bash = Path::new("/bin/bash");
 
-        let argv = bash_command_argv(bash, BashInvocation::File(script), None);
+        let argv = bash_command_argv(bash, script, None);
         assert_eq!(argv, vec![os("/bin/bash"), raw.to_os_string()]);
         assert_ne!(
             argv[1],
@@ -5710,54 +5690,19 @@ mod tests {
             "non-UTF-8 path must not become an empty arg"
         );
 
-        let argv = bash_command_argv(bash, BashInvocation::File(script), Some(30));
+        let argv = bash_command_argv(bash, script, Some(30));
         assert_eq!(argv[3], raw.to_os_string());
     }
 
-    /// An inline command containing shell metacharacters is passed as ONE argv
-    /// element after `-c`; no quoting, splitting or escaping is applied.
     #[test]
-    fn test_bash_command_argv_passes_inline_command_verbatim() {
-        let bash = Path::new("/bin/bash");
-        let cmd = "echo 'a b'; echo \"$HOME\" | cat # trailing";
-
-        let argv = bash_command_argv(bash, BashInvocation::Inline(cmd), None);
-        assert_eq!(argv, vec![os("/bin/bash"), os("-c"), os(cmd)]);
-        assert_eq!(argv.len(), 3, "the command must stay a single argv element");
-    }
-
-    /// An empty inline command still produces the `-c ""` form (today's
-    /// `test_execute_bash_step_empty_command` depends on this succeeding).
-    #[test]
-    fn test_bash_command_argv_empty_inline_command() {
-        let bash = Path::new("/bin/bash");
-        let argv = bash_command_argv(bash, BashInvocation::Inline(""), None);
-        assert_eq!(argv, vec![os("/bin/bash"), os("-c"), os("")]);
-    }
-
-    // ── Spawn-failure context strings ─────────────────────────────────
-
-    /// All four operator-facing `with_context` strings preserved verbatim, so
-    /// spawn-failure text does not regress with the refactor.
-    #[test]
-    fn test_bash_spawn_context_preserves_all_four_messages() {
-        let script = Path::new("/tmp/s.sh");
-
+    fn test_bash_spawn_context_reports_timeout_mode() {
         assert_eq!(
-            bash_spawn_context(&BashInvocation::File(script), Some(30)),
+            bash_spawn_context(Some(30)),
             "Failed to execute file-backed bash step with timeout"
         );
         assert_eq!(
-            bash_spawn_context(&BashInvocation::File(script), None),
+            bash_spawn_context(None),
             "Failed to execute file-backed bash step"
-        );
-        assert_eq!(
-            bash_spawn_context(&BashInvocation::Inline("echo hi"), Some(30)),
-            "Failed to execute bash step with timeout"
-        );
-        assert_eq!(
-            bash_spawn_context(&BashInvocation::Inline("echo hi"), None),
-            "Failed to execute bash step"
         );
     }
 

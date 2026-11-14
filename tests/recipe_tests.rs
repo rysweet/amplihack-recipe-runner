@@ -1611,12 +1611,12 @@ steps:
     assert!(r.success);
     assert_eq!(r.step_results.len(), 6);
     // Steps 0-4 should complete, step 5 should skip (review is truthy)
-    for i in 0..5 {
+    for step in r.step_results.iter().take(5) {
         assert_eq!(
-            r.step_results[i].status,
+            step.status,
             StepStatus::Completed,
             "step {} should complete",
-            r.step_results[i].step_id
+            step.step_id
         );
     }
     assert_eq!(r.step_results[5].status, StepStatus::Skipped);

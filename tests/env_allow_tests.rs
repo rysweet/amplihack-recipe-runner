@@ -115,7 +115,9 @@ fn agent_step_receives_only_the_named_variable() {
     let launcher = dir.path().join("amplihack");
     write_executable(
         &launcher,
-        &format!("#!/bin/sh\nprintf '%s|%s' \"${{{NAMED}-unset}}\" \"${{{UNNAMED}-unset}}\"\n"),
+        &format!(
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s|%s' \"${{{NAMED}-unset}}\" \"${{{UNNAMED}-unset}}\"\n"
+        ),
     );
 
     // Default: every parent variable reaches the child, as before.

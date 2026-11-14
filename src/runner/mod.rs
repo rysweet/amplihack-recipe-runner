@@ -1217,9 +1217,8 @@ impl<A: Adapter> RecipeRunner<A> {
                         None => {
                             if step.parse_json_required {
                                 error!(
-                                    "Step '{}': parse_json failed (parse_json_required=true). Raw: {}...",
-                                    diagnostic_identifier(&step.id),
-                                    crate::safe_truncate(&output, 200)
+                                    "Step '{}': parse_json failed (parse_json_required=true)",
+                                    diagnostic_identifier(&step.id)
                                 );
                                 (
                                     String::new(),
@@ -1361,9 +1360,8 @@ impl<A: Adapter> RecipeRunner<A> {
         ctx: &mut RecipeContext,
     ) -> Result<String, StepExecutionError> {
         log::debug!(
-            "execute_sub_recipe: step='{}', recipe={:?}, depth={}",
+            "execute_sub_recipe: step='{}', depth={}",
             diagnostic_identifier(&step.id),
-            step.recipe,
             self.depth.get()
         );
         let current_depth = self.depth.get();
@@ -1377,19 +1375,27 @@ impl<A: Adapter> RecipeRunner<A> {
             });
         }
 
-        let recipe_name = step.recipe.as_ref().ok_or_else(|| StepExecutionError {
+        let raw_recipe_name = step.recipe.as_ref().ok_or_else(|| StepExecutionError {
             step_id: step.id.clone(),
             message: "Recipe step is missing the 'recipe' field".to_string(),
         })?;
 
+        // #211: a name rendered from context can carry context values, so its
+        // diagnostics omit the name and the nested parser and inheritance
+        // detail, which can quote the selected file. A fixed name is recipe
+        // text, so it and the underlying errors are reported in full.
+        let rendered_name = crate::context::contains_template_expression(raw_recipe_name);
         // Resolve against incoming context, before applying child overrides.
         // Render once: substituted text must never become another expression.
-        let recipe_name = ctx.render(recipe_name);
+        let recipe_name = ctx.render(raw_recipe_name);
+        let shown_name = (!rendered_name).then_some(recipe_name.as_str());
+        let label = shown_name.map_or_else(String::new, |name| format!(" '{name}'"));
         sub_recipe_paths::validate_sub_recipe_name(&recipe_name).map_err(|reason| {
+            let name = shown_name.map_or_else(String::new, |name| format!(" {name:?}"));
             StepExecutionError {
                 step_id: step.id.clone(),
                 message: format!(
-                    "Invalid resolved sub-recipe name {recipe_name:?}: {reason}. {}",
+                    "Invalid resolved sub-recipe name{name}: {reason}. {}",
                     sub_recipe_paths::RECIPE_NAME_GUIDANCE
                 ),
             }
@@ -1401,8 +1407,7 @@ impl<A: Adapter> RecipeRunner<A> {
             .ok_or_else(|| StepExecutionError {
                 step_id: step.id.clone(),
                 message: format!(
-                    "Sub-recipe '{}' not found. Searched the following directories (in order):\n{}",
-                    recipe_name,
+                    "Sub-recipe{label} not found. Searched the following directories (in order):\n{}",
                     self.sub_recipe_search_diagnostic()
                 ),
             })?;
@@ -1413,7 +1418,10 @@ impl<A: Adapter> RecipeRunner<A> {
                 .parse_file(Path::new(&path))
                 .map_err(|e| StepExecutionError {
                     step_id: step.id.clone(),
-                    message: format!("Failed to parse sub-recipe '{}': {}", recipe_name, e),
+                    message: match shown_name {
+                        Some(name) => format!("Failed to parse sub-recipe '{name}': {e}"),
+                        None => "Failed to parse sub-recipe".to_string(),
+                    },
                 })?;
 
         // Resolve extends (single-level inheritance) if the sub-recipe uses it
@@ -1421,10 +1429,12 @@ impl<A: Adapter> RecipeRunner<A> {
             resolve_extends(&mut sub_recipe, &self.recipe_search_dirs).map_err(|e| {
                 StepExecutionError {
                     step_id: step.id.clone(),
-                    message: format!(
-                        "Failed to resolve extends for sub-recipe '{}': {}",
-                        recipe_name, e
-                    ),
+                    message: match shown_name {
+                        Some(name) => {
+                            format!("Failed to resolve extends for sub-recipe '{name}': {e}")
+                        }
+                        None => "Failed to resolve extends for sub-recipe".to_string(),
+                    },
                 }
             })?;
         }
@@ -1493,13 +1503,13 @@ impl<A: Adapter> RecipeRunner<A> {
                             && (output.to_lowercase().contains("status: complete")
                                 || output.to_lowercase().contains("recovered")) =>
                     {
-                        info!("Sub-recipe '{}' recovered via agent", recipe_name);
+                        info!("Sub-recipe{label} recovered via agent");
                         return Ok(output);
                     }
                     _ => {
                         let mut message = format!(
-                            "Sub-recipe '{}' failed and agentic recovery was unsuccessful.\n{}",
-                            recipe_name, failure_summary
+                            "Sub-recipe{label} failed and agentic recovery was unsuccessful.\n{}",
+                            failure_summary
                         );
                         if let Some(diagnostic) = self.terminal.diagnostic().as_ref() {
                             message.push('\n');
@@ -1515,7 +1525,7 @@ impl<A: Adapter> RecipeRunner<A> {
 
             return Err(StepExecutionError {
                 step_id: step.id.clone(),
-                message: format!("Sub-recipe '{}' failed.\n{}", recipe_name, failure_summary),
+                message: format!("Sub-recipe{label} failed.\n{}", failure_summary),
             });
         }
 
@@ -1525,8 +1535,7 @@ impl<A: Adapter> RecipeRunner<A> {
         }
 
         info!(
-            "Sub-recipe '{}' completed successfully (depth {})",
-            recipe_name,
+            "Sub-recipe{label} completed successfully (depth {})",
             current_depth + 1
         );
         Ok(format!("{}", sub_result))
@@ -1599,14 +1608,13 @@ impl<A: Adapter> RecipeRunner<A> {
     }
 
     fn find_recipe_path(&self, name: &str) -> Option<String> {
-        log::debug!("find_recipe_path: name={:?}", name);
+        log::debug!("find_recipe_path: searching for recipe");
         // Security: reject names with path separators / parent-dir markers
         // before any filesystem resolution. Failures bubble up as part of
         // the Zero-BS diagnostic emitted by the caller.
         if let Err(reason) = sub_recipe_paths::validate_sub_recipe_name(name) {
             log::warn!(
-                "find_recipe_path: rejecting unsafe sub-recipe name {:?}: {}",
-                name,
+                "find_recipe_path: rejecting unsafe sub-recipe name: {}",
                 reason
             );
             return None;
@@ -1642,10 +1650,7 @@ impl<A: Adapter> RecipeRunner<A> {
             if sub_recipe_paths::is_within_any(&path, &anchored) {
                 return Some(path.display().to_string());
             }
-            log::warn!(
-                "find_recipe_path: rejecting candidate {} — resolves outside anchored search roots",
-                path.display()
-            );
+            log::warn!("find_recipe_path: rejecting candidate outside anchored search roots");
         }
 
         // 3. Fall back to discovery module's default search dirs
@@ -2093,24 +2098,22 @@ fn validate_context(rules: &HashMap<String, String>, ctx: &HashMap<String, Value
                     path.clone()
                 };
                 if !std::path::Path::new(&resolved).is_dir() {
-                    errors.push(format!("  ✗ '{}' path '{}' does not exist", var_name, path));
+                    errors.push(format!("  ✗ '{}' path does not exist", var_name));
                 } else if !std::path::Path::new(&resolved).join(".git").exists()
                     && git_for_given_dir()
-                        .args(["-C", &resolved, "rev-parse", "--git-dir"])
+                        .current_dir(&resolved)
+                        .args(["rev-parse", "--git-dir"])
                         .output()
                         .map(|o| !o.status.success())
                         .unwrap_or(true)
                 {
-                    errors.push(format!(
-                        "  ✗ '{}' path '{}' is not a git repository",
-                        var_name, path
-                    ));
+                    errors.push(format!("  ✗ '{}' path is not a git repository", var_name));
                 }
             }
             "path" => match value {
                 Some(Value::String(s)) if !s.is_empty() => {
                     if !std::path::Path::new(s.as_str()).exists() {
-                        errors.push(format!("  ✗ '{}' path '{}' does not exist", var_name, s));
+                        errors.push(format!("  ✗ '{}' path does not exist", var_name));
                     }
                 }
                 _ => {

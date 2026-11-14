@@ -228,7 +228,8 @@ fn an_agent_definition_resolves_only_from_explicit_directories() {
     write(&l.explicit.join("planted.md"), "EXPLICIT AGENT DEFINITION");
     let calls = l.root.path().join("calls");
     std::fs::create_dir(&calls).unwrap();
-    // Each call writes its arguments, NUL-separated, to calls/<n>.
+    // Each call snapshots its --system-prompt-file before the runner removes
+    // it (#205: the system prompt reaches Claude through that file).
     let launcher = l.root.path().join("launcher.sh");
     std::fs::write(
         &launcher,
@@ -236,7 +237,12 @@ fn an_agent_definition_resolves_only_from_explicit_directories() {
             "#!/usr/bin/env bash\n\
              set -u\n\
              n=$(( $(ls '{calls}' | wc -l) ))\n\
-             for a in \"$@\"; do printf '%s\\0' \"$a\" >> '{calls}/'\"$n\"; done\n\
+             prev=\"\"\n\
+             for a in \"$@\"; do\n\
+               if [ \"$prev\" = --system-prompt-file ]; then cat -- \"$a\" > '{calls}/'\"$n\"; fi\n\
+               prev=\"$a\"\n\
+             done\n\
+             cat >/dev/null\n\
              echo done\n",
             calls = calls.display(),
         ),
@@ -258,15 +264,8 @@ fn an_agent_definition_resolves_only_from_explicit_directories() {
             .unwrap()
     };
     let system_prompt = |call: &str| {
-        let argv: Vec<String> = std::fs::read(calls.join(call))
+        std::fs::read_to_string(calls.join(call))
             .unwrap_or_else(|e| panic!("launcher call {call} not recorded: {e}"))
-            .split(|b| *b == 0)
-            .map(|s| String::from_utf8_lossy(s).into_owned())
-            .collect();
-        argv.windows(2)
-            .find(|w| w[0] == "--system-prompt")
-            .map(|w| w[1].clone())
-            .unwrap_or_else(|| panic!("no --system-prompt in call {call}: {argv:?}"))
     };
 
     let out = run(&[recipe, "--output-format", "json"]);

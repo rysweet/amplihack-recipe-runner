@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Exercise the over-32KiB agent prompt transport (#159) through the built CLI.
+# Exercise agent prompt transport (#159, #205) for an over-32KiB prompt through
+# the built CLI: Claude gets the system prompt by file and the task on stdin;
+# Copilot gets a request naming a private file holding both.
 # Unix QA only; requires bash, realpath, and Python 3 at /usr/bin/python3.
 set -euo pipefail
 : "${RECIPE_RUNNER_QA_BINARY:?set RECIPE_RUNNER_QA_BINARY to the candidate recipe-runner-rs binary}"
@@ -22,7 +24,9 @@ root = pathlib.Path(os.environ["QA_RECORD_DIR"])
 root.mkdir(parents=True, exist_ok=True)
 args = sys.argv[1:]
 snapshots = {}
-for flag in ("--append-system-prompt-file", "--append-system-prompt", "--add-dir"):
+# Only Claude-family providers take the task on stdin; Copilot inherits it.
+stdin_text = sys.stdin.read() if "--system-prompt-file" in args else None
+for flag in ("--system-prompt-file", "--append-system-prompt-file", "--append-system-prompt", "--add-dir"):
     if flag in args:
         value = args[args.index(flag) + 1]
         path = pathlib.Path(value)
@@ -34,7 +38,7 @@ for flag in ("--append-system-prompt-file", "--append-system-prompt", "--add-dir
             "is_file": len(value) < 4096 and path.is_file(),
             "content": path.read_text() if len(value) < 4096 and path.is_file() else None,
         }
-(root / "record.json").write_text(json.dumps({"args": args, "snapshots": snapshots}))
+(root / "record.json").write_text(json.dumps({"args": args, "snapshots": snapshots, "stdin": stdin_text}))
 print("FAKE_AGENT_OK", flush=True)
 LAUNCHER
 chmod 755 "$fixture/bin/launcher"
@@ -92,30 +96,41 @@ assert result["success"] is True, result
 assert result["step_results"][0]["output"] == "FAKE_AGENT_OK", result
 rec = json.loads((root / "record.json").read_text())
 args, snaps = rec["args"], rec["snapshots"]
-p_value = args[args.index("-p") + 1]
-assert "HEAD_SENTINEL" in p_value
-assert "OVERFLOW_TAIL_SENTINEL_159" not in p_value, "tail must not be inline"
-assert len(p_value.encode()) < 32 * 1024, len(p_value)
+for arg in args:
+    assert "HEAD_SENTINEL" not in arg, "task head must not be on argv"
+    assert "OVERFLOW_TAIL_SENTINEL_159" not in arg, "tail must not be on argv"
+    assert "PERSONA_SENTINEL" not in arg, "persona must not be on argv"
 assert "--system-prompt" not in args, args[:6]
+assert "--append-system-prompt" not in args, "text flag must never carry the path (#159)"
+assert "--append-system-prompt-file" not in args, "the system prompt replaces, it does not append (#205)"
 if provider == "claude":
-    assert "--append-system-prompt" not in args, "text flag must never carry the path (#159)"
-    snap = snaps["--append-system-prompt-file"]
+    after = args[args.index("-p") + 1:]
+    assert not after or after[0].startswith("-"), "-p must be bare (#205)"
+    snap = snaps["--system-prompt-file"]
     assert snap["is_file"], snap
     content = snap["content"]
     assert content.startswith("System/persona fixture text: PERSONA_SENTINEL."), content[:200]
     assert "Do not invoke /dev" in content           # RECIPE_CHILD_NO_REENTRY guard
-    assert "# Continued task instructions" in content
-    assert "OVERFLOW_TAIL_SENTINEL_159: the end of the task." in content, content[-200:]
-    assert content.index("# Continued task instructions") < content.index("OVERFLOW_TAIL_SENTINEL_159")
-    print(f"claude: --append-system-prompt-file {snap['path']} ({len(content)} bytes, tail + no-reentry guard present)")
+    assert "HEAD_SENTINEL" not in content, "the task is the user turn, not system prompt"
+    task = rec["stdin"]
+    assert task.startswith("HEAD_SENTINEL: start of the task."), task[:200]
+    assert "OVERFLOW_TAIL_SENTINEL_159: the end of the task." in task, task[-300:]
+    assert "Proceed autonomously" in task
+    print(f"claude: --system-prompt-file {snap['path']} ({len(content)} bytes); task on stdin ({len(task)} bytes)")
 else:
+    p_value = args[args.index("-p") + 1]
     assert "--append-system-prompt-file" not in args and "--append-system-prompt" not in args
     snap = snaps["--add-dir"]
     assert snap["is_file"], snap
     assert snap["path"] in p_value, "inline note must name the prompt file path"
+    # amplihack copilot passes a -p value through unchanged only when it
+    # starts with amplihack's FILE_REFERENCE_PREFIX.
+    assert p_value == f"Read and follow the complete instructions in the file {snap['path']}. Its contents are the task prompt.", p_value
     assert "the appended system prompt" not in p_value
     assert "OVERFLOW_TAIL_SENTINEL_159" in snap["content"]
-    note = p_value[p_value.index("IMPORTANT:"):]
+    assert "HEAD_SENTINEL" in snap["content"]
+    assert "PERSONA_SENTINEL" in snap["content"]
+    note = p_value
     print(f"{provider}: --add-dir; inline note -> {note[:160]}...")
 PY
 }
@@ -124,4 +139,4 @@ run_case claude "$fixture/claude"
 validate claude "$fixture/claude"
 run_case copilot "$fixture/copilot"
 validate copilot "$fixture/copilot"
-printf 'PASS: over-32KiB prompt reaches claude via --append-system-prompt-file; copilot note names the file\n'
+printf 'PASS: over-32KiB prompt reaches claude via --system-prompt-file and stdin; copilot request names the file\n'

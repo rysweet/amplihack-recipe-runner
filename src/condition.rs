@@ -672,10 +672,7 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, ConditionError> {
             let n = match arg {
                 Value::Number(n) => n.as_i64().unwrap_or(0),
                 Value::String(s) => s.trim().parse::<i64>().map_err(|_| {
-                    ConditionError::Parse(format!(
-                        "cannot convert '{}' to int",
-                        crate::safe_truncate(s, 50)
-                    ))
+                    ConditionError::Parse("cannot convert value to int".to_string())
                 })?,
                 Value::Bool(b) => i64::from(*b),
                 _ => 0,
@@ -687,10 +684,7 @@ fn apply_function(name: &str, args: &[Value]) -> Result<Value, ConditionError> {
             let n = match arg {
                 Value::Number(n) => n.as_f64().unwrap_or(0.0),
                 Value::String(s) => s.trim().parse::<f64>().map_err(|_| {
-                    ConditionError::Parse(format!(
-                        "cannot convert '{}' to float",
-                        crate::safe_truncate(s, 50)
-                    ))
+                    ConditionError::Parse("cannot convert value to float".to_string())
                 })?,
                 Value::Bool(b) => f64::from(*b),
                 _ => 0.0,
@@ -782,8 +776,8 @@ fn apply_method(value: &Value, method: &str, args: &[Value]) -> Result<Value, Co
         Value::Null => "",
         _ => {
             return Err(ConditionError::Parse(format!(
-                "method '.{}()' can only be called on strings, numbers, booleans, or null; got {:?}",
-                method, value
+                "method '.{}()' can only be called on strings, numbers, booleans, or null",
+                method
             )));
         }
     };
@@ -947,7 +941,7 @@ fn value_in(needle: &Value, haystack: &Value) -> bool {
 }
 
 fn is_truthy(val: &Value) -> bool {
-    log::trace!("is_truthy: checking truthiness of {:?}", val);
+    log::trace!("is_truthy: checking truthiness");
     match val {
         Value::Null => false,
         Value::Bool(b) => *b,

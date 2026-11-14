@@ -2,6 +2,7 @@
 title: CLI Reference
 description: Command-line options, output and failure diagnostics for recipe-runner-rs.
 doc_type: reference
+last_updated: 2026-11-14
 ---
 
 # CLI Reference
@@ -13,8 +14,10 @@ Complete reference for the `recipe-runner-rs` command-line interface.
 - [Synopsis](#synopsis)
 - [Subcommands](#subcommands)
 - [Global options](#global-options)
+- [Context file](#--context-file-path)
 - [JSON recipe input](#json-recipe-input)
 - [Sub-recipe references](#sub-recipe-references)
+- [Agent prompt transport](#agent-prompt-transport)
 - [Failed bash stdout](#failed-bash-stdout)
 - [Exit codes](#exit-codes)
 - [Smart context value parsing](#smart-context-value-parsing---set)
@@ -46,7 +49,8 @@ recipe-runner-rs list --recipe-dir ./team-recipes --recipe-dir ./personal-recipe
 ### `--capabilities`
 
 Standalone compatibility probe. Emits one JSON object with `schema_version: 1`,
-the compiled package `version`, and `capabilities: ["codex_exec"]` on Unix
+the compiled package `version`, and
+`capabilities: ["codex_exec", "durable_recovery_v1", "context_file_v1", "agent_prompt_file_v1"]` on Unix
 (an empty capability list on non-Unix), then exits zero.
 It performs no update, cache-write, network, or agent-startup work. Do not combine
 it with other arguments. See the [capability API](codex-exec.md#compatibility-probe-api).
@@ -132,9 +136,10 @@ suppressed, a step that needs a tool the CLI would ask about fails instead.
 ### `--no-add-dir`
 
 Do not grant the step's working directory to the agent CLI with `--add-dir`. Without the option every Claude-family
-and Copilot agent step is given `--add-dir <working directory>`. With it, that grant is not made. The directory
-that holds an overflow prompt file is still granted to a CLI that reads the file through `--add-dir`, because that
-CLI cannot read its prompt without it. The Codex adapter passes no `--add-dir` and is unaffected.
+and Copilot agent step is given `--add-dir .` from its effective working directory, keeping rendered paths off argv.
+With it, that grant is not made. A Copilot step is still granted the directory that holds its private prompt file,
+because Copilot cannot read its prompt without it (see [Agent prompt transport](#agent-prompt-transport)). The
+Codex adapter passes no `--add-dir` and is unaffected.
 
 ### `-C, --working-dir <DIR>`
 
@@ -221,9 +226,100 @@ restricts only what children receive.
 recipe-runner-rs deploy.yaml --env-allow PATH --env-allow HOME --env-allow ANTHROPIC_API_KEY
 ```
 
+### `--context-file <PATH>`
+
+Load context from one UTF-8 JSON object at startup. The runner's command line
+contains the path instead of the file's context values. This option is supported
+on Unix builds advertising the exact `context_file_v1` capability. For a complete
+example, see [Pass context through a file](howto/context-file.md).
+
+Context sources merge by key in this order, with later sources winning:
+
+1. Recipe defaults.
+2. Context file.
+3. `--set` pairs, regardless of where `--context-file` appears in the command.
+
+Merging replaces the entire value for a key; it does not recursively merge objects.
+Without `--context-file`, existing defaults and `--set` behavior are unchanged.
+
+#### JSON values
+
+The root must be exactly one object. An empty object (`{}`) and trailing whitespace
+are valid. Additional JSON values after the object are invalid. Duplicate object
+keys follow the existing JSON parser behavior: the last value wins.
+
+Top-level string values use the same [smart parsing](#smart-context-value-parsing---set)
+as `--set`. Native JSON values retain their types, and strings inside arrays or
+objects remain strings.
+
+| File member | Loaded value |
+|-------------|--------------|
+| `"task_description": "Fix the widget"` | String `Fix the widget` |
+| `"is_critical_code": "true"` | Boolean `true` |
+| `"count": "42"` | Number `42` |
+| `"ratio": "0.75"` | Number `0.75` |
+| `"optional": "null"` | Null |
+| `"settings": "{\"enabled\":true}"` | Object `{"enabled":true}` |
+| `"tags": "[\"web\",\"api\"]"` | Array `["web","api"]` |
+| `"enabled": false` | Boolean `false` |
+| `"replicas": 3` | Number `3` |
+| `"threshold": 0.5` | Number `0.5` |
+| `"missing": null` | Null |
+| `"items": ["true", "42"]` | Array containing two strings |
+| `"nested": {"count": "42"}` | Object whose `count` remains a string |
+
+#### Opening and lifetime
+
+On Unix, the runner opens the file read-only with `O_NOFOLLOW | O_NONBLOCK`,
+checks metadata through the opened descriptor, and accepts only a regular file.
+A final-component symbolic link is invalid; parent-directory symbolic links are
+permitted. Directories, FIFOs and other special files are invalid. A FIFO cannot
+block startup while waiting for a writer.
+
+The file is read and parsed once during initialization, then closed before step
+execution. Later changes have no effect on the running recipe. The runner never
+deletes, writes, renames, changes permissions on, locks or watches the file. The
+caller owns its creation and cleanup. There are no additional ownership,
+permission-mode or size restrictions. Memory use grows with the file size;
+concurrent writes during ingestion have no snapshot guarantee.
+
+#### Errors and value exposure
+
+All context-file failures exit with `BAD_ARGS` (code `4`). The diagnostic names
+the supplied path and one controlled category:
+
+```text
+invalid context file '/run/example/context/context.json': invalid JSON
+```
+
+| Category | Meaning |
+|----------|---------|
+| `cannot open file` | Opening failed, including a missing or unreadable path or a final-component symbolic link |
+| `cannot inspect file` | Descriptor metadata could not be read |
+| `not a regular file` | The opened descriptor identifies a directory or other nonregular file |
+| `cannot read file` | Reading the opened file failed |
+| `invalid JSON` | Malformed JSON, invalid UTF-8 or additional JSON after the object |
+| `expected JSON object` | The JSON root is an array, scalar or null |
+| `unsupported platform` | The build does not implement secure context-file opening |
+
+Diagnostics never include file contents, context values, parser excerpts or raw
+operating-system errors. Loading, parsing and condition evaluation do not log
+file-loaded values, including at trace level.
+
+File context reaches bash and agent steps through the existing `RECIPE_VAR_*`
+environment mirror and `{{placeholder}}` substitution. The loader adds no child
+arguments carrying those values. Intentional recipe output and JSON results can
+still contain context, and recipes can explicitly pass values to commands.
+Rendered agent prompts stay off launcher and agent command lines under a
+separate contract, [agent prompt transport](#agent-prompt-transport), which
+builds advertise as `agent_prompt_file_v1`.
+
 ### `--set <KEY=VALUE>`
 
 Override a context variable. Can be specified multiple times to set several variables. Values are automatically typed using smart parsing (see [Smart Context Value Parsing](#smart-context-value-parsing---set)).
+`--set` overrides [file context](#--context-file-path) regardless of argument order.
+For repeated `--set` keys, the last pair wins. Values supplied with `--set` remain
+visible in the runner's command line.
 
 ```bash
 # String value
@@ -623,12 +719,97 @@ before applying that step's child context overrides. It checks the complete rend
 other non-string values retain the usual context rendering. Substituted text is not rendered again.
 Empty results, remaining braces, paths and other invalid resolved names fail with a diagnostic identifying
 the step and the resolved-name failure. Earlier parent steps may have executed before this value is known.
+Because a rendered name can carry context values, diagnostics for a reference that contains an expression omit
+the resolved name and the nested parse and `extends` errors. Diagnostics for a fixed reference name the
+sub-recipe and include those errors.
 
 Static validation accepts any reference containing a supported expression, including
 `"recipes/{{child_name}}.yaml"`; that example fails after rendering because the result contains a separator
 and a dot. Malformed template-like text without a supported expression, such as `"{{ child_name }}"`,
 receives ordinary literal validation and fails before execution. Successful static validation of a template
 does not establish that its resolved name is valid or that a matching child exists.
+
+## Agent prompt transport
+
+Agent steps keep the rendered task and the system prompt off the launcher's and
+the agent's command line, whatever their size. Unix builds advertise this as the
+capability `agent_prompt_file_v1`.
+
+| Provider | Command line | System prompt | Task |
+|----------|--------------|---------------|------|
+| `claude`, `launch`, `RustyClawd` | `--system-prompt-file <file> -p` | In `<file>` | On stdin, then EOF |
+| `copilot` | `--add-dir <file directory> -p "Read and follow the complete instructions in the file <file>. Its contents are the task prompt."` | In `<file>` | In `<file>`, after `# Task instructions` |
+| `codex` | `exec --output-last-message <file> -` | On stdin | On stdin |
+
+The system prompt is the agent definition named by the step's `agent:` field,
+followed by the runner's instruction not to start another workflow. The task is
+the rendered `prompt:` followed by the instruction to proceed without asking
+questions.
+
+### Claude-family CLIs
+
+`--system-prompt-file` replaces the CLI's default system prompt, as
+`--system-prompt <text>` did in earlier releases. Recipe agent definitions
+therefore replace Claude Code's default prompt rather than add to it. The task
+remains the user turn: `-p` takes no argument, so the CLI reads the prompt from
+stdin, and hooks that read the user prompt see the task. Whatever follows `-p`
+is another flag (`--add-dir`, `--model`) or nothing, so a wrapper such as
+`amplihack claude` passes the bare `-p` through and the CLI inherits the
+wrapper's stdin.
+
+Earlier releases sent prompts of 32 KiB or more (task plus system prompt) with
+`--append-system-prompt-file`, which appends to the default system prompt, and
+put the first 8 KiB of the task on the command line. Those prompts now also
+replace the default system prompt.
+
+The agent's exit status decides the step. The runner writes the task to stdin
+and closes it, but it cannot confirm that the agent read the task: a pipe
+accepts up to its capacity (64 KiB by default on Linux) whether or not anyone
+reads from it, and a shorter write fails only if the agent has already closed
+stdin when the write runs, which depends on scheduling. If an agent exits with
+status zero before the whole task was written, the runner logs a warning naming
+the I/O error kind (usually `BrokenPipe`) and keeps the agent's result. A failed
+agent is reported by its exit status and stderr as before.
+
+### Copilot
+
+Copilot receives no system-prompt file and no prompt on stdin in this mode. Its
+only prompt argument is the fixed request above; the file holds the system
+prompt and the task. The task arrives only if the model calls its file-reading
+tool on that path, which the `--add-dir` grant permits. The runner cannot
+confirm that the file was read: a Copilot step that ignores the request can
+still exit zero, and its output is then not an answer to the task. Earlier
+releases put Copilot prompts under 32 KiB directly on the command line, where
+delivery did not depend on the model.
+
+The request is amplihack's own pointer sentence (`FILE_REFERENCE_TEMPLATE` in
+amplihack-rs `crates/amplihack-utils/src/prompt_delivery.rs`). `amplihack
+copilot` passes a `-p` value that starts with its `FILE_REFERENCE_PREFIX`
+through unchanged; any other value it writes into a second private file and
+points Copilot at that, which would leave the task two file reads away. Because
+the value passes through unchanged, amplihack 1.2.158 and later do not append a
+run's operator guidance to it; when a run has guidance they print "operator
+guidance not added". They do the same for Claude-family steps, whose task
+arrives on stdin rather than on the wrapper's command line.
+
+The automated tests use a stub that reads the file itself, so they show what
+the runner sends, not what a model does with it.
+`tests/qa/real-agent-prompt-transport.sh` runs a step against the real
+`amplihack claude` and `amplihack copilot` wrappers and checks that a random
+token present only in the task, and another present only in the agent
+definition, come back in the reply. For Copilot it also checks that no command
+line named a second pointer file of amplihack's own. It needs authenticated CLIs
+and uses model tokens, so it is opt-in and CI does not run it.
+
+### Files and cleanup
+
+The file is `agent-system-prompt.md`, mode `0600`, in a mode `0700` directory
+under `TMPDIR`. Each attempt writes it before the agent starts. The runner
+removes it when the step returns, whether the agent succeeds, fails, times out
+or is cancelled. While a Claude-family, Copilot or Codex step runs, the runner
+handles SIGINT and SIGTERM: it stops the agent wrapper, removes the file and
+stops the recipe with a cancellation error. A runner killed with SIGKILL cannot
+remove the directory.
 
 ## Failed Bash Stdout
 
@@ -752,6 +933,7 @@ trailing whitespace in retained output.
 | `0` | Success | Recipe completed successfully; all steps passed |
 | `1` | Failure | Recipe failed; at least one step failed during execution |
 | `2` | Parse/validation error | Invalid YAML syntax, missing required fields, or other parse errors. Unknown step fields are warnings, not errors. |
+| `4` | Invalid arguments (`BAD_ARGS`) | Invalid context file, unsupported context-file platform, or invalid CLI configuration |
 
 ```bash
 # Check exit code in scripts
@@ -773,12 +955,14 @@ recipe-runner-rs deploy.yaml --validate-only && recipe-runner-rs deploy.yaml
 
 ## Smart Context Value Parsing (`--set`)
 
-When using `--set KEY=VALUE`, the runner automatically determines the value type by attempting each parse strategy in order:
+When using `--set KEY=VALUE`, or loading a top-level string from
+[`--context-file`](#--context-file-path), the runner determines the value type
+by attempting each parse strategy in order:
 
 | Priority | Type | Detection | Example |
 |----------|------|-----------|---------|
-| 1 | JSON | Valid JSON object/array | `--set data='{"key": "val"}'` |
-| 2 | Boolean | Literal `true` or `false` | `--set verbose=true` |
+| 1 | JSON | Any valid JSON value except a JSON string, including objects, arrays, booleans, numbers and `null` | `--set data='{"key": "val"}'` |
+| 2 | Boolean | Literal `True` or `False` (lowercase forms parse as JSON) | `--set verbose=True` |
 | 3 | Integer | Digits only (with optional sign) | `--set count=5` |
 | 4 | Float | Numeric with decimal point | `--set ratio=0.5` |
 | 5 | String | Everything else (fallback) | `--set name=hello` |
@@ -830,8 +1014,9 @@ Overrides the interpreter used to run **bash steps**. Must be an **absolute
 path** to an executable file.
 
 Bash steps do not hardcode `/bin/bash`. The runner resolves one interpreter in
-the parent process and uses that same absolute path for every bash step —
-inline (`-c`) or file-backed, with or without a `timeout` wrapper.
+the parent process and uses that same absolute path for every bash step, with or
+without a `timeout` wrapper. Every bash step runs from a private temporary script
+file (`<bash> <script-file>`); no step passes its source with `-c`.
 
 #### What it covers
 
