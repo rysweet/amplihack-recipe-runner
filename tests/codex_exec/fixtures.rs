@@ -49,7 +49,7 @@ if mode == 'blocked': time.sleep(30)
 if mode == 'partial':
     if final: final.write_text('false success')
     sys.exit(0)
-data = sys.stdin.buffer.read() if final else b''
+data = sys.stdin.buffer.read()
 (root/'stdin').write_bytes(data)
 print('PROGRESS_ONLY')
 if mode == 'flood':

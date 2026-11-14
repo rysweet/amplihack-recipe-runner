@@ -8,7 +8,11 @@ use std::process::{Command, Output};
 
 fn stand_in(dir: &Path, name: &str, label: &str) -> std::path::PathBuf {
     let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\nprintf '{label}:%s ' \"$@\"\n")).unwrap();
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\ncat >/dev/null\nprintf '{label}:%s ' \"$@\"\n"),
+    )
+    .unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
@@ -90,7 +94,7 @@ fn relative_launcher_path_is_rejected_with_validate_only_too() {
 }
 
 #[test]
-fn no_add_dir_help_mentions_the_overflow_prompt_directory() {
+fn no_add_dir_help_mentions_the_private_prompt_directory() {
     let out = Command::new(env!("CARGO_BIN_EXE_recipe-runner-rs"))
         .arg("--help")
         .env("RECIPE_RUNNER_NO_UPDATE_CHECK", "1")
@@ -99,7 +103,7 @@ fn no_add_dir_help_mentions_the_overflow_prompt_directory() {
     let help = String::from_utf8_lossy(&out.stdout);
     let at = help.find("--no-add-dir").expect("--no-add-dir in help");
     assert!(
-        help[at..].contains("overflow prompt file is still granted"),
+        help[at..].contains("private prompt file is still granted"),
         "{}",
         &help[at..]
     );

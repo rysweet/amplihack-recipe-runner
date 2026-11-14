@@ -235,8 +235,11 @@ fn an_agent_definition_resolves_only_from_explicit_directories() {
         format!(
             "#!/usr/bin/env bash\n\
              set -u\n\
-             n=$(( $(ls '{calls}' | wc -l) ))\n\
+             n=$(( $(find '{calls}' -type f ! -name '*.system' | wc -l) ))\n\
              for a in \"$@\"; do printf '%s\\0' \"$a\" >> '{calls}/'\"$n\"; done\n\
+             previous=\"\"\n\
+             for a in \"$@\"; do if [ \"$previous\" = --system-prompt-file ]; then cat -- \"$a\" > '{calls}/'\"$n\".system; fi; previous=\"$a\"; done\n\
+             cat > /dev/null\n\
              echo done\n",
             calls = calls.display(),
         ),
@@ -258,15 +261,8 @@ fn an_agent_definition_resolves_only_from_explicit_directories() {
             .unwrap()
     };
     let system_prompt = |call: &str| {
-        let argv: Vec<String> = std::fs::read(calls.join(call))
-            .unwrap_or_else(|e| panic!("launcher call {call} not recorded: {e}"))
-            .split(|b| *b == 0)
-            .map(|s| String::from_utf8_lossy(s).into_owned())
-            .collect();
-        argv.windows(2)
-            .find(|w| w[0] == "--system-prompt")
-            .map(|w| w[1].clone())
-            .unwrap_or_else(|| panic!("no --system-prompt in call {call}: {argv:?}"))
+        std::fs::read_to_string(calls.join(format!("{call}.system")))
+            .unwrap_or_else(|e| panic!("launcher call {call} system file not recorded: {e}"))
     };
 
     let out = run(&[recipe, "--output-format", "json"]);

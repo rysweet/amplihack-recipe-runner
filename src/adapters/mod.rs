@@ -4,6 +4,7 @@
 pub mod cli_subprocess;
 mod codex_exec;
 mod env_spill;
+mod prompt_transport;
 #[cfg(test)]
 mod test_log;
 pub(crate) use codex_exec::{CleanupFailure, Interruption};

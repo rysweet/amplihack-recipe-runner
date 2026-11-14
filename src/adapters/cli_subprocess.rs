@@ -1,3 +1,4 @@
+use super::prompt_transport::PromptTransport;
 /// CLI subprocess adapter — executes agent steps by spawning `amplihack <agent>`
 /// subprocesses (configurable via `AMPLIHACK_AGENT_BINARY` env var, defaults to `claude`)
 /// and bash steps via a bash interpreter resolved once in the parent process
@@ -41,10 +42,6 @@ const RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT: &str = "You are already inside an a
      /dev, dev-orchestrator, ultrathink, smart-orchestrator, or any other workflow or recipe \
      runner. Execute the requested step directly and return only the output requested by this \
      step.";
-const MAX_INLINE_AGENT_PROMPT_BYTES: usize = 32 * 1024;
-const FILE_BACKED_INLINE_PROMPT_BYTES: usize = 8 * 1024;
-const FILE_BACKED_PROMPT_CONTINUATION_NOTE: &str = "\n\nIMPORTANT: Additional task instructions, output requirements, and context continue in the appended system prompt. Treat that appended content as part of this same request and follow it fully.";
-
 /// Read at most `max_bytes + 1` bytes from `path`, returning UTF-8 (lossy).
 ///
 /// The `+1` is a sentinel: callers can detect overflow when the returned
@@ -912,7 +909,7 @@ impl CLISubprocessAdapter {
     }
 
     /// Do not grant the step's working directory to the agent CLI with
-    /// `--add-dir`. The directory that holds an overflow prompt file for a CLI
+    /// `--add-dir`. The directory that holds a private prompt file for a CLI
     /// that reads it through `--add-dir` is still granted, because that CLI
     /// cannot read the prompt without it. The default is to grant both.
     pub fn without_working_dir_grant(mut self) -> Self {
@@ -1035,136 +1032,18 @@ impl CLISubprocessAdapter {
         child_env
     }
 
-    fn supports_file_backed_prompt_transport(&self) -> bool {
-        // Claude-family CLIs support --append-system-prompt-file for overflow.
-        // Copilot CLI does not, but we still need to avoid E2BIG.
-        // For Copilot: truncate -p and write overflow to a prompt file
-        // in the working dir that the agent can read via --add-dir.
-        true
-    }
-
-    fn should_use_file_backed_prompt_transport(
-        &self,
-        prompt: &str,
-        system_prompt: Option<&str>,
-    ) -> bool {
-        self.supports_file_backed_prompt_transport()
-            && prompt.len() + system_prompt.map_or(0, str::len) > MAX_INLINE_AGENT_PROMPT_BYTES
-    }
-
     fn build_effective_system_prompt(system_prompt: Option<&str>) -> String {
-        match system_prompt.map(str::trim).filter(|s| !s.is_empty()) {
+        match system_prompt.filter(|s| !s.is_empty()) {
             Some(existing) => format!("{existing}\n\n{RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT}"),
             None => RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT.to_string(),
         }
-    }
-
-    fn write_private_prompt_file(
-        prompt_file: &std::path::Path,
-        content: &str,
-    ) -> Result<(), anyhow::Error> {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-
-            // Create private from the start; set_permissions below also
-            // covers a file left over from an earlier attempt.
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(prompt_file)
-            .with_context(|| format!("Failed to create prompt file {}", prompt_file.display()))?;
-        file.write_all(content.as_bytes())
-            .with_context(|| format!("Failed to write prompt file {}", prompt_file.display()))?;
-        file.flush()
-            .with_context(|| format!("Failed to flush prompt file {}", prompt_file.display()))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            std::fs::set_permissions(prompt_file, std::fs::Permissions::from_mode(0o600))
-                .with_context(|| {
-                    format!("Failed to chmod prompt file {}", prompt_file.display())
-                })?;
-        }
-
-        Ok(())
-    }
-
-    fn clamp_char_boundary(text: &str, max_bytes: usize) -> usize {
-        let mut boundary = max_bytes.min(text.len());
-        while boundary > 0 && !text.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        boundary
-    }
-
-    fn build_file_backed_prompt_payload(
-        &self,
-        output_dir: &std::path::Path,
-        prompt: &str,
-        system_prompt: Option<&str>,
-    ) -> Result<(String, Option<std::path::PathBuf>), anyhow::Error> {
-        let prompt_file_path = output_dir.join("agent-system-prompt.md");
-        let preview_boundary = Self::clamp_char_boundary(prompt, FILE_BACKED_INLINE_PROMPT_BYTES);
-        let prompt_overflow = if preview_boundary < prompt.len() {
-            &prompt[preview_boundary..]
-        } else {
-            ""
-        };
-
-        let mut inline_prompt = if preview_boundary > 0 {
-            prompt[..preview_boundary].to_string()
-        } else {
-            String::new()
-        };
-        if !prompt_overflow.is_empty() {
-            if matches!(self.cli.as_str(), "claude" | "launch" | "RustyClawd") {
-                inline_prompt.push_str(FILE_BACKED_PROMPT_CONTINUATION_NOTE);
-            } else {
-                // Non-Claude CLIs only see the file via --add-dir, so name it.
-                inline_prompt.push_str(&format!(
-                    "\n\nIMPORTANT: Additional task instructions, output requirements, and \
-                     context continue in the file {}. Read that file and treat its content \
-                     as part of this same request and follow it fully.",
-                    prompt_file_path.display()
-                ));
-            }
-        }
-
-        let mut appended_prompt = String::new();
-        if let Some(sp) = system_prompt
-            && !sp.is_empty()
-        {
-            appended_prompt.push_str(sp);
-        }
-        if !prompt_overflow.is_empty() {
-            if !appended_prompt.is_empty() {
-                appended_prompt.push_str("\n\n");
-            }
-            appended_prompt.push_str("# Continued task instructions\n\n");
-            appended_prompt.push_str(prompt_overflow);
-        }
-
-        let prompt_file = if appended_prompt.is_empty() {
-            None
-        } else {
-            Self::write_private_prompt_file(&prompt_file_path, &appended_prompt)?;
-            Some(prompt_file_path)
-        };
-
-        Ok((inline_prompt, prompt_file))
     }
 
     fn build_agent_command(
         &self,
         output_dir: &std::path::Path,
         resolved_cwd: &std::path::Path,
-        prompt: &str,
-        system_prompt: Option<&str>,
+        transport: &PromptTransport,
         model: Option<&str>,
     ) -> Result<std::process::Command, anyhow::Error> {
         // Launch via `amplihack <agent>` by default so the amplihack
@@ -1215,41 +1094,7 @@ impl CLISubprocessAdapter {
         {
             cmd.arg("--allow-all-tools");
         }
-        let effective_system_prompt = Self::build_effective_system_prompt(system_prompt);
-
-        if self.should_use_file_backed_prompt_transport(prompt, Some(&effective_system_prompt)) {
-            let (inline_prompt, prompt_file) = self.build_file_backed_prompt_payload(
-                output_dir,
-                prompt,
-                Some(&effective_system_prompt),
-            )?;
-            log::info!(
-                "Using file-backed prompt transport for '{}' (prompt={} bytes, system_prompt={} bytes)",
-                self.cli,
-                prompt.len(),
-                effective_system_prompt.len()
-            );
-            if let Some(ref pf) = prompt_file {
-                // Claude-family CLIs read the file via --append-system-prompt-file.
-                // (--append-system-prompt takes TEXT: passing the path there
-                // dropped the overflow and the no-reentry guard, #159.)
-                // Copilot CLI does not — use --add-dir so the agent can read the file.
-                if matches!(self.cli.as_str(), "claude" | "launch" | "RustyClawd") {
-                    cmd.args(["--append-system-prompt-file", &pf.to_string_lossy()]);
-                } else {
-                    // For Copilot and others: make the prompt file accessible via --add-dir
-                    // and include a note in the inline prompt pointing to it.
-                    cmd.args(["--add-dir", &output_dir.to_string_lossy()]);
-                }
-            }
-            cmd.args(["-p", &inline_prompt]);
-        } else {
-            cmd.args(["-p", prompt]);
-            // Only pass --system-prompt for CLIs that support it
-            if matches!(self.cli.as_str(), "claude" | "launch" | "RustyClawd") {
-                cmd.args(["--system-prompt", &effective_system_prompt]);
-            }
-        }
+        transport.configure(&mut cmd);
 
         if self.add_working_dir {
             cmd.args(["--add-dir", &resolved_cwd.to_string_lossy()]);
@@ -1267,6 +1112,20 @@ impl CLISubprocessAdapter {
     /// given number of seconds.  Without a timeout the step runs until the
     /// underlying CLI process exits on its own.
     fn execute_agent_step_impl(
+        &self,
+        prompt: &str,
+        system_prompt: Option<&str>,
+        model: Option<&str>,
+        working_dir: &str,
+        timeout: Option<u64>,
+    ) -> anyhow::Result<String> {
+        let cancellation = super::codex_exec::Cancellation::install()?;
+        let result =
+            self.execute_agent_step_owned(prompt, system_prompt, model, working_dir, timeout);
+        super::codex_exec::finish_resources(result, cancellation.close())
+    }
+
+    fn execute_agent_step_owned(
         &self,
         prompt: &str,
         system_prompt: Option<&str>,
@@ -1326,12 +1185,8 @@ impl CLISubprocessAdapter {
             let mut child_env = Self::build_child_env_with(self.env_allow.as_deref());
             child_env.insert("AMPLIHACK_AGENT_BINARY".into(), self.cli.clone());
             let child_env = bounded_env(&child_env)?;
-            let envelope = format!(
-                "# System instructions\n{}\n\n# Task instructions\n{}{}",
-                Self::build_effective_system_prompt(system_prompt),
-                prompt,
-                NON_INTERACTIVE_FOOTER
-            );
+            let task = format!("{prompt}{NON_INTERACTIVE_FOOTER}");
+            let system = Self::build_effective_system_prompt(system_prompt);
             let codex_timeout = match (self.timeout_action, timeout) {
                 (TimeoutAction::Report, Some(secs)) => {
                     // On stderr, not through `log`: the binary shows no warnings
@@ -1341,29 +1196,31 @@ impl CLISubprocessAdapter {
                 }
                 _ => timeout,
             };
-            #[cfg(unix)]
-            let cancellation = super::codex_exec::Cancellation::install()?;
             let result = (|| {
                 let config = RateLimitConfig::from_env();
                 let mut attempt = 0;
                 loop {
                     let resources = tempfile::tempdir()
                         .context("Failed to allocate private Codex resources")?;
-                    let command = self.build_agent_command(
-                        resources.path(),
-                        &resolved_cwd,
-                        prompt,
-                        system_prompt,
-                        model,
-                    )?;
-                    let result = super::codex_exec::execute(
-                        command,
-                        resources.path(),
-                        &resolved_cwd,
-                        &child_env,
-                        &envelope,
-                        codex_timeout,
-                    );
+                    super::codex_exec::check_cancellation()?;
+                    let mut transport = PromptTransport::prepare(&self.cli, &task, &system)?;
+                    let result = (|| {
+                        let command = self.build_agent_command(
+                            resources.path(),
+                            &resolved_cwd,
+                            &transport,
+                            model,
+                        )?;
+                        super::codex_exec::execute(
+                            command,
+                            resources.path(),
+                            &resolved_cwd,
+                            &child_env,
+                            &transport.stdin,
+                            codex_timeout,
+                        )
+                    })();
+                    let result = super::codex_exec::finish_resources(result, transport.cleanup());
                     let cleanup = resources.close().context("Failed to clean Codex resources");
                     let result = super::codex_exec::finish_resources(result, cleanup);
                     #[cfg(unix)]
@@ -1398,8 +1255,6 @@ impl CLISubprocessAdapter {
                     }
                 }
             })();
-            #[cfg(unix)]
-            let result = super::codex_exec::finish_resources(result, cancellation.close());
             return result;
         }
 
@@ -1495,125 +1350,113 @@ impl CLISubprocessAdapter {
             // Always launch via `amplihack <agent>` so the amplihack infrastructure
             // (env setup, guards, hooks) is properly initialized.
             // The agent runs from the real repo/worktree cwd, not a temp dir.
-            let mut cmd = self.build_agent_command(
-                &output_dir,
-                &resolved_cwd,
+            super::codex_exec::check_cancellation()?;
+            let mut transport = PromptTransport::prepare(
+                &self.cli,
                 &full_prompt,
-                system_prompt,
-                effective_model,
+                &Self::build_effective_system_prompt(system_prompt),
             )?;
-            let mut child = cmd
-                .current_dir(&resolved_cwd)
-                .env_clear()
-                .envs(bounded_child.iter().map(|(k, v)| (k, v)))
-                .stdout(log_fh)
-                .stderr(stderr_fh)
-                .spawn()
-                .with_context(|| format!("Failed to execute 'amplihack {}'", self.cli))?;
+            let execution = (|| {
+                let mut cmd = self.build_agent_command(
+                    &output_dir,
+                    &resolved_cwd,
+                    &transport,
+                    effective_model,
+                )?;
+                super::codex_exec::check_cancellation()?;
+                cmd.current_dir(&resolved_cwd)
+                    .env_clear()
+                    .envs(bounded_child.iter().map(|(k, v)| (k, v)))
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(log_fh)
+                    .stderr(stderr_fh);
+                let mut process = super::codex_exec::AgentProcess::spawn(&mut cmd, &mut transport)
+                    .with_context(|| format!("Failed to execute 'amplihack {}'", self.cli))?;
+                let child = &mut process.child;
 
-            // Background heartbeat thread for progress reporting.
-            // Monitors the output log file for growth and prints status updates
-            // to stderr.  When the agent is working but producing no stdout
-            // (common with `claude -p` which writes all output at the end),
-            // the heartbeat shows elapsed time and confirms the process is alive
-            // so the user (or parent orchestrator) does not mistake silence for
-            // a hang.  See issue #3266.
-            //
-            // Issue #1421: it used to infer liveness from the existence of
-            // `/proc/<pid>` and, when that said "gone", print
-            // `... waiting (Ns elapsed, process may be finishing)` — a progress
-            // message about a process that had already died. `/proc` does not
-            // exist on macOS at all, so that branch was taken on EVERY tick
-            // there, and an operator watched a run report progress for
-            // fifty-five minutes with nothing behind it. The guess is gone: the
-            // thread that reaps the child publishes the real exit into
-            // `exit_slot`, and the heartbeat reports that exit (with the
-            // child's stderr tail when it ended badly) and stops.
-            let stop = Arc::new(AtomicBool::new(false));
-            let exit_slot: ExitSlot = Arc::new(std::sync::Mutex::new(None));
-            let stop_clone = stop.clone();
-            let exit_clone = exit_slot.clone();
-            let output_path = output_file.clone();
-            let stderr_path = stderr_file.clone();
-            let child_pid = child.id();
-            let agent_label = self.cli.clone();
+                // Background heartbeat thread for progress reporting.
+                // Monitors the output log file for growth and prints status updates
+                // to stderr.  When the agent is working but producing no stdout
+                // (common with `claude -p` which writes all output at the end),
+                // the heartbeat shows elapsed time and confirms the process is alive
+                // so the user (or parent orchestrator) does not mistake silence for
+                // a hang.  See issue #3266.
+                //
+                // Issue #1421: it used to infer liveness from the existence of
+                // `/proc/<pid>` and, when that said "gone", print
+                // `... waiting (Ns elapsed, process may be finishing)` — a progress
+                // message about a process that had already died. `/proc` does not
+                // exist on macOS at all, so that branch was taken on EVERY tick
+                // there, and an operator watched a run report progress for
+                // fifty-five minutes with nothing behind it. The guess is gone: the
+                // thread that reaps the child publishes the real exit into
+                // `exit_slot`, and the heartbeat reports that exit (with the
+                // child's stderr tail when it ended badly) and stops.
+                let stop = Arc::new(AtomicBool::new(false));
+                let exit_slot: ExitSlot = Arc::new(std::sync::Mutex::new(None));
+                let stop_clone = stop.clone();
+                let exit_clone = exit_slot.clone();
+                let output_path = output_file.clone();
+                let stderr_path = stderr_file.clone();
+                let child_pid = child.id();
+                let agent_label = self.cli.clone();
 
-            let heartbeat = std::thread::spawn(move || {
-                // Issue #52: stream all new bytes between ticks (not just the
-                // last line) and prefix each line with `[HH:MM:SS] [agent:pid]`
-                // so operators can correlate with external logs.
-                let label = format!("amplihack:{}:{}", agent_label, child_pid);
-                let mut emit = |line: &str| eprintln!("{}", line);
-                run_heartbeat(
-                    &HeartbeatConfig {
-                        output_path: &output_path,
-                        stderr_path: &stderr_path,
-                        label: &label,
-                        tick: HEARTBEAT_TICK,
-                        idle_threshold: HEARTBEAT_IDLE_THRESHOLD,
-                    },
-                    &stop_clone,
-                    &exit_clone,
-                    &mut emit,
+                let heartbeat = std::thread::spawn(move || {
+                    // Issue #52: stream all new bytes between ticks (not just the
+                    // last line) and prefix each line with `[HH:MM:SS] [agent:pid]`
+                    // so operators can correlate with external logs.
+                    let label = format!("amplihack:{}:{}", agent_label, child_pid);
+                    let mut emit = |line: &str| eprintln!("{}", line);
+                    run_heartbeat(
+                        &HeartbeatConfig {
+                            output_path: &output_path,
+                            stderr_path: &stderr_path,
+                            label: &label,
+                            tick: HEARTBEAT_TICK,
+                            idle_threshold: HEARTBEAT_IDLE_THRESHOLD,
+                        },
+                        &stop_clone,
+                        &exit_clone,
+                        &mut emit,
+                    );
+                });
+
+                // All paths after spawn retire the child and join the heartbeat before
+                // returning. Delivery never blocks cancellation on a full stdin pipe.
+                let execution = wait_with_input(
+                    child,
+                    &transport.stdin,
+                    timeout,
+                    self.timeout_action,
+                    &exit_slot,
                 );
-            });
-
-            // Issue #1421: `try_wait` is polled in BOTH the timeout and the
-            // no-timeout case. The no-timeout case used to block in `wait()`,
-            // which left the heartbeat with no way to ever learn the child was
-            // gone — the exit was observable only by the thread that could not
-            // report it. Polling publishes the exit the moment it happens.
-            let mut deadline = timeout.map(|secs| Instant::now() + Duration::from_secs(secs));
-            let status = loop {
-                match child.try_wait()? {
-                    Some(s) => {
-                        publish_exit(&exit_slot, &s);
-                        break s;
-                    }
-                    None => {
-                        let expired = deadline.is_some_and(|d| Instant::now() >= d);
-                        if expired && self.timeout_action == TimeoutAction::Report {
-                            // Report once, then wait without a deadline.
-                            eprintln!(
-                                "{}",
-                                timeout_report_line(
-                                    "Agent step",
-                                    timeout.unwrap_or_default(),
-                                    child.id()
-                                )
-                            );
-                            deadline = None;
-                        } else if expired {
-                            let secs = timeout.unwrap_or_default();
-                            log::warn!(
-                                "Agent step timed out after {}s — killing pid {}",
-                                secs,
-                                child.id()
-                            );
-                            let pid = child.id();
-                            child.kill().ok();
-                            // Reap the zombie so we don't leak processes, and
-                            // publish the result so the heartbeat's last word is
-                            // the kill rather than a claim of progress.
-                            if let Ok(killed) = child.wait() {
-                                publish_exit(&exit_slot, &killed);
-                            }
-                            stop.store(true, Ordering::SeqCst);
-                            let _ = heartbeat.join();
-                            anyhow::bail!(
-                                "Agent step timed out after {}s (killed pid {})",
-                                secs,
-                                pid
-                            );
+                child.stdin.take();
+                let retirement = process.retire();
+                let observation = process
+                    .child
+                    .try_wait()
+                    .context("Failed to inspect retired agent wrapper")
+                    .map(|status| {
+                        if let Some(status) = status {
+                            publish_exit(&exit_slot, &status);
                         }
-                        std::thread::sleep(Duration::from_millis(250));
-                    }
+                    });
+                let retirement = super::codex_exec::combine_result(retirement, observation);
+                if retirement.is_ok() {
+                    transport.consumer_retired();
                 }
-            };
-            stop.store(true, Ordering::SeqCst);
-            if let Err(e) = heartbeat.join() {
-                log::warn!("Heartbeat thread panicked: {:?}", e);
-            }
+                stop.store(true, Ordering::SeqCst);
+                let heartbeat_result = heartbeat
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("Agent heartbeat thread panicked"));
+                let cleanup = super::codex_exec::combine_result(retirement, heartbeat_result);
+                finish_agent_status(execution, cleanup, &self.cli)
+            })();
+            let execution = finish_agent_status(execution, transport.cleanup(), &self.cli);
+            let status = super::codex_exec::combine_result(
+                execution,
+                super::codex_exec::check_cancellation(),
+            )?;
 
             // Read agent output with retry and graceful fallback (#3740).
             // The output file can be missing if: the temp dir was cleaned by the OS,
@@ -1629,7 +1472,7 @@ impl CLISubprocessAdapter {
                         "Agent output file not found: {}. Retrying after 1s...",
                         output_file.display()
                     );
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    wait_observing_cancellation(Duration::from_secs(1))?;
                     match read_capped(&output_file, max_out) {
                         Ok(content) => {
                             log::info!("Agent output file found on retry");
@@ -1699,7 +1542,7 @@ impl CLISubprocessAdapter {
                     // so transient files don't leak across attempts.
                     self.discard_stderr_log(&stderr_file);
                     if !wait.is_zero() {
-                        std::thread::sleep(wait);
+                        wait_observing_cancellation(wait)?;
                     }
                     attempt += 1;
                     continue;
@@ -1732,6 +1575,119 @@ impl CLISubprocessAdapter {
             );
         }
     }
+}
+
+/// Deliver all bytes and EOF while retaining the existing execution deadline.
+fn wait_with_input(
+    child: &mut std::process::Child,
+    input: &str,
+    timeout: Option<u64>,
+    action: TimeoutAction,
+    exit: &ExitSlot,
+) -> anyhow::Result<std::process::ExitStatus> {
+    use std::os::fd::AsRawFd;
+    let stdin = child.stdin.take().context("Missing agent stdin")?;
+    let fd = stdin.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(std::io::Error::last_os_error()).context("Failed to configure agent stdin");
+        }
+    }
+    let mut offset = 0;
+    let mut writer = if input.is_empty() {
+        drop(stdin);
+        None
+    } else {
+        Some(stdin)
+    };
+    let mut deadline = timeout
+        .map(|seconds| {
+            Instant::now()
+                .checked_add(Duration::from_secs(seconds))
+                .context("Agent deadline overflow")
+        })
+        .transpose()?;
+    loop {
+        super::codex_exec::check_cancellation()?;
+        if let Some(status) = child.try_wait().context("Failed to wait for agent")? {
+            publish_exit(exit, &status);
+            anyhow::ensure!(
+                offset == input.len(),
+                "Agent stdin delivery incomplete: {offset}/{} bytes",
+                input.len()
+            );
+            return Ok(status);
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if action == TimeoutAction::Report {
+                eprintln!(
+                    "{}",
+                    timeout_report_line("Agent step", timeout.unwrap_or_default(), child.id())
+                );
+                deadline = None;
+            } else {
+                anyhow::bail!(
+                    "Agent step timed out after {}s (pid {})",
+                    timeout.unwrap_or_default(),
+                    child.id()
+                );
+            }
+        }
+        let mut progress = false;
+        if let Some(stdin) = writer.as_mut() {
+            match stdin.write(&input.as_bytes()[offset..]) {
+                Ok(0) => anyhow::bail!("Agent stdin write returned zero before completion"),
+                Ok(count) => {
+                    offset += count;
+                    progress = true;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => {
+                    return Err(error).context("Failed to deliver agent stdin instructions");
+                }
+            }
+            if offset == input.len() {
+                writer.take();
+            }
+        }
+        if !progress {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// Keep a nonzero exit as the primary failure when finalization also fails.
+fn finish_agent_status(
+    execution: anyhow::Result<std::process::ExitStatus>,
+    cleanup: anyhow::Result<()>,
+    cli: &str,
+) -> anyhow::Result<std::process::ExitStatus> {
+    let execution = match execution {
+        Ok(status) if !status.success() && cleanup.is_err() => Err(anyhow::anyhow!(
+            "amplihack {cli} failed (exit {})",
+            status.code().unwrap_or(-1)
+        )),
+        result => result,
+    };
+    super::codex_exec::combine_result(execution, cleanup)
+}
+
+fn wait_observing_cancellation(delay: Duration) -> anyhow::Result<()> {
+    let started = Instant::now();
+    while started.elapsed() < delay {
+        super::codex_exec::check_cancellation()?;
+        std::thread::sleep(
+            delay
+                .saturating_sub(started.elapsed())
+                .min(Duration::from_millis(10)),
+        );
+    }
+    super::codex_exec::check_cancellation()
 }
 
 impl Default for CLISubprocessAdapter {
@@ -2626,13 +2582,14 @@ mod tests {
     }
 
     /// A launcher stand-in that sleeps past the step timeout, then writes to
-    /// stdout and stderr and exits 0.
+    /// stdout and stderr and exits 0. Tests using this stdout-based protocol
+    /// must select Claude explicitly instead of inheriting the host's agent.
     fn slow_launcher(dir: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("slow-launcher");
         std::fs::write(
             &path,
-            "#!/bin/sh\nsleep 2\necho agent-said-this\necho agent-err-said-this >&2\n",
+            "#!/bin/sh\ncat >/dev/null\nsleep 2\necho agent-said-this\necho agent-err-said-this >&2\n",
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2654,7 +2611,7 @@ mod tests {
         let _guard = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
         let tmp = tempfile::tempdir().unwrap();
         use_launcher(&slow_launcher(tmp.path()));
-        let adapter = CLISubprocessAdapter::new();
+        let adapter = CLISubprocessAdapter::new().with_binary("claude");
         let err = adapter
             .execute_agent_step_impl("p", None, None, tmp.path().to_str().unwrap(), Some(1))
             .unwrap_err();
@@ -2667,7 +2624,9 @@ mod tests {
         let _guard = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
         let tmp = tempfile::tempdir().unwrap();
         use_launcher(&slow_launcher(tmp.path()));
-        let adapter = CLISubprocessAdapter::new().with_timeout_action(TimeoutAction::Report);
+        let adapter = CLISubprocessAdapter::new()
+            .with_binary("claude")
+            .with_timeout_action(TimeoutAction::Report);
         let out = adapter
             .execute_agent_step_impl("p", None, None, tmp.path().to_str().unwrap(), Some(1))
             .expect("a reported overrun must not fail the step");
@@ -2697,7 +2656,9 @@ mod tests {
         std::fs::create_dir(&logs).unwrap();
         std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let adapter = CLISubprocessAdapter::new().with_log_dir(&logs);
+        let adapter = CLISubprocessAdapter::new()
+            .with_binary("claude")
+            .with_log_dir(&logs);
         adapter
             .execute_agent_step_impl("p", None, None, tmp.path().to_str().unwrap(), None)
             .unwrap();
@@ -2722,7 +2683,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         use_launcher(&slow_launcher(tmp.path()));
         let logs = tmp.path().join("logs").join("nested");
-        let adapter = CLISubprocessAdapter::new().with_log_dir(&logs);
+        let adapter = CLISubprocessAdapter::new()
+            .with_binary("claude")
+            .with_log_dir(&logs);
         let out = adapter
             .execute_agent_step_impl("p", None, None, tmp.path().to_str().unwrap(), None)
             .unwrap();
@@ -2769,13 +2732,23 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
 
         let from_env = CLISubprocessAdapter::new()
-            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .build_agent_command(
+                tmp.path(),
+                tmp.path(),
+                &PromptTransport::prepare("claude", "hello", "system").unwrap(),
+                None,
+            )
             .unwrap();
         assert_eq!(from_env.get_program(), "/from/env/launcher");
 
         let explicit = CLISubprocessAdapter::new()
             .with_launcher("/opt/explicit/launcher")
-            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .build_agent_command(
+                tmp.path(),
+                tmp.path(),
+                &PromptTransport::prepare("claude", "hello", "system").unwrap(),
+                None,
+            )
             .unwrap();
         assert_eq!(explicit.get_program(), "/opt/explicit/launcher");
     }
@@ -2786,7 +2759,12 @@ mod tests {
         for relative in ["amplihack", "./launcher", "bin/launcher"] {
             let err = CLISubprocessAdapter::new()
                 .with_launcher(relative)
-                .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+                .build_agent_command(
+                    tmp.path(),
+                    tmp.path(),
+                    &PromptTransport::prepare("claude", "hello", "system").unwrap(),
+                    None,
+                )
                 .unwrap_err();
             assert!(
                 err.to_string().contains("must be absolute"),
@@ -2805,7 +2783,12 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         let cmd = CLISubprocessAdapter::new()
-            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .build_agent_command(
+                tmp.path(),
+                tmp.path(),
+                &PromptTransport::prepare("claude", "hello", "system").unwrap(),
+                None,
+            )
             .unwrap();
         assert_eq!(cmd.get_program(), "amplihack");
     }
@@ -2822,14 +2805,24 @@ mod tests {
 
         let default = CLISubprocessAdapter::new()
             .with_binary("copilot")
-            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .build_agent_command(
+                tmp.path(),
+                tmp.path(),
+                &PromptTransport::prepare("claude", "hello", "system").unwrap(),
+                None,
+            )
             .unwrap();
         assert!(command_args(&default).contains(&"--allow-all-tools".to_string()));
 
         let opted_out = CLISubprocessAdapter::new()
             .with_binary("copilot")
             .without_allow_all_tools()
-            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .build_agent_command(
+                tmp.path(),
+                tmp.path(),
+                &PromptTransport::prepare("claude", "hello", "system").unwrap(),
+                None,
+            )
             .unwrap();
         assert!(!command_args(&opted_out).contains(&"--allow-all-tools".to_string()));
     }
@@ -2842,15 +2835,27 @@ mod tests {
         let cwd_text = cwd.to_string_lossy().into_owned();
 
         let default = CLISubprocessAdapter::new()
-            .build_agent_command(tmp.path(), &cwd, "hello", None, None)
+            .with_binary("claude")
+            .build_agent_command(
+                tmp.path(),
+                &cwd,
+                &PromptTransport::prepare("claude", "hello", "system").unwrap(),
+                None,
+            )
             .unwrap();
         let args = command_args(&default);
         let pos = args.iter().position(|a| a == "--add-dir").unwrap();
         assert_eq!(args[pos + 1], cwd_text);
 
         let without = CLISubprocessAdapter::new()
+            .with_binary("claude")
             .without_working_dir_grant()
-            .build_agent_command(tmp.path(), &cwd, "hello", None, None)
+            .build_agent_command(
+                tmp.path(),
+                &cwd,
+                &PromptTransport::prepare("claude", "hello", "system").unwrap(),
+                None,
+            )
             .unwrap();
         let args = command_args(&without);
         assert!(!args.contains(&"--add-dir".to_string()), "{args:?}");
@@ -2858,28 +2863,21 @@ mod tests {
     }
 
     #[test]
-    fn without_working_dir_grant_keeps_the_overflow_prompt_directory_grant() {
-        // A CLI that reads an overflow prompt through --add-dir cannot do so
-        // without the output directory, so that grant stays.
+    fn without_working_dir_grant_keeps_the_prompt_directory_grant() {
         let tmp = tempfile::tempdir().unwrap();
-        let out = tmp.path().join("out");
-        let cwd = tmp.path().join("work");
-        std::fs::create_dir(&out).unwrap();
-        std::fs::create_dir(&cwd).unwrap();
-        let prompt = "p".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1);
+        let transport = PromptTransport::prepare("copilot", "task", "system").unwrap();
         let cmd = CLISubprocessAdapter::new()
             .with_binary("copilot")
             .without_working_dir_grant()
-            .build_agent_command(&out, &cwd, &prompt, None, None)
+            .build_agent_command(tmp.path(), tmp.path(), &transport, None)
             .unwrap();
         let args = command_args(&cmd);
-        let grants: Vec<&String> = args
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| *a == "--add-dir")
-            .map(|(i, _)| &args[i + 1])
+        let grants: Vec<_> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--add-dir")
+            .map(|pair| Path::new(&pair[1]))
             .collect();
-        assert_eq!(grants, vec![&out.to_string_lossy().into_owned()]);
+        assert_eq!(grants, [transport.directory().unwrap()]);
     }
 
     // ── --env-allow: only named parent variables reach children ───────
@@ -3251,20 +3249,28 @@ mod tests {
     }
 
     #[test]
-    fn test_build_agent_command_always_includes_system_prompt() {
-        // Claude CLI gets --system-prompt; Copilot does not
+    fn test_build_agent_command_always_includes_system_prompt_file() {
         let adapter = CLISubprocessAdapter::new().with_binary("claude");
         let tmp = tempfile::tempdir().unwrap();
+        let transport = PromptTransport::prepare(
+            "claude",
+            "hello",
+            &CLISubprocessAdapter::build_effective_system_prompt(None),
+        )
+        .unwrap();
         let cmd = adapter
-            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .build_agent_command(tmp.path(), tmp.path(), &transport, None)
             .unwrap();
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        assert!(args.windows(2).any(|w| {
-            w[0] == "--system-prompt" && w[1].contains(RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT)
-        }));
+        let args = command_args(&cmd);
+        let pair = args
+            .windows(2)
+            .find(|pair| pair[0] == "--system-prompt-file")
+            .unwrap();
+        assert!(
+            std::fs::read_to_string(&pair[1])
+                .unwrap()
+                .contains(RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT)
+        );
     }
 
     #[test]
@@ -3281,440 +3287,6 @@ mod tests {
     }
 
     #[test]
-    fn test_should_use_file_backed_prompt_transport_for_large_claude_prompt() {
-        let adapter = CLISubprocessAdapter::new().with_binary("claude");
-        let large_prompt = "x".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1);
-        assert!(adapter.should_use_file_backed_prompt_transport(&large_prompt, None));
-    }
-
-    #[test]
-    fn test_prompt_at_exact_inline_limit_stays_inline() {
-        // Exactly MAX bytes (prompt + system prompt combined) stays inline;
-        // one byte more switches to file-backed transport.
-        let adapter = CLISubprocessAdapter::new().with_binary("claude");
-        let system = "s".repeat(16);
-        let prompt = "x".repeat(MAX_INLINE_AGENT_PROMPT_BYTES - system.len());
-        assert_eq!(prompt.len() + system.len(), MAX_INLINE_AGENT_PROMPT_BYTES);
-        assert!(!adapter.should_use_file_backed_prompt_transport(&prompt, Some(&system)));
-        assert!(
-            adapter.should_use_file_backed_prompt_transport(&format!("{prompt}x"), Some(&system))
-        );
-    }
-
-    #[test]
-    fn test_uses_file_backed_prompt_transport_for_copilot() {
-        // Copilot now also uses file-backed transport for large prompts
-        let adapter = CLISubprocessAdapter::new().with_binary("copilot");
-        let large_prompt = "x".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1);
-        assert!(adapter.should_use_file_backed_prompt_transport(&large_prompt, None));
-    }
-
-    #[test]
-    fn test_build_agent_command_inlines_small_prompts() {
-        let tmp = tempfile::tempdir().unwrap();
-        let output_dir = tmp.path().join(".recipe-output");
-        std::fs::create_dir_all(&output_dir).unwrap();
-
-        let adapter = CLISubprocessAdapter::new().with_binary("claude");
-        let cmd = adapter
-            .build_agent_command(
-                &output_dir,
-                tmp.path(),
-                "short prompt",
-                Some("system"),
-                None,
-            )
-            .unwrap();
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-
-        assert!(args.iter().any(|arg| arg == "-p"));
-        assert!(args.iter().any(|arg| arg == "--system-prompt"));
-        assert!(!args.iter().any(|arg| arg == "--append-system-prompt"));
-        assert!(!args.iter().any(|arg| arg == "--append-system-prompt-file"));
-    }
-
-    #[test]
-    fn test_build_agent_command_uses_file_transport_for_large_claude_prompt() {
-        let tmp = tempfile::tempdir().unwrap();
-        let output_dir = tmp.path().join(".recipe-output");
-        std::fs::create_dir_all(&output_dir).unwrap();
-
-        let adapter = CLISubprocessAdapter::new().with_binary("claude");
-        let large_prompt = format!(
-            "Task: implement prompt transport.\nOutput: json.\n\n{}",
-            "x".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1)
-        );
-        let prompt_with_footer = format!("{}{}", large_prompt, NON_INTERACTIVE_FOOTER);
-        let cmd = adapter
-            .build_agent_command(
-                &output_dir,
-                tmp.path(),
-                &prompt_with_footer,
-                Some("system"),
-                None,
-            )
-            .unwrap();
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-
-        // #159: the overflow file must go to the FILE flag, never the TEXT flag.
-        assert!(args.iter().any(|arg| arg == "--append-system-prompt-file"));
-        assert!(!args.iter().any(|arg| arg == "--append-system-prompt"));
-        assert!(!args.iter().any(|arg| arg == "--system-prompt"));
-
-        let prompt_arg_index = args.iter().position(|arg| arg == "-p").unwrap();
-        let inline_prompt = &args[prompt_arg_index + 1];
-        assert!(inline_prompt.starts_with("Task: implement prompt transport."));
-        assert!(inline_prompt.contains(FILE_BACKED_PROMPT_CONTINUATION_NOTE));
-        assert!(inline_prompt.len() < prompt_with_footer.len());
-
-        let prompt_file_index = args
-            .iter()
-            .position(|arg| arg == "--append-system-prompt-file")
-            .expect("--append-system-prompt-file must be present (#159)");
-        let prompt_file = std::path::PathBuf::from(&args[prompt_file_index + 1]);
-        let prompt_file_contents = std::fs::read_to_string(&prompt_file).unwrap();
-        assert!(prompt_file_contents.contains("system"));
-        assert!(prompt_file_contents.contains("# Continued task instructions"));
-        assert!(prompt_file_contents.contains(NON_INTERACTIVE_FOOTER));
-        assert!(prompt_file_contents.contains(&"x".repeat(1024)));
-        assert!(prompt_file_contents.contains(NON_INTERACTIVE_FOOTER));
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let mode = std::fs::metadata(&prompt_file)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o600);
-        }
-    }
-
-    #[test]
-    fn test_large_system_prompt_keeps_full_user_prompt_inline() {
-        let tmp = tempfile::tempdir().unwrap();
-        let output_dir = tmp.path().join(".recipe-output");
-        std::fs::create_dir_all(&output_dir).unwrap();
-
-        let adapter = CLISubprocessAdapter::new().with_binary("claude");
-        let prompt = "Task: audit this workflow.";
-        let large_system_prompt = "s".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1);
-        let cmd = adapter
-            .build_agent_command(
-                &output_dir,
-                tmp.path(),
-                prompt,
-                Some(&large_system_prompt),
-                None,
-            )
-            .unwrap();
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-
-        let prompt_arg_index = args.iter().position(|arg| arg == "-p").unwrap();
-        assert_eq!(args[prompt_arg_index + 1], prompt);
-
-        let prompt_file_index = args
-            .iter()
-            .position(|arg| arg == "--append-system-prompt-file")
-            .expect("--append-system-prompt-file must be present (#159)");
-        let prompt_file = std::path::PathBuf::from(&args[prompt_file_index + 1]);
-        let prompt_file_contents = std::fs::read_to_string(&prompt_file).unwrap();
-        assert!(prompt_file_contents.starts_with(&large_system_prompt));
-        assert!(prompt_file_contents.contains(RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT));
-    }
-
-    // ── #159: overflow prompt file must be passed via --append-system-prompt-file ──
-
-    fn args_of(cmd: &std::process::Command) -> Vec<String> {
-        cmd.get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect()
-    }
-
-    /// (a) Claude-family CLIs pass the overflow file with the FILE flag, as its
-    /// own argv element, pointing at an existing absolute 0600 file — and never
-    /// pass anything to the TEXT flag `--append-system-prompt` (#159).
-    #[test]
-    fn test_claude_family_large_prompt_uses_append_system_prompt_file() {
-        for cli in ["claude", "launch", "RustyClawd"] {
-            let tmp = tempfile::tempdir().unwrap();
-            let output_dir = tmp.path().join(".recipe-output");
-            std::fs::create_dir_all(&output_dir).unwrap();
-
-            let adapter = CLISubprocessAdapter::new().with_binary(cli);
-            let prompt = "y".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1);
-            let cmd = adapter
-                .build_agent_command(&output_dir, tmp.path(), &prompt, Some("system"), None)
-                .unwrap();
-            let args = args_of(&cmd);
-
-            assert!(
-                !args.iter().any(|arg| arg == "--append-system-prompt"),
-                "{cli}: --append-system-prompt takes TEXT; passing a path loses the overflow (#159): {:?}",
-                args.iter()
-                    .map(|a| &a[..a.len().min(80)])
-                    .collect::<Vec<_>>()
-            );
-            let flag_index = args
-                .iter()
-                .position(|arg| arg == "--append-system-prompt-file")
-                .unwrap_or_else(|| panic!("{cli}: --append-system-prompt-file missing"));
-            let prompt_file = std::path::PathBuf::from(
-                args.get(flag_index + 1)
-                    .unwrap_or_else(|| panic!("{cli}: flag has no value")),
-            );
-            assert!(prompt_file.is_absolute(), "{cli}: path must be absolute");
-            assert!(prompt_file.exists(), "{cli}: prompt file must exist");
-            assert_eq!(prompt_file, output_dir.join("agent-system-prompt.md"));
-            assert_eq!(
-                args.iter()
-                    .filter(|arg| *arg == "--append-system-prompt-file")
-                    .count(),
-                1,
-                "{cli}: flag must appear exactly once"
-            );
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = std::fs::metadata(&prompt_file)
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777;
-                assert_eq!(mode, 0o600, "{cli}: prompt file must be private");
-            }
-        }
-    }
-
-    /// (b) The prompt file holds effective system prompt + overflow byte-for-byte.
-    /// (Already green before the fix: the content was right, only the flag was wrong.)
-    #[test]
-    fn test_file_backed_prompt_file_is_byte_exact() {
-        let tmp = tempfile::tempdir().unwrap();
-        let adapter = CLISubprocessAdapter::new().with_binary("claude");
-        let prompt = format!(
-            "HEAD{}UNIQUE_OVERFLOW_TAIL_159",
-            "x".repeat(MAX_INLINE_AGENT_PROMPT_BYTES)
-        );
-        let effective = CLISubprocessAdapter::build_effective_system_prompt(Some("system"));
-
-        let (inline_prompt, prompt_file) = adapter
-            .build_file_backed_prompt_payload(tmp.path(), &prompt, Some(&effective))
-            .unwrap();
-        let prompt_file = prompt_file.expect("overflow must produce a prompt file");
-
-        let boundary =
-            CLISubprocessAdapter::clamp_char_boundary(&prompt, FILE_BACKED_INLINE_PROMPT_BYTES);
-        assert_eq!(boundary, FILE_BACKED_INLINE_PROMPT_BYTES);
-        let expected = format!(
-            "{}\n\n# Continued task instructions\n\n{}",
-            effective,
-            &prompt[boundary..]
-        );
-        let contents = std::fs::read_to_string(&prompt_file).unwrap();
-        assert_eq!(contents, expected);
-        assert!(contents.contains(RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT));
-        assert!(contents.ends_with("UNIQUE_OVERFLOW_TAIL_159"));
-        assert_eq!(
-            inline_prompt,
-            format!(
-                "{}{}",
-                &prompt[..boundary],
-                FILE_BACKED_PROMPT_CONTINUATION_NOTE
-            )
-        );
-    }
-
-    /// (b') A multibyte char straddling the 8 KiB boundary is split on a char
-    /// boundary (no panic), and inline head + file overflow == original prompt.
-    #[test]
-    fn test_file_backed_prompt_file_is_byte_exact_multibyte_boundary() {
-        let tmp = tempfile::tempdir().unwrap();
-        let adapter = CLISubprocessAdapter::new().with_binary("claude");
-        let prompt = format!(
-            "{}🦀{}",
-            "a".repeat(FILE_BACKED_INLINE_PROMPT_BYTES - 1),
-            "x".repeat(MAX_INLINE_AGENT_PROMPT_BYTES)
-        );
-        let effective = CLISubprocessAdapter::build_effective_system_prompt(Some("system"));
-
-        let boundary =
-            CLISubprocessAdapter::clamp_char_boundary(&prompt, FILE_BACKED_INLINE_PROMPT_BYTES);
-        assert_eq!(boundary, FILE_BACKED_INLINE_PROMPT_BYTES - 1);
-
-        let (inline_prompt, prompt_file) = adapter
-            .build_file_backed_prompt_payload(tmp.path(), &prompt, Some(&effective))
-            .unwrap();
-        let contents = std::fs::read_to_string(prompt_file.unwrap()).unwrap();
-        let header = format!("{effective}\n\n# Continued task instructions\n\n");
-        assert!(contents.starts_with(&header));
-        let overflow = &contents[header.len()..];
-        assert!(overflow.starts_with('🦀'));
-
-        let inline_head = inline_prompt
-            .strip_suffix(FILE_BACKED_PROMPT_CONTINUATION_NOTE)
-            .expect("claude inline prompt must end with the continuation note");
-        assert_eq!(format!("{inline_head}{overflow}"), prompt);
-    }
-
-    /// (c) End-to-end: a fake `claude` launcher recording its argv receives the
-    /// overflow via `--append-system-prompt-file`, and the file it reads during
-    /// the run contains the overflow tail and the no-reentry guard (#159).
-    #[cfg(unix)]
-    #[test]
-    fn test_fake_claude_receives_overflow_via_file_flag() {
-        let script_dir = tempfile::tempdir().unwrap();
-        let capture_dir = tempfile::tempdir().unwrap();
-        let work_dir = tempfile::tempdir().unwrap();
-        let launcher = script_dir.path().join("fake-launcher.sh");
-        let counter_file = capture_dir.path().join("count");
-        let argv_capture = capture_dir.path().join("argv.bin");
-        let file_capture = capture_dir.path().join("prompt-file.txt");
-
-        // argv is recorded NUL-separated because the -p value contains newlines.
-        // The prompt file is copied while the child runs: the step's tempdir
-        // (and the file) is removed once execute_agent_step_impl returns.
-        write_fake_launcher(
-            &launcher,
-            &format!(
-                ": > '{argv}'\n\
-                 prev=''\n\
-                 for a in \"$@\"; do\n\
-                 printf '%s\\0' \"$a\" >> '{argv}'\n\
-                 if [ \"$prev\" = \"--append-system-prompt-file\" ]; then cat -- \"$a\" > '{file}'; fi\n\
-                 prev=\"$a\"\n\
-                 done\n\
-                 echo AGENT_OK\n\
-                 exit 0",
-                argv = argv_capture.display(),
-                file = file_capture.display(),
-            ),
-        );
-
-        let prompt = format!("HEAD{}UNIQUE_OVERFLOW_TAIL_159", "x".repeat(40 * 1024));
-        // Run with env overridden, then release the env guards and ENV_MUTEX
-        // BEFORE asserting, so a failure here can't poison the mutex for the
-        // other env-mutating tests.
-        let result = {
-            let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-            let _g_launcher = EnvGuard::new("AMPLIHACK_LAUNCHER_BINARY");
-            let _g_counter = EnvGuard::new("AMPLIHACK_TEST_RL_COUNTER");
-            let _g_agent = EnvGuard::new("AMPLIHACK_AGENT_BINARY");
-            let _g_retries = EnvGuard::new("AMPLIHACK_RATELIMIT_MAX_RETRIES");
-            // SAFETY: test holds ENV_MUTEX to serialize env var access
-            unsafe {
-                env::set_var("AMPLIHACK_LAUNCHER_BINARY", launcher.to_str().unwrap());
-                env::set_var("AMPLIHACK_TEST_RL_COUNTER", counter_file.to_str().unwrap());
-                env::set_var("AMPLIHACK_AGENT_BINARY", "claude");
-                env::set_var("AMPLIHACK_RATELIMIT_MAX_RETRIES", "0");
-            }
-            CLISubprocessAdapter::new().execute_agent_step_impl(
-                &prompt,
-                Some("system"),
-                None,
-                work_dir.path().to_str().unwrap(),
-                Some(60),
-            )
-        };
-        assert!(result.is_ok(), "fake claude step must succeed: {result:?}");
-
-        let raw = std::fs::read(&argv_capture).expect("fake launcher must record argv");
-        let argv: Vec<String> = raw
-            .split(|b| *b == 0)
-            .filter(|s| !s.is_empty())
-            .map(|s| String::from_utf8_lossy(s).into_owned())
-            .collect();
-        assert!(
-            !argv.iter().any(|a| a == "--append-system-prompt"),
-            "child must never get the overflow path as system-prompt TEXT (#159)"
-        );
-        let flag_index = argv
-            .iter()
-            .position(|a| a == "--append-system-prompt-file")
-            .expect("child argv must contain --append-system-prompt-file (#159)");
-        assert!(
-            argv.get(flag_index + 1)
-                .is_some_and(|p| p.ends_with("agent-system-prompt.md")),
-            "flag must be followed by the prompt file path"
-        );
-
-        let delivered = std::fs::read_to_string(&file_capture)
-            .expect("child must have been able to read the prompt file during the run");
-        assert!(delivered.contains("UNIQUE_OVERFLOW_TAIL_159"));
-        assert!(delivered.contains(RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT));
-        assert!(delivered.contains("system"));
-        assert!(delivered.contains(NON_INTERACTIVE_FOOTER));
-    }
-
-    /// (d) Non-Claude CLIs can't take a system-prompt file, so the inline note
-    /// must name the overflow file's absolute path instead of pointing at an
-    /// "appended system prompt" the CLI never receives (#159).
-    #[test]
-    fn test_copilot_large_prompt_note_names_prompt_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let output_dir = tmp.path().join(".recipe-output");
-        std::fs::create_dir_all(&output_dir).unwrap();
-
-        let adapter = CLISubprocessAdapter::new().with_binary("copilot");
-        let prompt = format!(
-            "Task: copilot overflow.\n{}",
-            "z".repeat(MAX_INLINE_AGENT_PROMPT_BYTES + 1)
-        );
-        let cmd = adapter
-            .build_agent_command(&output_dir, tmp.path(), &prompt, Some("system"), None)
-            .unwrap();
-        let args = args_of(&cmd);
-
-        let prompt_file = output_dir.join("agent-system-prompt.md");
-        assert!(prompt_file.is_absolute());
-        assert!(prompt_file.exists());
-
-        let p_index = args.iter().position(|arg| arg == "-p").unwrap();
-        let inline_prompt = &args[p_index + 1];
-        assert!(inline_prompt.starts_with("Task: copilot overflow."));
-        assert!(
-            inline_prompt.contains(&prompt_file.display().to_string()),
-            "copilot note must name the prompt file path"
-        );
-        assert!(
-            !inline_prompt.contains("appended system prompt"),
-            "copilot never receives an appended system prompt"
-        );
-        assert!(!inline_prompt.contains(FILE_BACKED_PROMPT_CONTINUATION_NOTE));
-        assert!(inline_prompt.ends_with(&format!(
-            "\n\nIMPORTANT: Additional task instructions, output requirements, and context \
-             continue in the file {}. Read that file and treat its content as part of this \
-             same request and follow it fully.",
-            prompt_file.display()
-        )));
-
-        let output_dir_str = output_dir.to_string_lossy().into_owned();
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "--add-dir" && w[1] == output_dir_str),
-            "copilot must get --add-dir <output_dir>"
-        );
-        assert!(
-            !args
-                .iter()
-                .any(|arg| arg.starts_with("--append-system-prompt")),
-            "copilot must not receive any --append-system-prompt* flag"
-        );
-    }
-
-    #[test]
     fn test_build_agent_command_includes_separator_before_passthrough_args() {
         // All CLIs require `--` separator between `amplihack <agent>` flags
         // and passthrough args like `-p`, `--model`, `--add-dir` (#4342).
@@ -3722,7 +3294,12 @@ mod tests {
             let adapter = CLISubprocessAdapter::new().with_binary(binary);
             let tmp = tempfile::tempdir().unwrap();
             let cmd = adapter
-                .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+                .build_agent_command(
+                    tmp.path(),
+                    tmp.path(),
+                    &PromptTransport::prepare("claude", "hello", "system").unwrap(),
+                    None,
+                )
                 .unwrap();
             let args: Vec<String> = cmd
                 .get_args()
@@ -3752,7 +3329,12 @@ mod tests {
         let adapter = CLISubprocessAdapter::new().with_binary("copilot");
         let tmp = tempfile::tempdir().unwrap();
         let cmd = adapter
-            .build_agent_command(tmp.path(), tmp.path(), "hello", None, Some("gpt-4"))
+            .build_agent_command(
+                tmp.path(),
+                tmp.path(),
+                &PromptTransport::prepare("copilot", "hello", "system").unwrap(),
+                Some("gpt-4"),
+            )
             .unwrap();
         let args: Vec<String> = cmd
             .get_args()
@@ -3783,7 +3365,12 @@ mod tests {
         let adapter = CLISubprocessAdapter::new().with_binary("copilot");
         let tmp = tempfile::tempdir().unwrap();
         let cmd = adapter
-            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .build_agent_command(
+                tmp.path(),
+                tmp.path(),
+                &PromptTransport::prepare("claude", "hello", "system").unwrap(),
+                None,
+            )
             .unwrap();
         let args: Vec<String> = cmd
             .get_args()
@@ -3807,7 +3394,12 @@ mod tests {
             let adapter = CLISubprocessAdapter::new().with_binary(binary);
             let tmp = tempfile::tempdir().unwrap();
             let cmd = adapter
-                .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+                .build_agent_command(
+                    tmp.path(),
+                    tmp.path(),
+                    &PromptTransport::prepare("claude", "hello", "system").unwrap(),
+                    None,
+                )
                 .unwrap();
             let args: Vec<String> = cmd
                 .get_args()
@@ -3834,7 +3426,12 @@ mod tests {
         let adapter = CLISubprocessAdapter::new().with_binary("copilot");
         let tmp = tempfile::tempdir().unwrap();
         let cmd = adapter
-            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .build_agent_command(
+                tmp.path(),
+                tmp.path(),
+                &PromptTransport::prepare("claude", "hello", "system").unwrap(),
+                None,
+            )
             .unwrap();
         let args: Vec<String> = cmd
             .get_args()
@@ -3859,7 +3456,12 @@ mod tests {
         let adapter = CLISubprocessAdapter::new().with_binary("copilot");
         let tmp = tempfile::tempdir().unwrap();
         let cmd = adapter
-            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .build_agent_command(
+                tmp.path(),
+                tmp.path(),
+                &PromptTransport::prepare("claude", "hello", "system").unwrap(),
+                None,
+            )
             .unwrap();
         let args: Vec<String> = cmd
             .get_args()
@@ -4095,7 +3697,12 @@ mod tests {
         let adapter = CLISubprocessAdapter::new().with_binary("claude");
         let tmp = tempfile::tempdir().unwrap();
         let cmd = adapter
-            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .build_agent_command(
+                tmp.path(),
+                tmp.path(),
+                &PromptTransport::prepare("claude", "hello", "system").unwrap(),
+                None,
+            )
             .unwrap();
         assert_eq!(
             cmd.get_program().to_string_lossy(),
@@ -4117,7 +3724,12 @@ mod tests {
         let adapter = CLISubprocessAdapter::new().with_binary("claude");
         let tmp = tempfile::tempdir().unwrap();
         let cmd = adapter
-            .build_agent_command(tmp.path(), tmp.path(), "hello", None, None)
+            .build_agent_command(
+                tmp.path(),
+                tmp.path(),
+                &PromptTransport::prepare("claude", "hello", "system").unwrap(),
+                None,
+            )
             .unwrap();
         assert_eq!(cmd.get_program().to_string_lossy(), "amplihack");
     }
@@ -4139,6 +3751,7 @@ mod tests {
              c=$(cat \"$f\" 2>/dev/null || echo 0)\n\
              c=$((c+1))\n\
              echo \"$c\" > \"$f\"\n\
+             cat >/dev/null\n\
              {body}\n"
         );
         std::fs::write(path, script).unwrap();
@@ -5809,8 +5422,7 @@ mod codex_exec_contract_tests {
             .build_agent_command(
                 resources.path(),
                 resources.path(),
-                "TASK_SENTINEL",
-                Some("PERSONA_SENTINEL"),
+                &PromptTransport::prepare("codex", "TASK_SENTINEL", "PERSONA_SENTINEL").unwrap(),
                 None,
             )
             .unwrap();

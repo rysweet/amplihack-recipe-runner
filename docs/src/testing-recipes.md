@@ -1,8 +1,8 @@
 ---
 title: Testing and edge-case recipes
-description: Regression recipe catalog and Codex verification coverage.
+description: Regression recipe catalog, prompt transport, and Codex verification coverage.
 doc_type: reference
-last_updated: 2026-10-07
+last_updated: 2026-11-14
 ---
 
 # Testing & Edge-Case Recipes
@@ -27,7 +27,62 @@ Source: [recipes/testing/](https://github.com/rysweet/amplihack-recipe-runner/tr
 | [large-context](https://github.com/rysweet/amplihack-recipe-runner/blob/main/recipes/testing/large-context.yaml) | Many context variables and long values to test template rendering at scale |
 | [empty-and-edge-cases](https://github.com/rysweet/amplihack-recipe-runner/blob/main/recipes/testing/empty-and-edge-cases.yaml) | Empty strings, missing variables, whitespace-only values, special characters |
 
+## Prompt transport verification
+
+The Linux Rust behavior tests in `tests/prompt_transport.rs` launch real agent
+steps against stub wrappers without invoking a model. The support launcher and
+worker use explicit `STARTED`, `INPUT_RECEIVED`, and `RELEASE` acknowledgments.
+Descendant scenarios launch a separate backend and acknowledge its PID, prompt
+receipt, and shutdown. A control request makes the still-live backend reread its
+prompt during shutdown before it is released or retired by escalation.
+Startup cancellation uses a Rust fork gate to acknowledge the boundary before the
+parent accepts anchor readiness. Both signals and both file-backed providers must
+remove prompts after confirmed retirement; denied group signals must retain them
+with an explicit cleanup error. Wrapper reaping and the absence of remaining owned
+children are checked separately.
+
+The existing `tests/qa/prompt-file-transport.sh` entry point and its scenario run
+this suite plus the context-file and standalone capability contracts. Run them
+directly with:
+
+```bash
+cargo test --test prompt_transport --test context_file_tests --test codex_capabilities_tests
+```
+
+After `STARTED`, the controller inspects the acknowledged live wrapper PID's
+`/proc/<pid>/cmdline` and resource permissions. The stub acknowledges receipt of
+the full input, including stdin EOF where required, and remains alive until
+released. Synchronization uses no sleeps, timed polling, retries, or timer-based
+release. Socket and readiness deadlines bound test failures. Each fixture records
+the PIDs it starts and waits for its children; process
+names or command-line patterns never select processes for termination.
+
+| Area | Verified behavior |
+|---|---|
+| Runner CLI | The actual runner receives small and large context through `--context-file`, renders an agent prompt, and holds each provider's wrapper alive. Both the recorded runner PID and acknowledged wrapper PID are inspected for context, task, and system sentinels; the wrapper receives the complete bytes. |
+| Context compatibility | JSON types and whitespace survive file input; recipe defaults, file values, and `--set` precedence are checked. Legacy `--set` is exercised separately. Invalid or non-private files fail with code 4 without echoing content, and the probe advertises `context_file_v1`. |
+| Claude | Bare `-p`, complete task on stdin followed by EOF, effective system instructions in `--system-prompt-file`, and neither supplied input in wrapper argv. |
+| Codex | `exec -`, complete system/task envelope on stdin followed by EOF, neither supplied input in argv, and no temporary prompt file. Existing final-message behavior remains covered. |
+| Copilot | Only fixed pointer wording and a generated absolute path carry instructions in argv. The file contains both complete inputs, including small personas. Its directory is granted even when the working-directory grant is disabled. |
+| Content | Small prompts, content beyond the former 8 KiB preview and 32 KiB threshold, independently large system/task text, whitespace-only personas, leading/trailing whitespace, Unicode, tabs, blank lines, and leading dashes survive byte-for-byte. Existing envelope labels, autonomy footer, and workflow-prevention instructions remain present. |
+| Live permissions | Every prompt directory is `0700` and every prompt file is `0600` while the wrapper is alive. Files are complete before wrapper startup and remain available through execution. |
+| Cleanup | Prompt files and directories disappear after success, nonzero exit, command construction/startup failure, delivery failure, terminating timeout, and cancellation. Retained logs do not retain prompts. Report-only timeouts keep resources available until actual completion. |
+| Delivery failure | A successful child exit before complete large-stdin delivery fails the attempt. Transport errors bypass rate-limit recovery. |
+| Cancellation | Real SIGINT/SIGTERM during delivery and after input receipt stop owned work and remove resources. Claude and Copilot wrapper/backend pairs prove prompt availability during shutdown and backend retirement before return, including ignored TERM and wrapper-first exit. Backpressure uses pipe-capacity information and acknowledgments. Typed interruption stops later steps under nonfatal and JSON-enabled policies. |
+| Unconfirmed retirement | Explicit cleanup and Drop preserve private prompt resources when backend retirement is unconfirmed; explicit cleanup reports their location. Confirmed retirement permits removal. |
+| Combined failures | Cleanup errors preserve typed `CleanupFailure` and the primary execution error. Signal handlers are restored explicitly after cleanup. A removal error is reported without claiming resources are absent. |
+| Compatibility | Launcher overrides, passthrough separators, model options, working directory, permission opt-outs, output handling, and existing timeout policies remain effective. |
+
+These checks cover every prompt size and verify the wrapper process itself; inspecting
+only the downstream model process does not establish argv secrecy.
+
 ## Codex verification
+
+`tests/qa/codex-exec.sh` exercises the supplied candidate binary for all three
+providers. Its Claude and Copilot controls read the referenced private prompt
+file while the child is running, check the required content and permissions
+without logging prompt text, and verify removal after completion. The behavior
+suite above covers cancellation during startup and execution.
 
 The [Codex agent-step contract](codex-exec.md) requires both deterministic
 regression tests and production integration evidence. The following checks guide
@@ -41,7 +96,7 @@ and write controlled final files. Keep fixtures and output under a private
 | Area | Required checks |
 |---|---|
 | Capability probe | Exact frozen JSON and package version, empty stderr, standalone argument enforcement, stdout-write failure, and no logging/update/cache/network effects under ambient logging/update settings. |
-| Prompt and dispatch | Small and large prompts, multiline/Unicode/leading-dash/NUL content, full system/persona/no-reentry/autonomy envelope, stdin EOF, effective cwd, explicit model only, no implicit add-dir, and unchanged Claude/Copilot argv/results. |
+| Prompt and dispatch | Small and large prompts, multiline/Unicode/leading-dash/NUL content, full system/persona/no-reentry/autonomy envelope, stdin EOF, effective cwd, explicit model only, no implicit add-dir, and Claude/Copilot results. Cross-provider prompt secrecy is covered above. |
 | Final response | Progress excluded; whitespace and trailing newlines preserved; existing empty file accepted; missing, directory, symlink, unsafe permissions, unreadable and invalid UTF-8 files rejected. Exact `MAX_STEP_OUTPUT_BYTES` succeeds; one byte over fails without unbounded allocation or silent truncation. |
 | Lifecycle | Spawn/write failure, blocked or partially consumed stdin, immediate zero timeout, nonzero exit despite a final file, lingering descendants, owned-tree termination/reaping, I/O completion and cleanup errors. Verify private permissions and absent initial final path. |
 | Retries | Fresh output resources, no stale-file reuse, complete context/model/timeout preservation for rate-limit and JSON repair attempts, bounded backoff, Codex excluded from auto-model fallback, and local delivery/file/decoding/cleanup failures not retried based on diagnostic text. |

@@ -1,5 +1,5 @@
 name: Codex exec CLI transport contract
-description: Run the published candidate through Codex exec and legacy-provider controls using an isolated fake launcher (Unix QA; requires bash, realpath, and Python 3).
+description: Run the published candidate through Codex exec and Claude/Copilot private prompt transport with an isolated launcher (Unix QA; requires bash, realpath, and Python 3).
 version: "1.0.0"
 config:
   timeout: 180000

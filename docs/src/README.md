@@ -21,6 +21,9 @@ recipe-runner-rs path/to/recipe.yaml
 # With context overrides
 recipe-runner-rs recipe.yaml --set task_description="Add auth" --set repo_path="."
 
+# Private context from a caller-owned JSON object file (0600 on Unix)
+recipe-runner-rs recipe.yaml --context-file /private/work/context.json
+
 # Dry run
 recipe-runner-rs recipe.yaml --dry-run
 ```

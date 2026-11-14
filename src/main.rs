@@ -80,6 +80,10 @@ struct Cli {
     #[arg(short, long = "set", value_name = "KEY=VALUE")]
     context: Vec<String>,
 
+    /// Read context from a private JSON object file. --set overrides its values.
+    #[arg(long, value_name = "PATH")]
+    context_file: Option<PathBuf>,
+
     /// Directory to search for sub-recipes (can be specified multiple times)
     #[arg(short = 'R', long = "recipe-dir")]
     recipe_dirs: Vec<String>,
@@ -164,7 +168,7 @@ struct Cli {
     no_allow_all_tools: bool,
 
     /// Do not grant the working directory to the agent CLI with --add-dir.
-    /// The directory that holds an overflow prompt file is still granted to
+    /// The directory that holds a private prompt file is still granted to
     /// CLIs that read the file through --add-dir (such as Copilot).
     #[arg(long)]
     no_add_dir: bool,
@@ -229,6 +233,44 @@ fn parse_context_pair(pair: &str) -> Option<(String, Value)> {
     Some((key.to_string(), parse_context_value(val)))
 }
 
+/// Read caller-owned context without placing its contents in argv or errors.
+fn read_context_file(path: &std::path::Path) -> anyhow::Result<HashMap<String, Value>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Reject symlinks and avoid blocking on a FIFO before checking its type.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(metadata.is_file(), "context file must be a regular file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        anyhow::ensure!(
+            metadata.uid() == uid && metadata.mode() & 0o077 == 0,
+            "context file must be owned by the current user with no group or other permissions"
+        );
+    }
+    let value: Value = serde_json::from_reader(file).map_err(|error| {
+        // Serde's diagnostic text can include supplied values. Only report
+        // coordinates, never keys, values, or excerpts from private context.
+        anyhow::anyhow!(
+            "invalid context JSON at line {}, column {}",
+            error.line(),
+            error.column()
+        )
+    })?;
+    match value {
+        Value::Object(values) => Ok(values.into_iter().collect()),
+        _ => anyhow::bail!("context file must contain a JSON object"),
+    }
+}
+
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
     if args.iter().skip(1).any(|arg| arg == "--capabilities") {
@@ -238,9 +280,9 @@ fn main() {
         }
         use std::io::Write;
         let capabilities: &[&str] = if cfg!(unix) {
-            &["codex_exec", "durable_recovery_v1"]
+            &["codex_exec", "durable_recovery_v1", "context_file_v1"]
         } else {
-            &[]
+            &["context_file_v1"]
         };
         let report = serde_json::json!({"schema_version":1,"version":env!("CARGO_PKG_VERSION"),"capabilities":capabilities});
         if let Err(error) = writeln!(std::io::stdout().lock(), "{report}") {
@@ -321,8 +363,19 @@ fn run() -> i32 {
         return exit_codes::BAD_ARGS;
     }
 
-    // Parse context overrides with type detection
-    let mut user_context: HashMap<String, Value> = HashMap::new();
+    // File values retain JSON types; legacy --set overrides take precedence.
+    let mut user_context = match cli
+        .context_file
+        .as_deref()
+        .map(read_context_file)
+        .transpose()
+    {
+        Ok(context) => context.unwrap_or_default(),
+        Err(error) => {
+            eprintln!("Error: Failed to read --context-file: {error}");
+            return exit_codes::BAD_ARGS;
+        }
+    };
     for pair in &cli.context {
         if let Some((key, val)) = parse_context_pair(pair) {
             user_context.insert(key, val);

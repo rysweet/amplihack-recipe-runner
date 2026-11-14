@@ -1,3 +1,10 @@
+---
+title: Environment budget and safe subprocess spawning
+description: Environment limits, bash value spilling, and agent input transport.
+doc_type: explanation
+last_updated: 2026-11-14
+---
+
 # Environment Budget & Safe Subprocess Spawning
 
 The recipe runner starts `bash` and agent subprocesses for many steps. On Linux
@@ -308,9 +315,17 @@ See [Migration to 0.6.0](migration-v0.6.md#amplihack_context_file-is-no-longer-s
 ## Agent steps
 
 Agent subprocesses don't receive `RECIPE_VAR_*` values. Recipe data reaches an
-agent through its prompt, and prompts over `MAX_INLINE_AGENT_PROMPT_BYTES`
-already go through a file. An agent child's environment is the sanitized
-inherited environment plus `AMPLIHACK_AGENT_BINARY`.
+agent through its prompt. Claude receives the complete task on stdin and effective
+system instructions through `--system-prompt-file`. Codex receives its complete
+system/task envelope on stdin. Copilot receives a fixed pointer to a private file
+containing both inputs, with access to that file's private directory.
+
+Every prompt size uses the same transport. No supplied task or system text appears
+in wrapper argv. The [agent prompt transport](agent-prompt-transport.md) describes
+exact preservation, private permissions, and cleanup after completion or cancellation.
+
+An agent child's environment is the sanitized inherited environment plus
+`AMPLIHACK_AGENT_BINARY`.
 
 That inherited environment is filtered before any step-specific variable is
 added. A variable is dropped, with a warning naming it and giving its size, when
