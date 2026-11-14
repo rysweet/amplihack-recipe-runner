@@ -100,7 +100,7 @@ determines their location. Prompt bytes never become file or directory names.
 | Directory | Created with mode `0700` on Unix. |
 | Prompt file | Created exclusively with mode `0600` on Unix, using a fixed filename inside the fresh directory. |
 | Preparation | File contents are completely written and the file closed before the wrapper starts. |
-| Lifetime | Files remain available until the agent finishes, including after a report-only timeout. |
+| Lifetime | Files remain available until the wrapper and its backend processes have stopped, including during graceful shutdown and after a report-only timeout. |
 | Cleanup | Files and directories are removed after success, nonzero exit, preparation or command-construction failure, startup failure, stdin-delivery failure, terminating timeout, or supported cancellation. |
 | Retained logs | `--log-dir` retains output logs without retaining prompt files. |
 | Repeated attempts | Resources are removed before any existing retry delay; a later attempt receives fresh resources. |
@@ -108,6 +108,10 @@ determines their location. Prompt bytes never become file or directory names.
 Codex still owns private final-message resources; those are output resources,
 not prompt files. Resource creation, writing, or removal failures are reported.
 A cleanup failure does not establish that every resource was removed.
+If backend retirement cannot be confirmed, the runner retains the private prompt
+directory, reports its location, and returns a terminal cleanup failure. Both
+explicit cleanup and resource guards preserve these files; an operator can remove
+them after establishing that their consumers have stopped.
 
 ## Delivery, cancellation, and failures
 
@@ -121,10 +125,30 @@ Transport failures do not enter rate-limit recovery.
 Shared scoped SIGINT/SIGTERM ownership starts before prompt preparation and
 continues through child shutdown, I/O completion, resource removal, and explicit
 restoration of prior signal handlers. Application cancellation and handled SIGINT
-or SIGTERM stop the owned agent and clean its resources. Typed `Interruption`
+or SIGTERM request the wrapper's supported SIGTERM shutdown. Each file-backed
+invocation starts in a dedicated process group. A retained group anchor preserves
+authority to signal that invocation even if the wrapper exits first. The wrapper
+gets up to four seconds to finish its shutdown path (including its three-second
+backend grace period); group cleanup then sends TERM,
+allows a bounded grace period, escalates to KILL, and confirms backend retirement.
+The runner never signals its inherited process group.
+
+Cancellation completes only after the invocation's backend processes have stopped
+and its prompt resources have been cleaned up. Termination or observation failures
+are reported explicitly and retain prompt resources when retirement is unconfirmed.
+The process-group boundary covers backend descendants that remain in the invocation's
+group; a backend that deliberately detaches into another session is outside this
+ownership contract. Typed `Interruption`
 stops subsequent steps, retries, JSON repair, and recovery even under nonfatal
 recipe policies. Typed `CleanupFailure` remains terminal too; combined failures
 retain both markers and the primary execution failure.
+
+Cancellation assurance requires descendant-process evidence. The earlier
+single-process transport checks established ordinary input handling and cleanup,
+but did not establish that a wrapper's backend had stopped. The descendant
+regressions now require acknowledged backend input receipt and shutdown, a live
+prompt read during shutdown, and retirement before adapter return under both
+SIGINT and SIGTERM, including escalation and wrapper-first exit.
 
 Existing timeout behavior remains in force. A terminating timeout attempts cleanup
 before returning. A report-only timeout keeps waiting and retains resources until

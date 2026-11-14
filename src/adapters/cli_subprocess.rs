@@ -1364,15 +1364,15 @@ impl CLISubprocessAdapter {
                     effective_model,
                 )?;
                 super::codex_exec::check_cancellation()?;
-                let mut child = cmd
-                    .current_dir(&resolved_cwd)
+                cmd.current_dir(&resolved_cwd)
                     .env_clear()
                     .envs(bounded_child.iter().map(|(k, v)| (k, v)))
                     .stdin(std::process::Stdio::piped())
                     .stdout(log_fh)
-                    .stderr(stderr_fh)
-                    .spawn()
+                    .stderr(stderr_fh);
+                let mut process = super::codex_exec::AgentProcess::spawn(&mut cmd, &mut transport)
                     .with_context(|| format!("Failed to execute 'amplihack {}'", self.cli))?;
+                let child = &mut process.child;
 
                 // Background heartbeat thread for progress reporting.
                 // Monitors the output log file for growth and prints status updates
@@ -1424,14 +1424,27 @@ impl CLISubprocessAdapter {
                 // All paths after spawn retire the child and join the heartbeat before
                 // returning. Delivery never blocks cancellation on a full stdin pipe.
                 let execution = wait_with_input(
-                    &mut child,
+                    child,
                     &transport.stdin,
                     timeout,
                     self.timeout_action,
                     &exit_slot,
                 );
                 child.stdin.take();
-                let retirement = retire_agent(&mut child, &exit_slot);
+                let retirement = process.retire();
+                let observation = process
+                    .child
+                    .try_wait()
+                    .context("Failed to inspect retired agent wrapper")
+                    .map(|status| {
+                        if let Some(status) = status {
+                            publish_exit(&exit_slot, &status);
+                        }
+                    });
+                let retirement = super::codex_exec::combine_result(retirement, observation);
+                if retirement.is_ok() {
+                    transport.consumer_retired();
+                }
                 stop.store(true, Ordering::SeqCst);
                 let heartbeat_result = heartbeat
                     .join()
@@ -1662,33 +1675,6 @@ fn finish_agent_status(
         result => result,
     };
     super::codex_exec::combine_result(execution, cleanup)
-}
-
-/// Retire only this attempt's recorded child and always reap it before cleanup.
-fn retire_agent(child: &mut std::process::Child, exit: &ExitSlot) -> anyhow::Result<()> {
-    if let Some(status) = child
-        .try_wait()
-        .context("Failed to inspect owned agent during cleanup")?
-    {
-        publish_exit(exit, &status);
-        return Ok(());
-    }
-    let termination = child.kill();
-    // A concurrent natural exit can make kill fail; waiting still establishes retirement.
-    let status = child
-        .wait()
-        .context("Failed to reap owned agent during cleanup")?;
-    publish_exit(exit, &status);
-    if let Err(error) = termination {
-        // InvalidInput means std already observed completion. ESRCH means the
-        // recorded process exited between inspection and termination.
-        if error.kind() != std::io::ErrorKind::InvalidInput
-            && error.raw_os_error() != Some(libc::ESRCH)
-        {
-            return Err(error).context("Failed to terminate owned agent during cleanup");
-        }
-    }
-    Ok(())
 }
 
 fn wait_observing_cancellation(delay: Duration) -> anyhow::Result<()> {

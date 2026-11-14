@@ -3,12 +3,47 @@
 use std::{
     env, fs,
     io::{self, BufRead, BufReader, Read, Write},
+    os::fd::AsRawFd,
     os::unix::net::UnixStream,
     path::PathBuf,
+    process::{Command, Stdio},
+    sync::atomic::{AtomicI32, Ordering},
 };
 
 unsafe extern "C" {
     fn fcntl(fd: i32, command: i32, ...) -> i32;
+    fn signal(signal: i32, handler: usize) -> usize;
+    fn write(fd: i32, bytes: *const u8, count: usize) -> isize;
+    fn kill(pid: i32, signal: i32) -> i32;
+}
+
+static SIGNAL_SOCKET: AtomicI32 = AtomicI32::new(-1);
+static BACKEND_PID: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn wrapper_shutdown(_: i32) {
+    let bytes = b"WRAPPER_SHUTDOWN\n";
+    unsafe {
+        write(
+            SIGNAL_SOCKET.load(Ordering::Relaxed),
+            bytes.as_ptr(),
+            bytes.len(),
+        );
+        let pid = BACKEND_PID.load(Ordering::Relaxed);
+        if pid > 1 {
+            kill(pid, 15);
+        }
+    }
+}
+
+extern "C" fn backend_shutdown(_: i32) {
+    let bytes = b"BACKEND_SHUTDOWN\n";
+    unsafe {
+        write(
+            SIGNAL_SOCKET.load(Ordering::Relaxed),
+            bytes.as_ptr(),
+            bytes.len(),
+        );
+    }
 }
 
 fn message(wire: &mut BufReader<UnixStream>, text: &str) -> io::Result<()> {
@@ -23,8 +58,27 @@ fn command(wire: &mut BufReader<UnixStream>) -> io::Result<String> {
 
 fn run() -> io::Result<()> {
     let root = PathBuf::from(env::var_os("PROMPT_TEST_ROOT").unwrap());
-    let mut wire = BufReader::new(UnixStream::connect(root.join("agent.sock"))?);
+    let backend = env::var_os("PROMPT_TEST_BACKEND").is_some();
+    let mut wire = BufReader::new(UnixStream::connect(root.join(if backend {
+        "backend.sock"
+    } else {
+        "agent.sock"
+    }))?);
     let args: Vec<_> = env::args().skip(1).collect();
+    let scenario = fs::read_to_string(root.join("scenario"))?;
+    if backend || scenario.starts_with("descendant_") {
+        SIGNAL_SOCKET.store(wire.get_ref().as_raw_fd(), Ordering::Relaxed);
+        unsafe {
+            signal(
+                15,
+                if backend {
+                    backend_shutdown as *const () as usize
+                } else {
+                    wrapper_shutdown as *const () as usize
+                },
+            );
+        }
+    }
     fs::write(
         root.join("wrapper.cwd"),
         env::current_dir()?.as_os_str().as_encoded_bytes(),
@@ -32,7 +86,18 @@ fn run() -> io::Result<()> {
     let final_message = args
         .windows(2)
         .find_map(|pair| (pair[0] == "--output-last-message").then(|| PathBuf::from(&pair[1])));
-    message(&mut wire, &format!("STARTED {}", std::process::id()))?;
+    message(
+        &mut wire,
+        &format!(
+            "{} {}",
+            if backend {
+                "BACKEND_STARTED"
+            } else {
+                "STARTED"
+            },
+            std::process::id()
+        ),
+    )?;
     let mut input = Vec::new();
     let mut instruction = command(&mut wire)?;
     if instruction == "PREFIX" {
@@ -48,13 +113,32 @@ fn run() -> io::Result<()> {
     if instruction != "READ" {
         return Ok(());
     }
+    if !backend && scenario.starts_with("descendant_") {
+        let mut child = Command::new(env::current_exe()?)
+            .args(&args)
+            .env("PROMPT_TEST_BACKEND", "1")
+            .stdin(Stdio::inherit())
+            .spawn()?;
+        BACKEND_PID.store(child.id() as i32, Ordering::Relaxed);
+        message(&mut wire, &format!("BACKEND_LAUNCHED {}", child.id()))?;
+        if scenario == "descendant_orphan" {
+            // The backend remains in the invocation group after this wrapper exits.
+            let _ = command(&mut wire)?;
+            return Ok(());
+        }
+        let status = child.wait()?;
+        fs::write(root.join("backend.wait_status"), status.to_string())?;
+        return Ok(());
+    }
     // Consume the same input the real backend would consume, rather than
     // treating the controller's filesystem snapshot as proof of receipt.
     let mut system = Vec::new();
+    let mut prompt_path = None;
     for pair in args.windows(2) {
         match pair[0].as_str() {
             "--system-prompt-file" | "--append-system-prompt-file" => {
                 system = fs::read(&pair[1])?;
+                prompt_path = Some(PathBuf::from(&pair[1]));
             }
             "--system-prompt" => system = pair[1].as_bytes().to_vec(),
             "--add-dir" if args.first().is_some_and(|arg| arg == "copilot") => {
@@ -64,7 +148,8 @@ fn run() -> io::Result<()> {
                     if path.is_file()
                         && pointer.is_some_and(|pair| pair[1].contains(path.to_str().unwrap()))
                     {
-                        system = fs::read(path)?;
+                        system = fs::read(&path)?;
+                        prompt_path = Some(path);
                     }
                 }
             }
@@ -72,7 +157,6 @@ fn run() -> io::Result<()> {
         }
     }
     fs::write(root.join("system.received"), system)?;
-    let scenario = fs::read_to_string(root.join("scenario"))?;
     if scenario != "early_zero" {
         // Reading to EOF proves delivery closed stdin, including empty input.
         io::stdin().read_to_end(&mut input)?;
@@ -82,8 +166,18 @@ fn run() -> io::Result<()> {
         fs::write(path, b"STUB_FINAL")?;
     }
     message(&mut wire, "INPUT_RECEIVED")?;
-    if command(&mut wire)? != "RELEASE" {
-        return Ok(());
+    loop {
+        match command(&mut wire)?.as_str() {
+            "CHECK" if backend => {
+                let bytes = fs::read(prompt_path.as_ref().unwrap())?;
+                if bytes != fs::read(root.join("system.received"))? {
+                    return Err(io::Error::other("prompt changed during shutdown"));
+                }
+                message(&mut wire, "PROMPT_AVAILABLE")?;
+            }
+            "RELEASE" => break,
+            _ => return Ok(()),
+        }
     }
     println!("STUB_STDOUT");
     eprintln!("STUB_STDERR");

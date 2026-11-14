@@ -1,6 +1,10 @@
 //! Owned noninteractive Codex attempts. Progress is diagnostic, never a result.
 use std::{path::Path, process::Command};
 #[cfg(unix)]
+mod agent_process;
+#[cfg(unix)]
+pub(super) use agent_process::AgentProcess;
+#[cfg(unix)]
 mod anchor_child;
 #[cfg(all(unix, any(not(target_os = "linux"), test)))]
 mod anchor_fifo;

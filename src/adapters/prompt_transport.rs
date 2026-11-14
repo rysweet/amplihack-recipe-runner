@@ -7,6 +7,7 @@ pub(super) struct PromptTransport {
     pub(super) stdin: String,
     directory: Option<tempfile::TempDir>,
     pointer: Option<String>,
+    consumer_active: bool,
 }
 
 impl PromptTransport {
@@ -17,6 +18,7 @@ impl PromptTransport {
                 stdin: envelope(),
                 directory: None,
                 pointer: None,
+                consumer_active: false,
             });
         }
         let directory = tempfile::Builder::new()
@@ -35,6 +37,7 @@ impl PromptTransport {
             },
             directory: Some(directory),
             pointer: None,
+            consumer_active: false,
         };
         let preparation = (|| {
             let path = transport.file().context("Missing prompt file path")?;
@@ -94,8 +97,26 @@ impl PromptTransport {
         }
     }
 
-    /// Explicit removal reports failures; retained ownership supplies a Drop fallback.
+    pub(super) fn consumer_started(&mut self) {
+        self.consumer_active = true;
+    }
+
+    pub(super) fn consumer_retired(&mut self) {
+        self.consumer_active = false;
+    }
+
+    /// Never remove a prompt while retirement is unconfirmed, including on unwind.
+    /// Keep the private directory and report its location for operator cleanup.
     pub(super) fn cleanup(&mut self) -> anyhow::Result<()> {
+        if self.consumer_active
+            && let Some(directory) = self.directory.take()
+        {
+            let path = directory.keep();
+            anyhow::bail!(
+                "Agent retirement unconfirmed; private prompt resources retained at {}",
+                path.display()
+            );
+        }
         if let Some(directory) = &self.directory {
             std::fs::remove_dir_all(directory.path())
                 .context("Failed to clean private prompt resources")?;
@@ -112,5 +133,40 @@ impl Drop for PromptTransport {
         if let Err(error) = self.cleanup() {
             log::error!("{error:#}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unconfirmed_retirement_preserves_prompts_for_explicit_cleanup_and_drop() {
+        for explicit_cleanup in [false, true] {
+            let mut transport = PromptTransport::prepare("claude", "task", "system").unwrap();
+            let directory = transport.directory().unwrap().to_owned();
+            transport.consumer_started();
+            if explicit_cleanup {
+                let error = transport.cleanup().unwrap_err();
+                assert!(error.to_string().contains("retirement unconfirmed"));
+                assert!(error.to_string().contains(directory.to_str().unwrap()));
+            }
+            drop(transport);
+            assert_eq!(
+                std::fs::read(directory.join("instructions.md")).unwrap(),
+                b"system"
+            );
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn confirmed_retirement_allows_prompt_cleanup() {
+        let mut transport = PromptTransport::prepare("copilot", "task", "system").unwrap();
+        let directory = transport.directory().unwrap().to_owned();
+        transport.consumer_started();
+        transport.consumer_retired();
+        transport.cleanup().unwrap();
+        assert!(!directory.exists());
     }
 }

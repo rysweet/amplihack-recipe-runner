@@ -32,6 +32,9 @@ Source: [recipes/testing/](https://github.com/rysweet/amplihack-recipe-runner/tr
 The Linux Rust behavior tests in `tests/prompt_transport.rs` launch real agent
 steps against stub wrappers without invoking a model. The support launcher and
 worker use explicit `STARTED`, `INPUT_RECEIVED`, and `RELEASE` acknowledgments.
+Descendant scenarios launch a separate backend and acknowledge its PID, prompt
+receipt, and shutdown. A control request makes the still-live backend reread its
+prompt during shutdown before it is released or retired by escalation.
 The existing `tests/qa/prompt-file-transport.sh` entry point and its scenario run
 this suite. Run it directly with:
 
@@ -43,7 +46,8 @@ After `STARTED`, the controller inspects the acknowledged live wrapper PID's
 `/proc/<pid>/cmdline` and resource permissions. The stub acknowledges receipt of
 the full input, including stdin EOF where required, and remains alive until
 released. Synchronization uses no sleeps, timed polling, retries, or timer-based
-release. Each fixture records the PIDs it starts and waits for them; process
+release. Socket and readiness deadlines bound test failures. Each fixture records
+the PIDs it starts and waits for its children; process
 names or command-line patterns never select processes for termination.
 
 | Area | Verified behavior |
@@ -55,7 +59,8 @@ names or command-line patterns never select processes for termination.
 | Live permissions | Every prompt directory is `0700` and every prompt file is `0600` while the wrapper is alive. Files are complete before wrapper startup and remain available through execution. |
 | Cleanup | Prompt files and directories disappear after success, nonzero exit, command construction/startup failure, delivery failure, terminating timeout, and cancellation. Retained logs do not retain prompts. Report-only timeouts keep resources available until actual completion. |
 | Delivery failure | A successful child exit before complete large-stdin delivery fails the attempt. Transport errors bypass rate-limit recovery. |
-| Cancellation | Real SIGINT/SIGTERM during delivery and after input receipt stop owned work and remove resources. Backpressure uses pipe-capacity information and acknowledgments. Typed interruption stops later steps under nonfatal and JSON-enabled policies. |
+| Cancellation | Real SIGINT/SIGTERM during delivery and after input receipt stop owned work and remove resources. Claude and Copilot wrapper/backend pairs prove prompt availability during shutdown and backend retirement before return, including ignored TERM and wrapper-first exit. Backpressure uses pipe-capacity information and acknowledgments. Typed interruption stops later steps under nonfatal and JSON-enabled policies. |
+| Unconfirmed retirement | Explicit cleanup and Drop preserve private prompt resources when backend retirement is unconfirmed; explicit cleanup reports their location. Confirmed retirement permits removal. |
 | Combined failures | Cleanup errors preserve typed `CleanupFailure` and the primary execution error. Signal handlers are restored explicitly after cleanup. A removal error is reported without claiming resources are absent. |
 | Compatibility | Launcher overrides, passthrough separators, model options, working directory, permission opt-outs, output handling, and existing timeout policies remain effective. |
 

@@ -18,6 +18,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::OnceLock,
+    time::Duration,
 };
 
 const FOOTER: &str = "\n\nIMPORTANT: Proceed autonomously. Do not ask questions. Make reasonable decisions and continue.";
@@ -63,6 +64,26 @@ fn receive(wire: &mut BufReader<UnixStream>) -> String {
         "fixture disconnected before acknowledgment"
     );
     text.trim_end().to_owned()
+}
+
+fn accept(listener: &UnixListener) -> BufReader<UnixStream> {
+    let mut ready = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert!(
+        unsafe { libc::poll(&mut ready, 1, 15_000) } > 0,
+        "fixture connection deadline exceeded"
+    );
+    let stream = listener.accept().unwrap().0;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    BufReader::new(stream)
 }
 
 fn send(wire: &mut BufReader<UnixStream>, text: &str) {
@@ -148,14 +169,14 @@ impl Fixture {
             .spawn()
             .unwrap();
         let worker = OwnedWorker(child);
-        let mut worker_wire = BufReader::new(workers.accept().unwrap().0);
+        let mut worker_wire = accept(&workers);
         assert_eq!(receive(&mut worker_wire), "WORKER_STARTED");
         // Startup-error and zero-timeout cases must return without readiness.
         let expect_wrapper =
             config["startup"].is_null() && (config["timeout"] != 0 || config["report"] == true);
         let (agent, args, wrapper_pid) = if expect_wrapper {
             // Wait for either explicit readiness or an early adapter result.
-            // An infinite OS descriptor wait has no interval or polling loop.
+            // A deadline bounds fixture failure; readiness establishes ordering.
             let mut ready = [
                 libc::pollfd {
                     fd: agents.as_raw_fd(),
@@ -168,7 +189,7 @@ impl Fixture {
                     revents: 0,
                 },
             ];
-            assert!(unsafe { libc::poll(ready.as_mut_ptr(), ready.len() as _, -1) } > 0);
+            assert!(unsafe { libc::poll(ready.as_mut_ptr(), ready.len() as _, 15_000) } > 0);
             assert_eq!(
                 ready[1].revents,
                 0,
@@ -179,7 +200,7 @@ impl Fixture {
                     String::new()
                 }
             );
-            let mut wire = BufReader::new(agents.accept().unwrap().0);
+            let mut wire = accept(&agents);
             let started = receive(&mut wire);
             let pid: u32 = started.strip_prefix("STARTED ").unwrap().parse().unwrap();
             // Inspect the actual, acknowledged wrapper, before it reads stdin.
@@ -661,6 +682,109 @@ fn codex_signals_cancel_delivery_and_stop_nonfatal_recipes() {
 #[test]
 fn copilot_signals_remove_prompt_files_and_stop_nonfatal_recipes() {
     assert_signal_contract("copilot");
+}
+
+fn backend_running(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    !matches!(
+        stat.rsplit_once(')').unwrap().1.split_whitespace().next(),
+        Some("Z" | "X")
+    )
+}
+
+#[test]
+fn descendant_backends_retire_before_prompt_cleanup_on_both_signals() {
+    for provider in ["claude", "copilot"] {
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            for scenario in [
+                "descendant_graceful",
+                "descendant_ignore",
+                "descendant_orphan",
+            ] {
+                let mut fixture =
+                    Fixture::start(provider, TASK, Some(SYSTEM), json!({"scenario": scenario}));
+                let listener =
+                    UnixListener::bind(fixture.root.path().join("backend.sock")).unwrap();
+                let wrapper = fixture.agent.as_mut().unwrap();
+                send(wrapper, "READ");
+                let launched = receive(wrapper);
+                let pid: u32 = launched
+                    .strip_prefix("BACKEND_LAUNCHED ")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let mut backend = accept(&listener);
+                assert_eq!(receive(&mut backend), format!("BACKEND_STARTED {pid}"));
+                send(&mut backend, "READ");
+                assert_eq!(receive(&mut backend), "INPUT_RECEIVED");
+                // Backend receipt, rather than a filesystem snapshot, proves delivery.
+                assert_payload(
+                    &fs::read(fixture.root.path().join("system.received")).unwrap(),
+                    fixture.live_system.as_ref().unwrap(),
+                );
+                if provider == "claude" {
+                    assert_payload(&fixture.input(), format!("{TASK}{FOOTER}").as_bytes());
+                }
+                assert_eq!(
+                    unsafe { libc::kill(fixture.worker.0.id() as i32, signal) },
+                    0
+                );
+                assert_eq!(receive(fixture.agent.as_mut().unwrap()), "WRAPPER_SHUTDOWN");
+                assert_eq!(receive(&mut backend), "BACKEND_SHUTDOWN");
+                assert!(
+                    backend_running(pid),
+                    "backend exited before explicit release"
+                );
+                send(&mut backend, "CHECK");
+                assert_eq!(receive(&mut backend), "PROMPT_AVAILABLE");
+                for path in &fixture.prompt_files {
+                    assert!(
+                        path.exists(),
+                        "prompt removed while backend is shutting down"
+                    );
+                }
+                let mut ready = libc::pollfd {
+                    fd: fixture.worker_wire.get_ref().as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                assert_eq!(
+                    unsafe { libc::poll(&mut ready, 1, 0) },
+                    0,
+                    "adapter returned while backend remained alive"
+                );
+                match scenario {
+                    "descendant_graceful" => send(&mut backend, "RELEASE"),
+                    "descendant_orphan" => send(fixture.agent.as_mut().unwrap(), "ORPHAN"),
+                    _ => {} // Backend deliberately keeps running after TERM; only escalation retires it.
+                }
+                let result = fixture.result(None);
+                assert!(
+                    !backend_running(pid),
+                    "backend survived cancellation: {result}"
+                );
+                assert!(
+                    result["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("cancelled by signal"),
+                    "{result}"
+                );
+                fixture.assert_cleaned();
+                fixture.assert_secrecy();
+                if scenario == "descendant_graceful" {
+                    assert!(
+                        fs::read_to_string(fixture.root.path().join("backend.wait_status"))
+                            .unwrap()
+                            .contains("exit status: 0"),
+                        "wrapper did not reap its backend gracefully"
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn assert_signal_contract(provider: &str) {
