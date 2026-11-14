@@ -641,7 +641,7 @@ mod unix {
     // The marker records cwd independently of the runner's intentional output.
     fn directory_launcher(f: &Fixture) -> PathBuf {
         let launcher = f.dir.path().join("launcher");
-        fs::write(&launcher, "#!/bin/sh\npwd -P > \"${0%/*}/agent-cwd\"\nfinal=\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = --output-last-message ]; then shift; final=$1; fi\n  shift\ndone\nif [ -n \"$final\" ]; then\n  cat > /dev/null\n  printf launched > \"$final\"\nelse\n  printf launched\nfi\n").unwrap();
+        fs::write(&launcher, "#!/bin/sh\npwd -P > \"${0%/*}/agent-cwd\"\nfinal=\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = --output-last-message ]; then shift; final=$1; fi\n  shift\ndone\ncat > /dev/null\nif [ -n \"$final\" ]; then\n  printf launched > \"$final\"\nelse\n  printf launched\nfi\n").unwrap();
         fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
         launcher
     }
@@ -1129,8 +1129,8 @@ elif [[ -n "$system_file" ]]; then
     cat > "$DELIVERED_PROMPT"
     printf '%s' "$system_file" > "$PROMPT_PATH"
 else
-    prompt_file=${request#Read the file }
-    prompt_file=${prompt_file% and follow all task instructions and output requirements in it.}
+    prompt_file=${request#Read and follow the complete instructions in the file }
+    prompt_file=${prompt_file%. Its contents are the task prompt.}
     cat -- "$prompt_file" > "$DELIVERED_PROMPT"
     printf '%s' "$prompt_file" > "$PROMPT_PATH"
 fi

@@ -1,5 +1,5 @@
 name: Agent prompt transport against real wrappers (#205, #211)
-description: Opt-in. Run one agent step through the real amplihack claude and amplihack copilot wrappers; the reply must hold a random task token and a random persona token, neither may appear on any process command line during the step, and the private prompt file must be removed afterwards (Linux; requires authenticated CLIs, bash, realpath and Python 3; uses model tokens).
+description: Opt-in. Run one agent step through the real amplihack claude and amplihack copilot wrappers; the reply must hold a random task token and a random persona token, neither may appear on any process command line during the step, amplihack must pass the Copilot pointer through without a second file, and the private prompt file must be removed afterwards (Linux; requires authenticated CLIs, bash, realpath and Python 3; uses model tokens).
 version: "1.0.0"
 config:
   timeout: 900000

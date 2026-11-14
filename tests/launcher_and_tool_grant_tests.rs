@@ -8,7 +8,11 @@ use std::process::{Command, Output};
 
 fn stand_in(dir: &Path, name: &str, label: &str) -> std::path::PathBuf {
     let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\nprintf '{label}:%s ' \"$@\"\n")).unwrap();
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\ncat >/dev/null\nprintf '{label}:%s ' \"$@\"\n"),
+    )
+    .unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }

@@ -242,6 +242,7 @@ fn an_agent_definition_resolves_only_from_explicit_directories() {
                if [ \"$prev\" = --system-prompt-file ]; then cat -- \"$a\" > '{calls}/'\"$n\"; fi\n\
                prev=\"$a\"\n\
              done\n\
+             cat >/dev/null\n\
              echo done\n",
             calls = calls.display(),
         ),

@@ -123,6 +123,9 @@ else:
     snap = snaps["--add-dir"]
     assert snap["is_file"], snap
     assert snap["path"] in p_value, "inline note must name the prompt file path"
+    # amplihack copilot passes a -p value through unchanged only when it
+    # starts with amplihack's FILE_REFERENCE_PREFIX.
+    assert p_value == f"Read and follow the complete instructions in the file {snap['path']}. Its contents are the task prompt.", p_value
     assert "the appended system prompt" not in p_value
     assert "OVERFLOW_TAIL_SENTINEL_159" in snap["content"]
     assert "HEAD_SENTINEL" in snap["content"]

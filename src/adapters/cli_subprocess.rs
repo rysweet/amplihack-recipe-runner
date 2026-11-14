@@ -45,9 +45,23 @@ const RECIPE_CHILD_NO_REENTRY_SYSTEM_PROMPT: &str = "You are already inside an a
 /// directory. Claude-family CLIs receive it with `--system-prompt-file`;
 /// Copilot is asked to read it.
 const AGENT_PROMPT_FILE: &str = "agent-system-prompt.md";
-/// How long a finished agent may leave the stdin writer blocked before the
-/// task is treated as undelivered (#205).
+/// How long the runner waits, after an agent exits, for the stdin writer to
+/// report how the write ended (#205). The result is only logged; a writer
+/// still blocked after this is left detached.
 const TASK_DELIVERY_GRACE: Duration = Duration::from_secs(2);
+/// amplihack's pointer sentence for Copilot, split around the file path.
+///
+/// Source: amplihack-rs `crates/amplihack-utils/src/prompt_delivery.rs`,
+/// `FILE_REFERENCE_TEMPLATE` ("Read and follow the complete instructions in
+/// the file {path}. Its contents are the task prompt.") and
+/// `FILE_REFERENCE_PREFIX`, identical in v1.2.157, v1.2.158 and v1.2.161.
+/// `amplihack copilot` passes a `-p` value that starts with
+/// `FILE_REFERENCE_PREFIX` through unchanged (`codex_copilot_rewrite.rs`).
+/// Any other value it writes into a second private file and points Copilot at
+/// that file, so the task would sit two model-driven file reads away.
+const AMPLIHACK_FILE_REFERENCE_PREFIX: &str =
+    "Read and follow the complete instructions in the file ";
+const AMPLIHACK_FILE_REFERENCE_SUFFIX: &str = ". Its contents are the task prompt.";
 
 /// Read at most `max_bytes + 1` bytes from `path`, returning UTF-8 (lossy).
 ///
@@ -460,27 +474,64 @@ fn spawn_task_writer(
     })
 }
 
-/// Result of the stdin write once the agent has exited. Errors name the I/O
-/// failure kind only, never task text. A writer still blocked after
-/// [`TASK_DELIVERY_GRACE`] (a descendant holding the pipe without reading) is
-/// left detached; it ends when that descendant does.
+/// How the stdin write ended once the agent had exited (#205).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskDelivery {
+    /// Every byte was accepted by the pipe and stdin was closed. A pipe
+    /// accepts up to its capacity (64 KiB by default on Linux) whether or not
+    /// anyone reads it, so this does not show that the agent read the task.
+    Written,
+    /// The write failed, usually with `BrokenPipe` because every reader had
+    /// closed stdin before the whole task was written.
+    Failed(std::io::ErrorKind),
+    /// The writer was still blocked after the grace period: a process still
+    /// holds stdin open without reading it. The writer is left detached and
+    /// ends when that process closes stdin.
+    StillBlocked,
+    /// The writer thread panicked.
+    Panicked,
+}
+
+impl TaskDelivery {
+    /// Fixed-text warning for an incomplete write; never contains task text.
+    fn warning(self) -> Option<String> {
+        let what = match self {
+            TaskDelivery::Written => return None,
+            TaskDelivery::Failed(kind) => format!("the stdin write failed ({kind:?})"),
+            TaskDelivery::StillBlocked => {
+                "the stdin write was still blocked after the agent exited".to_string()
+            }
+            TaskDelivery::Panicked => "the stdin writer panicked".to_string(),
+        };
+        Some(format!(
+            "Agent exited 0 before its whole task was written to stdin: {what}. \
+             The step keeps the agent's result."
+        ))
+    }
+}
+
+/// Wait up to `grace` for the stdin writer to finish after the agent has
+/// exited, and say how the write ended.
+///
+/// The result is diagnostic only. Whether a write below the pipe capacity
+/// fails depends on whether the agent closed stdin before the writer ran,
+/// which is a matter of scheduling, so it cannot decide a step's outcome:
+/// the agent's exit status does.
 fn finish_task_delivery(
     writer: std::thread::JoinHandle<std::io::Result<()>>,
-) -> Result<(), anyhow::Error> {
-    let deadline = Instant::now() + TASK_DELIVERY_GRACE;
+    grace: Duration,
+) -> TaskDelivery {
+    let deadline = Instant::now() + grace;
     while !writer.is_finished() {
         if Instant::now() >= deadline {
-            anyhow::bail!("Agent exited before reading its task from stdin");
+            return TaskDelivery::StillBlocked;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     match writer.join() {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => anyhow::bail!(
-            "Failed to deliver the agent task on stdin ({:?})",
-            error.kind()
-        ),
-        Err(_) => anyhow::bail!("Agent task writer panicked"),
+        Ok(Ok(())) => TaskDelivery::Written,
+        Ok(Err(error)) => TaskDelivery::Failed(error.kind()),
+        Err(_) => TaskDelivery::Panicked,
     }
 }
 
@@ -1114,11 +1165,13 @@ impl CLISubprocessAdapter {
         matches!(self.cli.as_str(), "claude" | "launch" | "RustyClawd")
     }
 
-    /// Copilot's only prompt argument: a fixed request naming the private
-    /// prompt file. The path is a random temporary path, not recipe content.
+    /// Copilot's only prompt argument: amplihack's own pointer sentence
+    /// naming the private prompt file, so `amplihack copilot` passes it
+    /// through unchanged and Copilot reads the task in one file read. The
+    /// path is a random temporary path, not recipe content.
     fn copilot_prompt_request(prompt_file: &Path) -> String {
         format!(
-            "Read the file {} and follow all task instructions and output requirements in it.",
+            "{AMPLIHACK_FILE_REFERENCE_PREFIX}{}{AMPLIHACK_FILE_REFERENCE_SUFFIX}",
             prompt_file.display()
         )
     }
@@ -1614,7 +1667,8 @@ impl CLISubprocessAdapter {
             }
             // Joined only after the agent exits: the writer may still be
             // blocked on a full pipe while the agent runs.
-            let delivery = task_writer.map(finish_task_delivery);
+            let delivery =
+                task_writer.map(|writer| finish_task_delivery(writer, TASK_DELIVERY_GRACE));
 
             // Read agent output with retry and graceful fallback (#3740).
             // The output file can be missing if: the temp dir was cleaned by the OS,
@@ -1659,10 +1713,12 @@ impl CLISubprocessAdapter {
             // temp_dir is dropped after the loop exits, cleaning up automatically.
 
             if status.success() {
-                // An agent that exits cleanly without reading its whole task
-                // did not run the step it was given (#205).
-                if let Some(Err(error)) = delivery {
-                    return Err(error);
+                // The exit status decides the step. An incomplete stdin write
+                // is reported, not enforced: below the pipe capacity the write
+                // succeeds or fails according to which thread ran first, not
+                // according to whether the agent read the task (#205).
+                if let Some(warning) = delivery.and_then(TaskDelivery::warning) {
+                    log::warn!("{warning}");
                 }
                 // On success, remove the persistent stderr file (unless logs
                 // are kept with --log-dir).
@@ -2626,7 +2682,7 @@ mod tests {
         let path = dir.join("slow-launcher");
         std::fs::write(
             &path,
-            "#!/bin/sh\nsleep 2\necho agent-said-this\necho agent-err-said-this >&2\n",
+            "#!/bin/sh\ncat >/dev/null\nsleep 2\necho agent-said-this\necho agent-err-said-this >&2\n",
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -3519,12 +3575,13 @@ mod tests {
         assert_eq!(task, format!("{prompt}{NON_INTERACTIVE_FOOTER}"));
     }
 
-    /// (d) A Claude-family agent that exits 0 without reading a task larger
-    /// than the pipe buffer did not receive its step, so the step fails
-    /// instead of returning output for an undelivered task (#205).
+    /// (d) The agent's exit status decides a Claude-family step, not the stdin
+    /// write (#205). A task far larger than the pipe buffer, which the agent
+    /// never reads, makes the write fail on every schedule; the step still
+    /// returns the agent's output, and the diagnostic is only logged.
     #[cfg(unix)]
     #[test]
-    fn claude_step_fails_when_the_agent_does_not_read_its_task() {
+    fn claude_step_keeps_its_result_when_the_agent_does_not_read_its_task() {
         let script_dir = tempfile::tempdir().unwrap();
         let work_dir = tempfile::tempdir().unwrap();
         let launcher = script_dir.path().join("fake-launcher.sh");
@@ -3552,9 +3609,84 @@ mod tests {
                     Some(60),
                 )
         };
-        let error = format!("{:#}", result.unwrap_err());
-        assert!(error.contains("agent task on stdin"), "{error}");
-        assert!(!error.contains("zzzz"), "task text in diagnostic: {error}");
+        assert_eq!(result.unwrap(), "AGENT_OK");
+    }
+
+    /// A writer thread that finishes with `outcome`, for
+    /// `finish_task_delivery` tests that must not depend on scheduling.
+    fn finished_writer(
+        outcome: std::io::Result<()>,
+    ) -> std::thread::JoinHandle<std::io::Result<()>> {
+        let writer = std::thread::spawn(move || outcome);
+        while !writer.is_finished() {
+            std::thread::yield_now();
+        }
+        writer
+    }
+
+    #[test]
+    fn task_delivery_reports_a_complete_write_without_a_warning() {
+        let delivery = finish_task_delivery(finished_writer(Ok(())), Duration::ZERO);
+        assert_eq!(delivery, TaskDelivery::Written);
+        assert_eq!(delivery.warning(), None);
+    }
+
+    #[test]
+    fn task_delivery_reports_a_broken_pipe_as_a_warning_only() {
+        let broken = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        let delivery = finish_task_delivery(finished_writer(Err(broken)), Duration::ZERO);
+        assert_eq!(
+            delivery,
+            TaskDelivery::Failed(std::io::ErrorKind::BrokenPipe)
+        );
+        let warning = delivery.warning().unwrap();
+        assert!(warning.contains("BrokenPipe"), "{warning}");
+        assert!(warning.contains("keeps the agent's result"), "{warning}");
+    }
+
+    #[test]
+    fn task_delivery_detaches_a_writer_still_blocked_after_the_grace_period() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let writer = std::thread::spawn(move || {
+            let _ = blocked.recv();
+            Ok(())
+        });
+        let started = Instant::now();
+        let delivery = finish_task_delivery(writer, Duration::from_millis(50));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(delivery, TaskDelivery::StillBlocked);
+        assert!(delivery.warning().unwrap().contains("still blocked"));
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn task_delivery_reports_a_panicked_writer() {
+        let writer = std::thread::spawn(|| -> std::io::Result<()> {
+            panic!("writer test panic");
+        });
+        let delivery = finish_task_delivery(writer, Duration::from_secs(5));
+        assert_eq!(delivery, TaskDelivery::Panicked);
+        assert!(delivery.warning().is_some());
+    }
+
+    /// `amplihack copilot` (amplihack-rs v1.2.157, v1.2.158 and v1.2.161)
+    /// passes a `-p` value through unchanged only when it starts with
+    /// `FILE_REFERENCE_PREFIX` from
+    /// `crates/amplihack-utils/src/prompt_delivery.rs`; otherwise it wraps the
+    /// value in a second file. The literals below are copied from that file,
+    /// not from this crate, so a change to the runner's sentence fails here.
+    #[test]
+    fn copilot_request_is_amplihacks_own_pointer_sentence() {
+        const FILE_REFERENCE_TEMPLATE: &str = "Read and follow the complete instructions in the file {path}. Its contents are the task prompt.";
+        const FILE_REFERENCE_PREFIX: &str =
+            "Read and follow the complete instructions in the file ";
+        let path = Path::new("/tmp/.tmpAbC123/.recipe-output/agent-system-prompt.md");
+        let request = CLISubprocessAdapter::copilot_prompt_request(path);
+        assert!(request.starts_with(FILE_REFERENCE_PREFIX), "{request}");
+        assert_eq!(
+            request,
+            FILE_REFERENCE_TEMPLATE.replace("{path}", &path.display().to_string())
+        );
     }
 
     /// (e) Copilot takes no system-prompt file, so its only prompt argument
@@ -3596,7 +3728,7 @@ mod tests {
         assert_eq!(
             inline_prompt,
             &format!(
-                "Read the file {} and follow all task instructions and output requirements in it.",
+                "Read and follow the complete instructions in the file {}. Its contents are the task prompt.",
                 prompt_file.display()
             )
         );
@@ -4070,7 +4202,8 @@ mod tests {
         write_fake_launcher(
             &launcher,
             &format!(
-                "if [ \"$c\" -le 2 ]; then\n\
+                "cat >/dev/null\n\
+                 if [ \"$c\" -le 2 ]; then\n\
                  echo \"{RATE_LIMIT_MSG}\" 1>&2\n\
                  exit 1\n\
                  fi\n\
@@ -4132,7 +4265,7 @@ mod tests {
         // Always throttle.
         write_fake_launcher(
             &launcher,
-            &format!("echo \"{RATE_LIMIT_MSG}\" 1>&2\nexit 1"),
+            &format!("cat >/dev/null\necho \"{RATE_LIMIT_MSG}\" 1>&2\nexit 1"),
         );
 
         // SAFETY: test holds ENV_MUTEX to serialize env var access
@@ -4188,7 +4321,7 @@ mod tests {
         // Generic, non-rate-limit failure (e.g. an auth error).
         write_fake_launcher(
             &launcher,
-            "echo \"error: authentication failed (401 Unauthorized)\" 1>&2\nexit 2",
+            "cat >/dev/null\necho \"error: authentication failed (401 Unauthorized)\" 1>&2\nexit 2",
         );
 
         // SAFETY: test holds ENV_MUTEX to serialize env var access
@@ -4246,7 +4379,8 @@ mod tests {
         write_fake_launcher(
             &launcher,
             &format!(
-                "has_auto=0\n\
+                "cat >/dev/null\n\
+                 has_auto=0\n\
                  for a in \"$@\"; do if [ \"$a\" = \"auto\" ]; then has_auto=1; fi; done\n\
                  if [ \"$has_auto\" = \"1\" ]; then\n\
                  echo \"AGENT_OK_AUTO\"\n\

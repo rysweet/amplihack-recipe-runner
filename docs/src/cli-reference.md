@@ -738,7 +738,7 @@ capability `agent_prompt_file_v1`.
 | Provider | Command line | System prompt | Task |
 |----------|--------------|---------------|------|
 | `claude`, `launch`, `RustyClawd` | `--system-prompt-file <file> -p` | In `<file>` | On stdin, then EOF |
-| `copilot` | `--add-dir <file directory> -p "Read the file <file> and follow all task instructions and output requirements in it."` | In `<file>` | In `<file>`, after `# Task instructions` |
+| `copilot` | `--add-dir <file directory> -p "Read and follow the complete instructions in the file <file>. Its contents are the task prompt."` | In `<file>` | In `<file>`, after `# Task instructions` |
 | `codex` | `exec --output-last-message <file> -` | On stdin | On stdin |
 
 The system prompt is the agent definition named by the step's `agent:` field,
@@ -762,9 +762,14 @@ Earlier releases sent prompts of 32 KiB or more (task plus system prompt) with
 put the first 8 KiB of the task on the command line. Those prompts now also
 replace the default system prompt.
 
-If the agent exits with status zero but the runner could not write the whole
-task to its stdin, the step fails: the agent did not receive the step it
-reported on. A failed agent is reported by its exit status and stderr as before.
+The agent's exit status decides the step. The runner writes the task to stdin
+and closes it, but it cannot confirm that the agent read the task: a pipe
+accepts up to its capacity (64 KiB by default on Linux) whether or not anyone
+reads from it, and a shorter write fails only if the agent has already closed
+stdin when the write runs, which depends on scheduling. If an agent exits with
+status zero before the whole task was written, the runner logs a warning naming
+the I/O error kind (usually `BrokenPipe`) and keeps the agent's result. A failed
+agent is reported by its exit status and stderr as before.
 
 ### Copilot
 
@@ -777,13 +782,24 @@ still exit zero, and its output is then not an answer to the task. Earlier
 releases put Copilot prompts under 32 KiB directly on the command line, where
 delivery did not depend on the model.
 
+The request is amplihack's own pointer sentence (`FILE_REFERENCE_TEMPLATE` in
+amplihack-rs `crates/amplihack-utils/src/prompt_delivery.rs`). `amplihack
+copilot` passes a `-p` value that starts with its `FILE_REFERENCE_PREFIX`
+through unchanged; any other value it writes into a second private file and
+points Copilot at that, which would leave the task two file reads away. Because
+the value passes through unchanged, amplihack 1.2.158 and later do not append a
+run's operator guidance to it; when a run has guidance they print "operator
+guidance not added". They do the same for Claude-family steps, whose task
+arrives on stdin rather than on the wrapper's command line.
+
 The automated tests use a stub that reads the file itself, so they show what
 the runner sends, not what a model does with it.
 `tests/qa/real-agent-prompt-transport.sh` runs a step against the real
 `amplihack claude` and `amplihack copilot` wrappers and checks that a random
 token present only in the task, and another present only in the agent
-definition, come back in the reply. It needs authenticated CLIs and uses model
-tokens, so it is opt-in and CI does not run it.
+definition, come back in the reply. For Copilot it also checks that no command
+line named a second pointer file of amplihack's own. It needs authenticated CLIs
+and uses model tokens, so it is opt-in and CI does not run it.
 
 ### Files and cleanup
 

@@ -37,8 +37,9 @@ if os.environ.get("QA_PROVIDER") == "claude":
 elif os.environ.get("QA_PROVIDER") == "copilot":
     # Follow the -p request by reading the file it names, as the model does.
     request = args[args.index("-p") + 1]
-    prefix = "Read the file "
-    suffix = " and follow all task instructions and output requirements in it."
+    # amplihack's FILE_REFERENCE_TEMPLATE, which `amplihack copilot` passes through.
+    prefix = "Read and follow the complete instructions in the file "
+    suffix = ". Its contents are the task prompt."
     assert request.startswith(prefix) and request.endswith(suffix), request
     payload = pathlib.Path(request[len(prefix):-len(suffix)]).read_text()
 record = {

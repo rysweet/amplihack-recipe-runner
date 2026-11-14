@@ -17,7 +17,10 @@
 # - no process's command line held either token or the persona text while the
 #   step ran;
 # - the private prompt file named on the wrapper's command line, under the
-#   run's own TMPDIR, is gone after the step.
+#   run's own TMPDIR, is gone after the step;
+# - for Copilot, amplihack passed the runner's pointer sentence through
+#   unchanged: no command line under the run's TMPDIR named a second
+#   `copilot-prompt.md` file of amplihack's own.
 # For Copilot the first point also shows the model read the file it was asked
 # to read: the task is not delivered any other way.
 set -euo pipefail
@@ -66,7 +69,7 @@ cat > "$fixture/sampler.py" <<'PY'
 import json, os, pathlib, sys, time
 out, stop = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
 markers = [os.environ[k] for k in ("QA_TASK_TOKEN", "QA_PERSONA_TOKEN", "QA_PERSONA_TEXT")]
-hits, prompt_paths, samples = [], set(), 0
+hits, prompt_paths, rewrapped, holders, samples = [], set(), set(), {}, 0
 while not stop.exists():
     samples += 1
     for entry in os.scandir("/proc"):
@@ -82,10 +85,17 @@ while not stop.exists():
                 hits.append({"pid": entry.name, "marker": marker[:12], "argv0": text[0][:80]})
         for a in text:
             for word in a.split():
+                # The pointer sentence puts a full stop straight after the path.
+                word = word.rstrip(".")
                 if word.endswith("agent-system-prompt.md"):
                     prompt_paths.add(word)
+                    holders.setdefault(word, set()).add(os.path.basename(text[0])[:40])
+                elif word.endswith("copilot-prompt.md"):
+                    rewrapped.add(word)
     time.sleep(0.02)
-out.write_text(json.dumps({"hits": hits, "prompt_paths": sorted(prompt_paths), "samples": samples}))
+out.write_text(json.dumps({"hits": hits, "prompt_paths": sorted(prompt_paths),
+                          "rewrapped": sorted(rewrapped), "samples": samples,
+                          "holders": {k: sorted(v) for k, v in holders.items()}}))
 PY
 
 failed=0
@@ -125,14 +135,19 @@ if persona not in output:
 argv = json.loads((directory / "argv.json").read_text())
 own = str(directory / "tmp") + "/"
 argv["prompt_paths"] = [p for p in argv["prompt_paths"] if p.startswith(own)]
+argv["rewrapped"] = [p for p in argv["rewrapped"] if p.startswith(own)]
 if argv["hits"]:
     problems.append(f"private text on a command line: {argv['hits'][:3]}")
+if argv["rewrapped"]:
+    problems.append(f"amplihack wrapped the pointer in a second file: {argv['rewrapped']}")
 if not argv["prompt_paths"]:
     problems.append("no wrapper command line named the private prompt file")
 for path in argv["prompt_paths"]:
     if pathlib.Path(path).exists():
         problems.append(f"private prompt file left behind: {path}")
-summary = f"{argv['samples']} argv samples, prompt files {argv['prompt_paths']}"
+held_by = sorted({h for p in argv["prompt_paths"] for h in argv["holders"].get(p, [])})
+summary = (f"{argv['samples']} argv samples, prompt files {argv['prompt_paths']}, "
+           f"named by {held_by}, second pointer files {argv['rewrapped']}")
 if problems:
     print(f"FAIL {provider}: {'; '.join(problems)} ({summary})")
     print(f"  reply: {output[-400:]!r}")
