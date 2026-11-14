@@ -168,10 +168,10 @@ coverage of these boundaries.
 recipe-runner-rs --capabilities
 ```
 
-The standalone probe exits zero and writes exactly one JSON object, optionally followed by a newline, with empty stderr. For a Unix build with package version 0.6.0:
+The standalone probe exits zero and writes exactly one JSON object, optionally followed by a newline, with empty stderr. For a Unix build with package version 0.7.0:
 
 ```json
-{"capabilities":["codex_exec","durable_recovery_v1","context_file_v1"],"schema_version":1,"version":"0.6.0"}
+{"capabilities":["codex_exec","durable_recovery_v1","context_file_v1"],"schema_version":1,"version":"0.7.0"}
 ```
 
 `version` is the compiled Cargo package version. The producer emits exactly these three keys. Unix builds advertise `codex_exec`, `durable_recovery_v1` and `context_file_v1`; non-Unix builds emit an empty capability list. The probe runs before logging initialization, context-file loading, update checks, update-cache writes, network access, or agent startup, regardless of ambient logging/update settings. Mixed recipe/subcommand/option invocations with `--capabilities` are rejected before execution or update effects. Failed stdout writes report failure.

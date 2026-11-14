@@ -10,13 +10,24 @@
 //!
 //! Spilled values are shell-local (not exported): exporting a value this large
 //! would make every external command the script runs fail with the same E2BIG.
-//! Values are never logged; only names, sizes and (at debug) the directory.
+//! Values are never logged; only diagnostic names, sizes and (at debug) the
+//! directory. Flattened nested names are masked because they contain JSON data.
 
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+
+/// Nested member names are content inside structured recipe context values.
+/// Keep actual environment names intact, but omit that content in diagnostics.
+pub(super) fn diagnostic_name(name: &str) -> &str {
+    if name.starts_with("RECIPE_VAR_") && name.contains("__") {
+        "RECIPE_VAR_<nested>"
+    } else {
+        name
+    }
+}
 
 /// Linux's per-string cap for argv/envp entries copied during `execve`.
 pub(crate) const MAX_ARG_STRLEN: usize = 131_072;
@@ -165,8 +176,13 @@ impl EnvSpill {
         let mut entries = Vec::with_capacity(items.len());
         for (i, (name, value)) in items.iter().enumerate() {
             let path = dir.path().join(format!("v{i}"));
-            write_private_file(&path, value.as_bytes())
-                .with_context(|| format!("failed to spill {name} ({} bytes)", value.len()))?;
+            write_private_file(&path, value.as_bytes()).with_context(|| {
+                format!(
+                    "failed to spill {} ({} bytes)",
+                    diagnostic_name(name),
+                    value.len()
+                )
+            })?;
             entries.push((name.to_string(), path));
         }
         Ok(Self { dir, entries })
@@ -185,8 +201,12 @@ impl EnvSpill {
                 .expect("private_tempdir rejects non-UTF-8 spill directories");
             out.push_str(&format!(
                 "{{ IFS= read -r -d '' {name} || :; }} < {} || \
-                 {{ printf 'amplihack: failed to load spilled env value {name}\\n' >&2; exit 125; }}\n",
-                shell_single_quote(path)
+                 {{ printf '%s\\n' {} >&2; exit 125; }}\n",
+                shell_single_quote(path),
+                shell_single_quote(&format!(
+                    "amplihack: failed to load spilled env value {}",
+                    diagnostic_name(name)
+                ))
             ));
         }
         out
@@ -251,14 +271,13 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Warning for an over-cap value that is dropped. Dropped names failed
-/// [`is_spillable_name`], and can come from untrusted JSON keys flattened into
-/// `RECIPE_VAR_*`, so they are escaped to keep control characters (ANSI/OSC
-/// sequences, newlines) out of the operator's terminal and logs.
+/// [`is_spillable_name`]. Nested JSON member names are masked; other names are
+/// escaped to keep control characters out of the operator's terminal and logs.
 fn drop_warning(name: &str, len: usize) -> String {
     format!(
         "Dropping env var {} ({len} bytes) from bash step: too large for one \
          environment string and not a name the step preamble can assign",
-        name.escape_debug()
+        diagnostic_name(name).escape_debug()
     )
 }
 
@@ -284,7 +303,8 @@ pub(crate) fn spill_for_bash(
         let value = &child_env[name];
         if value.contains('\0') {
             anyhow::bail!(
-                "recipe variable {name} ({} bytes) contains a NUL byte and cannot be passed to a bash step",
+                "recipe variable {} ({} bytes) contains a NUL byte and cannot be passed to a bash step",
+                diagnostic_name(name),
                 value.len()
             );
         }
@@ -313,7 +333,7 @@ pub(crate) fn spill_for_bash(
 
     let summary: Vec<String> = values
         .iter()
-        .map(|(k, v)| format!("{k} ({} bytes)", v.len()))
+        .map(|(k, v)| format!("{} ({} bytes)", diagnostic_name(k), v.len()))
         .collect();
     log::info!(
         "Spilled {} env value(s) for bash step to private files: {}",
@@ -411,9 +431,9 @@ mod tests {
 
     #[test]
     fn drop_warning_escapes_control_characters_in_the_name() {
-        let w = drop_warning("RECIPE_VAR_x__evil\u{1b}]0;pwn\u{7}\nWARN fake", 9);
+        let w = drop_warning("RECIPE_VAR_x_evil\u{1b}]0;pwn\u{7}\nWARN fake", 9);
         assert!(!w.contains('\u{1b}') && !w.contains('\u{7}') && !w.contains('\n'));
-        assert!(w.contains("RECIPE_VAR_x__evil"));
+        assert!(w.contains("RECIPE_VAR_x_evil"));
         assert!(w.contains("(9 bytes)"));
     }
 

@@ -483,6 +483,82 @@ mod unix {
         assert_eq!(actual["context"]["secret"], SENTINEL);
     }
 
+    #[test]
+    fn trace_diagnostics_do_not_disclose_member_names_inside_loaded_objects() {
+        let f = Fixture::new(json!({"name":"private-object-members", "steps":[
+            {"id":"one", "condition":"structured",
+             "command":"printf '%s' \"$RECIPE_VAR_structured__NESTED_MEMBER_PRIVATE_211__leaf\""}
+        ]}));
+        for leaf in ["ordinary".to_string(), "x".repeat(130 * 1024)] {
+            let structured = json!({"NESTED_MEMBER_PRIVATE_211":{"leaf":leaf}});
+            f.write(&json!({"structured":structured}));
+            let out = f.file_command().env("RUST_LOG", "trace").output().unwrap();
+            let diagnostics = String::from_utf8_lossy(&out.stderr);
+            assert!(diagnostics.contains("TRACE"));
+            assert!(!diagnostics.contains("NESTED_MEMBER_PRIVATE_211"));
+            if leaf.len() > 130_000 {
+                assert!(diagnostics.contains("Spilled"));
+            }
+            let actual = result(out);
+            assert_eq!(actual["step_results"][0]["output"], leaf);
+            assert_eq!(actual["context"]["structured"], structured);
+        }
+    }
+
+    #[test]
+    fn spill_rejection_and_drop_diagnostics_do_not_disclose_nested_member_names() {
+        let f = Fixture::simple();
+        let mut nul_leaf = "x".repeat(130 * 1024);
+        nul_leaf.push('\0');
+        f.write(&json!({"structured":{"NESTED_MEMBER_PRIVATE_211":{"leaf":nul_leaf}}}));
+        let out = f.file_command().env("RUST_LOG", "trace").output().unwrap();
+        assert_private_diagnostics(&out, "NESTED_MEMBER_PRIVATE_211", false);
+        failed_step(&out, "contains a NUL byte");
+
+        let structured = json!({"NESTED_MEMBER_PRIVATE_211?":{"leaf":"x".repeat(130 * 1024)}});
+        f.write(&json!({"structured":structured}));
+        let out = f.file_command().env("RUST_LOG", "trace").output().unwrap();
+        assert_private_diagnostics(&out, "NESTED_MEMBER_PRIVATE_211", false);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("Dropping env var"));
+        assert_eq!(result(out)["context"]["structured"], structured);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn aggregate_env_budget_failure_keeps_nested_member_names_private() {
+        let f = Fixture::simple();
+        let mut structured = serde_json::Map::new();
+        for index in 0..4 {
+            // Individually under the per-value cap, but the invalid names
+            // cannot be spilled when the combined environment exceeds budget.
+            structured.insert(
+                format!("NESTED_MEMBER_PRIVATE_211_{index}?"),
+                Value::String("x".repeat(100_000)),
+            );
+        }
+        f.write(&json!({"structured":structured}));
+        let mut cmd = f.file_command();
+        cmd.env("RUST_LOG", "trace");
+        // SAFETY: only async-signal-safe resource-limit calls run after fork.
+        // Bound this child's env budget independently of the host stack limit.
+        unsafe {
+            cmd.pre_exec(|| {
+                let mut limit = std::mem::zeroed::<libc::rlimit>();
+                if libc::getrlimit(libc::RLIMIT_STACK, &mut limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                limit.rlim_cur = limit.rlim_cur.min(1024 * 1024);
+                if libc::setrlimit(libc::RLIMIT_STACK, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let out = cmd.output().unwrap();
+        assert_private_diagnostics(&out, "NESTED_MEMBER_PRIVATE_211", false);
+        failed_step(&out, "child environment exceeds");
+    }
+
     fn assert_private_diagnostics(out: &Output, sentinel: &str, debug: bool) {
         let diagnostics = String::from_utf8_lossy(&out.stderr);
         assert!(!diagnostics.contains(sentinel), "context value disclosed");
@@ -760,6 +836,23 @@ mod unix {
             let actual: Value = serde_json::from_slice(&out.stdout).unwrap();
             assert_eq!(actual["step_results"][0]["status"], "failed");
             assert_eq!(actual["step_results"][0]["output"], "");
+        }
+    }
+
+    #[test]
+    fn required_json_failure_does_not_copy_file_loaded_output_into_diagnostics() {
+        let f = Fixture::new(json!({"name":"private-json-error", "steps":[
+            {"id":"invalid-json", "command":"printf '%s' \"$RECIPE_VAR_secret\"",
+             "parse_json":true, "parse_json_required":true}
+        ]}));
+        f.write(&json!({"secret":SENTINEL}));
+        for level in ["error", "trace"] {
+            let out = f.file_command().env("RUST_LOG", level).output().unwrap();
+            assert_private_diagnostics(&out, SENTINEL, false);
+            let actual = failed_step(&out, "parse_json failed");
+            assert_eq!(actual["step_results"][0]["output"], "");
+            // Intentional result context remains available to the caller.
+            assert_eq!(actual["context"]["secret"], SENTINEL);
         }
     }
 

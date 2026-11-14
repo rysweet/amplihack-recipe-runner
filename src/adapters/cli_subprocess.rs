@@ -505,7 +505,7 @@ fn into_trimmed_string(bytes: Vec<u8>) -> String {
 /// `Display`, and `Debug` without leaking secrets (R1).
 #[derive(Debug, Clone)]
 pub(crate) struct EnvBudgetError {
-    /// Names of the protected variables that cannot be dropped. Names only.
+    /// Diagnostic names of protected variables; nested recipe names are masked.
     offending: Vec<String>,
     /// Total bytes required by all protected variables (a size, not a value).
     protected_bytes: usize,
@@ -514,7 +514,7 @@ pub(crate) struct EnvBudgetError {
 }
 
 impl EnvBudgetError {
-    /// The protected variable names (never values) that overflowed the budget.
+    /// Diagnostic names (never values) of variables that overflowed the budget.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn offending_vars(&self) -> &[String] {
         &self.offending
@@ -568,7 +568,10 @@ pub(crate) fn bounded_env(
     // (names only) lets the operator move the payload out of the environment
     // rather than hitting an opaque E2BIG.
     if protected_bytes > budget {
-        let offending: Vec<String> = protected.iter().map(|(k, _)| k.clone()).collect();
+        let offending: Vec<String> = protected
+            .iter()
+            .map(|(k, _)| env_spill::diagnostic_name(k).to_string())
+            .collect();
         log::error!(
             "bounded_env: protected env var(s) exceed measured budget ({} > {} bytes); \
              refusing to spawn. Offending (names only): {:?}. Move large inherited or \

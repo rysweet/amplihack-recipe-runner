@@ -431,6 +431,9 @@ Guarantees:
 
 The environment code **never logs a variable's value**. Diagnostics only ever
 contain variable names, byte sizes, and (at `debug`) the spill directory.
+Spill diagnostics mask flattened nested recipe names as `RECIPE_VAR_<nested>`:
+those names contain member names from inside structured context values and can
+themselves be confidential. Actual environment names remain unchanged.
 
 The examples below are **illustrative**. The events, levels and the fields
 they carry (names and byte sizes, never values) are guaranteed; the exact

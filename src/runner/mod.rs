@@ -1217,9 +1217,8 @@ impl<A: Adapter> RecipeRunner<A> {
                         None => {
                             if step.parse_json_required {
                                 error!(
-                                    "Step '{}': parse_json failed (parse_json_required=true). Raw: {}...",
-                                    diagnostic_identifier(&step.id),
-                                    crate::safe_truncate(&output, 200)
+                                    "Step '{}': parse_json failed (parse_json_required=true)",
+                                    diagnostic_identifier(&step.id)
                                 );
                                 (
                                     String::new(),

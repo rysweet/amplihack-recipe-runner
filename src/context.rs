@@ -499,11 +499,7 @@ impl RecipeContext {
         map: &serde_json::Map<String, Value>,
         env: &mut HashMap<String, String>,
     ) {
-        log::trace!(
-            "RecipeContext::flatten_nested: prefix={:?}, keys={}",
-            prefix,
-            map.len()
-        );
+        log::trace!("RecipeContext::flatten_nested: keys={}", map.len());
         for (k, v) in map {
             let key = format!("{}__{}", prefix, k.replace('.', "__").replace('-', "_"));
             match v {
