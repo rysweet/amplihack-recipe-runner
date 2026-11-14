@@ -17,6 +17,7 @@ Complete reference for the `recipe-runner-rs` command-line interface.
 - [Context file](#--context-file-path)
 - [JSON recipe input](#json-recipe-input)
 - [Sub-recipe references](#sub-recipe-references)
+- [Agent prompt transport](#agent-prompt-transport)
 - [Failed bash stdout](#failed-bash-stdout)
 - [Exit codes](#exit-codes)
 - [Smart context value parsing](#smart-context-value-parsing---set)
@@ -49,7 +50,7 @@ recipe-runner-rs list --recipe-dir ./team-recipes --recipe-dir ./personal-recipe
 
 Standalone compatibility probe. Emits one JSON object with `schema_version: 1`,
 the compiled package `version`, and
-`capabilities: ["codex_exec", "durable_recovery_v1", "context_file_v1"]` on Unix
+`capabilities: ["codex_exec", "durable_recovery_v1", "context_file_v1", "agent_prompt_file_v1"]` on Unix
 (an empty capability list on non-Unix), then exits zero.
 It performs no update, cache-write, network, or agent-startup work. Do not combine
 it with other arguments. See the [capability API](codex-exec.md#compatibility-probe-api).
@@ -136,9 +137,9 @@ suppressed, a step that needs a tool the CLI would ask about fails instead.
 
 Do not grant the step's working directory to the agent CLI with `--add-dir`. Without the option every Claude-family
 and Copilot agent step is given `--add-dir .` from its effective working directory, keeping rendered paths off argv.
-With it, that grant is not made. The directory that holds an overflow prompt file is still granted to a CLI that
-reads the file through `--add-dir`, because that
-CLI cannot read its prompt without it. The Codex adapter passes no `--add-dir` and is unaffected.
+With it, that grant is not made. A Copilot step is still granted the directory that holds its private prompt file,
+because Copilot cannot read its prompt without it (see [Agent prompt transport](#agent-prompt-transport)). The
+Codex adapter passes no `--add-dir` and is unaffected.
 
 ### `-C, --working-dir <DIR>`
 
@@ -309,8 +310,9 @@ File context reaches bash and agent steps through the existing `RECIPE_VAR_*`
 environment mirror and `{{placeholder}}` substitution. The loader adds no child
 arguments carrying those values. Intentional recipe output and JSON results can
 still contain context, and recipes can explicitly pass values to commands.
-Agent prompt transport is a separate contract: `context_file_v1` alone does not
-promise that rendered agent prompts stay off launcher command lines.
+Rendered agent prompts stay off launcher and agent command lines under a
+separate contract, [agent prompt transport](#agent-prompt-transport), which
+builds advertise as `agent_prompt_file_v1`.
 
 ### `--set <KEY=VALUE>`
 
@@ -717,12 +719,81 @@ before applying that step's child context overrides. It checks the complete rend
 other non-string values retain the usual context rendering. Substituted text is not rendered again.
 Empty results, remaining braces, paths and other invalid resolved names fail with a diagnostic identifying
 the step and the resolved-name failure. Earlier parent steps may have executed before this value is known.
+Because a rendered name can carry context values, diagnostics for a reference that contains an expression omit
+the resolved name and the nested parse and `extends` errors. Diagnostics for a fixed reference name the
+sub-recipe and include those errors.
 
 Static validation accepts any reference containing a supported expression, including
 `"recipes/{{child_name}}.yaml"`; that example fails after rendering because the result contains a separator
 and a dot. Malformed template-like text without a supported expression, such as `"{{ child_name }}"`,
 receives ordinary literal validation and fails before execution. Successful static validation of a template
 does not establish that its resolved name is valid or that a matching child exists.
+
+## Agent prompt transport
+
+Agent steps keep the rendered task and the system prompt off the launcher's and
+the agent's command line, whatever their size. Unix builds advertise this as the
+capability `agent_prompt_file_v1`.
+
+| Provider | Command line | System prompt | Task |
+|----------|--------------|---------------|------|
+| `claude`, `launch`, `RustyClawd` | `--system-prompt-file <file> -p` | In `<file>` | On stdin, then EOF |
+| `copilot` | `--add-dir <file directory> -p "Read the file <file> and follow all task instructions and output requirements in it."` | In `<file>` | In `<file>`, after `# Task instructions` |
+| `codex` | `exec --output-last-message <file> -` | On stdin | On stdin |
+
+The system prompt is the agent definition named by the step's `agent:` field,
+followed by the runner's instruction not to start another workflow. The task is
+the rendered `prompt:` followed by the instruction to proceed without asking
+questions.
+
+### Claude-family CLIs
+
+`--system-prompt-file` replaces the CLI's default system prompt, as
+`--system-prompt <text>` did in earlier releases. Recipe agent definitions
+therefore replace Claude Code's default prompt rather than add to it. The task
+remains the user turn: `-p` takes no argument, so the CLI reads the prompt from
+stdin, and hooks that read the user prompt see the task. Whatever follows `-p`
+is another flag (`--add-dir`, `--model`) or nothing, so a wrapper such as
+`amplihack claude` passes the bare `-p` through and the CLI inherits the
+wrapper's stdin.
+
+Earlier releases sent prompts of 32 KiB or more (task plus system prompt) with
+`--append-system-prompt-file`, which appends to the default system prompt, and
+put the first 8 KiB of the task on the command line. Those prompts now also
+replace the default system prompt.
+
+If the agent exits with status zero but the runner could not write the whole
+task to its stdin, the step fails: the agent did not receive the step it
+reported on. A failed agent is reported by its exit status and stderr as before.
+
+### Copilot
+
+Copilot receives no system-prompt file and no prompt on stdin in this mode. Its
+only prompt argument is the fixed request above; the file holds the system
+prompt and the task. The task arrives only if the model calls its file-reading
+tool on that path, which the `--add-dir` grant permits. The runner cannot
+confirm that the file was read: a Copilot step that ignores the request can
+still exit zero, and its output is then not an answer to the task. Earlier
+releases put Copilot prompts under 32 KiB directly on the command line, where
+delivery did not depend on the model.
+
+The automated tests use a stub that reads the file itself, so they show what
+the runner sends, not what a model does with it.
+`tests/qa/real-agent-prompt-transport.sh` runs a step against the real
+`amplihack claude` and `amplihack copilot` wrappers and checks that a random
+token present only in the task, and another present only in the agent
+definition, come back in the reply. It needs authenticated CLIs and uses model
+tokens, so it is opt-in and CI does not run it.
+
+### Files and cleanup
+
+The file is `agent-system-prompt.md`, mode `0600`, in a mode `0700` directory
+under `TMPDIR`. Each attempt writes it before the agent starts. The runner
+removes it when the step returns, whether the agent succeeds, fails, times out
+or is cancelled. While a Claude-family, Copilot or Codex step runs, the runner
+handles SIGINT and SIGTERM: it stops the agent wrapper, removes the file and
+stops the recipe with a cancellation error. A runner killed with SIGKILL cannot
+remove the directory.
 
 ## Failed Bash Stdout
 
@@ -927,8 +998,9 @@ Overrides the interpreter used to run **bash steps**. Must be an **absolute
 path** to an executable file.
 
 Bash steps do not hardcode `/bin/bash`. The runner resolves one interpreter in
-the parent process and uses that same absolute path for every bash step —
-inline (`-c`) or file-backed, with or without a `timeout` wrapper.
+the parent process and uses that same absolute path for every bash step, with or
+without a `timeout` wrapper. Every bash step runs from a private temporary script
+file (`<bash> <script-file>`); no step passes its source with `-c`.
 
 #### What it covers
 

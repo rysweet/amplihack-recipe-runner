@@ -200,7 +200,7 @@ fn a_sub_recipe_resolves_only_from_explicit_directories() {
         assert_eq!(out.status.code(), Some(1), "{child}: {}", text(&out));
         let error = step_error(&out, "call");
         assert!(
-            error.contains("Sub-recipe could not be found")
+            error.contains(&format!("Sub-recipe '{child}' not found"))
                 && error.contains("default search is off"),
             "{child}: {error}"
         );
@@ -228,7 +228,8 @@ fn an_agent_definition_resolves_only_from_explicit_directories() {
     write(&l.explicit.join("planted.md"), "EXPLICIT AGENT DEFINITION");
     let calls = l.root.path().join("calls");
     std::fs::create_dir(&calls).unwrap();
-    // Each call snapshots the system/task file before the runner removes it.
+    // Each call snapshots its --system-prompt-file before the runner removes
+    // it (#205: the system prompt reaches Claude through that file).
     let launcher = l.root.path().join("launcher.sh");
     std::fs::write(
         &launcher,
@@ -238,7 +239,7 @@ fn an_agent_definition_resolves_only_from_explicit_directories() {
              n=$(( $(ls '{calls}' | wc -l) ))\n\
              prev=\"\"\n\
              for a in \"$@\"; do\n\
-               if [ \"$prev\" = --append-system-prompt-file ]; then cat -- \"$a\" > '{calls}/'\"$n\"; fi\n\
+               if [ \"$prev\" = --system-prompt-file ]; then cat -- \"$a\" > '{calls}/'\"$n\"; fi\n\
                prev=\"$a\"\n\
              done\n\
              echo done\n",

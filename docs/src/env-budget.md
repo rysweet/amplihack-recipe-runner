@@ -255,7 +255,7 @@ is never silently truncated.
 
 Parallel steps each get their own directory. Spill files are never written
 into the step's `working_dir`, and spilled values are never copied into the
-temporary script file used for large scripts (below).
+temporary script file that runs every bash step (below).
 
 If the runner process itself is killed with `SIGKILL`, it can't clean up, and
 the directory is left in `TMPDIR`. Its contents are still private (`0600` files
@@ -263,12 +263,12 @@ in a `0700` directory). If `TMPDIR` points at a world-writable directory
 without the sticky bit, other local users can rename or delete entries in it.
 Use a private or sticky `TMPDIR` on shared hosts.
 
-### Interaction with large scripts
+### Interaction with the script file
 
-Commands over 64 KiB are already written to a private temporary script file
-instead of being passed as `bash -c <script>`. The 64 KiB check is applied to
-the **combined** script (preamble plus your command), so the preamble always
-runs first, whether the script is inline or file-backed.
+Every bash step, whatever its size, is written to a private temporary script
+file and run as `<bash> <script-file>`; no step passes its source with
+`bash -c`. The file holds the **combined** script (preamble plus your command),
+so the preamble always runs first.
 
 ### `$LINENO` and shebangs
 
@@ -310,9 +310,11 @@ See [Migration to 0.6.0](migration-v0.6.md#amplihack_context_file-is-no-longer-s
 Agent subprocesses don't receive `RECIPE_VAR_*` values. Recipe data reaches an
 agent through its rendered prompt. Prompt and system content never go on the
 launcher or agent argv, regardless of size: Codex receives them on stdin;
-Claude-family CLIs read a private file via `--append-system-prompt-file`;
-Copilot receives a request to read the complete private file and an `--add-dir`
-grant for its directory. The runner removes that file when the step finishes.
+Claude-family CLIs read the system prompt from a private file via
+`--system-prompt-file` and the task from stdin behind a bare `-p`; Copilot
+receives a request to read a private file holding both, and an `--add-dir` grant
+for its directory. The runner removes that file when the step finishes. See
+[Agent prompt transport](cli-reference.md#agent-prompt-transport).
 An agent child's environment is the sanitized inherited environment plus
 `AMPLIHACK_AGENT_BINARY`.
 
@@ -384,7 +386,7 @@ merge extra_env                   (RECIPE_VAR_*, nested, legacy aliases)
 plan + write spill                (per-value cap, then budget; 0600 files)
 script = preamble + command
 bounded_env                       (unchanged: trims non-protected inherited vars)
-64 KiB inline-vs-file decision    (on the combined script)
+write private script file          (the combined script, every size)
 spawn, wait
 drop script file, drop spill dir
 ```

@@ -743,7 +743,7 @@ mod unix {
             }
             let out = cmd.output().unwrap();
             assert_private_diagnostics(&out, PRIVATE_RECIPE, debug);
-            let actual = failed_step(&out, "Sub-recipe could not be found");
+            let actual = failed_step(&out, "Sub-recipe not found");
             assert!(
                 !actual["step_results"][0]["error"]
                     .as_str()
@@ -783,7 +783,7 @@ mod unix {
         assert_private_diagnostics(&out, PRIVATE_RECIPE, true);
         let diagnostics = String::from_utf8_lossy(&out.stderr);
         assert!(diagnostics.contains("outside anchored search roots"));
-        failed_step(&out, "Sub-recipe could not be found");
+        failed_step(&out, "Sub-recipe not found");
         assert!(!f.dir.path().join("child-marker").exists());
         assert!(!outside.path().join("child-marker").exists());
     }
@@ -817,6 +817,49 @@ mod unix {
                     .unwrap()
                     .contains(PRIVATE_RECIPE)
             );
+        }
+    }
+
+    /// The redaction above applies only to names rendered from context. A
+    /// fixed name is recipe text, so a typo in that sub-recipe still reports
+    /// the name and the parser's location, and a missing one is named.
+    #[test]
+    fn fixed_sub_recipe_names_keep_parse_extends_and_lookup_detail() {
+        let f = Fixture::new(json!({"name":"parent", "steps":[
+            {"id":"dispatch", "recipe":"fixed-child"}
+        ]}));
+        f.write(&json!({"secret":SENTINEL}));
+        for (yaml, expected) in [
+            (
+                Some("name: child\nsteps: [\n".to_string()),
+                vec!["Failed to parse sub-recipe 'fixed-child'", "line"],
+            ),
+            (
+                Some(
+                    "name: child\nextends: fixed-base-missing\nsteps:\n  - id: one\n    command: true\n"
+                        .to_string(),
+                ),
+                vec![
+                    "Failed to resolve extends for sub-recipe 'fixed-child'",
+                    "fixed-base-missing",
+                ],
+            ),
+            (None, vec!["Sub-recipe 'fixed-child' not found"]),
+        ] {
+            let path = f.dir.path().join("fixed-child.yaml");
+            match yaml {
+                Some(yaml) => fs::write(&path, yaml).unwrap(),
+                None => {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+            let out = f.file_command().output().unwrap();
+            let actual = failed_step(&out, expected[0]);
+            let error = actual["step_results"][0]["error"].as_str().unwrap();
+            for part in expected {
+                assert!(error.contains(part), "missing {part:?}: {error}");
+            }
+            assert!(!error.contains(SENTINEL));
         }
     }
 
@@ -1056,42 +1099,38 @@ mod unix {
         assert_eq!(fs::read(&f.context).unwrap(), replacement);
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn live_agent_wrappers_keep_prompt_and_file_context_off_argv() {
-        const PROMPT: &str = "PRIVATE_AGENT_PROMPT_211_🦀";
-        const PRIVATE_CWD: &str = "PRIVATE_CWD_211";
-        for cli in ["claude", "launch", "RustyClawd", "copilot", "codex"] {
-            for size in [0, 40 * 1024] {
-                let prompt = format!("{PROMPT} {} {{{{secret}}}}", "x".repeat(size));
-                let f = Fixture::new(json!({"name":"agent-privacy", "steps":[
-                    {"id":"agent", "prompt":prompt, "auto_stage":false,
-                     "working_dir":"{{private_dir}}"}
-                ]}));
-                let private_dir = f.dir.path().join(PRIVATE_CWD);
-                fs::create_dir(&private_dir).unwrap();
-                fs::write(private_dir.join("cwd-proof"), "directory-access-ok").unwrap();
-                f.write(&json!({"secret":SENTINEL, "private_dir":private_dir}));
-                let launcher = f.dir.path().join("launcher");
-                fs::write(&launcher, r#"#!/bin/bash
+    /// Stub wrapper for the live agent tests. Claude-family providers read the
+    /// system prompt from `--system-prompt-file` and the task from stdin
+    /// behind a bare `-p`, as `claude -p` does. Copilot follows the `-p`
+    /// request by reading the file it names, as the model is asked to; it is
+    /// not told the path any other way. Codex reads stdin.
+    const LIVE_AGENT_STUB: &str = r#"#!/bin/bash
 set -eu
 provider=$1
 shift
 pwd > "$DELIVERED_CWD"
 cat cwd-proof > "$CWD_ACCESS"
-prompt_file=
+printf '%s\0' "$@" > "$DELIVERED_ARGV"
+system_file=
+request=
 final=
 while (( $# )); do
     case "$1" in
-        --append-system-prompt-file) prompt_file=$2; shift ;;
-        --add-dir) if [[ -f "$2/agent-system-prompt.md" ]]; then prompt_file=$2/agent-system-prompt.md; fi; shift ;;
+        --system-prompt-file) system_file=$2; shift ;;
+        -p) if (( $# > 1 )) && [[ "$2" != -* ]]; then request=$2; shift; fi ;;
         --output-last-message) final=$2; shift ;;
     esac
     shift
 done
 if [[ "$provider" == codex ]]; then
     cat > "$DELIVERED_PROMPT"
+elif [[ -n "$system_file" ]]; then
+    cat -- "$system_file" > "$DELIVERED_SYSTEM"
+    cat > "$DELIVERED_PROMPT"
+    printf '%s' "$system_file" > "$PROMPT_PATH"
 else
+    prompt_file=${request#Read the file }
+    prompt_file=${prompt_file% and follow all task instructions and output requirements in it.}
     cat -- "$prompt_file" > "$DELIVERED_PROMPT"
     printf '%s' "$prompt_file" > "$PROMPT_PATH"
 fi
@@ -1102,14 +1141,47 @@ if [[ "$provider" == codex ]]; then
 else
     printf 'agent-ok'
 fi
-"#).unwrap();
+"#;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_agent_wrappers_keep_prompt_and_file_context_off_argv() {
+        const PROMPT: &str = "PRIVATE_AGENT_PROMPT_211_🦀";
+        const PERSONA: &str = "PRIVATE_AGENT_PERSONA_205_λ";
+        const PRIVATE_CWD: &str = "PRIVATE_CWD_211";
+        for cli in ["claude", "launch", "RustyClawd", "copilot", "codex"] {
+            let claude_family = matches!(cli, "claude" | "launch" | "RustyClawd");
+            for size in [0, 40 * 1024] {
+                let prompt = format!("{PROMPT} {} {{{{secret}}}}", "x".repeat(size));
+                let agents = tempfile::tempdir().unwrap();
+                fs::write(
+                    agents.path().join("persona.md"),
+                    format!("{PERSONA} {}", "y".repeat(size)),
+                )
+                .unwrap();
+                let f = Fixture::new(json!({"name":"agent-privacy", "steps":[
+                    {"id":"agent", "agent":"test:persona", "prompt":prompt, "auto_stage":false,
+                     "working_dir":"{{private_dir}}"}
+                ]}));
+                let private_dir = f.dir.path().join(PRIVATE_CWD);
+                fs::create_dir(&private_dir).unwrap();
+                fs::write(private_dir.join("cwd-proof"), "directory-access-ok").unwrap();
+                f.write(&json!({"secret":SENTINEL, "private_dir":private_dir}));
+                let launcher = f.dir.path().join("launcher");
+                fs::write(&launcher, LIVE_AGENT_STUB).unwrap();
                 fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
                 let delivered = f.dir.path().join("delivered");
+                let delivered_system = f.dir.path().join("delivered-system");
+                let delivered_argv = f.dir.path().join("delivered-argv");
                 let prompt_path = f.dir.path().join("prompt-path");
                 let mut cmd = f.file_command();
-                cmd.env("AMPLIHACK_AGENT_BINARY", cli)
+                cmd.arg("--agent-dir")
+                    .arg(agents.path())
+                    .env("AMPLIHACK_AGENT_BINARY", cli)
                     .env("AMPLIHACK_LAUNCHER_BINARY", &launcher)
                     .env("DELIVERED_PROMPT", &delivered)
+                    .env("DELIVERED_SYSTEM", &delivered_system)
+                    .env("DELIVERED_ARGV", &delivered_argv)
                     .env("PROMPT_PATH", &prompt_path)
                     .env("DELIVERED_CWD", f.dir.path().join("delivered-cwd"))
                     .env("CWD_ACCESS", f.dir.path().join("cwd-access"));
@@ -1119,7 +1191,7 @@ fi
                 for pid in [runner_pid, wrapper_pid] {
                     let cmdline = fs::read(format!("/proc/{pid}/cmdline")).unwrap();
                     let args = String::from_utf8_lossy(&cmdline);
-                    for marker in [PROMPT, SENTINEL, PRIVATE_CWD] {
+                    for marker in [PROMPT, PERSONA, SENTINEL, PRIVATE_CWD] {
                         assert!(
                             !args.contains(marker),
                             "{cli}: private content on argv for PID {pid}"
@@ -1136,13 +1208,49 @@ fi
                     fs::read_to_string(f.dir.path().join("cwd-access")).unwrap(),
                     "directory-access-ok"
                 );
+                let argv: Vec<String> = fs::read(&delivered_argv)
+                    .unwrap()
+                    .split(|b| *b == 0)
+                    .filter(|a| !a.is_empty())
+                    .map(|a| String::from_utf8_lossy(a).into_owned())
+                    .collect();
+                for flag in [
+                    "--system-prompt",
+                    "--append-system-prompt",
+                    "--append-system-prompt-file",
+                ] {
+                    assert!(!argv.iter().any(|a| a == flag), "{cli}: {flag} in {argv:?}");
+                }
                 let content = fs::read_to_string(&delivered).unwrap();
+                let rendered = prompt.replace("{{secret}}", SENTINEL);
                 assert!(
-                    content.contains(&prompt.replace("{{secret}}", SENTINEL)),
+                    content.contains(&rendered),
                     "{cli}: full rendered prompt must reach the wrapper"
                 );
-                assert!(content.contains("Do not invoke /dev"));
                 assert!(content.contains("Proceed autonomously. Do not ask questions."));
+                let system = if claude_family {
+                    // #205: persona and guard replace the default system
+                    // prompt; the task stays the user turn, read from stdin.
+                    assert_eq!(
+                        argv.iter().filter(|a| *a == "--system-prompt-file").count(),
+                        1,
+                        "{cli}: {argv:?}"
+                    );
+                    let p = argv.iter().position(|a| a == "-p").unwrap();
+                    assert!(
+                        argv.get(p + 1).is_none_or(|next| next.starts_with('-')),
+                        "{cli}: -p must be bare: {argv:?}"
+                    );
+                    let system = fs::read_to_string(&delivered_system).unwrap();
+                    assert!(!system.contains(PROMPT), "{cli}: task in system prompt");
+                    assert!(!content.contains(PERSONA), "{cli}: persona in task");
+                    system
+                } else {
+                    assert!(!delivered_system.exists(), "{cli}: unexpected system file");
+                    content.clone()
+                };
+                assert!(system.contains(PERSONA), "{cli}: persona not delivered");
+                assert!(system.contains("Do not invoke /dev"));
                 let private_file = if cli == "codex" {
                     None
                 } else {
@@ -1150,6 +1258,14 @@ fi
                     assert_eq!(
                         fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                         0o600
+                    );
+                    assert_eq!(
+                        fs::metadata(path.parent().unwrap())
+                            .unwrap()
+                            .permissions()
+                            .mode()
+                            & 0o777,
+                        0o700
                     );
                     Some(path)
                 };
@@ -1162,6 +1278,86 @@ fi
                     );
                 }
             }
+        }
+    }
+
+    /// #205: the private system-prompt file is removed when a Claude step
+    /// fails and when the runner is cancelled with SIGTERM or SIGINT while
+    /// the agent runs, and a cancelled runner stops the agent wrapper.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn claude_prompt_file_is_removed_after_failure_and_cancellation() {
+        const STUB: &str = r#"#!/bin/bash
+set -eu
+shift
+system_file=
+while (( $# )); do
+    case "$1" in
+        --system-prompt-file) system_file=$2; shift ;;
+    esac
+    shift
+done
+printf '%s' "$system_file" > "$PROMPT_PATH"
+cat > /dev/null
+printf '%s\n' "$BASHPID" >&198
+IFS= read -r release <&198 || true
+if [[ "$OUTCOME" == fail ]]; then exit 3; fi
+sleep 600
+"#;
+        for (outcome, signal) in [
+            ("fail", None),
+            ("cancel", Some(libc::SIGTERM)),
+            ("cancel", Some(libc::SIGINT)),
+        ] {
+            let f = Fixture::new(json!({"name":"agent-cleanup", "steps":[
+                {"id":"agent", "prompt":"{{secret}}", "auto_stage":false}
+            ]}));
+            f.write(&json!({"secret":SENTINEL}));
+            let launcher = f.dir.path().join("launcher");
+            fs::write(&launcher, STUB).unwrap();
+            fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+            let prompt_path = f.dir.path().join("prompt-path");
+            let mut cmd = f.file_command();
+            cmd.env("AMPLIHACK_AGENT_BINARY", "claude")
+                .env("AMPLIHACK_LAUNCHER_BINARY", &launcher)
+                .env("AMPLIHACK_RATELIMIT_MAX_RETRIES", "0")
+                .env("PROMPT_PATH", &prompt_path)
+                .env("OUTCOME", outcome);
+            let mut live = LiveRun::start(&f, cmd);
+            let wrapper_pid = live.ready();
+            let private_file = PathBuf::from(fs::read_to_string(&prompt_path).unwrap());
+            assert!(private_file.is_file(), "{outcome}: prompt file missing");
+            let mut child = live.child.take().unwrap();
+            match signal {
+                Some(signal) => {
+                    // SAFETY: signals only the runner PID this test spawned.
+                    assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+                }
+                None => live.control.write_all(b"release\n").unwrap(),
+            }
+            let status = child.wait().unwrap();
+            assert!(!status.success(), "{outcome}: runner must report failure");
+            assert!(
+                status.code().is_some(),
+                "{outcome} {signal:?}: runner must exit itself, not die by the signal"
+            );
+            assert!(
+                !private_file.exists(),
+                "{outcome} {signal:?}: private prompt file must be removed"
+            );
+            assert!(
+                !Path::new(&format!("/proc/{wrapper_pid}")).exists(),
+                "{outcome} {signal:?}: agent wrapper must be stopped and reaped"
+            );
+            let stdout: Value = serde_json::from_slice(&fs::read(&live.stdout).unwrap())
+                .expect("one JSON recipe result");
+            let error = stdout["step_results"][0]["error"].as_str().unwrap();
+            if signal.is_some() {
+                assert!(error.contains("cancelled by signal"), "{error}");
+            } else {
+                assert!(error.contains("exit 3"), "{error}");
+            }
+            assert!(!error.contains(SENTINEL));
         }
     }
 

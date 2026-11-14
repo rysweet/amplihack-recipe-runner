@@ -29,9 +29,26 @@ fn standalone_probe_is_exact_and_has_no_update_side_effects() {
         serde_json::from_slice(&out.stdout).expect("exactly one JSON object");
     assert_eq!(
         value,
-        json!({"schema_version":1,"version":env!("CARGO_PKG_VERSION"),"capabilities":if cfg!(unix) { vec!["codex_exec", "durable_recovery_v1", "context_file_v1"] } else { vec![] }})
+        json!({"schema_version":1,"version":env!("CARGO_PKG_VERSION"),"capabilities":if cfg!(unix) { vec!["codex_exec", "durable_recovery_v1", "context_file_v1", "agent_prompt_file_v1"] } else { vec![] }})
     );
     assert_eq!(std::fs::read_to_string(cache).unwrap(), sentinel);
+}
+
+#[test]
+fn agent_prompt_transport_is_advertised_as_its_own_member() {
+    // #205/#211: consumers detect off-argv agent prompt delivery by this exact
+    // member; it is not implied by `context_file_v1`.
+    let out = Command::new(env!("CARGO_BIN_EXE_recipe-runner-rs"))
+        .arg("--capabilities")
+        .env("RECIPE_RUNNER_NO_UPDATE_CHECK", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "probe failed: {:?}", out);
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let members = value["capabilities"].as_array().unwrap();
+    let count = |name: &str| members.iter().filter(|v| *v == name).count();
+    assert_eq!(count("agent_prompt_file_v1"), usize::from(cfg!(unix)));
+    assert_eq!(count("context_file_v1"), usize::from(cfg!(unix)));
 }
 
 #[test]

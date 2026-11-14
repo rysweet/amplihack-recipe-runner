@@ -304,19 +304,14 @@ mod reference_validation {
             vec!["PARENT_EXECUTED"],
             "{result:?}"
         );
-        assert!(!result.success);
-        let step = result
-            .step_results
-            .iter()
-            .find(|s| s.step_id == "dispatch")
-            .unwrap();
-        assert_eq!(step.status, StepStatus::Failed);
+        // A fixed sub-recipe name keeps the parser's detail (#211 redacts
+        // only names rendered from context).
+        let error = diagnostic(&result, "dispatch");
         assert!(
-            step.error.contains("Failed to parse sub-recipe"),
-            "{}",
-            step.error
+            error.contains("Failed to parse sub-recipe 'child'"),
+            "{error}"
         );
-        assert!(!step.error.contains("../escape"), "{}", step.error);
+        assert!(error.contains("invalid-child-dispatch"), "{error}");
     }
 
     #[test]
@@ -503,8 +498,8 @@ fn missing_sub_recipe_diagnostic_lists_all_search_dirs() {
         .expect("dispatch step result missing");
     let err = dispatch.error.as_str();
     assert!(
-        err.contains("Sub-recipe could not be found"),
-        "diagnostic must identify the lookup failure; got: {err}"
+        err.contains("Sub-recipe 'child-step' not found"),
+        "diagnostic must name the missing sub-recipe; got: {err}"
     );
     assert!(
         err.contains("Searched the following directories"),

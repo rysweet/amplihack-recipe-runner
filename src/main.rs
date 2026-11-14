@@ -306,7 +306,12 @@ fn main() {
         }
         use std::io::Write;
         let capabilities: &[&str] = if cfg!(unix) {
-            &["codex_exec", "durable_recovery_v1", "context_file_v1"]
+            &[
+                "codex_exec",
+                "durable_recovery_v1",
+                "context_file_v1",
+                "agent_prompt_file_v1",
+            ]
         } else {
             &[]
         };

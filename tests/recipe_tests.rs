@@ -951,11 +951,7 @@ steps:
         RecordingAdapter::new(),
     );
     assert!(!r.success);
-    assert!(
-        r.step_results[0]
-            .error
-            .contains("Sub-recipe could not be found")
-    );
+    assert!(r.step_results[0].error.contains("not found"));
 }
 
 #[test]
@@ -2172,7 +2168,9 @@ steps:
     let result = runner.execute(&recipe, None);
     assert!(!result.success, "should fail without recovery");
     assert!(
-        result.step_results[0].error.contains("Sub-recipe failed"),
+        result.step_results[0]
+            .error
+            .contains("Sub-recipe 'failing' failed"),
         "error should mention sub-recipe failure, got: {}",
         result.step_results[0].error
     );

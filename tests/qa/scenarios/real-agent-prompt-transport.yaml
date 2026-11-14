@@ -1,0 +1,24 @@
+name: Agent prompt transport against real wrappers (#205, #211)
+description: Opt-in. Run one agent step through the real amplihack claude and amplihack copilot wrappers; the reply must hold a random task token and a random persona token, neither may appear on any process command line during the step, and the private prompt file must be removed afterwards (Linux; requires authenticated CLIs, bash, realpath and Python 3; uses model tokens).
+version: "1.0.0"
+config:
+  timeout: 900000
+  retries: 0
+  parallel: false
+environment:
+  requires: [RECIPE_RUNNER_QA_BINARY]
+agents:
+  - name: cli-agent
+    type: cli
+    config:
+      defaultTimeout: 900000
+steps:
+  - name: Real Claude and Copilot receive task and system prompt off argv
+    agent: cli-agent
+    action: execute_command
+    target: bash tests/qa/real-agent-prompt-transport.sh
+    timeout: 900000
+assertions: []
+metadata:
+  tags: [recipe-runner, claude, copilot, transport, real-agent, opt-in, issue-205, issue-211]
+  priority: high

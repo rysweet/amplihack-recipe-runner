@@ -74,15 +74,22 @@ Values supplied with `--set` still appear there. Intentional step output and
 JSON results can contain file-loaded values, as this example demonstrates.
 Bash steps execute from owner-only temporary script files, including when
 quoted heredocs inline context. These scripts are removed when the step returns.
-Agent instructions travel through private prompt files (Codex uses stdin).
-Agent working directories are set as the child process cwd; directory grants use
+Agent instructions stay off command lines as described in
+[Agent prompt transport](../cli-reference.md#agent-prompt-transport):
+Claude-family CLIs read the system prompt from a private file and the task from
+stdin, Copilot reads a private file, and Codex uses stdin. Agent working
+directories are set as the child process cwd; directory grants use
 `--add-dir .`, keeping context-rendered directory paths off launcher argv.
 
-Runner diagnostics omit rendered step working directories and sub-recipe lookup
-names, including at DEBUG level. Directory and lookup failures remain visible
-through operation categories without the rendered values. Sub-recipe parse and
-inheritance failures also omit nested error details that could disclose selected
-filenames or recipe content.
+Runner diagnostics omit rendered step working directories, including at DEBUG
+level. A sub-recipe reference that contains a `{{placeholder}}` is rendered from
+context, so its diagnostics omit the resolved name and the nested parse and
+inheritance errors, which could disclose the selected filename or recipe
+content; the failure stays visible through its category, such as
+`Sub-recipe not found` or `Failed to parse sub-recipe`. A fixed reference such
+as `recipe: default-workflow` is recipe text, so its diagnostics name it and
+include the parser's or the `extends` resolver's error, such as the line and
+column of a YAML syntax error or the missing base recipe's name.
 
 See the [context-file reference](../cli-reference.md#--context-file-path) for
 all JSON types, secure opening behavior and exit-code `4` diagnostics.
