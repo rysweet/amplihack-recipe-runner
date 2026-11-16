@@ -643,6 +643,11 @@ fn find_first_recipe_dir() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    /// Serialises the tests that set `AMPLIHACK_PACKAGE_RECIPE_DIR` and
+    /// `RECIPE_RUNNER_RECIPE_DIRS`, which otherwise race under parallel
+    /// `cargo test`.
+    static DISCOVERY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn test_discover_empty_dir() {
         let tmp = tempfile::tempdir().unwrap();
@@ -824,6 +829,7 @@ steps:
 
     #[test]
     fn test_package_recipe_dir_env_var() {
+        let _env = DISCOVERY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("env-recipe.yaml"),
@@ -832,7 +838,7 @@ steps:
         .unwrap();
 
         // Set the env var and verify discovery finds the recipe
-        // SAFETY: test runs are single-threaded for env var tests
+        // SAFETY: serialised by DISCOVERY_ENV_LOCK
         unsafe {
             std::env::set_var("AMPLIHACK_PACKAGE_RECIPE_DIR", tmp.path().as_os_str());
         }
@@ -855,7 +861,8 @@ steps:
 
     #[test]
     fn test_empty_package_recipe_dir_env_var_is_ignored() {
-        // SAFETY: test runs are single-threaded for env var tests
+        let _env = DISCOVERY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialised by DISCOVERY_ENV_LOCK
         unsafe {
             std::env::set_var("AMPLIHACK_PACKAGE_RECIPE_DIR", "");
         }
@@ -872,10 +879,11 @@ steps:
 
     #[test]
     fn test_package_recipe_dir_precedes_extra_recipe_dirs() {
+        let _env = DISCOVERY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let pkg = tempfile::tempdir().unwrap();
         let extra = tempfile::tempdir().unwrap();
 
-        // SAFETY: test runs are single-threaded for env var tests
+        // SAFETY: serialised by DISCOVERY_ENV_LOCK
         unsafe {
             std::env::set_var("AMPLIHACK_PACKAGE_RECIPE_DIR", pkg.path().as_os_str());
             std::env::set_var(
