@@ -164,12 +164,6 @@ impl StepContextMode {
     }
 }
 
-impl fmt::Display for StepContextMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 impl Step {
     /// Whether this step should continue on failure.
     /// `continue_on_error: true` OR `fatal: false` makes a step non-fatal.

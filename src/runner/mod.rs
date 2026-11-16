@@ -13,14 +13,14 @@ use terminal::{ParallelOutcome, TerminalFailure, TerminalState};
 #[cfg(test)]
 pub(crate) mod cleanup_test_observer;
 
-use crate::adapters::Adapter;
 use crate::adapters::cli_subprocess::{BashFailure, BashStdoutDiagnostic};
+use crate::adapters::{Adapter, AgentLaunch};
 use crate::agent_resolver::{AgentResolveError, AgentResolver};
 use crate::context::RecipeContext;
 use crate::discovery;
 use crate::models::{
-    Recipe, RecipeResult, Step, StepExecutionError, StepResult, StepStatus, StepType,
-    diagnostic_identifier,
+    Recipe, RecipeResult, Step, StepContextMode, StepExecutionError, StepResult, StepStatus,
+    StepType, diagnostic_identifier,
 };
 use crate::parser::{RecipeParser, resolve_extends};
 use log::{error, info, warn};
@@ -64,7 +64,7 @@ const MAX_LAUNCH_VALUE_BYTES: usize = 128;
 struct ResolvedLaunch {
     model: Option<String>,
     effort: Option<String>,
-    context_mode: Option<crate::models::StepContextMode>,
+    context_mode: Option<StepContextMode>,
 }
 
 /// Render `raw` with `ctx`, trim it, and treat an empty result as absent.
@@ -92,14 +92,21 @@ impl ResolvedLaunch {
             message,
         };
 
-        let model = render_launch_value(step.model.as_deref(), ctx);
-        if let Some(model) = model.as_deref() {
-            if model.len() > MAX_LAUNCH_VALUE_BYTES {
-                return Err(reject(format!(
-                    "rendered 'model' is {} bytes; the maximum is {MAX_LAUNCH_VALUE_BYTES}",
-                    model.len()
-                )));
+        // Shared by both sinks: render, trim, and bound the length. Neither
+        // sink is bounded anywhere else, so this is the one place it happens.
+        let bounded = |field: &str, raw: Option<&str>| {
+            let value = render_launch_value(raw, ctx);
+            match value.as_deref() {
+                Some(v) if v.len() > MAX_LAUNCH_VALUE_BYTES => Err(reject(format!(
+                    "rendered '{field}' is {} bytes; the maximum is {MAX_LAUNCH_VALUE_BYTES}",
+                    v.len()
+                ))),
+                _ => Ok(value),
             }
+        };
+
+        let model = bounded("model", step.model.as_deref())?;
+        if let Some(model) = model.as_deref() {
             if model.starts_with('-') {
                 return Err(reject(
                     "rendered 'model' starts with '-', which the launcher would read as an \
@@ -122,14 +129,8 @@ impl ResolvedLaunch {
             }
         }
 
-        let effort = render_launch_value(step.effort.as_deref(), ctx);
+        let effort = bounded("effort", step.effort.as_deref())?;
         if let Some(effort) = effort.as_deref() {
-            if effort.len() > MAX_LAUNCH_VALUE_BYTES {
-                return Err(reject(format!(
-                    "rendered 'effort' is {} bytes; the maximum is {MAX_LAUNCH_VALUE_BYTES}",
-                    effort.len()
-                )));
-            }
             // Covers NUL, which cannot be placed in an environment at all, and
             // ESC, which could otherwise carry a terminal escape sequence.
             if effort.chars().any(char::is_control) {
@@ -145,7 +146,7 @@ impl ResolvedLaunch {
             context_mode: step
                 .context_mode
                 .as_deref()
-                .and_then(crate::models::StepContextMode::parse),
+                .and_then(StepContextMode::parse),
         })
     }
 
@@ -159,9 +160,9 @@ impl ResolvedLaunch {
         step_id: &str,
         prompt: String,
         working_dir: &str,
-        context_mode: Option<crate::models::StepContextMode>,
-    ) -> crate::adapters::AgentLaunch {
-        crate::adapters::AgentLaunch {
+        context_mode: Option<StepContextMode>,
+    ) -> AgentLaunch {
+        AgentLaunch {
             prompt,
             agent_name: None,
             system_prompt: None,
@@ -173,15 +174,6 @@ impl ResolvedLaunch {
             step_id: step_id.to_string(),
             timeout: None,
         }
-    }
-
-    /// The three launch facts as they are written to a step record.
-    fn record(&self) -> (Option<String>, Option<String>, Option<String>) {
-        (
-            self.context_mode.map(|m| m.as_str().to_string()),
-            self.model.clone(),
-            self.effort.clone(),
-        )
     }
 }
 
@@ -1285,7 +1277,10 @@ impl<A: Adapter> RecipeRunner<A> {
                 };
             }
         };
-        let (recorded_context_mode, recorded_model, recorded_effort) = launch.record();
+        // The three launch facts as they are written to this step's record.
+        let recorded_context_mode = launch.context_mode.map(|m| m.as_str().to_string());
+        let recorded_model = launch.model.clone();
+        let recorded_effort = launch.effort.clone();
 
         // Execute the step
         let output = match self.dispatch_step(step, ctx, &launch) {
@@ -1524,7 +1519,7 @@ impl<A: Adapter> RecipeRunner<A> {
                 }
 
                 self.adapter
-                    .execute_agent_launch(&crate::adapters::AgentLaunch {
+                    .execute_agent_launch(&AgentLaunch {
                         prompt: rendered_prompt,
                         agent_name: agent_name.map(str::to_string),
                         system_prompt: agent_system_prompt,

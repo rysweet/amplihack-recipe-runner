@@ -3,7 +3,7 @@
 /// Parses YAML recipe definitions into Recipe model objects, with validation
 /// and step-type inference.
 use crate::discovery;
-use crate::models::{Recipe, StepType};
+use crate::models::{Recipe, StepContextMode, StepType};
 use crate::runner::sub_recipe_paths::validate_recipe_references;
 use log::{debug, info};
 use serde::de::DeserializeOwned;
@@ -454,9 +454,6 @@ impl Default for RecipeParser {
     }
 }
 
-/// Resolve recipe inheritance via the `extends` field, recursively.
-///
-/// If `recipe.extends` is `Some`, finds and parses the parent recipe, then
 /// Check the per-step launch declarations that the deserialiser cannot.
 ///
 /// `context_mode` is read as a plain string so that this pass — which has the
@@ -476,15 +473,15 @@ fn validate_step_launch_fields(recipe: &Recipe) -> Result<(), ParseError> {
         let Some(declared) = step.context_mode.as_deref() else {
             continue;
         };
-        if crate::models::StepContextMode::parse(declared).is_none() {
+        if StepContextMode::parse(declared).is_none() {
             return Err(ParseError::Invalid(format!(
                 "Step '{}': context_mode '{}' is not recognised; the only accepted value is '{}'",
                 crate::models::diagnostic_identifier(&step.id),
                 crate::models::diagnostic_identifier(declared),
-                crate::models::StepContextMode::MINIMAL
+                StepContextMode::MINIMAL
             )));
         }
-        if step.effective_type() != crate::models::StepType::Agent {
+        if step.effective_type() != StepType::Agent {
             return Err(ParseError::Invalid(format!(
                 "Step '{}': context_mode is only valid on an agent step",
                 crate::models::diagnostic_identifier(&step.id)
@@ -494,6 +491,9 @@ fn validate_step_launch_fields(recipe: &Recipe) -> Result<(), ParseError> {
     Ok(())
 }
 
+/// Resolve recipe inheritance via the `extends` field, recursively.
+///
+/// If `recipe.extends` is `Some`, finds and parses the parent recipe, then
 /// recursively resolves the parent's own `extends` chain *before* merging
 /// the parent into the child. The merge semantics are:
 ///

@@ -876,6 +876,21 @@ fn filter_inherited_env(
         .collect()
 }
 
+/// Place a launch's per-step contract (#219) on a child environment.
+///
+/// The counterpart of the removal loop in
+/// [`CLISubprocessAdapter::build_child_env_with`], and the only place these
+/// variables are ever set. Both agent branches call it at the same point:
+/// after the inherited environment has been built and filtered by the
+/// `--env-allow` allowlist — these values are this run's own, never inherited,
+/// so setting them afterwards confines nothing less — and before `bounded_env`
+/// measures the result, so they are covered by that budget.
+fn apply_contract_env(child_env: &mut HashMap<String, String>, contract_env: &[(&str, &str)]) {
+    for (name, value) in contract_env {
+        child_env.insert((*name).to_string(), (*value).to_string());
+    }
+}
+
 impl CLISubprocessAdapter {
     pub fn new() -> Self {
         // Use AMPLIHACK_AGENT_BINARY env var if set, otherwise default to "claude"
@@ -1373,13 +1388,7 @@ impl CLISubprocessAdapter {
         if self.cli == "codex" {
             let mut child_env = Self::build_child_env_with(self.env_allow.as_deref());
             child_env.insert("AMPLIHACK_AGENT_BINARY".into(), self.cli.clone());
-            // After the allowlist filter, as the session-tree variables are:
-            // these values are this run's own, never inherited, so inserting
-            // them confines nothing less. Before `bounded_env`, so the budget
-            // measures them.
-            for (name, value) in contract_env {
-                child_env.insert((*name).to_string(), (*value).to_string());
-            }
+            apply_contract_env(&mut child_env, contract_env);
             let child_env = bounded_env(&child_env)?;
             let envelope = format!(
                 "# System instructions\n{}\n\n# Task instructions\n{}{}",
@@ -1502,12 +1511,7 @@ impl CLISubprocessAdapter {
         let mut child_env = Self::build_child_env_with(self.env_allow.as_deref());
         // Ensure nested agent steps inherit the same agent binary preference
         child_env.insert("AMPLIHACK_AGENT_BINARY".to_string(), self.cli.clone());
-        // The per-step launch contract (#219), inserted after the allowlist
-        // filter like the session-tree variables and before the measurement
-        // below.
-        for (name, value) in contract_env {
-            child_env.insert((*name).to_string(), (*value).to_string());
-        }
+        apply_contract_env(&mut child_env, contract_env);
         // Bound the child environment to the MEASURED budget once, before the
         // retry loop, so an oversized inherited env can never blow execve for
         // the agent process either. Fails loud (naming protected vars) instead
