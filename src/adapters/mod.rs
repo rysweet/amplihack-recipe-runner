@@ -125,10 +125,19 @@ impl AgentLaunch {
 }
 
 impl fmt::Debug for AgentLaunch {
-    /// Reports the prompt and system prompt by size only.
+    /// Reports sizes and presence, never the values themselves.
     ///
-    /// Both can hold a client's private instructions, and a `Debug` of a launch
-    /// can reach a log line, an error chain and a CI log.
+    /// A `Debug` of a launch can reach a log line, an error chain and a CI log,
+    /// and every field here that a recipe can template is fed from the recipe
+    /// context — which carries earlier step output, agent output and
+    /// `--context-file` values. The prompt and system prompt can hold a
+    /// client's private instructions; the working directory, model and effort
+    /// are rendered, so each can hold a context value that the recipe author
+    /// never meant to publish.
+    ///
+    /// Only the step id is shown as written: it is the recipe's own label for
+    /// the step, and a diagnostic that cannot say which step it is about is
+    /// not worth logging.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AgentLaunch")
             .field("step_id", &self.step_id)
@@ -136,9 +145,9 @@ impl fmt::Debug for AgentLaunch {
             .field("has_system_prompt", &self.system_prompt.is_some())
             .field("agent_name", &self.agent_name)
             .field("mode", &self.mode)
-            .field("working_dir", &self.working_dir)
-            .field("model", &self.model)
-            .field("effort", &self.effort)
+            .field("working_dir_len", &self.working_dir.len())
+            .field("has_model", &self.model.is_some())
+            .field("has_effort", &self.effort.is_some())
             .field("context_mode", &self.context_mode)
             .field("timeout", &self.timeout)
             .finish()

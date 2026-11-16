@@ -89,13 +89,28 @@ pub fn write_audit_entry(file: &Option<std::fs::File>, result: &StepResult) -> b
         return false;
     };
     {
-        let entry = serde_json::json!({
+        let mut entry = serde_json::json!({
             "step_id": result.step_id,
             "status": format!("{}", result.status),
             "duration_ms": result.duration.map(|d| d.as_millis()),
             "error": if result.error.is_empty() { None } else { Some(&result.error) },
             "output_len": result.output.len(),
         });
+        // This line is built by hand, so `StepResult`'s serde does not reach
+        // it: the three launch fields (#219) are added here explicitly, and
+        // only when the step declared them. Writing `null` for an absent one
+        // would append three keys to every audit line in every repository.
+        if let Some(object) = entry.as_object_mut() {
+            for (key, value) in [
+                ("context_mode", result.context_mode.as_deref()),
+                ("model", result.model.as_deref()),
+                ("effort", result.effort.as_deref()),
+            ] {
+                if let Some(value) = value {
+                    object.insert(key.to_string(), serde_json::Value::from(value));
+                }
+            }
+        }
         if let Err(e) = writeln!(f, "{}", entry) {
             warn!("Failed to write audit log entry: {}", e);
             return false;

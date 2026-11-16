@@ -246,7 +246,7 @@ struct StepResult {
 
     // Agent launches only; omitted from serialization when absent, so a step
     // that declares none of them serializes exactly as it did before.
-    context_mode: Option<ContextMode>,  // Minimal
+    context_mode: Option<String>,       // "minimal", as launched
     model:        Option<String>,       // rendered, as launched
     effort:       Option<String>,       // rendered, as launched
 }
@@ -338,7 +338,7 @@ takes one `AgentLaunch` value instead of a parameter list. `AgentLaunch` holds
 everything `execute_agent_step` takes — prompt, agent name, system prompt, mode,
 working directory, model, timeout — plus the three values the
 [step context contract](step-context-contract.md) adds: `step_id`, `effort` and
-`minimal_context`. It is `#[non_exhaustive]`, so a later field is an additive
+`context_mode`. It is `#[non_exhaustive]`, so a later field is an additive
 change rather than a breaking one, and its `Debug` prints the sizes of the
 prompt and system prompt rather than their contents.
 

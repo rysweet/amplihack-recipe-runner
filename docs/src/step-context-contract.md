@@ -62,9 +62,9 @@ The **recovery launch** is the agent that runs when a step with
 identifier. It never carries `AMPLIHACK_STEP_CONTEXT`, and two independent
 things make that so.
 
-The launch site passes the minimal mark as a literal `false` rather than reading
-it from the step, so the omission is stated at the one place it could go wrong
-instead of being inferred. The mark is also unrepresentable here: `context_mode`
+The launch site passes the minimal mark as a literal "none declared" rather than
+reading it from the step, so the omission is stated at the one place it could go
+wrong instead of being inferred. The mark is also unrepresentable here: `context_mode`
 is accepted only on an agent step and is a parse error anywhere else, while
 `recovery_on_failure` is a recipe-step field, so a step that can trigger a
 recovery launch cannot have declared a minimal start in the first place.
