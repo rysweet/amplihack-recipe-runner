@@ -588,6 +588,52 @@ fn an_unchanged_bash_step_writes_the_audit_line_it_always_wrote() {
 }
 
 #[test]
+fn a_bash_step_declaring_model_and_effort_still_records_neither() {
+    // A bash step is the one type that can never launch an agent, so there is
+    // no launch for its record to describe. The fields stay as inert as they
+    // were before #219: accepted in silence by the parser, absent from the
+    // record. Without this, a bash step would assert a launch fact about a
+    // process that was never started.
+    let dir = tempfile::tempdir().unwrap();
+    let (json, audit) = records(
+        dir.path(),
+        "name: r\nsteps:\n  - id: a\n    type: bash\n    command: echo hi\n    model: sonnet\n    effort: high\n",
+    );
+    let before: BTreeSet<String> = ["step_id", "status", "duration_ms", "error", "output_len"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    assert_eq!(
+        keys_of(&audit[0]),
+        before,
+        "the audit line of a bash step gains no key, declared or not: {}",
+        audit[0]
+    );
+    for added in ["context_mode", "model", "effort"] {
+        assert!(
+            !keys_of(&json[0]).contains(added),
+            "json: a bash step records no '{added}': {}",
+            json[0]
+        );
+    }
+    assert_eq!(json[0]["status"], Value::from("completed"));
+}
+
+#[test]
+fn a_flag_shaped_model_on_a_bash_step_does_not_fail_the_run() {
+    // `model:` on a bash step was inert before #219 and stays inert: nothing
+    // reads it, so nothing checks its shape. A run-stopping validation here
+    // would be a behaviour regression on recipes the feature never touched.
+    let dir = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = run_binary(
+        dir.path(),
+        "name: r\nsteps:\n  - id: a\n    type: bash\n    command: echo hi\n    model: \"--add-dir\"\n",
+        &[],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+}
+
+#[test]
 fn a_step_declaring_only_a_model_records_only_the_model() {
     // The comparison arm: the saving is measured against steps that did not
     // opt in.

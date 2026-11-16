@@ -445,6 +445,13 @@ whatever agent a step launches — and they behave the same way on a step that
 launches none. The restriction belongs to `context_mode` alone, which names a
 start that only an agent launch can have.
 
+Silently unused means *entirely* unused. On a **bash step** — the one type that
+can never launch an agent — neither field is rendered, checked or recorded, so
+a `model:` or `effort:` that would fail an agent step cannot fail a bash step
+and does not appear in its [record](step-context-contract.md#step-records). On
+a recipe step the fields are resolved, because its recovery launch needs them,
+and the 128-byte and control-character checks above apply.
+
 As with `context_mode`, `effort` is part of the step definition that recovery
 fingerprints, so editing it invalidates that step's stored progress and the step
 re-executes on the next resume.

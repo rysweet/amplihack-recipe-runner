@@ -482,6 +482,36 @@ fn a_long_step_id_reaches_the_launch_whole() {
 }
 
 #[test]
+fn an_id_too_large_for_an_environment_costs_one_variable_not_the_run() {
+    // The other way an id cannot be placed in the environment: a
+    // `AMPLIHACK_STEP_ID=<id>\0` string over the kernel's per-string limit
+    // (`MAX_ARG_STRLEN`, 131072) would fail the whole `execve` with an opaque
+    // `Argument list too long`. The parser caps no step id — deliberately —
+    // so the cap lives at the one place the id reaches an environment.
+    let dir = tempfile::tempdir().unwrap();
+    let long = "s".repeat(200_000);
+    let out = run_recipe(
+        dir.path(),
+        &format!(
+            "name: contract\nsteps:\n  - id: {long}\n    type: agent\n    prompt: hello\n    context_mode: minimal\n"
+        ),
+        &[],
+        &[],
+    );
+    assert_ran(&out);
+    let env = recorded_env(dir.path(), 1);
+    assert!(
+        !env.contains_key(STEP_ID),
+        "an id too large to place in an environment is omitted, not spawned with"
+    );
+    assert_eq!(
+        env.get(CONTEXT).map(String::as_str),
+        Some("minimal"),
+        "the rest of the contract is unaffected"
+    );
+}
+
+#[test]
 fn an_id_that_cannot_travel_costs_one_variable_not_the_run() {
     // A control character cannot be placed in the environment safely. The
     // variable is omitted and the step still runs, which is why a consumer

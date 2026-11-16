@@ -143,6 +143,10 @@ impl ResolvedLaunch {
         Ok(Self {
             model,
             effort,
+            // `and_then` rather than a rejection: the parser already refused
+            // anything that is not `minimal`, so the only direction this can
+            // fall is losing a declared `minimal` and starting the agent
+            // normally — less saving, never more access.
             context_mode: step
                 .context_mode
                 .as_deref()
@@ -1263,18 +1267,29 @@ impl<A: Adapter> RecipeRunner<A> {
         // Resolve the launch after every early return, so a step that never
         // launches reports no launch, and before the dispatch, so a value that
         // cannot travel fails the step rather than the spawn.
-        let launch = match ResolvedLaunch::resolve(step, ctx) {
-            Ok(launch) => launch,
-            Err(e) => {
-                error!("{}", e);
-                return StepResult {
-                    step_id: step.id.clone(),
-                    status: StepStatus::Failed,
-                    output: String::new(),
-                    error: e.to_string(),
-                    duration: Some(step_start.elapsed()),
-                    ..Default::default()
-                };
+        //
+        // A bash step is the one type that can never launch an agent, so it
+        // has no launch to resolve, to validate or to record: `model:` and
+        // `effort:` on a bash step stay as inert as they were before #219,
+        // neither failing the step over a shape nothing reads nor appearing in
+        // its record. Every other type keeps resolving — a recipe step's
+        // resolved values are the ones its recovery launch would use.
+        let launch = if step.effective_type() == StepType::Bash {
+            ResolvedLaunch::default()
+        } else {
+            match ResolvedLaunch::resolve(step, ctx) {
+                Ok(launch) => launch,
+                Err(e) => {
+                    error!("{}", e);
+                    return StepResult {
+                        step_id: step.id.clone(),
+                        status: StepStatus::Failed,
+                        output: String::new(),
+                        error: e.to_string(),
+                        duration: Some(step_start.elapsed()),
+                        ..Default::default()
+                    };
+                }
             }
         };
         // The three launch facts as they are written to this step's record.

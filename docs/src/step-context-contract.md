@@ -112,10 +112,12 @@ precedence itself is implemented in amplihack's launcher, not here.
 
 The value is `step.id` exactly as the recipe writes it, after no rendering and
 no rewriting. It is set on every agent launch the runner makes on a step's
-behalf, with one exception: an id containing a control character is omitted
-rather than placed in the environment, and the omission is logged at debug
-level. An otherwise valid recipe is not stopped over the identifier of a step
-that is about to run. Treat the variable as **usually present**, not as an
+behalf, with one exception: an id holding a control character, or one too
+large to place in an environment — its `AMPLIHACK_STEP_ID=<id>` string
+exceeding the kernel's per-string limit, which would otherwise fail the whole
+spawn — is omitted rather than placed there, and the omission is logged at
+debug level. An otherwise valid recipe is not stopped over the identifier of a
+step that is about to run. Treat the variable as **usually present**, not as an
 invariant, and correlate on the launch rather than requiring the name.
 
 That exception is where the whole of the id's handling lives. The contract adds
@@ -252,14 +254,15 @@ omitted entirely when they do not apply:
 
 | Field | Written when |
 |-------|--------------|
-| `context_mode` | The step declared `minimal`. |
-| `model` | A non-empty rendered model reached the launch. |
-| `effort` | A non-empty rendered effort reached the launch. |
+| `context_mode` | The step declared `minimal` (only an agent step may). |
+| `model` | A non-empty rendered model resolved, and the step is not a bash step. |
+| `effort` | A non-empty rendered effort resolved, and the step is not a bash step. |
 
-The recorded values are the **effective, rendered** ones — what the step was
-actually launched with, not the template the recipe wrote. They are written for
-both successful and failed launches, so a failed lightweight step is still
-visible as one. A step that never ran carries none of them.
+The recorded values are the **effective, rendered** ones — the launch the step
+resolved, not the template the recipe wrote. They are written for both
+successful and failed launches, so a failed lightweight step is still visible
+as one. A step that never ran carries none of them, and neither does a bash
+step, which resolves no launch at all.
 
 Recording what each step was launched with is the point of the feature: without
 it there is no way to measure what a lightweight step saves against the steps
@@ -290,10 +293,22 @@ adapter's final attempt, inside the adapter. The record does not show that
 override. Reading the records tells you what each step was launched with, not
 what every attempt used.
 
-Because the fields are omitted when absent, the record of a bash step, a recipe
-step, or an agent step that declares none of the three is byte-identical to the
+Because the fields are omitted when absent, the record of a bash step, or of a
+step of any type that declares none of the three, is byte-identical to the
 record the same step produced before this feature existed. An agent step that
 already declares `model:` gains one key.
+
+A bash step records none of the three even when it declares them. It is the one
+step type that can never launch an agent, so there is no launch to describe;
+`model:` and `effort:` on a bash step remain the inert, unread fields they were
+before this feature existed, and are not validated either.
+
+A **recipe step** does record the values it resolved, whether or not anything
+was launched with them. A sub-recipe's steps resolve their own launches; the
+parent recipe step's resolved values are the ones its *recovery* launch would
+use, and recovery fires only when the sub-recipe fails. So read a recipe step's
+`model` and `effort` as the launch policy in force for that step, not as proof
+that a process was started with them.
 
 ### Adding a field to a step invalidates its stored progress
 

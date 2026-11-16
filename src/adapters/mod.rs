@@ -8,15 +8,17 @@ mod env_spill;
 mod test_log;
 pub(crate) use codex_exec::{CleanupFailure, Interruption};
 
+use crate::adapters::env_spill::{MAX_ARG_STRLEN, env_pair_bytes};
 use crate::models::StepContextMode;
 use std::fmt;
 
 /// Names the step that an agent launch is acting for.
 ///
 /// Set on every agent launch, with one exception: an id that cannot be placed
-/// in an environment at all (one holding a control character) is omitted, and
-/// the step runs without it. A consumer should therefore treat this as usually
-/// present rather than guaranteed.
+/// in an environment at all — one holding a control character, or one too
+/// large for the kernel's per-string limit — is omitted, and the step runs
+/// without it. A consumer should therefore treat this as usually present
+/// rather than guaranteed.
 ///
 /// The value is recipe-controlled text crossing into another program. A
 /// consumer must treat it as untrusted: never interpolate it unquoted into a
@@ -96,20 +98,35 @@ pub struct AgentLaunch {
 }
 
 impl AgentLaunch {
-    /// The contract variables this launch sets on its child, in name order.
+    /// The contract variables this launch sets on its child, in a fixed order.
     ///
     /// This is the whole policy: what is set, when, and with which value. The
     /// model is deliberately absent — it reaches the launcher as a `--model`
     /// argument and a second route would be a second thing to keep in step.
     pub fn contract_env(&self) -> Vec<(&'static str, &str)> {
         let mut pairs = Vec::with_capacity(CONTRACT_ENV_NAMES.len());
-        if self.step_id.chars().any(char::is_control) {
-            // A control character cannot be placed in the environment safely.
-            // Omitting one variable is better than failing a valid step.
+        // Two ways an id cannot be placed in the environment: a control
+        // character, which cannot be carried safely, and a `KEY=value\0`
+        // string over the kernel's per-string limit, which would fail the
+        // whole `execve` with an opaque `E2BIG`. The length predicate is the
+        // crate's existing one (`inherited_env_entry_too_large` applies it to
+        // inherited variables at the same threshold), so there is one rule
+        // here, not two. The parser caps no step id, deliberately; this is
+        // where an id too long to travel costs one variable, not the run.
+        let id_is_unusable = self.step_id.chars().any(char::is_control)
+            || env_pair_bytes(STEP_ID_ENV, &self.step_id) > MAX_ARG_STRLEN;
+        if id_is_unusable {
+            // Omitting one variable is better than failing a valid step. The
+            // log names the step and reports its length. The name is escaped,
+            // because an id can carry a terminal escape sequence, and bounded,
+            // because the length is exactly what can be wrong with it — an
+            // unbounded identifier here would put the whole oversized id in
+            // the log line that exists to report that it is oversized.
             log::debug!(
-                "AgentLaunch::contract_env: omitting {STEP_ID_ENV}; step id '{}' holds a \
-                 control character",
-                crate::models::diagnostic_identifier(&self.step_id)
+                "AgentLaunch::contract_env: omitting {STEP_ID_ENV}; step id '{}' ({} bytes) \
+                 cannot be placed in an environment",
+                crate::models::diagnostic_identifier(&self.step_id[..self.id_log_prefix_len()]),
+                self.step_id.len()
             );
         } else {
             pairs.push((STEP_ID_ENV, self.step_id.as_str()));
@@ -121,6 +138,23 @@ impl AgentLaunch {
             pairs.push((STEP_EFFORT_ENV, effort));
         }
         pairs
+    }
+
+    /// Byte length of the longest prefix of `step_id` safe to put in a log
+    /// line, rounded down to a character boundary.
+    ///
+    /// A normal id is far shorter than this and is logged whole.
+    fn id_log_prefix_len(&self) -> usize {
+        /// Enough to recognise any id a recipe would plausibly write.
+        const MAX_LOGGED_ID_BYTES: usize = 128;
+
+        if self.step_id.len() <= MAX_LOGGED_ID_BYTES {
+            return self.step_id.len();
+        }
+        (0..=MAX_LOGGED_ID_BYTES)
+            .rev()
+            .find(|&n| self.step_id.is_char_boundary(n))
+            .unwrap_or(0)
     }
 }
 
