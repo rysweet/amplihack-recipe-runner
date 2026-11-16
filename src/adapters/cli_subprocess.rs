@@ -1323,11 +1323,14 @@ impl CLISubprocessAdapter {
         timeout: Option<u64>,
         contract_env: &[(&str, &str)],
     ) -> Result<String, anyhow::Error> {
+        // SR-10: `model` is rendered from RecipeContext after #219, so it is
+        // untrusted data. Log its presence and length only, never its text.
         log::debug!(
-            "launch_agent_process: prompt_len={}, has_system_prompt={}, model={:?},              contract_vars={}",
+            "launch_agent_process: prompt_len={}, has_system_prompt={}, model_len={:?}, \
+             contract_vars={}",
             prompt.len(),
             system_prompt.is_some(),
-            model,
+            model.map(str::len),
             contract_env.len()
         );
         // Resolve the actual working directory for the agent.
@@ -1875,10 +1878,11 @@ impl Adapter for CLISubprocessAdapter {
         model: Option<&str>,
         timeout: Option<u64>,
     ) -> Result<String, anyhow::Error> {
+        // SR-10: see `launch_agent_process` — length and presence only.
         log::debug!(
-            "CLISubprocessAdapter::execute_agent_step: prompt_len={}, model={:?}, timeout={:?}",
+            "CLISubprocessAdapter::execute_agent_step: prompt_len={}, model_len={:?}, timeout={:?}",
             prompt.len(),
-            model,
+            model.map(str::len),
             timeout
         );
         self.execute_agent_step_impl(prompt, system_prompt, model, working_dir, timeout)
