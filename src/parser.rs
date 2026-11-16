@@ -52,6 +52,8 @@ const KNOWN_STEP_FIELDS: &[&str] = &[
     "when_tags",
     "recovery_on_failure",
     "model",
+    "context_mode",
+    "effort",
 ];
 
 /// Step fields that were honoured by earlier executors and are now ignored,
@@ -165,6 +167,8 @@ impl RecipeParser {
                 )));
             }
         }
+
+        validate_step_launch_fields(&recipe)?;
 
         validate_recipe_references(&recipe).map_err(|error| ParseError::Invalid(error.message))?;
 
@@ -453,6 +457,43 @@ impl Default for RecipeParser {
 /// Resolve recipe inheritance via the `extends` field, recursively.
 ///
 /// If `recipe.extends` is `Some`, finds and parses the parent recipe, then
+/// Check the per-step launch declarations that the deserialiser cannot.
+///
+/// `context_mode` is read as a plain string so that this pass — which has the
+/// step in hand — can name the step that owns a bad value. A typed field would
+/// be rejected inside document decoding, which knows only a position in the
+/// YAML.
+///
+/// This fails closed on purpose: an unrecognised value is an error, not a
+/// warning. A typo must not quietly cost a step the saving it asked for, and
+/// there is no value meaning "the normal start" that a mistake could land on.
+///
+/// `effort` is checked here only for being a string, which the deserialiser
+/// already did: it carries no vocabulary and no step-type restriction, exactly
+/// like `model`.
+fn validate_step_launch_fields(recipe: &Recipe) -> Result<(), ParseError> {
+    for step in &recipe.steps {
+        let Some(declared) = step.context_mode.as_deref() else {
+            continue;
+        };
+        if crate::models::StepContextMode::parse(declared).is_none() {
+            return Err(ParseError::Invalid(format!(
+                "Step '{}': context_mode '{}' is not recognised; the only accepted value is '{}'",
+                crate::models::diagnostic_identifier(&step.id),
+                crate::models::diagnostic_identifier(declared),
+                crate::models::StepContextMode::MINIMAL
+            )));
+        }
+        if step.effective_type() != crate::models::StepType::Agent {
+            return Err(ParseError::Invalid(format!(
+                "Step '{}': context_mode is only valid on an agent step",
+                crate::models::diagnostic_identifier(&step.id)
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// recursively resolves the parent's own `extends` chain *before* merging
 /// the parent into the child. The merge semantics are:
 ///
@@ -1265,6 +1306,8 @@ steps:
             when_tags: vec!["t".into()],
             recovery_on_failure: true,
             model: Some("m".into()),
+            context_mode: Some("minimal".into()),
+            effort: Some("low".into()),
         };
         let json = serde_json::to_value(&step).unwrap();
         for key in json.as_object().unwrap().keys() {

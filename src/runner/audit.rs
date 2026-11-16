@@ -119,6 +119,7 @@ mod tests {
             output: String::new(),
             error: String::new(),
             duration: None,
+            ..Default::default()
         };
         assert!(write_audit_entry(&None, &result), "no audit log configured");
         let writable = std::fs::OpenOptions::new()

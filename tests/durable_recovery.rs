@@ -168,6 +168,7 @@ fn typed_context_delta_preserves_null_and_removal() {
             output: "".into(),
             error: "".into(),
             duration: None,
+            ..Default::default()
         },
         delta: BTreeMap::from([
             ("remove".into(), ContextChange::Remove),
@@ -295,6 +296,7 @@ fn completion(probe: Probe) -> Record {
             output: String::new(),
             error: String::new(),
             duration: None,
+            ..Default::default()
         },
         probe,
         delta: Default::default(),
@@ -418,6 +420,7 @@ fn current_child_limit_survives_a_generic_parent_error_but_not_an_unrelated_fail
                 output: String::new(),
                 error: "child failed".into(),
                 duration: None,
+                ..Default::default()
             }],
             context: Default::default(),
             duration: None,

@@ -101,7 +101,73 @@ pub struct Step {
     #[serde(default)]
     pub recovery_on_failure: bool,
     /// Model override for agent steps (e.g., "haiku", "sonnet").
+    ///
+    /// Rendered against the recipe context before launch, so a recipe can
+    /// choose a tier from a context variable or an earlier step's output. The
+    /// runner holds no model vocabulary: the value travels to the launcher
+    /// unchanged, as a `--model` argument.
     pub model: Option<String>,
+    /// How much context the step is started with. The only accepted value is
+    /// `minimal`, and only on an agent step; a step asks for the normal start
+    /// by omitting the field.
+    ///
+    /// Carried as written so that the validation pass — which has the step in
+    /// hand — can name the step that owns an unrecognised value. Use
+    /// [`StepContextMode::parse`] to act on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_mode: Option<String>,
+    /// Reasoning-effort hint for the harness, rendered like `model`.
+    ///
+    /// Free-form: the accepted words differ per harness and the runner never
+    /// interprets them. Accepted wherever `model` is, with no step-type
+    /// restriction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+/// How much context an agent step is started with.
+///
+/// There is exactly one variant. A second spelling meaning "the normal start"
+/// would be a second thing to keep consistent with the absent field, so the
+/// normal start is expressed by omitting `context_mode` entirely.
+///
+/// The typed form exists for the code that acts on the declaration; the recipe
+/// field itself is a plain string, typed at the parser boundary so that a bad
+/// value is reported against the step that wrote it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepContextMode {
+    /// Start the step with only its rendered prompt and declared inputs.
+    Minimal,
+}
+
+impl StepContextMode {
+    /// The one accepted spelling, as written in a recipe and as placed on the
+    /// child environment.
+    pub const MINIMAL: &'static str = "minimal";
+
+    /// Parse a declared value, returning `None` for anything unrecognised.
+    ///
+    /// Matching is exact: `Minimal` and ` minimal` are not this value.
+    pub fn parse(value: &str) -> Option<Self> {
+        trace!("StepContextMode::parse: value={:?}", value);
+        match value {
+            Self::MINIMAL => Some(Self::Minimal),
+            _ => None,
+        }
+    }
+
+    /// The declared spelling of this mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => Self::MINIMAL,
+        }
+    }
+}
+
+impl fmt::Display for StepContextMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl Step {
@@ -255,6 +321,37 @@ pub struct StepResult {
         skip_serializing_if = "Option::is_none"
     )]
     pub duration: Option<Duration>,
+    /// The context mode this step was launched with, when it declared one.
+    ///
+    /// Absent — and omitted from the record — for a step that asked for the
+    /// normal start and for a step that never launched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_mode: Option<String>,
+    /// The model this step was launched with, after rendering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The effort this step was launched with, after rendering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl Default for StepResult {
+    /// A record for a step that has not run.
+    ///
+    /// `StepStatus` has no default of its own on purpose — a status is always
+    /// a statement about a step — so this names `Pending` explicitly.
+    fn default() -> Self {
+        Self {
+            step_id: String::new(),
+            status: StepStatus::Pending,
+            output: String::new(),
+            error: String::new(),
+            duration: None,
+            context_mode: None,
+            model: None,
+            effort: None,
+        }
+    }
 }
 
 impl fmt::Display for StepResult {
@@ -357,6 +454,7 @@ mod tests {
                 output: String::new(),
                 error: error.to_string(),
                 duration: None,
+                ..Default::default()
             }],
             context: HashMap::new(),
             duration: None,
@@ -400,6 +498,8 @@ mod tests {
             when_tags: vec![],
             recovery_on_failure: false,
             model: None,
+            context_mode: None,
+            effort: None,
         };
         // Explicit type overrides all field-based inference
         assert_eq!(step.effective_type(), StepType::Bash);
@@ -430,6 +530,8 @@ mod tests {
             when_tags: vec![],
             recovery_on_failure: false,
             model: None,
+            context_mode: None,
+            effort: None,
         };
         assert_eq!(step.effective_type(), StepType::Recipe);
     }
@@ -459,6 +561,8 @@ mod tests {
             when_tags: vec![],
             recovery_on_failure: false,
             model: None,
+            context_mode: None,
+            effort: None,
         };
         assert_eq!(step.effective_type(), StepType::Agent);
     }
@@ -488,6 +592,8 @@ mod tests {
             when_tags: vec![],
             recovery_on_failure: false,
             model: None,
+            context_mode: None,
+            effort: None,
         };
         assert_eq!(step.effective_type(), StepType::Agent);
     }
@@ -517,6 +623,8 @@ mod tests {
             when_tags: vec![],
             recovery_on_failure: false,
             model: None,
+            context_mode: None,
+            effort: None,
         };
         // command + prompt → Bash (prompt alone would be Agent, but command presence wins)
         assert_eq!(step.effective_type(), StepType::Bash);
@@ -547,6 +655,8 @@ mod tests {
             when_tags: vec![],
             recovery_on_failure: false,
             model: None,
+            context_mode: None,
+            effort: None,
         };
         assert_eq!(step.effective_type(), StepType::Bash);
     }
@@ -576,6 +686,7 @@ mod tests {
             output: "some output".into(),
             error: String::new(),
             duration: Some(Duration::from_secs_f64(1.5)),
+            ..Default::default()
         };
         let display = format!("{}", result);
         assert!(display.contains("completed"));
@@ -592,6 +703,7 @@ mod tests {
             output: String::new(),
             error: "something broke".into(),
             duration: None,
+            ..Default::default()
         };
         let display = format!("{}", result);
         assert!(display.contains("failed"));
@@ -623,6 +735,7 @@ mod tests {
                 output: String::new(),
                 error: "boom".into(),
                 duration: None,
+                ..Default::default()
             }],
             context: HashMap::new(),
             duration: None,

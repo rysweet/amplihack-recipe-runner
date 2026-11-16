@@ -228,6 +228,7 @@ mod tests {
                 output: String::new(),
                 error: String::new(),
                 duration: Some(Duration::from_millis(125)),
+                ..Default::default()
             });
         }
         drop(listener);

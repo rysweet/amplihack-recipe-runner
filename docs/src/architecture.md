@@ -243,6 +243,12 @@ struct StepResult {
     output:   Option<String>,
     error:    Option<String>,
     duration: Duration,
+
+    // Agent launches only; omitted from serialization when absent, so a step
+    // that declares none of them serializes exactly as it did before.
+    context_mode: Option<ContextMode>,  // Minimal
+    model:        Option<String>,       // rendered, as launched
+    effort:       Option<String>,       // rendered, as launched
 }
 
 struct RecipeResult {
@@ -253,6 +259,10 @@ struct RecipeResult {
     duration:     Duration,
 }
 ```
+
+The three optional `StepResult` fields reach `--output-format json`, the
+`--audit-dir` JSONL log and the recovery store alike; see
+[Step records](step-context-contract.md#step-records) for when each is written.
 
 ---
 
@@ -311,10 +321,32 @@ pub trait Adapter: Sync {
         extra_env: &std::collections::HashMap<String, String>,
     ) -> Result<String, anyhow::Error>;
 
+    /// Added for the step context contract; see below.
+    fn execute_agent_launch(&self, launch: &AgentLaunch) -> Result<String, anyhow::Error> {
+        // Default body forwards to `execute_agent_step`.
+    }
+
     fn is_available(&self) -> bool;
     fn name(&self) -> &str;
 }
 ```
+
+### `AgentLaunch` and `execute_agent_launch`
+
+The runner dispatches every agent step through `execute_agent_launch`, which
+takes one `AgentLaunch` value instead of a parameter list. `AgentLaunch` holds
+everything `execute_agent_step` takes — prompt, agent name, system prompt, mode,
+working directory, model, timeout — plus the three values the
+[step context contract](step-context-contract.md) adds: `step_id`, `effort` and
+`minimal_context`. It is `#[non_exhaustive]`, so a later field is an additive
+change rather than a breaking one, and its `Debug` prints the sizes of the
+prompt and system prompt rather than their contents.
+
+The method is **additive**: `execute_agent_step` keeps the signature above, and
+`execute_agent_launch` has a default body that forwards to it. An adapter
+written before the contract compiles and behaves exactly as it did, and simply
+sets none of the contract variables. `CLISubprocessAdapter` overrides the method
+and is where the variables are placed on the child environment.
 
 ### CLISubprocessAdapter
 

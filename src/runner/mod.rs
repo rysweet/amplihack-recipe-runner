@@ -358,6 +358,7 @@ impl<A: Adapter> RecipeRunner<A> {
                         output: String::new(),
                         error: msg,
                         duration: None,
+                        ..Default::default()
                     }],
                     context: HashMap::new(),
                     duration: None,
@@ -398,6 +399,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     output: String::new(),
                     error: error.message,
                     duration: None,
+                    ..Default::default()
                 }],
                 context: HashMap::new(),
                 duration: None,
@@ -434,6 +436,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     output: String::new(),
                     error: "audit log could not be opened and an audit log is required".to_string(),
                     duration: None,
+                    ..Default::default()
                 }],
                 context: ctx.to_map(),
                 duration: Some(start.elapsed()),
@@ -470,6 +473,7 @@ impl<A: Adapter> RecipeRunner<A> {
                             self.max_total_steps.get()
                         ),
                         duration: None,
+                        ..Default::default()
                     });
                     success = false;
                     break;
@@ -574,6 +578,7 @@ impl<A: Adapter> RecipeRunner<A> {
                             self.max_total_steps.get()
                         ),
                         duration: None,
+                        ..Default::default()
                     });
                     success = false;
                     break;
@@ -590,6 +595,7 @@ impl<A: Adapter> RecipeRunner<A> {
                         output: String::new(),
                         error: String::new(),
                         duration: None,
+                        ..Default::default()
                     });
                     step_idx += 1;
                     continue;
@@ -607,6 +613,7 @@ impl<A: Adapter> RecipeRunner<A> {
                         output: String::new(),
                         error: "skipped (resume from checkpoint)".to_string(),
                         duration: None,
+                        ..Default::default()
                     });
                     step_idx += 1;
                     continue;
@@ -1052,6 +1059,7 @@ impl<A: Adapter> RecipeRunner<A> {
                 output: String::new(),
                 error,
                 duration: Some(step_start.elapsed()),
+                ..Default::default()
             };
         }
 
@@ -1078,6 +1086,7 @@ impl<A: Adapter> RecipeRunner<A> {
                 output,
                 error: String::new(),
                 duration: Some(step_start.elapsed()),
+                ..Default::default()
             };
         }
 
@@ -1096,6 +1105,7 @@ impl<A: Adapter> RecipeRunner<A> {
                         output: String::new(),
                         error: String::new(),
                         duration: Some(step_start.elapsed()),
+                        ..Default::default()
                     };
                 }
                 Err(e) => {
@@ -1110,6 +1120,7 @@ impl<A: Adapter> RecipeRunner<A> {
                         output: String::new(),
                         error: format!("Condition error: {}", e),
                         duration: Some(step_start.elapsed()),
+                        ..Default::default()
                     };
                 }
             }
@@ -1130,6 +1141,7 @@ impl<A: Adapter> RecipeRunner<A> {
                             "Codex final output exceeds {MAX_STEP_OUTPUT_BYTES}-byte limit"
                         ),
                         duration: Some(step_start.elapsed()),
+                        ..Default::default()
                     };
                 }
                 if o.len() > MAX_STEP_OUTPUT_BYTES {
@@ -1159,6 +1171,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     output: String::new(),
                     error: diagnostic,
                     duration: Some(step_start.elapsed()),
+                    ..Default::default()
                 };
             }
         };
@@ -1171,6 +1184,7 @@ impl<A: Adapter> RecipeRunner<A> {
                 output: String::new(),
                 error,
                 duration: Some(step_start.elapsed()),
+                ..Default::default()
             };
         }
 
@@ -1207,6 +1221,7 @@ impl<A: Adapter> RecipeRunner<A> {
                             output: String::new(),
                             error: diagnostic.clone(),
                             duration: Some(step_start.elapsed()),
+                            ..Default::default()
                         };
                     }
 
@@ -1262,6 +1277,7 @@ impl<A: Adapter> RecipeRunner<A> {
             output: final_output,
             error: step_error,
             duration: Some(step_start.elapsed()),
+            ..Default::default()
         }
     }
 
@@ -1842,6 +1858,7 @@ impl<A: Adapter> RecipeRunner<A> {
                         output: String::new(),
                         error: String::new(),
                         duration: None,
+                        ..Default::default()
                     });
                     continue;
                 }
@@ -1917,6 +1934,7 @@ impl<A: Adapter> RecipeRunner<A> {
                                 panic_msg
                             ),
                             duration: None,
+                            ..Default::default()
                         });
                     }
                 }
@@ -1954,6 +1972,7 @@ impl<A: Adapter> RecipeRunner<A> {
                 output: "(dry-run)".to_string(),
                 error: String::new(),
                 duration: Some(step_start.elapsed()),
+                ..Default::default()
             }
             .into();
         }
@@ -1968,6 +1987,7 @@ impl<A: Adapter> RecipeRunner<A> {
                         output: String::new(),
                         error: String::new(),
                         duration: Some(step_start.elapsed()),
+                        ..Default::default()
                     }
                     .into();
                 }
@@ -1978,6 +1998,7 @@ impl<A: Adapter> RecipeRunner<A> {
                         output: String::new(),
                         error: format!("Condition error: {}", e),
                         duration: Some(step_start.elapsed()),
+                        ..Default::default()
                     }
                     .into();
                 }
@@ -2032,6 +2053,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     output: final_output,
                     error,
                     duration: Some(step_start.elapsed()),
+                    ..Default::default()
                 }
             }
             Err(e) => {
@@ -2048,6 +2070,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     output: String::new(),
                     error: format!("{e:#}"),
                     duration: Some(step_start.elapsed()),
+                    ..Default::default()
                 }
             }
         };
@@ -2198,6 +2221,7 @@ fn recovery_failure(step: &Step, error: anyhow::Error) -> StepResult {
         output: String::new(),
         error: format!("durable recovery failed: {error}"),
         duration: None,
+        ..Default::default()
     }
 }
 

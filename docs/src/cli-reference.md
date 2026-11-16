@@ -216,6 +216,11 @@ These are still present, because the runner or the recipe sets them rather than 
 - `HOME` and `PATH`, which fall back to `/root` and `/usr/local/bin:/usr/bin:/bin` when they are not named;
 - `AMPLIHACK_SESSION_DEPTH`, `AMPLIHACK_MAX_DEPTH`, `AMPLIHACK_MAX_SESSIONS`, `AMPLIHACK_TREE_ID` and
   `AMPLIHACK_AGENT_BINARY`;
+- on agent children, the [step context contract](step-context-contract.md) variables `AMPLIHACK_STEP_ID`, and,
+  where the step declares them, `AMPLIHACK_STEP_CONTEXT` and `AMPLIHACK_STEP_EFFORT`. The runner inserts these
+  after this filter runs, so the option is not exhaustive over an agent child's environment. The same three names
+  are removed from the inherited environment on every child, agent and bash alike and whatever the option says,
+  so a value from an outer run never reaches an inner one;
 - a step's own `env:` block and the `RECIPE_VAR_*` variables for shell steps.
 
 `CLAUDECODE` is never passed, even if it is named. The runner's own settings read from its environment, such as
@@ -480,6 +485,8 @@ Directory where JSONL audit log files are written. Each recipe run produces one 
 
 By default a failure to create the log or write an entry is logged as a warning and the run continues. With `--require-audit` (which needs `--audit-dir`), a log that cannot be opened fails the run before any step runs, and an entry that cannot be written fails its step and stops the run.
 
+Each line is a step record. Agent steps may carry `context_mode`, `model` and `effort`; see [Step records](step-context-contract.md#step-records) for when each is written and when it is omitted.
+
 ```bash
 # Write audit logs to a directory
 recipe-runner-rs deploy.yaml --audit-dir ./audit-logs
@@ -508,11 +515,16 @@ recipe-runner-rs deploy.yaml
 recipe-runner-rs deploy.yaml --output-format json
 
 # Pipe JSON output to jq
-recipe-runner-rs deploy.yaml --output-format json | jq '.steps[] | select(.status == "failed")'
+recipe-runner-rs deploy.yaml --output-format json | jq '.step_results[] | select(.status == "failed")'
 
 # JSON output with progress on stderr
 recipe-runner-rs deploy.yaml --output-format json --progress 2>/dev/null
 ```
+
+The `step_results` array holds the same step records that [`--audit-dir`](#--audit-dir-dir) writes as JSONL,
+so an agent step may carry the optional `context_mode`, `model` and `effort` keys described under
+[Step records](step-context-contract.md#step-records). They are absent on steps they do not apply to, which
+keeps every other step's object unchanged.
 
 ## JSON recipe input
 
