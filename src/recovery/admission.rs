@@ -1,7 +1,7 @@
 //! Launch registration. Call once in the executing process, after authorization.
 use super::{
     model::*,
-    private_fs::{Directory, lock, parse},
+    private_fs::{Directory, lock, parse, probe_lock},
 };
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -109,9 +109,9 @@ impl Admission {
                 if let Ok(previous_dir) = previous_dir {
                     let status = (|| -> Result<Tree> {
                         let owner = previous_dir.file("owner.lock", false)?;
-                        lock(&owner, true)?;
+                        probe_lock(&owner)?;
                         let writer = previous_dir.file("writer.lock", false)?;
-                        lock(&writer, true)?;
+                        probe_lock(&writer)?;
                         let tree: Tree = parse(&previous_dir.read("tree.json")?)?;
                         super::store::validate_tree(&tree)?;
                         ensure!(
