@@ -2,7 +2,7 @@
 use recipe_runner_rs::recovery::{
     admission::Admission,
     model::*,
-    private_fs::{Directory, lock, parse},
+    private_fs::{Directory, parse},
     store::Store,
 };
 use serde_json::{Value, json};
@@ -503,34 +503,6 @@ fn surviving_writer_prevents_recovery_after_the_host_owner_disappears() {
     assert!(b.descriptor.source.is_none());
     assert_eq!(b.descriptor.reason, "owner_active");
     drop(writer);
-}
-
-#[test]
-fn a_lock_duplicated_by_an_unrelated_spawn_does_not_look_like_a_live_owner() {
-    let f = Fixture::new();
-    let a = f.admit("a", false);
-    let mut writer = Store::open(a.descriptor.clone()).unwrap();
-    writer.outcome(Outcome::UsageLimit).unwrap();
-    let directory = a.descriptor.directory.clone();
-    drop(writer);
-    drop(a);
-    // A lock belongs to the open file description, so a concurrent spawn
-    // duplicates the released locks of a finished attempt and keeps them held
-    // until that unrelated child execs. Recoverable progress survives it.
-    let owner = Directory::open(&directory, false)
-        .unwrap()
-        .file("owner.lock", false)
-        .unwrap();
-    // Blocking: a live duplicate of this very lock is what the test simulates.
-    lock(&owner, false).unwrap();
-    let inherited = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        drop(owner);
-    });
-    let b = f.admit("b", false);
-    inherited.join().unwrap();
-    assert_eq!(b.descriptor.reason, "usage_limit");
-    assert!(b.descriptor.source.is_some());
 }
 
 #[test]

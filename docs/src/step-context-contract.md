@@ -127,6 +127,14 @@ feature existed. Carrying an id to the environment is not a reason to narrow
 what a recipe may call its steps, and an id that cannot travel costs one
 variable on one launch rather than a rejected recipe.
 
+The omission threshold is the kernel's per-string limit, which is the limit
+that makes an id *unplaceable*. It is not the environment budget the assembled
+block is measured against: an id can therefore be small enough to place and
+still be large enough to matter to a block already close to its budget, in
+which case the spawn reports a budget error naming the sizes. No id a recipe
+would plausibly write comes near either limit — the budget's floor alone is 256
+KiB — so the promise above holds in practice rather than by construction.
+
 Step ids are **recipe-local**. A sub-recipe's step id is unique within that
 sub-recipe, not within the run, so two steps in different recipes of one nested
 run can share an id. A consumer must not key a global lookup on this value
@@ -180,8 +188,8 @@ same moment, and they do not all fail the same thing.
 | Field | Checked | When it fails |
 |-------|---------|---------------|
 | `context_mode` | Must be exactly `minimal`, and only on an agent step. | At parse, beside the existing non-empty-id and duplicate-id checks: the recipe is rejected and no step runs. |
-| `model` | Rendered, trimmed, empty treated as absent. Characters limited to `A-Z a-z 0-9 . _ : / + -`, no leading `-`, at most 128 bytes. | At resolution, when the step is about to launch: the step fails, naming the step and the field. Earlier steps have already run. |
-| `effort` | Rendered, trimmed, empty treated as absent. No NUL, no control characters, at most 128 bytes. | At resolution, as for `model`. |
+| `model` | Rendered, trimmed, empty treated as absent. No leading `-`, no whitespace or shell metacharacter, no control or format character, at most 256 bytes. | At resolution, when the step is about to launch: the step fails, naming the step and the field. Earlier steps have already run. |
+| `effort` | Rendered, trimmed, empty treated as absent. No control or format characters, at most 256 bytes. | At resolution, as for `model`. |
 
 Nothing beyond shape is checked. The runner does not know whether a model
 exists, whether the harness supports it, whether a tier word is current, or
@@ -222,18 +230,40 @@ so can never hold a value a template dragged in from somewhere else.
 
 ### Why the shape rules exist
 
-The leading-hyphen and character-set rules on `model` exist only because the
-value becomes its own argv token after `--model`. A value rendering to
-`--add-dir` or `--allow-all-tools` would be read as a flag by the downstream
-launcher's argument parser, which this runner neither controls nor inspects.
-Every real model identifier and every tier word passes the rule unchanged.
+The shape rules on `model` exist only because the value becomes its own argv
+token after `--model`. A value rendering to `--add-dir` or `--allow-all-tools`
+would be read as a flag by the downstream launcher's argument parser, which this
+runner neither controls nor inspects — hence the leading-hyphen rule. For the
+same reason the value must stay one word: the runner passes it as a single argv
+token and never through a shell, but it cannot inspect what the launcher does
+with it, so whitespace and the shell metacharacters are refused as well.
 
-The 128-byte cap on each of the two rendered values exists because neither sink
+What the rules deliberately do **not** do is enumerate the characters a model
+name may use. The runner holds no model vocabulary, so an allowlist here would
+be the runner legislating a spelling it does not know: an earlier draft of this
+rule accepted `A-Z a-z 0-9 . _ : / + -` and so rejected
+`claude-sonnet-4-5@20250929`, the documented Vertex AI form. The rules name
+dangerous shapes instead, and every identifier a provider publishes — Vertex's
+`@` separator, a Bedrock inference-profile ARN, a tier word — passes unchanged.
+A character outside the rules is refused loudly, naming the step and the field,
+rather than being rewritten or dropped.
+
+The two rendered values are also refused when they carry a control or format
+character. NUL cannot be placed in an environment at all, ESC can carry a
+terminal escape sequence, and a bidi override such as `U+202E` reverses the
+display of text around it. The latter matters because these two values reach
+the audit JSONL and the JSON step records *unescaped*, unlike every other
+recipe-controlled string in a diagnostic, which `escape_debug` renders safe.
+
+The 256-byte cap on each of the two rendered values exists because neither sink
 is otherwise bounded. Argv is not measured against the environment budget at
 all, so an oversized `model` surfaces as an opaque `E2BIG` from the spawn; and
 because the budget's `AMPLIHACK_` prefix rule protects `AMPLIHACK_STEP_EFFORT`
 from eviction, an oversized effort stops the spawn with a budget error instead
-of being dropped with a warning. Since `model` and `effort` are rendered from
+of being dropped with a warning. The number clears the longest identifier any
+provider publishes — a Bedrock inference-profile ARN runs to about 110 bytes —
+while staying far below both the kernel's per-string limit and the budget's own
+floor. Since `model` and `effort` are rendered from
 the recipe's context — which is fed by step output, agent output, parsed JSON,
 `--context-file` and `--set` — the cap is what keeps a context value from
 becoming a run-wide failure.
@@ -267,6 +297,13 @@ step, which resolves no launch at all.
 Recording what each step was launched with is the point of the feature: without
 it there is no way to measure what a lightweight step saves against the steps
 that did not opt in.
+
+One pre-existing behaviour reads across this: when a rate-limited agent step is
+retried and `AMPLIHACK_RATELIMIT_FALLBACK_AUTO_MODEL` is set, the final attempt
+is launched with `--model auto` whatever the step resolved. The record keeps the
+step's resolved model, because that is what the step asked for. Anyone costing a
+run from records should know that the last attempt of a rate-limited step may
+have run on a different model.
 
 ### Where a record is observed
 

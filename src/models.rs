@@ -104,8 +104,11 @@ pub struct Step {
     ///
     /// Rendered against the recipe context before launch, so a recipe can
     /// choose a tier from a context variable or an earlier step's output. The
-    /// runner holds no model vocabulary: the value travels to the launcher
-    /// unchanged, as a `--model` argument.
+    /// runner holds no model vocabulary: the rendered value travels to the
+    /// launcher byte for byte, as a `--model` argument. It is never rewritten
+    /// — the only thing the runner does besides render and trim it is refuse
+    /// a shape that could not reach the launcher as one harmless argv token,
+    /// which fails the step rather than altering the value.
     pub model: Option<String>,
     /// How much context the step is started with. The only accepted value is
     /// `minimal`, and only on an agent step; a step asks for the normal start

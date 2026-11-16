@@ -743,16 +743,23 @@ fn every_shipped_recipe_still_parses() {
     // `context:` keeps its present meaning: the sub-recipe input map. The new
     // field is called `context_mode` precisely so that no shipped recipe has
     // to change.
+    //
+    // Asserted as "every shipped recipe parses", not as "no error mentions
+    // `context_mode`": the weaker form is satisfied by a file that fails for
+    // any other reason, and by the sibling test above already proving none of
+    // them carries the field. If a deliberately invalid fixture is ever
+    // shipped under these directories, name it here rather than weakening the
+    // assertion.
+    let mut rejected = Vec::new();
     for path in shipped_recipes() {
         let text = std::fs::read_to_string(&path).unwrap();
-        // Some fixtures are deliberately unparseable; a recipe that parsed
-        // before #219 must still parse.
         if let Err(e) = parse(&text) {
-            assert!(
-                !e.to_string().contains("context_mode"),
-                "{} is rejected by the new check: {e}",
-                path.display()
-            );
+            rejected.push(format!("{}: {e}", path.display()));
         }
     }
+    assert!(
+        rejected.is_empty(),
+        "shipped recipes must parse unchanged:\n{}",
+        rejected.join("\n")
+    );
 }

@@ -53,7 +53,36 @@ pub const MAX_STEP_OUTPUT_BYTES: usize = 10_000_000;
 /// drops. So neither is bounded anywhere else: without this cap an oversized
 /// value surfaces either as an opaque `E2BIG` from `execve` or as a budget
 /// error that stops the run. This is the one place both sinks are bounded.
-const MAX_LAUNCH_VALUE_BYTES: usize = 128;
+///
+/// The number is chosen to clear the longest identifier any provider
+/// publishes — a Bedrock inference-profile ARN runs to about 110 bytes — with
+/// room to spare, while staying far below both the kernel's per-string limit
+/// and the environment budget's floor. It bounds a sink; it does not express
+/// an opinion about what a model may be called.
+const MAX_LAUNCH_VALUE_BYTES: usize = 256;
+
+/// Characters rejected in a rendered `model` because they would stop it being
+/// a single word if anything downstream of the spawn reached a shell.
+///
+/// The runner itself passes the value as one argv token and never through a
+/// shell, so this guards a parser it neither controls nor inspects. It is a
+/// list of dangerous shapes rather than a model vocabulary: every character a
+/// published identifier uses passes, including Vertex AI's `@` version
+/// separator and the `:` and `/` of a Bedrock inference-profile ARN.
+const MODEL_SHELL_METACHARACTERS: &str = "\\\"'`$;&|<>()[]{}*?!#~";
+
+/// A character a display escape would hide: a control character such as NUL or
+/// ESC, or a format character such as the bidi override `U+202E`.
+///
+/// `char::escape_debug` escapes exactly this class, and it is the escape the
+/// crate's own diagnostics use. A rendered `model` or `effort`, though, also
+/// reaches the child process, the audit JSONL and the JSON step records
+/// unescaped, so for these two values the shape is refused rather than escaped
+/// on the way out. The three characters `escape_debug` escapes for quoting
+/// reasons are not of this class and are excluded.
+fn hides_in_display(c: char) -> bool {
+    c.escape_debug().next() == Some('\\') && !matches!(c, '\\' | '\'' | '"')
+}
 
 /// A step's launch parameters, rendered once and checked once.
 ///
@@ -116,26 +145,41 @@ impl ResolvedLaunch {
             }
             // Opaque in meaning, constrained in shape. The runner holds no
             // model vocabulary — amplihack-rs resolves tier words like `fast`
-            // in its own launcher — but a value reaching argv as its own token
-            // must not be able to become a flag or carry a control character.
-            if !model.chars().all(|c| {
-                c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '+' | '-')
-            }) {
+            // in its own launcher, and every provider spells its identifiers
+            // differently — so what is rejected here is a shape that could
+            // stop being one harmless word, never a character some provider
+            // happens not to use.
+            if model.chars().any(hides_in_display) {
                 return Err(reject(
-                    "rendered 'model' contains a character that is not accepted in a model name \
-                     (letters, digits and '. _ : / + -')"
-                        .to_string(),
+                    "rendered 'model' contains a control or format character".to_string(),
                 ));
+            }
+            if let Some(bad) = model
+                .chars()
+                .find(|c| c.is_whitespace() || MODEL_SHELL_METACHARACTERS.contains(*c))
+            {
+                return Err(reject(format!(
+                    "rendered 'model' contains {}, so it would not reach the launcher as a \
+                     single word",
+                    if bad.is_whitespace() {
+                        "whitespace"
+                    } else {
+                        "a shell metacharacter"
+                    }
+                )));
             }
         }
 
         let effort = bounded("effort", step.effort.as_deref())?;
         if let Some(effort) = effort.as_deref() {
-            // Covers NUL, which cannot be placed in an environment at all, and
-            // ESC, which could otherwise carry a terminal escape sequence.
-            if effort.chars().any(char::is_control) {
+            // Covers NUL, which cannot be placed in an environment at all; ESC,
+            // which could otherwise carry a terminal escape sequence; and the
+            // format characters, of which a bidi override such as `U+202E`
+            // reverses the display of the audit JSONL and the JSON step
+            // records — the two surfaces that write this value unescaped.
+            if effort.chars().any(hides_in_display) {
                 return Err(reject(
-                    "rendered 'effort' contains a control character".to_string(),
+                    "rendered 'effort' contains a control or format character".to_string(),
                 ));
             }
         }

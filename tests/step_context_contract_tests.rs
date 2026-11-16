@@ -11,8 +11,9 @@
 //!
 //! The runner does not implement the minimal start: it trims no prompt, drops
 //! no system prompt and changes no argv token on account of `context_mode`.
-//! These tests therefore assert what reaches a stand-in launcher's environment
-//! and argument vector, never what an agent does with it.
+//! These tests therefore assert what reaches a stand-in launcher — its
+//! environment, its argument vector, its standard input and the system prompt
+//! file it is handed — never what an agent does with it.
 //!
 //! The end-to-end tests run the built binary against a launcher script that
 //! records each call, following `tests/env_allow_tests.rs` and
@@ -29,6 +30,12 @@ use std::process::{Command, Output};
 const CONTEXT: &str = "AMPLIHACK_STEP_CONTEXT";
 const EFFORT: &str = "AMPLIHACK_STEP_EFFORT";
 const STEP_ID: &str = "AMPLIHACK_STEP_ID";
+
+/// Mirrors the runner's private `MAX_LAUNCH_VALUE_BYTES`.
+///
+/// Kept as a literal rather than imported so that moving the cap without
+/// revisiting these tests fails the boundary test instead of passing silently.
+const MAX_LAUNCH_VALUE_BYTES: usize = 256;
 
 // ── harness ────────────────────────────────────────────────────────────────
 
@@ -55,10 +62,11 @@ fn write_recording_launcher(dir: &Path) -> PathBuf {
              for a in \"$@\"; do printf '%s\\0' \"$a\" >> '{d}/argv-'\"$c\"; done\n\
              while [ $# -gt 0 ]; do\n\
              \x20 if [ \"$1\" = --output-last-message ]; then shift; final=$1; fi\n\
+             \x20 if [ \"$1\" = --system-prompt-file ]; then shift; cp \"$1\" '{d}/sysprompt-'\"$c\"; fi\n\
              \x20 shift\n\
              done\n\
-             cat >/dev/null\n\
-             env > '{d}/env-'\"$c\"\n\
+             cat > '{d}/stdin-'\"$c\"\n\
+             env -0 > '{d}/env-'\"$c\" 2>/dev/null || env > '{d}/env-'\"$c\"\n\
              if [ -n \"$final\" ]; then printf 'ok' > \"$final\"; else printf 'ok'; fi\n"
         ),
     )
@@ -94,12 +102,25 @@ fn run_recipe(dir: &Path, yaml: &str, extra_args: &[&str], parent: &[(&str, &str
 }
 
 /// The environment of launcher call `n`, as a map.
+///
+/// The launcher prefers `env -0`, so each entry is one NUL-terminated record
+/// and a variable holding a newline cannot make the next line look like a
+/// second variable. That exactness is what the absence assertions below need:
+/// without it they would say "no line looked like that" rather than "the
+/// variable is unset". Where `env -0` is unavailable the launcher falls back
+/// to line records, and this reader follows it.
 fn recorded_env(dir: &Path, call: usize) -> HashMap<String, String> {
     let path = dir.join(format!("env-{call}"));
-    let text = std::fs::read_to_string(&path)
+    let bytes = std::fs::read(&path)
         .unwrap_or_else(|e| panic!("launcher call {call} recorded no environment: {e}"));
-    text.lines()
-        .filter_map(|line| line.split_once('='))
+    let text = String::from_utf8_lossy(&bytes);
+    let records: Box<dyn Iterator<Item = &str>> = if bytes.contains(&0) {
+        Box::new(text.split('\0').filter(|r| !r.is_empty()))
+    } else {
+        Box::new(text.lines())
+    };
+    records
+        .filter_map(|record| record.split_once('='))
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect()
 }
@@ -107,12 +128,37 @@ fn recorded_env(dir: &Path, call: usize) -> HashMap<String, String> {
 /// The argument vector of launcher call `n`.
 fn recorded_argv(dir: &Path, call: usize) -> Vec<String> {
     let path = dir.join(format!("argv-{call}"));
-    std::fs::read(&path)
-        .unwrap_or_else(|e| panic!("launcher call {call} recorded no arguments: {e}"))
-        .split(|b| *b == 0)
-        .filter(|s| !s.is_empty())
+    let raw = std::fs::read(&path)
+        .unwrap_or_else(|e| panic!("launcher call {call} recorded no arguments: {e}"));
+    // Each argument is written with a trailing NUL, so the split leaves one
+    // empty element at the end. Only that one is dropped: an argument the
+    // runner actually emitted empty — `--model ""` — has to stay visible, or
+    // the test that forbids it cannot fail.
+    let mut parts: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+    if parts.last().is_some_and(|last| last.is_empty()) {
+        parts.pop();
+    }
+    parts
+        .into_iter()
         .map(|s| String::from_utf8_lossy(s).into_owned())
         .collect()
+}
+
+/// What the runner wrote to the standard input of launcher call `n`.
+///
+/// The task prompt travels this way rather than on the command line, so a
+/// claim about the prompt can only be checked here.
+fn recorded_stdin(dir: &Path, call: usize) -> String {
+    let path = dir.join(format!("stdin-{call}"));
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("launcher call {call} recorded no stdin: {e}"))
+}
+
+/// The contents of the `--system-prompt-file` of launcher call `n`.
+fn recorded_system_prompt(dir: &Path, call: usize) -> String {
+    let path = dir.join(format!("sysprompt-{call}"));
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("launcher call {call} passed no system prompt file: {e}"))
 }
 
 fn assert_ran(out: &Output) {
@@ -167,7 +213,7 @@ fn step_error(out: &Output, step_id: &str) -> String {
 
 /// A single agent step, with whatever extra fields the test needs.
 fn one_agent_step(extra: &str) -> String {
-    format!("name: contract\nsteps:\n  - id: only\n    type: agent\n    prompt: hello\n{extra}")
+    format!("name: contract\nsteps:\n  - id: solo\n    type: agent\n    prompt: hello\n{extra}")
 }
 
 // ── the context variable ───────────────────────────────────────────────────
@@ -184,7 +230,7 @@ fn a_minimal_step_announces_itself_on_the_environment() {
     assert_ran(&out);
     let env = recorded_env(dir.path(), 1);
     assert_eq!(env.get(CONTEXT).map(String::as_str), Some("minimal"));
-    assert_eq!(env.get(STEP_ID).map(String::as_str), Some("only"));
+    assert_eq!(env.get(STEP_ID).map(String::as_str), Some("solo"));
 }
 
 #[test]
@@ -257,6 +303,30 @@ fn the_context_mode_changes_no_argument() {
         without.len() > 2,
         "the comparison must be over a real command line: {without:?}"
     );
+
+    // The same comparison for the two surfaces argv does not carry: the task
+    // prompt, which travels on standard input, and the system prompt, which
+    // travels in a file named on the command line. Together with the argv
+    // comparison above these are the whole of what the runner sends, so this
+    // is what "the runner implements no part of the minimal start" means.
+    assert_eq!(
+        recorded_stdin(plain.path(), 1),
+        recorded_stdin(minimal.path(), 1),
+        "context_mode trims no byte of the prompt"
+    );
+    assert!(
+        recorded_stdin(plain.path(), 1).contains("hello"),
+        "the comparison must be over a real prompt"
+    );
+    assert_eq!(
+        recorded_system_prompt(plain.path(), 1),
+        recorded_system_prompt(minimal.path(), 1),
+        "context_mode drops no part of the system prompt"
+    );
+    assert!(
+        !recorded_system_prompt(plain.path(), 1).is_empty(),
+        "the comparison must be over a real system prompt"
+    );
 }
 
 #[test]
@@ -272,7 +342,7 @@ fn the_codex_path_carries_the_same_contract() {
     let env = recorded_env(dir.path(), 1);
     assert_eq!(env.get(CONTEXT).map(String::as_str), Some("minimal"));
     assert_eq!(env.get(EFFORT).map(String::as_str), Some("low"));
-    assert_eq!(env.get(STEP_ID).map(String::as_str), Some("only"));
+    assert_eq!(env.get(STEP_ID).map(String::as_str), Some("solo"));
 }
 
 #[test]
@@ -293,7 +363,7 @@ fn the_json_repair_retry_carries_the_same_declaration() {
              : > '{d}/argv-'\"$c\"\n\
              for a in \"$@\"; do printf '%s\\0' \"$a\" >> '{d}/argv-'\"$c\"; done\n\
              cat >/dev/null\n\
-             env > '{d}/env-'\"$c\"\n\
+             env -0 > '{d}/env-'\"$c\" 2>/dev/null || env > '{d}/env-'\"$c\"\n\
              if [ \"$c\" = 1 ]; then printf 'not json'; else printf '{{\"ok\":true}}'; fi\n"
         ),
     )
@@ -302,7 +372,7 @@ fn the_json_repair_retry_carries_the_same_declaration() {
     let recipe = dir.path().join("recipe.yaml");
     std::fs::write(
         &recipe,
-        "name: contract\nsteps:\n  - id: only\n    type: agent\n    prompt: give json\n    parse_json: true\n    context_mode: minimal\n    model: haiku\n    effort: low\n",
+        "name: contract\nsteps:\n  - id: solo\n    type: agent\n    prompt: give json\n    parse_json: true\n    context_mode: minimal\n    model: haiku\n    effort: low\n",
     )
     .unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_recipe-runner-rs"))
@@ -327,7 +397,7 @@ fn the_json_repair_retry_carries_the_same_declaration() {
             "call {call} is the same step's work"
         );
         assert_eq!(env.get(EFFORT).map(String::as_str), Some("low"));
-        assert_eq!(env.get(STEP_ID).map(String::as_str), Some("only"));
+        assert_eq!(env.get(STEP_ID).map(String::as_str), Some("solo"));
         let argv = recorded_argv(dir.path(), call);
         assert!(
             argv.windows(2)
@@ -380,7 +450,7 @@ fn stale_contract_variables_do_not_survive_into_an_agent_child() {
     assert!(!env.contains_key(EFFORT), "an inherited effort is stale");
     assert_eq!(
         env.get(STEP_ID).map(String::as_str),
-        Some("only"),
+        Some("solo"),
         "the step id is this run's, not the outer run's"
     );
 }
@@ -437,7 +507,7 @@ fn naming_a_contract_variable_to_env_allow_does_not_let_it_through() {
     assert!(!env.contains_key(EFFORT), "{env:?}");
     assert_eq!(
         env.get(STEP_ID).map(String::as_str),
-        Some("only"),
+        Some("solo"),
         "the run's own value is inserted after the filter"
     );
 }
@@ -458,7 +528,118 @@ fn the_contract_survives_env_allow() {
     let env = recorded_env(dir.path(), 1);
     assert_eq!(env.get(CONTEXT).map(String::as_str), Some("minimal"));
     assert_eq!(env.get(EFFORT).map(String::as_str), Some("low"));
-    assert_eq!(env.get(STEP_ID).map(String::as_str), Some("only"));
+    assert_eq!(env.get(STEP_ID).map(String::as_str), Some("solo"));
+}
+
+#[test]
+fn the_steps_own_value_replaces_an_inherited_one_rather_than_joining_it() {
+    // The removal and the insertion are different operations on the same name:
+    // a parent value is stripped whether or not the step has one of its own,
+    // and the step's own value is then set. The child must see the step's.
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_recipe(
+        dir.path(),
+        &one_agent_step("    effort: low\n"),
+        &[],
+        &[(EFFORT, "high"), (CONTEXT, "minimal")],
+    );
+    assert_ran(&out);
+    let env = recorded_env(dir.path(), 1);
+    assert_eq!(
+        env.get(EFFORT).map(String::as_str),
+        Some("low"),
+        "the step's own effort wins over the inherited one: {env:?}"
+    );
+    assert!(
+        !env.contains_key(CONTEXT),
+        "a step that did not declare a context mode starts normally, whatever \
+         the parent environment said: {env:?}"
+    );
+}
+
+// ── the sub-recipe recovery launch ─────────────────────────────────────────
+
+#[test]
+fn the_recovery_launch_carries_the_steps_model_effort_and_id_but_no_context_mode() {
+    // The third of the three launch sites, and the only one with deliberately
+    // different behaviour: a `type: recipe` step whose sub-recipe failed
+    // launches an agent to recover. It acts for the step, so it carries the
+    // step's rendered model and effort and the step's id — but it is never
+    // started lightweight, because it has to reason about a failure it was not
+    // given the context for.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("recipes")).unwrap();
+    std::fs::write(
+        dir.path().join("recipes").join("child.yaml"),
+        "name: child\nsteps:\n  - id: fails\n    type: bash\n    command: \"exit 1\"\n",
+    )
+    .unwrap();
+    let yaml = "name: contract\nsteps:\n  - id: delegate\n    type: recipe\n    recipe: child\n    recovery_on_failure: true\n    model: haiku\n    effort: low\n";
+    // The parent environment carries stale values, so the absence assertion
+    // below is about this launch rather than about an empty environment.
+    let out = run_recipe(
+        dir.path(),
+        yaml,
+        &["--recipe-dir", "recipes"],
+        &[
+            (CONTEXT, "minimal"),
+            (EFFORT, "high"),
+            (STEP_ID, "a-step-of-the-outer-run"),
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "the launcher stand-in answers 'ok', which is not a recovery: {}",
+        combined(&out)
+    );
+    let argv = recorded_argv(dir.path(), 1);
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair[0] == "--model" && pair[1] == "haiku"),
+        "the recovery launch keeps the step's model: {argv:?}"
+    );
+    let env = recorded_env(dir.path(), 1);
+    assert_eq!(
+        env.get(EFFORT).map(String::as_str),
+        Some("low"),
+        "the recovery launch keeps the step's effort: {env:?}"
+    );
+    assert_eq!(
+        env.get(STEP_ID).map(String::as_str),
+        Some("delegate"),
+        "the launch acts for the recipe step, not for a step of the sub-recipe \
+         and not for the outer run: {env:?}"
+    );
+    assert!(
+        !env.contains_key(CONTEXT),
+        "a recovery launch is never lightweight: {env:?}"
+    );
+}
+
+#[test]
+fn a_recipe_step_resolves_its_model_even_when_recovery_never_fires() {
+    // A `type: recipe` step is not exempt the way a bash step is: its launch
+    // values are resolved because its recovery launch may need them, so an
+    // unusable one fails the step at run time even on the path where no agent
+    // is ever launched.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("recipes")).unwrap();
+    std::fs::write(
+        dir.path().join("recipes").join("child.yaml"),
+        "name: child\nsteps:\n  - id: works\n    type: bash\n    command: \"true\"\n",
+    )
+    .unwrap();
+    let yaml = "name: contract\ncontext:\n  tier: \"--add-dir\"\nsteps:\n  - id: delegate\n    type: recipe\n    recipe: child\n    model: \"{{tier}}\"\n";
+    let out = run_recipe(dir.path(), yaml, &["--recipe-dir", "recipes"], &[]);
+    assert!(
+        !out.status.success(),
+        "an unusable model fails a recipe step: {}",
+        combined(&out)
+    );
+    assert!(
+        step_error(&out, "delegate").contains("model"),
+        "the message names the field"
+    );
 }
 
 // ── the step id ────────────────────────────────────────────────────────────
@@ -541,7 +722,7 @@ fn an_id_that_cannot_travel_costs_one_variable_not_the_run() {
 #[test]
 fn effort_reaches_the_launch_rendered_not_literal() {
     let dir = tempfile::tempdir().unwrap();
-    let yaml = "name: contract\ncontext:\n  chosen: low\nsteps:\n  - id: only\n    type: agent\n    prompt: hello\n    effort: \"{{chosen}}\"\n";
+    let yaml = "name: contract\ncontext:\n  chosen: low\nsteps:\n  - id: solo\n    type: agent\n    prompt: hello\n    effort: \"{{chosen}}\"\n";
     let out = run_recipe(dir.path(), yaml, &[], &[]);
     assert_ran(&out);
     assert_eq!(
@@ -554,7 +735,7 @@ fn effort_reaches_the_launch_rendered_not_literal() {
 #[test]
 fn effort_rendered_from_an_earlier_step_reaches_the_launch() {
     let dir = tempfile::tempdir().unwrap();
-    let yaml = "name: contract\nsteps:\n  - id: pick\n    type: bash\n    command: \"printf medium\"\n    output: chosen\n  - id: only\n    type: agent\n    prompt: hello\n    effort: \"{{chosen}}\"\n";
+    let yaml = "name: contract\nsteps:\n  - id: pick\n    type: bash\n    command: \"printf medium\"\n    output: chosen\n  - id: solo\n    type: agent\n    prompt: hello\n    effort: \"{{chosen}}\"\n";
     let out = run_recipe(dir.path(), yaml, &[], &[]);
     assert_ran(&out);
     assert_eq!(
@@ -591,7 +772,7 @@ fn an_oversized_effort_fails_the_step_before_the_spawn() {
     // `AMPLIHACK_` prefix protects it from budget eviction, so an unbounded
     // value would stop the spawn with an opaque budget error instead.
     let dir = tempfile::tempdir().unwrap();
-    let long = "e".repeat(200);
+    let long = "e".repeat(MAX_LAUNCH_VALUE_BYTES + 1);
     let out = run_recipe(
         dir.path(),
         &one_agent_step(&format!("    effort: \"{long}\"\n")),
@@ -599,8 +780,8 @@ fn an_oversized_effort_fails_the_step_before_the_spawn() {
         &[],
     );
     assert!(!out.status.success(), "an oversized effort must fail loud");
-    let text = step_error(&out, "only");
-    assert!(text.contains("only"), "the message names the step: {text}");
+    let text = step_error(&out, "solo");
+    assert!(text.contains("solo"), "the message names the step: {text}");
     assert!(
         text.contains("effort"),
         "the message names the field: {text}"
@@ -616,8 +797,70 @@ fn an_oversized_effort_fails_the_step_before_the_spawn() {
 }
 
 #[test]
-fn an_effort_carrying_a_control_character_fails_the_step() {
-    for (case, value) in [("escape", "lo\\u001bw"), ("nul", "lo\\u0000w")] {
+fn the_length_cap_is_a_cap_on_bytes_and_applies_after_the_render() {
+    // Three things at once, because they are one rule: the boundary is
+    // inclusive, it counts bytes rather than characters, and it is applied to
+    // what the template produced rather than to what the recipe wrote.
+    let dir = tempfile::tempdir().unwrap();
+    let at_cap = "e".repeat(MAX_LAUNCH_VALUE_BYTES);
+    let out = run_recipe(
+        dir.path(),
+        &one_agent_step(&format!("    effort: \"{at_cap}\"\n")),
+        &[],
+        &[],
+    );
+    assert_ran(&out);
+    assert_eq!(
+        recorded_env(dir.path(), 1).get(EFFORT).map(String::as_str),
+        Some(at_cap.as_str()),
+        "a value of exactly the cap is accepted"
+    );
+
+    // 129 characters, 258 bytes: accepted on a character count, refused on a
+    // byte count, which is what the sinks are measured in.
+    let dir = tempfile::tempdir().unwrap();
+    let wide = "é".repeat(MAX_LAUNCH_VALUE_BYTES / 2 + 1);
+    let out = run_recipe(
+        dir.path(),
+        &one_agent_step(&format!("    effort: \"{wide}\"\n")),
+        &[],
+        &[],
+    );
+    assert!(
+        !out.status.success(),
+        "the cap counts bytes, not characters: {}",
+        combined(&out)
+    );
+
+    // The recipe text is short; only the rendered value is oversized.
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "name: contract\ncontext:\n  chosen: \"{}\"\nsteps:\n  - id: solo\n    type: agent\n    prompt: hello\n    effort: \"{{{{chosen}}}}\"\n",
+        "e".repeat(MAX_LAUNCH_VALUE_BYTES + 1)
+    );
+    let out = run_recipe(dir.path(), &yaml, &[], &[]);
+    assert!(
+        !out.status.success(),
+        "the cap is applied to the rendered value: {}",
+        combined(&out)
+    );
+    assert!(
+        step_error(&out, "solo").contains("effort"),
+        "the message names the field"
+    );
+}
+
+#[test]
+fn an_effort_carrying_a_control_or_format_character_fails_the_step() {
+    for (case, value) in [
+        ("escape", "lo\\u001bw"),
+        ("nul", "lo\\u0000w"),
+        // A bidi override reverses the display of the text around it. Both
+        // record surfaces write `effort` unescaped, so this one is refused at
+        // resolution rather than escaped on the way out.
+        ("bidi override", "lo\\u202Ehigh"),
+        ("bidi isolate", "lo\\u2066high"),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let out = run_recipe(
             dir.path(),
@@ -626,7 +869,7 @@ fn an_effort_carrying_a_control_character_fails_the_step() {
             &[],
         );
         assert!(!out.status.success(), "{case}: {}", combined(&out));
-        let text = step_error(&out, "only");
+        let text = step_error(&out, "solo");
         assert!(
             !text.contains('\u{1b}') && !text.contains('\u{0}'),
             "{case}: no raw control character reaches the error: {text:?}"
@@ -647,7 +890,7 @@ fn an_effort_carrying_a_control_character_fails_the_step() {
 #[test]
 fn model_reaches_the_launch_rendered_not_literal() {
     let dir = tempfile::tempdir().unwrap();
-    let yaml = "name: contract\ncontext:\n  tier: haiku\nsteps:\n  - id: only\n    type: agent\n    prompt: hello\n    model: \"{{tier}}\"\n";
+    let yaml = "name: contract\ncontext:\n  tier: haiku\nsteps:\n  - id: solo\n    type: agent\n    prompt: hello\n    model: \"{{tier}}\"\n";
     let out = run_recipe(dir.path(), yaml, &[], &[]);
     assert_ran(&out);
     let argv = recorded_argv(dir.path(), 1);
@@ -724,14 +967,14 @@ fn a_model_that_renders_to_a_flag_fails_the_step() {
     // with a hyphen would be read as an option by a launcher this runner
     // neither controls nor inspects.
     let dir = tempfile::tempdir().unwrap();
-    let yaml = "name: contract\nsteps:\n  - id: pick\n    type: bash\n    command: \"printf -- --dangerously-skip-permissions\"\n    output: tier\n  - id: only\n    type: agent\n    prompt: hello\n    model: \"{{tier}}\"\n";
+    let yaml = "name: contract\nsteps:\n  - id: pick\n    type: bash\n    command: \"printf -- --dangerously-skip-permissions\"\n    output: tier\n  - id: solo\n    type: agent\n    prompt: hello\n    model: \"{{tier}}\"\n";
     let out = run_recipe(dir.path(), yaml, &[], &[]);
     assert!(
         !out.status.success(),
         "a model shaped like a flag must fail the step, not reach the command line"
     );
-    let text = step_error(&out, "only");
-    assert!(text.contains("only"), "the message names the step: {text}");
+    let text = step_error(&out, "solo");
+    assert!(text.contains("solo"), "the message names the step: {text}");
     assert!(
         text.contains("model"),
         "the message names the field: {text}"
@@ -749,18 +992,94 @@ fn a_model_that_renders_to_a_flag_fails_the_step() {
 }
 
 #[test]
-fn a_model_carrying_a_shell_metacharacter_fails_the_step() {
-    let dir = tempfile::tempdir().unwrap();
-    let yaml = "name: contract\ncontext:\n  tier: \"haiku; rm -rf /\"\nsteps:\n  - id: only\n    type: agent\n    prompt: hello\n    model: \"{{tier}}\"\n";
-    let out = run_recipe(dir.path(), yaml, &[], &[]);
-    assert!(!out.status.success(), "{}", combined(&out));
-    assert!(!dir.path().join("argv-1").exists());
+fn every_published_model_identifier_reaches_the_launcher_unchanged() {
+    // The accept side of the shape rules, and the reason they are a list of
+    // dangerous shapes rather than a list of permitted characters: the runner
+    // holds no model vocabulary, so a rule narrower than this one rejects a
+    // spelling some provider already ships. Each value below is a real
+    // identifier form.
+    for (case, model) in [
+        ("tier word", "fast"),
+        ("anthropic api", "claude-opus-4-5-20251101"),
+        ("vertex ai version separator", "claude-sonnet-4-5@20250929"),
+        (
+            "bedrock cross-region",
+            "us.anthropic.claude-sonnet-4-5-v1:0",
+        ),
+        (
+            "bedrock inference-profile arn",
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-sonnet-4-5-v1:0",
+        ),
+        ("namespaced tag", "anthropic/claude:latest"),
+        ("local quantisation tag", "llama3.1:8b-instruct-q4_K_M"),
+        ("plus suffix", "gpt-4o+turbo"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_recipe(
+            dir.path(),
+            &one_agent_step(&format!("    model: \"{model}\"\n")),
+            &[],
+            &[],
+        );
+        assert_ran(&out);
+        let argv = recorded_argv(dir.path(), 1);
+        let position = argv
+            .iter()
+            .position(|a| a == "--model")
+            .unwrap_or_else(|| panic!("{case}: no --model argument: {argv:?}"));
+        assert_eq!(
+            argv.get(position + 1).map(String::as_str),
+            Some(model),
+            "{case}: the identifier must travel byte for byte"
+        );
+    }
+}
+
+#[test]
+fn each_model_shape_rule_fails_the_step_on_its_own() {
+    // One value per rule, each tripping exactly one of them, so a failure
+    // names the rule that broke rather than the composite. Every message must
+    // name the field, and none may echo the value.
+    for (case, tier) in [
+        ("space", "haiku --allow-all-tools"),
+        ("command separator", "haiku;id"),
+        ("command substitution", "haiku$(id)"),
+        ("pipe", "haiku|id"),
+        ("backtick", "haiku`id`"),
+        ("glob", "haiku*"),
+        ("escape character", "hai\\u001bku"),
+        ("bidi override", "hai\\u202Eku"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            "name: contract\ncontext:\n  tier: \"{tier}\"\nsteps:\n  - id: solo\n    type: agent\n    prompt: hello\n    model: \"{{{{tier}}}}\"\n"
+        );
+        let out = run_recipe(dir.path(), &yaml, &[], &[]);
+        assert!(
+            !out.status.success(),
+            "{case}: must fail the step: {}",
+            combined(&out)
+        );
+        let text = step_error(&out, "solo");
+        assert!(
+            text.contains("solo") && text.contains("model"),
+            "{case}: the message names the step and the field: {text}"
+        );
+        assert!(
+            !text.contains("haiku") && !text.contains('\u{1b}') && !text.contains('\u{202e}'),
+            "{case}: the message must not echo the rejected value: {text:?}"
+        );
+        assert!(
+            !dir.path().join("argv-1").exists(),
+            "{case}: the step must fail before the launcher is started"
+        );
+    }
 }
 
 #[test]
 fn an_oversized_model_fails_the_step() {
     let dir = tempfile::tempdir().unwrap();
-    let long = "m".repeat(200);
+    let long = "m".repeat(MAX_LAUNCH_VALUE_BYTES + 1);
     let out = run_recipe(
         dir.path(),
         &one_agent_step(&format!("    model: {long}\n")),
@@ -768,6 +1087,20 @@ fn an_oversized_model_fails_the_step() {
         &[],
     );
     assert!(!out.status.success(), "{}", combined(&out));
+    let text = step_error(&out, "solo");
+    assert!(
+        text.contains("solo") && text.contains("model"),
+        "the message names the step and the field, so a YAML error or a \
+         missing launcher cannot satisfy this test: {text}"
+    );
+    assert!(
+        text.contains(&MAX_LAUNCH_VALUE_BYTES.to_string()),
+        "the message reports the cap that fired: {text}"
+    );
+    assert!(
+        !text.contains(&long),
+        "the message must not echo the rejected value: {text}"
+    );
     assert!(!dir.path().join("argv-1").exists());
 }
 
@@ -776,7 +1109,7 @@ fn a_failing_model_does_not_fall_back_to_the_default() {
     // A template defect is loud rather than silent: the step fails rather than
     // launching with whatever the launcher would have chosen.
     let dir = tempfile::tempdir().unwrap();
-    let yaml = "name: contract\ncontext:\n  tier: \"--add-dir\"\nsteps:\n  - id: only\n    type: agent\n    prompt: hello\n    model: \"{{tier}}\"\n  - id: after\n    type: bash\n    command: \"touch ran\"\n";
+    let yaml = "name: contract\ncontext:\n  tier: \"--add-dir\"\nsteps:\n  - id: solo\n    type: agent\n    prompt: hello\n    model: \"{{tier}}\"\n  - id: after\n    type: bash\n    command: \"touch ran\"\n";
     let out = run_recipe(dir.path(), yaml, &[], &[]);
     assert!(!out.status.success(), "{}", combined(&out));
     assert!(
@@ -801,7 +1134,7 @@ fn a_step_declaring_none_of_the_three_launches_as_it_always_did() {
     let env = recorded_env(dir.path(), 1);
     assert!(!env.contains_key(CONTEXT));
     assert!(!env.contains_key(EFFORT));
-    assert_eq!(env.get(STEP_ID).map(String::as_str), Some("only"));
+    assert_eq!(env.get(STEP_ID).map(String::as_str), Some("solo"));
 }
 
 // ── the adapter contract ───────────────────────────────────────────────────
@@ -944,7 +1277,7 @@ mod adapter {
         }
     }
 
-    const RECIPE: &str = "name: contract\ncontext:\n  tier: haiku\nsteps:\n  - id: only\n    type: agent\n    prompt: a client's private instructions\n    context_mode: minimal\n    model: \"{{tier}}\"\n    effort: low\n";
+    const RECIPE: &str = "name: contract\ncontext:\n  tier: haiku\nsteps:\n  - id: solo\n    type: agent\n    prompt: a client's private instructions\n    context_mode: minimal\n    model: \"{{tier}}\"\n    effort: low\n";
 
     fn run_with<A: recipe_runner_rs::adapters::Adapter>(adapter: A) {
         let dir = tempfile::tempdir().unwrap();
@@ -965,7 +1298,7 @@ mod adapter {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         let launch = &seen[0];
-        assert_eq!(launch.step_id, "only");
+        assert_eq!(launch.step_id, "solo");
         assert_eq!(
             launch.model.as_deref(),
             Some("haiku"),
@@ -986,7 +1319,7 @@ mod adapter {
             .iter()
             .cloned()
             .collect();
-        assert_eq!(env.get(STEP_ID_ENV).map(String::as_str), Some("only"));
+        assert_eq!(env.get(STEP_ID_ENV).map(String::as_str), Some("solo"));
         assert_eq!(
             env.get(STEP_CONTEXT_ENV).map(String::as_str),
             Some(MINIMAL_CONTEXT),
@@ -1016,7 +1349,7 @@ mod adapter {
             "its size is reported instead: {shown}"
         );
         assert!(
-            shown.contains("only"),
+            shown.contains("solo"),
             "the step id is small and is shown: {shown}"
         );
     }

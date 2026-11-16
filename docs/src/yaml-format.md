@@ -336,12 +336,16 @@ A template referring to a variable that does not exist renders to nothing, so a
 misspelled variable name falls back to the default rather than failing. Watch
 the render warning in the log if a model override appears not to take effect.
 
-The runner does not check that the model exists. It checks only that the string
-is safe to place on a command line: characters from `A-Z a-z 0-9 . _ : / + -`,
-no leading `-`, at most 128 bytes. A value failing that check fails the step
-rather than quietly falling back, and the message names the step and the field
-without echoing the value. Because `model` becomes an argv token, and argv is
-readable by other local processes, do not render a secret into it.
+The runner does not check that the model exists, and holds no list of model
+names. It checks only that the string is safe to place on a command line: no
+leading `-`, no whitespace or shell metacharacter, no control or format
+character, at most 256 bytes. Every identifier a provider publishes passes,
+including Vertex AI's `claude-sonnet-4-5@20250929`, a Bedrock
+`us.anthropic.claude-sonnet-4-5-v1:0` or inference-profile ARN, and a tier word.
+A value failing the check fails the step rather than quietly falling back, and
+the message names the step and the field without echoing the value. Because
+`model` becomes an argv token, and argv is readable by other local processes, do
+not render a secret into it.
 
 Where amplihack's launcher accepts tier words such as `fast`, `standard` and
 `strong`, they travel in this same `model` field. The runner passes them through
@@ -428,8 +432,9 @@ absent when it renders to nothing. It reaches the agent as
 `AMPLIHACK_STEP_EFFORT`.
 
 The runner holds no vocabulary for the field, because accepted values differ per
-harness. It checks only that the value is at most 128 bytes and free of NUL and
-control characters, then passes it through. A value failing that check fails the
+harness. It checks only that the value is at most 256 bytes and free of control
+and format characters — NUL and ESC, and the bidi overrides that would reverse
+the display of a record written from it — then passes it through. A value failing that check fails the
 step, as an unusable `model` does, rather than being dropped. A value the
 launcher does not recognise is the launcher's concern, not a recipe error.
 
@@ -450,7 +455,7 @@ can never launch an agent — neither field is rendered, checked or recorded, so
 a `model:` or `effort:` that would fail an agent step cannot fail a bash step
 and does not appear in its [record](step-context-contract.md#step-records). On
 a recipe step the fields are resolved, because its recovery launch needs them,
-and the 128-byte and control-character checks above apply.
+and the length and character checks above apply.
 
 As with `context_mode`, `effort` is part of the step definition that recovery
 fingerprints, so editing it invalidates that step's stored progress and the step

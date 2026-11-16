@@ -215,31 +215,6 @@ pub fn lock(file: &File, nonblocking: bool) -> Result<()> {
     Ok(())
 }
 
-/// Liveness probe of an *other* attempt's lock. A lock belongs to the open
-/// file description, so any concurrent spawn in this process duplicates it
-/// between fork and exec, and an unrelated child briefly keeps the lock of an
-/// attempt that already released it. Retry within a bounded budget so a
-/// finished attempt is never mistaken for a live owner and its recoverable
-/// progress discarded. A genuinely live owner still conflicts throughout and
-/// is reported as before.
-pub fn probe_lock(file: &File) -> Result<()> {
-    const ATTEMPTS: u32 = 20;
-    const PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
-    for remaining in (0..ATTEMPTS).rev() {
-        let result = lock(file, true);
-        let contended = result
-            .as_ref()
-            .err()
-            .and_then(|e| e.downcast_ref::<std::io::Error>())
-            .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock);
-        if remaining == 0 || !contended {
-            return result;
-        }
-        std::thread::sleep(PAUSE);
-    }
-    unreachable!("the final attempt returns")
-}
-
 /// Reject duplicate properties at every depth, before deserializing a contract.
 struct Unique(Value);
 impl<'de> Deserialize<'de> for Unique {

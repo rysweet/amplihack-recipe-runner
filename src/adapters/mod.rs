@@ -134,7 +134,11 @@ impl AgentLaunch {
         if let Some(mode) = self.context_mode {
             pairs.push((STEP_CONTEXT_ENV, mode.as_str()));
         }
-        if let Some(effort) = self.effort.as_deref() {
+        // Filtered rather than assumed: the runner already treats a value that
+        // rendered to nothing as absent, and this keeps the invariant true
+        // where the variable is set, so `AMPLIHACK_STEP_EFFORT=` cannot reach
+        // a child by way of some other caller.
+        if let Some(effort) = self.effort.as_deref().filter(|e| !e.is_empty()) {
             pairs.push((STEP_EFFORT_ENV, effort));
         }
         pairs
@@ -251,4 +255,115 @@ pub trait Adapter: Sync {
 
     /// Return the adapter name.
     fn name(&self) -> &str;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapters::test_log::LogCapture;
+
+    /// A launch with nothing declared, for a step called `step`.
+    fn launch() -> AgentLaunch {
+        AgentLaunch {
+            prompt: "hello".to_string(),
+            agent_name: None,
+            system_prompt: None,
+            mode: None,
+            working_dir: "/tmp".to_string(),
+            model: None,
+            effort: None,
+            context_mode: None,
+            step_id: "step".to_string(),
+            timeout: None,
+        }
+    }
+
+    #[test]
+    fn a_launch_declaring_nothing_names_only_the_step() {
+        assert_eq!(launch().contract_env(), vec![(STEP_ID_ENV, "step")]);
+    }
+
+    #[test]
+    fn each_declaration_contributes_its_own_variable_and_no_other() {
+        let full = AgentLaunch {
+            effort: Some("low".to_string()),
+            context_mode: Some(StepContextMode::Minimal),
+            ..launch()
+        };
+        assert_eq!(
+            full.contract_env(),
+            vec![
+                (STEP_ID_ENV, "step"),
+                (STEP_CONTEXT_ENV, MINIMAL_CONTEXT),
+                (STEP_EFFORT_ENV, "low"),
+            ]
+        );
+        // The model is deliberately absent: it reaches the launcher as an
+        // argument, and a second route would be a second thing to keep in step.
+        let with_model = AgentLaunch {
+            model: Some("haiku".to_string()),
+            ..launch()
+        };
+        assert_eq!(with_model.contract_env(), vec![(STEP_ID_ENV, "step")]);
+    }
+
+    #[test]
+    fn an_effort_that_is_empty_sets_no_variable() {
+        // `AMPLIHACK_STEP_EFFORT=` would read as a declared effort of "", which
+        // is not what a step that declared nothing usable asked for.
+        let empty = AgentLaunch {
+            effort: Some(String::new()),
+            ..launch()
+        };
+        assert_eq!(empty.contract_env(), vec![(STEP_ID_ENV, "step")]);
+    }
+
+    #[test]
+    fn an_unusable_step_id_is_omitted_and_logged_without_the_whole_id() {
+        // The omission path is also the one place in this module a slice can
+        // panic, so the id is multi-byte and far past the logged prefix: the
+        // prefix must land on a character boundary.
+        let capture = LogCapture::start();
+        let id = "é".repeat(MAX_ARG_STRLEN);
+        let oversized = AgentLaunch {
+            step_id: id.clone(),
+            effort: Some("low".to_string()),
+            ..launch()
+        };
+        let pairs = oversized.contract_env();
+        assert_eq!(
+            pairs,
+            vec![(STEP_EFFORT_ENV, "low")],
+            "the step runs without the variable rather than failing"
+        );
+        // Positively on this thread, because the recording logger captures
+        // every thread's records and these tests run in parallel.
+        let messages: Vec<String> = capture.this_thread().into_iter().map(|(_, m)| m).collect();
+        let omission = messages
+            .iter()
+            .find(|m| m.contains(STEP_ID_ENV))
+            .unwrap_or_else(|| panic!("the omission is logged: {messages:?}"));
+        assert!(
+            omission.contains(&id.len().to_string()),
+            "the log reports the length, which is what is wrong with it: {omission}"
+        );
+        assert!(
+            !omission.contains(&id),
+            "the line reporting an oversized id does not carry the whole id"
+        );
+    }
+
+    #[test]
+    fn a_step_id_holding_a_control_character_is_omitted() {
+        let capture = LogCapture::start();
+        let control = AgentLaunch {
+            step_id: "a\u{1b}b".to_string(),
+            ..launch()
+        };
+        assert!(control.contract_env().is_empty());
+        assert!(
+            !capture.all_messages().iter().any(|m| m.contains('\u{1b}')),
+            "the id is escaped for the log"
+        );
+    }
 }
