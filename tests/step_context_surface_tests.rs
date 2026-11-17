@@ -252,6 +252,175 @@ fn a_parent_recipe_cannot_smuggle_a_bad_step_in_through_extends() {
     assert!(err.to_string().contains("build"), "{err}");
 }
 
+// ── literal launch values are checked at parse time ────────────────────────
+//
+// A `model:` or `effort:` written out in full carries no context, so the shape
+// rules can be applied to it before any step of the recipe runs. A value
+// holding a placeholder cannot be, and is left to the run. The two surfaces
+// share one predicate, so what the run rejects is what the parse rejects.
+
+#[test]
+fn validate_only_rejects_a_literal_model_that_can_never_launch() {
+    // `--add-dir` would be read as an option by the launcher, so this value
+    // could never have launched anything. Reporting it at parse saves the run
+    // reaching the step to find out.
+    let dir = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = run_binary(
+        dir.path(),
+        "name: p\nsteps:\n  - id: classify\n    type: agent\n    prompt: hi\n    model: \"--add-dir\"\n",
+        &["--validate-only"],
+    );
+    assert_eq!(code, 2, "stdout: {stdout}\nstderr: {stderr}");
+    let text = format!("{stdout}{stderr}");
+    assert!(
+        text.contains("classify"),
+        "the message names the step: {text}"
+    );
+    assert!(
+        text.contains("model"),
+        "the message names the field: {text}"
+    );
+    assert!(
+        !text.contains("add-dir"),
+        "the message must not echo the value, as the run-time message does \
+         not: {text}"
+    );
+}
+
+#[test]
+fn validate_only_rejects_a_literal_model_holding_whitespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = run_binary(
+        dir.path(),
+        "name: p\nsteps:\n  - id: classify\n    type: agent\n    prompt: hi\n    model: \"haiku --allow-all-tools\"\n",
+        &["--validate-only"],
+    );
+    assert_eq!(code, 2, "stdout: {stdout}\nstderr: {stderr}");
+    let text = format!("{stdout}{stderr}");
+    assert!(
+        text.contains("classify") && text.contains("model"),
+        "{text}"
+    );
+    assert!(!text.contains("haiku"), "the value is not echoed: {text}");
+}
+
+#[test]
+fn validate_only_rejects_a_literal_effort_over_the_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let long = "e".repeat(257);
+    let (code, stdout, stderr) = run_binary(
+        dir.path(),
+        &format!(
+            "name: p\nsteps:\n  - id: classify\n    type: agent\n    prompt: hi\n    effort: {long}\n"
+        ),
+        &["--validate-only"],
+    );
+    assert_eq!(code, 2, "stdout: {stdout}\nstderr: {stderr}");
+    let text = format!("{stdout}{stderr}");
+    assert!(
+        text.contains("classify"),
+        "the message names the step: {text}"
+    );
+    assert!(
+        text.contains("effort"),
+        "the message names the field: {text}"
+    );
+    assert!(text.contains("256"), "the message reports the cap: {text}");
+    assert!(!text.contains(&long), "the value is not echoed: {text}");
+}
+
+#[test]
+fn a_bracketed_model_passes_the_parse_time_check() {
+    // The parse-time check holds no model vocabulary either: it is the same
+    // predicate the run uses, so amplihack's own default model parses.
+    parse(&agent_step("    model: \"claude-opus-5[1m]\"\n"))
+        .expect("a published identifier must parse");
+}
+
+#[test]
+fn a_templated_launch_value_is_left_to_the_run() {
+    // The parser cannot know what `{{tier}}` renders to: the context it would
+    // need includes earlier step output. Whatever it renders to is checked at
+    // the step, by the same predicate.
+    let dir = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = run_binary(
+        dir.path(),
+        "name: p\ncontext:\n  tier: \"--add-dir\"\nsteps:\n  - id: classify\n    type: agent\n    prompt: hi\n    model: \"{{tier}}\"\n",
+        &["--validate-only"],
+    );
+    assert_eq!(
+        code, 0,
+        "a value holding a placeholder is not decided at parse: {stdout}{stderr}"
+    );
+}
+
+#[test]
+fn a_bash_step_keeps_its_inert_launch_fields() {
+    // A bash step never launches an agent, so the runner does not resolve its
+    // `model:` at all. The parse-time check follows that exemption, or a
+    // recipe that runs today would stop validating.
+    let dir = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = run_binary(
+        dir.path(),
+        "name: p\nsteps:\n  - id: build\n    type: bash\n    command: echo hi\n    model: \"--add-dir\"\n",
+        &["--validate-only"],
+    );
+    assert_eq!(
+        code, 0,
+        "a bash step's launch fields stay as inert as they were before #219: \
+         {stdout}{stderr}"
+    );
+}
+
+#[test]
+fn a_literal_that_trims_to_empty_means_absent_at_parse_as_at_run() {
+    // An empty value leaves the launcher's own default in place rather than
+    // producing `--model ""`. The parse-time check keeps that convention.
+    parse(&agent_step("    model: \"   \"\n")).expect("an empty model means absent");
+    parse(&agent_step("    effort: \"\"\n")).expect("an empty effort means absent");
+}
+
+#[test]
+fn a_literal_is_checked_after_trimming() {
+    // `ResolvedLaunch::resolve` trims before it checks, so leading whitespace
+    // a recipe writes is not what the rules see. A value that is a model name
+    // once trimmed parses, and launches.
+    parse(&agent_step("    model: \" haiku\"\n")).expect("the check runs on the trimmed value");
+}
+
+#[test]
+fn a_spaced_placeholder_is_not_a_placeholder() {
+    // Rendering recognises `{{tier}}` and not `{{ tier }}`, so the spaced form
+    // is a literal that happens to contain braces and spaces. It is rejected
+    // for its whitespace rather than deferred.
+    let text = parse_error(&agent_step("    model: \"{{ review_model }}\"\n"));
+    assert!(
+        text.contains("Step 'a'") && text.contains("model"),
+        "the message names the step and the field: {text}"
+    );
+    assert!(
+        !text.contains("review_model"),
+        "the value is not echoed: {text}"
+    );
+}
+
+#[test]
+fn a_bad_literal_model_stops_an_ordinary_run_before_any_step() {
+    // The check lives in the parser, so it fires on every parse rather than
+    // only under --validate-only, and none of this recipe's steps run.
+    let dir = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = run_binary(
+        dir.path(),
+        "name: p\nsteps:\n  - id: first\n    type: bash\n    command: \"touch ran\"\n  - id: classify\n    type: agent\n    prompt: hi\n    model: \"--add-dir\"\n",
+        &[],
+    );
+    assert_eq!(code, 2, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        !dir.path().join("ran").exists(),
+        "none of the recipe's steps run when it is rejected"
+    );
+}
+
 // ── effort is not restricted ───────────────────────────────────────────────
 
 #[test]
