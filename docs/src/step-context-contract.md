@@ -388,6 +388,10 @@ That asymmetry is also why no `AMPLIHACK_STEP_MODEL` exists: `model` already has
 exactly one route to the launcher, and adding a second would mean two ways to
 say the same thing.
 
+The asymmetry holds against other local users only. Both rendered values are
+written in full to the step records described below, so neither field should
+be templated from context that may carry a secret.
+
 ## Step records
 
 A step's record gains three optional fields, written for agent launches only and
