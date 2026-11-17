@@ -996,8 +996,9 @@ fn every_published_model_identifier_reaches_the_launcher_unchanged() {
     // The accept side of the shape rules, and the reason they are a list of
     // dangerous shapes rather than a list of permitted characters: the runner
     // holds no model vocabulary, so a rule narrower than this one rejects a
-    // spelling some provider already ships. Each value below is a real
-    // identifier form.
+    // spelling some provider already ships. Every value below but the last is
+    // an identifier form a provider publishes today; the last is constructed,
+    // and stands for the separator a provider has not used yet.
     for (case, model) in [
         ("tier word", "fast"),
         ("anthropic api", "claude-opus-4-5-20251101"),
@@ -1012,7 +1013,7 @@ fn every_published_model_identifier_reaches_the_launcher_unchanged() {
         ),
         ("namespaced tag", "anthropic/claude:latest"),
         ("local quantisation tag", "llama3.1:8b-instruct-q4_K_M"),
-        ("plus suffix", "gpt-4o+turbo"),
+        ("constructed: plus separator", "vendor-model+variant"),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let out = run_recipe(
