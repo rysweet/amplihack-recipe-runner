@@ -29,7 +29,7 @@ pub const STEP_ID_ENV: &str = "AMPLIHACK_STEP_ID";
 /// Declares that the step asked to start with only its prompt and inputs.
 ///
 /// Set only when the step declared `context_mode: minimal`, and then only to
-/// [`MINIMAL_CONTEXT`]. Absence is the normal start. The runner implements no
+/// [`StepContextMode::MINIMAL`]. Absence is the normal start. The runner implements no
 /// part of the minimal start itself; this variable is the whole declaration.
 ///
 /// Note the deliberate difference in names: the recipe field is `context_mode`
@@ -46,9 +46,6 @@ pub const STEP_CONTEXT_ENV: &str = "AMPLIHACK_STEP_CONTEXT";
 /// The runner holds no effort vocabulary; the accepted words belong to the
 /// harness that reads this.
 pub const STEP_EFFORT_ENV: &str = "AMPLIHACK_STEP_EFFORT";
-
-/// The one value [`STEP_CONTEXT_ENV`] ever takes.
-pub const MINIMAL_CONTEXT: &str = StepContextMode::MINIMAL;
 
 /// Every environment variable this contract owns.
 ///
@@ -294,7 +291,7 @@ mod tests {
             full.contract_env(),
             vec![
                 (STEP_ID_ENV, "step"),
-                (STEP_CONTEXT_ENV, MINIMAL_CONTEXT),
+                (STEP_CONTEXT_ENV, StepContextMode::MINIMAL),
                 (STEP_EFFORT_ENV, "low"),
             ]
         );

@@ -1142,8 +1142,7 @@ fn a_step_declaring_none_of_the_three_launches_as_it_always_did() {
 
 mod adapter {
     use recipe_runner_rs::adapters::{
-        AgentLaunch, CONTRACT_ENV_NAMES, MINIMAL_CONTEXT, STEP_CONTEXT_ENV, STEP_EFFORT_ENV,
-        STEP_ID_ENV,
+        AgentLaunch, CONTRACT_ENV_NAMES, STEP_CONTEXT_ENV, STEP_EFFORT_ENV, STEP_ID_ENV,
     };
     use recipe_runner_rs::models::StepContextMode;
     use recipe_runner_rs::parser::RecipeParser;
@@ -1163,7 +1162,7 @@ mod adapter {
         assert_eq!(STEP_ID_ENV, "AMPLIHACK_STEP_ID");
         assert_eq!(STEP_CONTEXT_ENV, "AMPLIHACK_STEP_CONTEXT");
         assert_eq!(STEP_EFFORT_ENV, "AMPLIHACK_STEP_EFFORT");
-        assert_eq!(MINIMAL_CONTEXT, "minimal");
+        assert_eq!(StepContextMode::MINIMAL, "minimal");
     }
 
     /// What a stand-in adapter saw of one launch.
@@ -1323,7 +1322,7 @@ mod adapter {
         assert_eq!(env.get(STEP_ID_ENV).map(String::as_str), Some("solo"));
         assert_eq!(
             env.get(STEP_CONTEXT_ENV).map(String::as_str),
-            Some(MINIMAL_CONTEXT),
+            Some(StepContextMode::MINIMAL),
             "the only value this variable ever takes"
         );
         assert_eq!(env.get(STEP_EFFORT_ENV).map(String::as_str), Some("low"));
