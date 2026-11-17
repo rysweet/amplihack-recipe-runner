@@ -207,7 +207,7 @@ A stale runner that rejects the probe is incompatible. Managed Amplihack install
 
 ## Rust adapter API
 
-The public `Adapter: Sync` interface and `StepResult` types are unchanged. `execute_agent_step` accepts prompt, optional agent name, effective system prompt, mode, working directory, optional model, and optional timeout, returning `Result<String, anyhow::Error>`.
+The public `Adapter: Sync` interface and `StepResult` types are unchanged by Codex support. `execute_agent_step` accepts prompt, optional agent name, effective system prompt, mode, working directory, optional model, and optional timeout, returning `Result<String, anyhow::Error>`, and keeps that signature. The [step context contract](step-context-contract.md) later added a default-bodied `execute_agent_launch` beside it and three optional agent-step fields to `StepResult`; both are additive and neither changes anything described on this page.
 
 For a Codex `CLISubprocessAdapter`, `Ok(String)` contains the verbatim final message within the output bound, including `Ok(String::new())` for an intentionally empty file. Execution/resource failures return contextual `Err`; ordinary failures follow existing failure and `continue_on_error` policies. SIGINT/SIGTERM cancellation and cleanup failure are terminal and stop the recipe regardless of those policies, including during nested recovery. Optional JSON parsing happens after successful raw extraction. No new public error enum, output-path parameter, or JSONL protocol is required.
 

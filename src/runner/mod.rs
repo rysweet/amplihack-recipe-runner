@@ -13,14 +13,14 @@ use terminal::{ParallelOutcome, TerminalFailure, TerminalState};
 #[cfg(test)]
 pub(crate) mod cleanup_test_observer;
 
-use crate::adapters::Adapter;
 use crate::adapters::cli_subprocess::{BashFailure, BashStdoutDiagnostic};
+use crate::adapters::{Adapter, AgentLaunch};
 use crate::agent_resolver::{AgentResolveError, AgentResolver};
 use crate::context::RecipeContext;
 use crate::discovery;
 use crate::models::{
-    Recipe, RecipeResult, Step, StepExecutionError, StepResult, StepStatus, StepType,
-    diagnostic_identifier,
+    LaunchField, Recipe, RecipeResult, Step, StepContextMode, StepExecutionError, StepResult,
+    StepStatus, StepType, check_launch_value, diagnostic_identifier,
 };
 use crate::parser::{RecipeParser, resolve_extends};
 use log::{error, info, warn};
@@ -42,6 +42,100 @@ const MAX_PARALLEL_STEPS: usize = 50;
 
 /// Maximum size of step output stored in memory (10 MB).
 pub const MAX_STEP_OUTPUT_BYTES: usize = 10_000_000;
+
+/// A step's launch parameters, rendered once and checked once.
+///
+/// Rendering lives here rather than in an adapter because every launch site
+/// needs the same answer, and because an empty render must leave the
+/// launcher's own default in place rather than produce `--model ""`.
+#[derive(Clone, Debug, Default)]
+struct ResolvedLaunch {
+    model: Option<String>,
+    effort: Option<String>,
+    context_mode: Option<StepContextMode>,
+}
+
+/// Render `raw` with `ctx`, trim it, and treat an empty result as absent.
+///
+/// `RecipeContext::render` replaces an unknown variable with the empty string
+/// and warns, so an empty result is the natural way a template that resolved
+/// to nothing arrives here. Absent means the launcher's default stands.
+fn render_launch_value(raw: Option<&str>, ctx: &RecipeContext) -> Option<String> {
+    let rendered = ctx.render(raw?);
+    let trimmed = rendered.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+impl ResolvedLaunch {
+    /// Resolve a step's model, effort and context mode against `ctx`.
+    ///
+    /// Fails the step when a rendered value could not reach an argument vector
+    /// or an environment safely. The rules themselves live in
+    /// [`crate::models::check_launch_value`], shared with the parser's pass
+    /// over literal values so that the two surfaces cannot apply different
+    /// rules to a value they both check. The message names the field; the step
+    /// id is already in `StepExecutionError`'s `Display`. It never echoes the
+    /// rejected value, which can carry a secret or a terminal escape sequence
+    /// into stderr, the recorded step error and a CI log.
+    fn resolve(step: &Step, ctx: &RecipeContext) -> Result<Self, StepExecutionError> {
+        // Render, trim, then check. `check_launch_value` reports against the
+        // quoted field name, so prefixing `rendered` names the value the rules
+        // actually saw rather than the one the recipe wrote.
+        let checked =
+            |field: LaunchField, raw: Option<&str>| -> Result<Option<String>, StepExecutionError> {
+                let value = render_launch_value(raw, ctx);
+                if let Some(v) = value.as_deref() {
+                    check_launch_value(field, v).map_err(|reason| StepExecutionError {
+                        step_id: step.id.clone(),
+                        message: format!("rendered {reason}"),
+                    })?;
+                }
+                Ok(value)
+            };
+
+        let model = checked(LaunchField::Model, step.model.as_deref())?;
+        let effort = checked(LaunchField::Effort, step.effort.as_deref())?;
+
+        Ok(Self {
+            model,
+            effort,
+            // `and_then` rather than a rejection: the parser already refused
+            // anything that is not `minimal`, so the only direction this can
+            // fall is losing a declared `minimal` and starting the agent
+            // normally — less saving, never more access.
+            context_mode: step
+                .context_mode
+                .as_deref()
+                .and_then(StepContextMode::parse),
+        })
+    }
+
+    /// Build the launch for an agent process acting for `step`.
+    ///
+    /// `context_mode` is passed in rather than read from `self` because not
+    /// every launch carries the step's declaration: a sub-recipe recovery
+    /// launch has to reason about a failure and is never started lightweight.
+    fn agent_launch(
+        &self,
+        step_id: &str,
+        prompt: String,
+        working_dir: &str,
+        context_mode: Option<StepContextMode>,
+    ) -> AgentLaunch {
+        AgentLaunch {
+            prompt,
+            agent_name: None,
+            system_prompt: None,
+            mode: None,
+            working_dir: working_dir.to_string(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            context_mode,
+            step_id: step_id.to_string(),
+            timeout: None,
+        }
+    }
+}
 
 /// A failed bash stdout artifact or retention problem from this invocation.
 /// Kept separate from step errors/output and exported recipe context.
@@ -358,6 +452,7 @@ impl<A: Adapter> RecipeRunner<A> {
                         output: String::new(),
                         error: msg,
                         duration: None,
+                        ..Default::default()
                     }],
                     context: HashMap::new(),
                     duration: None,
@@ -398,6 +493,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     output: String::new(),
                     error: error.message,
                     duration: None,
+                    ..Default::default()
                 }],
                 context: HashMap::new(),
                 duration: None,
@@ -434,6 +530,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     output: String::new(),
                     error: "audit log could not be opened and an audit log is required".to_string(),
                     duration: None,
+                    ..Default::default()
                 }],
                 context: ctx.to_map(),
                 duration: Some(start.elapsed()),
@@ -470,6 +567,7 @@ impl<A: Adapter> RecipeRunner<A> {
                             self.max_total_steps.get()
                         ),
                         duration: None,
+                        ..Default::default()
                     });
                     success = false;
                     break;
@@ -574,6 +672,7 @@ impl<A: Adapter> RecipeRunner<A> {
                             self.max_total_steps.get()
                         ),
                         duration: None,
+                        ..Default::default()
                     });
                     success = false;
                     break;
@@ -590,6 +689,7 @@ impl<A: Adapter> RecipeRunner<A> {
                         output: String::new(),
                         error: String::new(),
                         duration: None,
+                        ..Default::default()
                     });
                     step_idx += 1;
                     continue;
@@ -607,6 +707,7 @@ impl<A: Adapter> RecipeRunner<A> {
                         output: String::new(),
                         error: "skipped (resume from checkpoint)".to_string(),
                         duration: None,
+                        ..Default::default()
                     });
                     step_idx += 1;
                     continue;
@@ -1052,6 +1153,7 @@ impl<A: Adapter> RecipeRunner<A> {
                 output: String::new(),
                 error,
                 duration: Some(step_start.elapsed()),
+                ..Default::default()
             };
         }
 
@@ -1078,6 +1180,7 @@ impl<A: Adapter> RecipeRunner<A> {
                 output,
                 error: String::new(),
                 duration: Some(step_start.elapsed()),
+                ..Default::default()
             };
         }
 
@@ -1096,6 +1199,7 @@ impl<A: Adapter> RecipeRunner<A> {
                         output: String::new(),
                         error: String::new(),
                         duration: Some(step_start.elapsed()),
+                        ..Default::default()
                     };
                 }
                 Err(e) => {
@@ -1110,13 +1214,47 @@ impl<A: Adapter> RecipeRunner<A> {
                         output: String::new(),
                         error: format!("Condition error: {}", e),
                         duration: Some(step_start.elapsed()),
+                        ..Default::default()
                     };
                 }
             }
         }
 
+        // Resolve the launch after every early return, so a step that never
+        // launches reports no launch, and before the dispatch, so a value that
+        // cannot travel fails the step rather than the spawn.
+        //
+        // A bash step is the one type that can never launch an agent, so it
+        // has no launch to resolve, to validate or to record: `model:` and
+        // `effort:` on a bash step stay as inert as they were before #219,
+        // neither failing the step over a shape nothing reads nor appearing in
+        // its record. Every other type keeps resolving — a recipe step's
+        // resolved values are the ones its recovery launch would use.
+        let launch = if step.effective_type() == StepType::Bash {
+            ResolvedLaunch::default()
+        } else {
+            match ResolvedLaunch::resolve(step, ctx) {
+                Ok(launch) => launch,
+                Err(e) => {
+                    error!("{}", e);
+                    return StepResult {
+                        step_id: step.id.clone(),
+                        status: StepStatus::Failed,
+                        output: String::new(),
+                        error: e.to_string(),
+                        duration: Some(step_start.elapsed()),
+                        ..Default::default()
+                    };
+                }
+            }
+        };
+        // The three launch facts as they are written to this step's record.
+        let recorded_context_mode = launch.context_mode.map(|m| m.as_str().to_string());
+        let recorded_model = launch.model.clone();
+        let recorded_effort = launch.effort.clone();
+
         // Execute the step
-        let output = match self.dispatch_step(step, ctx) {
+        let output = match self.dispatch_step(step, ctx, &launch) {
             Ok(o) => {
                 if o.len() > MAX_STEP_OUTPUT_BYTES
                     && self.adapter.name() == "codex"
@@ -1130,6 +1268,9 @@ impl<A: Adapter> RecipeRunner<A> {
                             "Codex final output exceeds {MAX_STEP_OUTPUT_BYTES}-byte limit"
                         ),
                         duration: Some(step_start.elapsed()),
+                        context_mode: recorded_context_mode,
+                        model: recorded_model,
+                        effort: recorded_effort,
                     };
                 }
                 if o.len() > MAX_STEP_OUTPUT_BYTES {
@@ -1159,6 +1300,9 @@ impl<A: Adapter> RecipeRunner<A> {
                     output: String::new(),
                     error: diagnostic,
                     duration: Some(step_start.elapsed()),
+                    context_mode: recorded_context_mode,
+                    model: recorded_model,
+                    effort: recorded_effort,
                 };
             }
         };
@@ -1171,6 +1315,9 @@ impl<A: Adapter> RecipeRunner<A> {
                 output: String::new(),
                 error,
                 duration: Some(step_start.elapsed()),
+                context_mode: recorded_context_mode,
+                model: recorded_model,
+                effort: recorded_effort,
             };
         }
 
@@ -1190,15 +1337,17 @@ impl<A: Adapter> RecipeRunner<A> {
                         "Step '{}': parse_json failed on first attempt. Retrying with JSON reminder.",
                         diagnostic_identifier(&step.id)
                     );
-                    let retry_result = self.retry_for_json(step, ctx).and_then(|retry_output| {
-                        parse_json_output(&retry_output, &step.id).map(|parsed| {
-                            info!(
-                                "Step '{}': parse_json succeeded on retry.",
-                                diagnostic_identifier(&step.id)
-                            );
-                            serde_json::to_string(&parsed).unwrap_or(retry_output)
-                        })
-                    });
+                    let retry_result =
+                        self.retry_for_json(step, ctx, &launch)
+                            .and_then(|retry_output| {
+                                parse_json_output(&retry_output, &step.id).map(|parsed| {
+                                    info!(
+                                        "Step '{}': parse_json succeeded on retry.",
+                                        diagnostic_identifier(&step.id)
+                                    );
+                                    serde_json::to_string(&parsed).unwrap_or(retry_output)
+                                })
+                            });
 
                     if let Some(diagnostic) = self.terminal.diagnostic().as_ref() {
                         return StepResult {
@@ -1207,6 +1356,9 @@ impl<A: Adapter> RecipeRunner<A> {
                             output: String::new(),
                             error: diagnostic.clone(),
                             duration: Some(step_start.elapsed()),
+                            context_mode: recorded_context_mode,
+                            model: recorded_model,
+                            effort: recorded_effort,
                         };
                     }
 
@@ -1262,6 +1414,9 @@ impl<A: Adapter> RecipeRunner<A> {
             output: final_output,
             error: step_error,
             duration: Some(step_start.elapsed()),
+            context_mode: recorded_context_mode,
+            model: recorded_model,
+            effort: recorded_effort,
         }
     }
 
@@ -1269,6 +1424,7 @@ impl<A: Adapter> RecipeRunner<A> {
         &self,
         step: &Step,
         ctx: &mut RecipeContext,
+        launch: &ResolvedLaunch,
     ) -> Result<String, StepExecutionError> {
         log::debug!(
             "dispatch_step: step='{}', type={:?}",
@@ -1288,7 +1444,7 @@ impl<A: Adapter> RecipeRunner<A> {
         let st = step.effective_type();
 
         match st {
-            StepType::Recipe => self.execute_sub_recipe(step, ctx),
+            StepType::Recipe => self.execute_sub_recipe(step, ctx, launch),
             StepType::Bash => {
                 let rendered = ctx.render_shell(step.command.as_deref().unwrap_or(""));
                 let env_vars = ctx.shell_env_for_step();
@@ -1334,15 +1490,18 @@ impl<A: Adapter> RecipeRunner<A> {
                 }
 
                 self.adapter
-                    .execute_agent_step(
-                        &rendered_prompt,
-                        agent_name,
-                        agent_system_prompt.as_deref(),
-                        step.mode.as_deref(),
-                        working_dir,
-                        step.model.as_deref(),
-                        step.timeout,
-                    )
+                    .execute_agent_launch(&AgentLaunch {
+                        prompt: rendered_prompt,
+                        agent_name: agent_name.map(str::to_string),
+                        system_prompt: agent_system_prompt,
+                        mode: step.mode.clone(),
+                        working_dir: working_dir.to_string(),
+                        model: launch.model.clone(),
+                        effort: launch.effort.clone(),
+                        context_mode: launch.context_mode,
+                        step_id: step.id.clone(),
+                        timeout: step.timeout,
+                    })
                     .map_err(|e| {
                         self.terminal.observe(&e);
                         StepExecutionError {
@@ -1358,6 +1517,7 @@ impl<A: Adapter> RecipeRunner<A> {
         &self,
         step: &Step,
         ctx: &mut RecipeContext,
+        launch: &ResolvedLaunch,
     ) -> Result<String, StepExecutionError> {
         log::debug!(
             "execute_sub_recipe: step='{}', depth={}",
@@ -1484,16 +1644,20 @@ impl<A: Adapter> RecipeRunner<A> {
                 );
 
                 // The recovery call works on the step's behalf, so it keeps the
-                // step's model rather than falling back to the CLI default.
-                let recovery = self.adapter.execute_agent_step(
-                    &recovery_prompt,
-                    None,
-                    None,
-                    None,
+                // step's rendered model and effort rather than falling back to
+                // the launcher default.
+                //
+                // It is never started lightweight: it has to reason about a
+                // failure it was not given the context for. Passing `None`
+                // here says so at the launch, rather than leaving it to the
+                // parse-time rule that a recipe step cannot declare a context
+                // mode at all.
+                let recovery = self.adapter.execute_agent_launch(&launch.agent_launch(
+                    &step.id,
+                    recovery_prompt,
                     working_dir,
-                    step.model.as_deref(),
-                    None, // timeout
-                );
+                    None,
+                ));
                 if let Err(ref error) = recovery {
                     self.terminal.observe(error);
                 }
@@ -1727,7 +1891,12 @@ impl<A: Adapter> RecipeRunner<A> {
     }
 
     /// Retry an agent step with an explicit JSON-only instruction.
-    fn retry_for_json(&self, step: &Step, ctx: &mut RecipeContext) -> Option<String> {
+    fn retry_for_json(
+        &self,
+        step: &Step,
+        ctx: &mut RecipeContext,
+        launch: &ResolvedLaunch,
+    ) -> Option<String> {
         log::debug!("retry_for_json: step='{}'", diagnostic_identifier(&step.id));
         if self.terminal.is_terminal() || step.effective_type() != StepType::Agent {
             return None; // No pending repair after terminal observation
@@ -1744,20 +1913,18 @@ impl<A: Adapter> RecipeRunner<A> {
         let result = if self.adapter.name() == "codex" {
             let mut repair_step = step.clone();
             repair_step.prompt = Some(retry_prompt);
-            self.dispatch_step(&repair_step, ctx)
+            self.dispatch_step(&repair_step, ctx, launch)
                 .map_err(anyhow::Error::new)
         } else {
-            // The repair call keeps the step's model, as the Codex path above
-            // does by re-dispatching a copy of the step.
-            self.adapter.execute_agent_step(
-                &ctx.render(&retry_prompt),
-                None,
-                None,
-                None,
+            // The repair call is the same step's work, so it inherits the
+            // step's whole declaration — model, effort and context mode — as
+            // the Codex path above does by re-dispatching a copy of the step.
+            self.adapter.execute_agent_launch(&launch.agent_launch(
+                &step.id,
+                ctx.render(&retry_prompt),
                 step.working_dir.as_deref().unwrap_or(&self.working_dir),
-                step.model.as_deref(),
-                None,
-            )
+                launch.context_mode,
+            ))
         };
         match result {
             Ok(output) => Some(output),
@@ -1842,6 +2009,7 @@ impl<A: Adapter> RecipeRunner<A> {
                         output: String::new(),
                         error: String::new(),
                         duration: None,
+                        ..Default::default()
                     });
                     continue;
                 }
@@ -1917,6 +2085,7 @@ impl<A: Adapter> RecipeRunner<A> {
                                 panic_msg
                             ),
                             duration: None,
+                            ..Default::default()
                         });
                     }
                 }
@@ -1954,6 +2123,7 @@ impl<A: Adapter> RecipeRunner<A> {
                 output: "(dry-run)".to_string(),
                 error: String::new(),
                 duration: Some(step_start.elapsed()),
+                ..Default::default()
             }
             .into();
         }
@@ -1968,6 +2138,7 @@ impl<A: Adapter> RecipeRunner<A> {
                         output: String::new(),
                         error: String::new(),
                         duration: Some(step_start.elapsed()),
+                        ..Default::default()
                     }
                     .into();
                 }
@@ -1978,6 +2149,7 @@ impl<A: Adapter> RecipeRunner<A> {
                         output: String::new(),
                         error: format!("Condition error: {}", e),
                         duration: Some(step_start.elapsed()),
+                        ..Default::default()
                     }
                     .into();
                 }
@@ -2032,6 +2204,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     output: final_output,
                     error,
                     duration: Some(step_start.elapsed()),
+                    ..Default::default()
                 }
             }
             Err(e) => {
@@ -2048,6 +2221,7 @@ impl<A: Adapter> RecipeRunner<A> {
                     output: String::new(),
                     error: format!("{e:#}"),
                     duration: Some(step_start.elapsed()),
+                    ..Default::default()
                 }
             }
         };
@@ -2198,6 +2372,7 @@ fn recovery_failure(step: &Step, error: anyhow::Error) -> StepResult {
         output: String::new(),
         error: format!("durable recovery failed: {error}"),
         duration: None,
+        ..Default::default()
     }
 }
 

@@ -61,7 +61,9 @@ step.
 | `working_dir`       | string          | no       | —       | Override working directory for this step                 |
 | `timeout`           | int             | no       | —       | Step timeout in seconds                                  |
 | `auto_stage`        | bool            | no       | `true`  | Git auto-stage after agent steps; `false` opts the step out, and `--no-auto-stage` turns staging off for every step |
-| `model`             | string          | no       | —       | Model override for agent steps (e.g., "haiku", "sonnet") |
+| `model`             | string          | no       | —       | Model override for agent steps (e.g. `haiku`, `sonnet`), rendered as a template |
+| `context_mode`      | string          | no       | —       | Agent steps only; the one accepted value is `minimal`, which asks the launcher to start the step lightweight (see below) |
+| `effort`            | string          | no       | —       | Reasoning-effort hint, rendered as a template and passed to the launcher verbatim (see below) |
 | `recipe`            | string          | no       | —       | Sub-recipe name (recipe steps)                           |
 | `recovery_on_failure` | bool            | no       | `false` | Attempt agentic recovery if sub-recipe fails (see below) |
 | `context`           | map             | no       | —       | Context overrides passed to sub-recipe                   |
@@ -313,6 +315,180 @@ the Claude examples below are not portable Codex model names. See
   prompt: "Thorough security review of {{file_path}}"
   model: sonnet  # more capable model for complex analysis
 ```
+
+`model` is rendered with the step's context before it is passed on, so a recipe
+can choose a model from earlier output, from a `context:` block or from `--set`:
+
+```yaml
+context:
+  review_model: sonnet
+
+steps:
+  - id: review
+    agent: reviewer
+    prompt: "Review {{file_path}}"
+    model: "{{review_model}}"
+```
+
+The rendered value is trimmed, and a value that renders to nothing is treated as
+absent: no `--model` argument is passed and the launcher's own default stands.
+A template referring to a variable that does not exist renders to nothing, so a
+misspelled variable name falls back to the default rather than failing. Watch
+the render warning in the log if a model override appears not to take effect.
+
+The runner does not check that the model exists, and holds no list of model
+names. It checks four things about the trimmed string: no leading `-`, no
+whitespace, no control or format character, at most 256 bytes. The leading
+hyphen would be read as an option by the launcher's own argument parser. The
+whitespace rule is a conservative one rather than a necessity: the value is
+passed as a single element of an argument vector and never through a shell, so a
+space survives inside it just as `$`, `;` and `[` do, but no published model
+identifier contains one, and anything downstream that re-parses the value would
+split it where the argument vector does not. Shell metacharacters are inert here
+and are **not** rejected. Every identifier in use passes unchanged, including
+Vertex AI's `claude-sonnet-4-5@20250929`, a Bedrock
+`us.anthropic.claude-sonnet-4-5-v1:0` or inference-profile ARN, a tier word, and
+a context-window suffix such as `opus[1m]` or `claude-opus-5[1m]`.
+
+Where the recipe writes the model out in full, that check runs on the trimmed
+value as the recipe is read, so
+[`--validate-only`](cli-reference.md#--validate-only) reports a value that could
+never have launched anything and the run does not start. Where the value holds a
+`{{…}}` [placeholder](cli-reference.md#template-references), its final form is
+not known until the step has its context, and the check runs there instead.
+Either way a failing value fails loudly rather than quietly falling back to the
+launcher's default, and the message names the step and the field without echoing
+the value. Because `model` becomes an argv token, and argv is readable by other
+local processes, do not render a secret into it.
+
+Where amplihack's launcher accepts tier words such as `fast`, `standard` and
+`strong`, they travel in this same `model` field. The runner passes them through
+byte for byte; the launcher resolves them. There is one field for choosing a
+step's model, whether the value names a model or names a tier.
+
+---
+
+## Lightweight Agent Steps (`context_mode`)
+
+An agent step that only needs its own rendered prompt can ask to start without
+the rest of the session's context:
+
+```yaml
+- id: classify
+  agent: analyzer
+  prompt: "Classify this diff as feature, fix or chore. Answer with one word.\n\n{{diff}}"
+  context_mode: minimal
+  model: fast
+  output: category
+```
+
+`context_mode` accepts exactly one value, `minimal`. Omitting the field is how a
+step asks for the normal start, and that is what every step does today. There is
+no value that spells "full".
+
+`minimal` sets `AMPLIHACK_STEP_CONTEXT=minimal` on the agent child, and the
+launcher decides what a minimal start means for its harness. The runner itself
+trims no prompt, drops no agent system prompt and changes no argument on account
+of the field, so a launcher that ignores the variable runs the step exactly as
+before. The field is a cost hint: it asks for less context, never for more
+access.
+
+An unrecognised value, and the field on a step that is not an agent step, are
+both parse errors rather than warnings: a typo should not silently cost the
+saving, and a misplaced field should not look as if it worked.
+
+```text
+Error: Failed to parse recipe: Invalid recipe: Step 'classify': context_mode 'mininal' is not recognised; the only accepted value is 'minimal'
+```
+
+```text
+Error: Failed to parse recipe: Invalid recipe: Step 'build': context_mode is only valid on an agent step
+```
+
+Both exit `2`, from a normal run and from
+[`--validate-only`](cli-reference.md#--validate-only) alike, and no step runs.
+Each message names the step that owns the mistake, and the step id and the
+rejected value are escaped for display exactly as every other parse diagnostic
+escapes them. A misspelled *key* — `context_mdoe` — is still an unknown field
+and still a warning, as
+[unknown step fields](#unknown-and-retired-step-fields) have always been.
+
+`context_mode` has no bearing on a bash step or a recipe step, which is why
+declaring it on one is rejected outright. It is also the only field of the three
+restricted this way: `effort` and `model` are accepted wherever either makes
+sense.
+
+Changing `context_mode` on a step changes the step definition that recovery
+fingerprints, so a step whose `context_mode` was added, altered or removed
+re-executes on the next resume rather than reusing its stored record.
+
+---
+
+## Per-Step Effort (`effort`)
+
+`effort` is a free-form hint passed to the launcher alongside the model:
+
+```yaml
+- id: classify
+  agent: analyzer
+  prompt: "Classify this diff. Answer with one word.\n\n{{diff}}"
+  context_mode: minimal
+  effort: low
+
+- id: design
+  agent: architect
+  prompt: "Design the migration described in {{spec_path}}"
+  effort: "{{design_effort}}"
+```
+
+Like `model`, it is rendered with the step's context, trimmed, and treated as
+absent when it renders to nothing. It reaches the agent as
+`AMPLIHACK_STEP_EFFORT`.
+
+The runner holds no vocabulary for the field, because accepted values differ per
+harness. It checks only that the trimmed value is at most 256 bytes and free of
+control and format characters — NUL and ESC, and the bidi overrides that would
+reverse the display of a record written from it — then passes it through. As
+with `model`, a value written out in full is checked as the recipe is read and a
+value holding a `{{…}}` [placeholder](cli-reference.md#template-references) when
+the step resolves. A value failing that check fails, as an unusable `model`
+does, rather than being dropped. A value the launcher does not recognise is the
+launcher's concern, not a recipe error.
+
+Where a step's `model:` names a tier, that tier already implies an effort, and
+amplihack's launcher uses `effort:` as the override for the one it implies. The
+[precedence in full](step-context-contract.md#amplihack_step_effort) is the
+launcher's, not the runner's: the runner reads no tier word out of `model:` and
+derives nothing.
+
+`effort` is accepted on any step, exactly as `model` is, and ignored where no
+agent is launched. A recipe step with `recovery_on_failure: true` does launch an
+agent when its sub-recipe fails, and that launch carries the step's `effort`,
+just as it already carries the step's `model`.
+
+There is **no step-type check on `effort`** and no warning when a bash step or a
+recipe step declares one: it is silently unused, the way `model` on a bash step
+has always been. `effort` and `model` are the same kind of field — a hint for
+whatever agent a step launches — and they behave the same way on a step that
+launches none. The restriction belongs to `context_mode` alone, which names a
+start that only an agent launch can have.
+
+Silently unused means *entirely* unused. On a **bash step** — the one type that
+can never launch an agent — neither field is rendered, checked or recorded, so
+a `model:` or `effort:` that would fail an agent step cannot fail a bash step
+and does not appear in its [record](step-context-contract.md#step-records). The
+parse-time check keeps that exemption, so a bash step carrying such a value
+validates as it always has. On
+a recipe step the fields are resolved, because its recovery launch needs them,
+and the length and character checks above apply.
+
+As with `context_mode`, `effort` is part of the step definition that recovery
+fingerprints, so editing it invalidates that step's stored progress and the step
+re-executes on the next resume.
+
+For the launch contract in full — the step identifier the runner also passes,
+which launches carry what, and what step records show — see the
+[Step context contract](step-context-contract.md).
 
 ---
 

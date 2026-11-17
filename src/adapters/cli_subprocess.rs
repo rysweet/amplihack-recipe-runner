@@ -876,6 +876,21 @@ fn filter_inherited_env(
         .collect()
 }
 
+/// Place a launch's per-step contract (#219) on a child environment.
+///
+/// The counterpart of the removal loop in
+/// [`CLISubprocessAdapter::build_child_env_with`], and the only place these
+/// variables are ever set. Both agent branches call it at the same point:
+/// after the inherited environment has been built and filtered by the
+/// `--env-allow` allowlist — these values are this run's own, never inherited,
+/// so setting them afterwards confines nothing less — and before `bounded_env`
+/// measures the result, so they are covered by that budget.
+fn apply_contract_env(child_env: &mut HashMap<String, String>, contract_env: &[(&str, &str)]) {
+    for (name, value) in contract_env {
+        child_env.insert((*name).to_string(), (*value).to_string());
+    }
+}
+
 impl CLISubprocessAdapter {
     pub fn new() -> Self {
         // Use AMPLIHACK_AGENT_BINARY env var if set, otherwise default to "claude"
@@ -1066,6 +1081,22 @@ impl CLISubprocessAdapter {
         let mut child_env = filter_inherited_env(env::vars());
         child_env.remove("AMPLIHACK_RECOVERY_DESCRIPTOR");
         child_env.remove("AMPLIHACK_RECOVERY_ATTACHMENT");
+        // Security control, not housekeeping. The per-step launch contract
+        // (#219) says a step starts lightweight only when it says so, and
+        // absence must therefore mean absence. A runner started from inside an
+        // agent step inherits that step's variables; without this removal, a
+        // process that can set `AMPLIHACK_STEP_CONTEXT` once would silently
+        // degrade every nested agent step of every recipe beneath it, with
+        // nothing in any recipe to show for it.
+        //
+        // Unconditional, and for bash children as well as agent ones: the
+        // contract is an agent-launch contract, so a bash step must never see
+        // these at all. The removal happens before the `--env-allow` filter so
+        // that naming one of them to the allowlist cannot re-admit an
+        // inherited value; the launch sets its own values afterwards.
+        for name in super::CONTRACT_ENV_NAMES {
+            child_env.remove(*name);
+        }
         #[cfg(unix)]
         if let Some(attachment) =
             crate::recovery::ipc::current_environment().expect("attachment serialization")
@@ -1272,7 +1303,8 @@ impl CLISubprocessAdapter {
         Ok(cmd)
     }
 
-    /// Internal: spawn agent with optional system prompt and timeout.
+    /// Internal: spawn agent with optional system prompt and timeout, setting
+    /// no per-step contract variables.
     ///
     /// When `timeout` is `Some(secs)`, the agent process is killed after the
     /// given number of seconds.  Without a timeout the step runs until the
@@ -1285,11 +1317,36 @@ impl CLISubprocessAdapter {
         working_dir: &str,
         timeout: Option<u64>,
     ) -> Result<String, anyhow::Error> {
+        self.launch_agent_process(prompt, system_prompt, model, working_dir, timeout, &[])
+    }
+
+    /// Internal: spawn an agent process, placing `contract_env` on its
+    /// environment.
+    ///
+    /// `contract_env` holds the per-step launch contract (#219) for this
+    /// launch, already decided by [`super::AgentLaunch::contract_env`]. The
+    /// entries are inserted after the inherited environment has been built and
+    /// filtered, and before it is measured against the argument/environment
+    /// budget, so they are covered by that budget and cannot be confused with
+    /// an inherited value.
+    fn launch_agent_process(
+        &self,
+        prompt: &str,
+        system_prompt: Option<&str>,
+        model: Option<&str>,
+        working_dir: &str,
+        timeout: Option<u64>,
+        contract_env: &[(&str, &str)],
+    ) -> Result<String, anyhow::Error> {
+        // SR-10: `model` is rendered from RecipeContext after #219, so it is
+        // untrusted data. Log its presence and length only, never its text.
         log::debug!(
-            "execute_agent_step_impl: prompt_len={}, has_system_prompt={}, model={:?}",
+            "launch_agent_process: prompt_len={}, has_system_prompt={}, model_len={:?}, \
+             contract_vars={}",
             prompt.len(),
             system_prompt.is_some(),
-            model
+            model.map(str::len),
+            contract_env.len()
         );
         // Resolve the actual working directory for the agent.
         // Use the recipe's working_dir so agents operate against the real repo,
@@ -1331,6 +1388,7 @@ impl CLISubprocessAdapter {
         if self.cli == "codex" {
             let mut child_env = Self::build_child_env_with(self.env_allow.as_deref());
             child_env.insert("AMPLIHACK_AGENT_BINARY".into(), self.cli.clone());
+            apply_contract_env(&mut child_env, contract_env);
             let child_env = bounded_env(&child_env)?;
             let envelope = format!(
                 "# System instructions\n{}\n\n# Task instructions\n{}{}",
@@ -1416,13 +1474,21 @@ impl CLISubprocessAdapter {
         // dispositions are restored.
         #[cfg(unix)]
         let cancellation = super::codex_exec::Cancellation::install()?;
-        let result = self.run_agent_attempts(prompt, system_prompt, model, &resolved_cwd, timeout);
+        let result = self.run_agent_attempts(
+            prompt,
+            system_prompt,
+            model,
+            &resolved_cwd,
+            timeout,
+            contract_env,
+        );
         #[cfg(unix)]
         let result = super::codex_exec::finish_resources(result, cancellation.close());
         result
     }
 
     /// Claude-family and Copilot attempts, with bounded rate-limit retries.
+    #[allow(clippy::too_many_arguments)]
     fn run_agent_attempts(
         &self,
         prompt: &str,
@@ -1430,6 +1496,7 @@ impl CLISubprocessAdapter {
         model: Option<&str>,
         resolved_cwd: &Path,
         timeout: Option<u64>,
+        contract_env: &[(&str, &str)],
     ) -> Result<String, anyhow::Error> {
         // Own the private prompt and output files until all attempts finish.
         // The agent process itself runs from the resolved repo cwd.
@@ -1444,6 +1511,7 @@ impl CLISubprocessAdapter {
         let mut child_env = Self::build_child_env_with(self.env_allow.as_deref());
         // Ensure nested agent steps inherit the same agent binary preference
         child_env.insert("AMPLIHACK_AGENT_BINARY".to_string(), self.cli.clone());
+        apply_contract_env(&mut child_env, contract_env);
         // Bound the child environment to the MEASURED budget once, before the
         // retry loop, so an oversized inherited env can never blow execve for
         // the agent process either. Fails loud (naming protected vars) instead
@@ -1814,13 +1882,34 @@ impl Adapter for CLISubprocessAdapter {
         model: Option<&str>,
         timeout: Option<u64>,
     ) -> Result<String, anyhow::Error> {
+        // SR-10: see `launch_agent_process` — length and presence only.
         log::debug!(
-            "CLISubprocessAdapter::execute_agent_step: prompt_len={}, model={:?}, timeout={:?}",
+            "CLISubprocessAdapter::execute_agent_step: prompt_len={}, model_len={:?}, timeout={:?}",
             prompt.len(),
-            model,
+            model.map(str::len),
             timeout
         );
         self.execute_agent_step_impl(prompt, system_prompt, model, working_dir, timeout)
+    }
+
+    /// Launch an agent step with its per-step contract (#219) on the child
+    /// environment.
+    ///
+    /// The contract travels on the environment alone: no new command-line flag
+    /// is added, and the model keeps its single existing route as a `--model`
+    /// argument. `/proc/<pid>/cmdline` is world-readable where
+    /// `/proc/<pid>/environ` is not, which is a reason to add nothing further
+    /// to the command line.
+    fn execute_agent_launch(&self, launch: &super::AgentLaunch) -> Result<String, anyhow::Error> {
+        log::debug!("CLISubprocessAdapter::execute_agent_launch: {launch:?}");
+        self.launch_agent_process(
+            &launch.prompt,
+            launch.system_prompt.as_deref(),
+            launch.model.as_deref(),
+            &launch.working_dir,
+            launch.timeout,
+            &launch.contract_env(),
+        )
     }
 
     fn execute_bash_step(

@@ -31,7 +31,10 @@ enum Operation {
         probe: Probe,
     },
     Commit {
-        record: Record,
+        // Boxed to keep `Operation` small: `Record` embeds a `StepResult` and
+        // is several times the size of every other variant. `Box` is
+        // transparent to serde, so the wire format is unchanged.
+        record: Box<Record>,
     },
     Attach {
         prefix: String,
@@ -253,7 +256,9 @@ impl Client {
         )?)
     }
     pub fn commit(&self, record: Record) -> Result<()> {
-        self.call(Operation::Commit { record })?;
+        self.call(Operation::Commit {
+            record: Box::new(record),
+        })?;
         Ok(())
     }
     pub fn attach(&self, prefix: String) -> Result<Self> {
@@ -357,7 +362,7 @@ fn serve(
                         authorized(grant, &record.probe.location.invocation_path),
                         "outside invocation subtree"
                     );
-                    store.commit(record)?;
+                    store.commit(*record)?;
                     Ok(serde_json::Value::Null)
                 }
                 Operation::Attach { prefix } => {

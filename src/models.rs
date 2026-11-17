@@ -17,6 +17,120 @@ pub fn diagnostic_identifier(raw: &str) -> String {
     raw.escape_debug().collect()
 }
 
+/// Longest rendered `model:` or `effort:` accepted.
+///
+/// Both became template sinks with #219, and a template is fed from the recipe
+/// context — which carries earlier step output, agent output, parsed JSON and
+/// `--context-file` values. The model becomes an argv token, which the
+/// environment budget does not measure at all; the effort becomes an
+/// `AMPLIHACK_`-prefixed environment value, which that budget protects from
+/// eviction rather than drops. So neither is bounded anywhere else: without
+/// this cap an oversized value surfaces either as an opaque `E2BIG` from
+/// `execve` or as a budget error that stops the run. This is the one place
+/// both sinks are bounded.
+///
+/// The number is chosen to clear the longest identifier any provider
+/// publishes — a Bedrock inference-profile ARN runs to about 110 bytes — with
+/// room to spare, while staying far below both the kernel's per-string limit
+/// and the environment budget's floor. It bounds a sink; it does not express
+/// an opinion about what a model may be called.
+const MAX_LAUNCH_VALUE_BYTES: usize = 256;
+
+/// A character a display escape would hide: a control character such as NUL or
+/// ESC, or a format character such as the bidi override `U+202E`.
+///
+/// `char::escape_debug` escapes exactly this class, and it is the escape the
+/// crate's own diagnostics use. A rendered `model` or `effort`, though, also
+/// reaches the child process, the audit JSONL and the JSON step records
+/// unescaped, so for these two values the shape is rejected rather than
+/// escaped on the way out. The three characters `escape_debug` escapes for
+/// quoting reasons are not of this class and are excluded.
+fn hides_in_display(c: char) -> bool {
+    c.escape_debug().next() == Some('\\') && !matches!(c, '\\' | '\'' | '"')
+}
+
+/// Which of the two launch fields' rules [`check_launch_value`] applies.
+///
+/// The two fields do not carry the same rules — `model` becomes an argv token
+/// and so must not look like an option, while `effort` becomes an environment
+/// value — and the selector is an enum rather than a field name so that a
+/// rename or a typo cannot silently drop `model`'s extra rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LaunchField {
+    Model,
+    Effort,
+}
+
+impl LaunchField {
+    /// The field's spelling in a recipe, as it appears in a message.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Effort => "effort",
+        }
+    }
+}
+
+/// Check an already-trimmed launch value against the shape rules for `field`.
+///
+/// The one place the rules live, so the parse-time pass over a literal and the
+/// run-time pass over a rendered value cannot disagree about a value they both
+/// check. It holds no model vocabulary: amplihack-rs resolves tier words such
+/// as `fast` in its own launcher, and every provider spells its identifiers
+/// differently, so what is rejected here is a shape that could not reach the
+/// launcher intact, never a character some provider happens not to use.
+///
+/// The returned reason begins with the quoted field name, so a caller can
+/// prefix it — the runner says `rendered 'model' …`, the parser prefixes the
+/// step id. It never contains the value, which can carry a secret or a
+/// terminal escape sequence into stderr, a step record and a CI log. This
+/// function performs no I/O and no logging.
+pub(crate) fn check_launch_value(field: LaunchField, value: &str) -> Result<(), String> {
+    let name = field.name();
+
+    // First, so the cost of checking a hostile value is bounded by the cap
+    // rather than by the length of the input.
+    if value.len() > MAX_LAUNCH_VALUE_BYTES {
+        return Err(format!(
+            "'{name}' is {} bytes; the maximum is {MAX_LAUNCH_VALUE_BYTES}",
+            value.len()
+        ));
+    }
+
+    // The highest-severity rule of the set: `--add-dir` or
+    // `--dangerously-skip-permissions` would be read as an option and alter
+    // the child's privileges rather than its model.
+    if field == LaunchField::Model && value.starts_with('-') {
+        return Err(format!(
+            "'{name}' starts with '-', which the launcher would read as an option rather than a \
+             model name"
+        ));
+    }
+
+    // Covers NUL, which cannot be placed in an environment at all; ESC, which
+    // could otherwise carry a terminal escape sequence; and the format
+    // characters, of which a bidi override such as `U+202E` reverses the
+    // display of the audit JSONL and the JSON step records — the two surfaces
+    // that write these values unescaped.
+    if value.chars().any(hides_in_display) {
+        return Err(format!("'{name}' contains a control or format character"));
+    }
+
+    // Not an argv-splitting hazard: the runner passes the model as a single
+    // argv entry and performs no shell quoting, so a space survives inside it
+    // exactly as `$` or `;` would. The rule is conservatism about anything
+    // downstream that re-parses the value, together with the observation that
+    // no published identifier contains a space, so a value that has acquired
+    // one is more likely a mis-rendered template than a model name.
+    if field == LaunchField::Model && value.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "'{name}' contains whitespace, so it would not reach the launcher as a single word"
+        ));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StepType {
@@ -101,7 +215,72 @@ pub struct Step {
     #[serde(default)]
     pub recovery_on_failure: bool,
     /// Model override for agent steps (e.g., "haiku", "sonnet").
+    ///
+    /// Rendered against the recipe context before launch, so a recipe can
+    /// choose a tier from a context variable or an earlier step's output. The
+    /// runner holds no model vocabulary: the rendered value travels to the
+    /// launcher byte for byte, as a single `--model` argument, with no shell
+    /// quoting anywhere on the way. It is never rewritten — the only thing
+    /// the runner does besides render and trim it is apply
+    /// [`check_launch_value`], which fails the step rather than altering the
+    /// value. A value written out in full is checked by the parser instead,
+    /// against the same rules.
     pub model: Option<String>,
+    /// How much context the step is started with. The only accepted value is
+    /// `minimal`, and only on an agent step; a step asks for the normal start
+    /// by omitting the field.
+    ///
+    /// Carried as written so that the validation pass — which has the step in
+    /// hand — can name the step that owns an unrecognised value. Use
+    /// [`StepContextMode::parse`] to act on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_mode: Option<String>,
+    /// Reasoning-effort hint for the harness, rendered like `model`.
+    ///
+    /// Free-form: the accepted words differ per harness and the runner never
+    /// interprets them. Accepted wherever `model` is, with no step-type
+    /// restriction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+/// How much context an agent step is started with.
+///
+/// There is exactly one variant. A second spelling meaning "the normal start"
+/// would be a second thing to keep consistent with the absent field, so the
+/// normal start is expressed by omitting `context_mode` entirely.
+///
+/// The typed form exists for the code that acts on the declaration; the recipe
+/// field itself is a plain string, typed at the parser boundary so that a bad
+/// value is reported against the step that wrote it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepContextMode {
+    /// Start the step with only its rendered prompt and declared inputs.
+    Minimal,
+}
+
+impl StepContextMode {
+    /// The one accepted spelling, as written in a recipe and as placed on the
+    /// child environment.
+    pub const MINIMAL: &'static str = "minimal";
+
+    /// Parse a declared value, returning `None` for anything unrecognised.
+    ///
+    /// Matching is exact: `Minimal` and ` minimal` are not this value.
+    pub fn parse(value: &str) -> Option<Self> {
+        trace!("StepContextMode::parse: value={:?}", value);
+        match value {
+            Self::MINIMAL => Some(Self::Minimal),
+            _ => None,
+        }
+    }
+
+    /// The declared spelling of this mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => Self::MINIMAL,
+        }
+    }
 }
 
 impl Step {
@@ -255,6 +434,37 @@ pub struct StepResult {
         skip_serializing_if = "Option::is_none"
     )]
     pub duration: Option<Duration>,
+    /// The context mode this step was launched with, when it declared one.
+    ///
+    /// Absent — and omitted from the record — for a step that asked for the
+    /// normal start and for a step that never launched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_mode: Option<String>,
+    /// The model this step was launched with, after rendering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The effort this step was launched with, after rendering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl Default for StepResult {
+    /// A record for a step that has not run.
+    ///
+    /// `StepStatus` has no default of its own on purpose — a status is always
+    /// a statement about a step — so this names `Pending` explicitly.
+    fn default() -> Self {
+        Self {
+            step_id: String::new(),
+            status: StepStatus::Pending,
+            output: String::new(),
+            error: String::new(),
+            duration: None,
+            context_mode: None,
+            model: None,
+            effort: None,
+        }
+    }
 }
 
 impl fmt::Display for StepResult {
@@ -357,6 +567,7 @@ mod tests {
                 output: String::new(),
                 error: error.to_string(),
                 duration: None,
+                ..Default::default()
             }],
             context: HashMap::new(),
             duration: None,
@@ -400,6 +611,8 @@ mod tests {
             when_tags: vec![],
             recovery_on_failure: false,
             model: None,
+            context_mode: None,
+            effort: None,
         };
         // Explicit type overrides all field-based inference
         assert_eq!(step.effective_type(), StepType::Bash);
@@ -430,6 +643,8 @@ mod tests {
             when_tags: vec![],
             recovery_on_failure: false,
             model: None,
+            context_mode: None,
+            effort: None,
         };
         assert_eq!(step.effective_type(), StepType::Recipe);
     }
@@ -459,6 +674,8 @@ mod tests {
             when_tags: vec![],
             recovery_on_failure: false,
             model: None,
+            context_mode: None,
+            effort: None,
         };
         assert_eq!(step.effective_type(), StepType::Agent);
     }
@@ -488,6 +705,8 @@ mod tests {
             when_tags: vec![],
             recovery_on_failure: false,
             model: None,
+            context_mode: None,
+            effort: None,
         };
         assert_eq!(step.effective_type(), StepType::Agent);
     }
@@ -517,6 +736,8 @@ mod tests {
             when_tags: vec![],
             recovery_on_failure: false,
             model: None,
+            context_mode: None,
+            effort: None,
         };
         // command + prompt → Bash (prompt alone would be Agent, but command presence wins)
         assert_eq!(step.effective_type(), StepType::Bash);
@@ -547,6 +768,8 @@ mod tests {
             when_tags: vec![],
             recovery_on_failure: false,
             model: None,
+            context_mode: None,
+            effort: None,
         };
         assert_eq!(step.effective_type(), StepType::Bash);
     }
@@ -576,6 +799,7 @@ mod tests {
             output: "some output".into(),
             error: String::new(),
             duration: Some(Duration::from_secs_f64(1.5)),
+            ..Default::default()
         };
         let display = format!("{}", result);
         assert!(display.contains("completed"));
@@ -592,6 +816,7 @@ mod tests {
             output: String::new(),
             error: "something broke".into(),
             duration: None,
+            ..Default::default()
         };
         let display = format!("{}", result);
         assert!(display.contains("failed"));
@@ -623,6 +848,7 @@ mod tests {
                 output: String::new(),
                 error: "boom".into(),
                 duration: None,
+                ..Default::default()
             }],
             context: HashMap::new(),
             duration: None,

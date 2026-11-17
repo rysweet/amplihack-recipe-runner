@@ -2,7 +2,7 @@
 title: CLI Reference
 description: Command-line options, output and failure diagnostics for recipe-runner-rs.
 doc_type: reference
-last_updated: 2026-11-14
+last_updated: 2026-11-17
 ---
 
 # CLI Reference
@@ -216,6 +216,11 @@ These are still present, because the runner or the recipe sets them rather than 
 - `HOME` and `PATH`, which fall back to `/root` and `/usr/local/bin:/usr/bin:/bin` when they are not named;
 - `AMPLIHACK_SESSION_DEPTH`, `AMPLIHACK_MAX_DEPTH`, `AMPLIHACK_MAX_SESSIONS`, `AMPLIHACK_TREE_ID` and
   `AMPLIHACK_AGENT_BINARY`;
+- on agent children, the [step context contract](step-context-contract.md) variables `AMPLIHACK_STEP_ID`, and,
+  where the step declares them, `AMPLIHACK_STEP_CONTEXT` and `AMPLIHACK_STEP_EFFORT`. The runner inserts these
+  after this filter runs, so the option is not exhaustive over an agent child's environment. The same three names
+  are removed from the inherited environment on every child, agent and bash alike and whatever the option says,
+  so a value from an outer run never reaches an inner one;
 - a step's own `env:` block and the `RECIPE_VAR_*` variables for shell steps.
 
 `CLAUDECODE` is never passed, even if it is named. The runner's own settings read from its environment, such as
@@ -377,6 +382,23 @@ Parse and validate the recipe, print any warnings, then exit. Does not execute a
 JSON recipe files support UTF-8 text and escaped Unicode surrogate pairs. See
 [JSON recipe input](#json-recipe-input) for decoding rules, limits and an example.
 
+Validation covers a step's launch declarations as well as its structure: a
+`context_mode` that is not `minimal` or sits on a step that is not an agent
+step, and a `model:` or `effort:` written out in full whose trimmed shape could
+never reach a launcher — a leading `-`, whitespace, a control or format
+character, or more than 256 bytes. Each is a parse error naming the step, and
+the command exits `2`.
+
+Two kinds of value are outside what this reports. A `model:` or `effort:`
+holding a `{{…}}` [placeholder](#template-references) is **not** checked here:
+its value exists only once the step has its context at run time. Neither is a
+literal in a sub-recipe, because validation covers the recipe it was given and
+does not walk the child graph (see
+[Literal validation and failure timing](#literal-validation-and-failure-timing)).
+A recipe can therefore validate and still fail a step on its launch values. See
+[Model Override](yaml-format.md#model-override-model) and the
+[Step context contract](step-context-contract.md#what-the-runner-validates).
+
 Unknown step fields are listed once, in the same wording a normal run uses, and the command still exits `0` because they are warnings. A normal run reports the same unknown fields as parse-time warnings and keeps going (see [Unknown and retired step fields](yaml-format.md#unknown-and-retired-step-fields)). `--validate-only` doesn't repeat them as parse-time warnings.
 
 ```bash
@@ -480,6 +502,8 @@ Directory where JSONL audit log files are written. Each recipe run produces one 
 
 By default a failure to create the log or write an entry is logged as a warning and the run continues. With `--require-audit` (which needs `--audit-dir`), a log that cannot be opened fails the run before any step runs, and an entry that cannot be written fails its step and stops the run.
 
+Each line is a step record. Agent steps may carry `context_mode`, `model` and `effort`; see [Step records](step-context-contract.md#step-records) for when each is written and when it is omitted.
+
 ```bash
 # Write audit logs to a directory
 recipe-runner-rs deploy.yaml --audit-dir ./audit-logs
@@ -508,11 +532,16 @@ recipe-runner-rs deploy.yaml
 recipe-runner-rs deploy.yaml --output-format json
 
 # Pipe JSON output to jq
-recipe-runner-rs deploy.yaml --output-format json | jq '.steps[] | select(.status == "failed")'
+recipe-runner-rs deploy.yaml --output-format json | jq '.step_results[] | select(.status == "failed")'
 
 # JSON output with progress on stderr
 recipe-runner-rs deploy.yaml --output-format json --progress 2>/dev/null
 ```
+
+The `step_results` array holds the same step records that [`--audit-dir`](#--audit-dir-dir) writes as JSONL,
+so an agent step may carry the optional `context_mode`, `model` and `effort` keys described under
+[Step records](step-context-contract.md#step-records). They are absent on steps they do not apply to, which
+keeps every other step's object unchanged.
 
 ## JSON recipe input
 

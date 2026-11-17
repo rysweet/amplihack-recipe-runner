@@ -3,7 +3,7 @@
 /// Parses YAML recipe definitions into Recipe model objects, with validation
 /// and step-type inference.
 use crate::discovery;
-use crate::models::{Recipe, StepType};
+use crate::models::{LaunchField, Recipe, StepContextMode, StepType, check_launch_value};
 use crate::runner::sub_recipe_paths::validate_recipe_references;
 use log::{debug, info};
 use serde::de::DeserializeOwned;
@@ -52,6 +52,8 @@ const KNOWN_STEP_FIELDS: &[&str] = &[
     "when_tags",
     "recovery_on_failure",
     "model",
+    "context_mode",
+    "effort",
 ];
 
 /// Step fields that were honoured by earlier executors and are now ignored,
@@ -165,6 +167,8 @@ impl RecipeParser {
                 )));
             }
         }
+
+        validate_step_launch_fields(&recipe)?;
 
         validate_recipe_references(&recipe).map_err(|error| ParseError::Invalid(error.message))?;
 
@@ -448,6 +452,82 @@ impl Default for RecipeParser {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Check the per-step launch declarations that the deserialiser cannot.
+///
+/// `context_mode` is read as a plain string so that this pass — which has the
+/// step in hand — can name the step that owns a bad value. A typed field would
+/// be rejected inside document decoding, which knows only a position in the
+/// YAML.
+///
+/// This fails closed on purpose: an unrecognised value is an error, not a
+/// warning. A typo must not quietly cost a step the saving it asked for, and
+/// there is no value meaning "the normal start" that a mistake could land on.
+///
+/// `effort` carries no vocabulary and no step-type restriction, exactly like
+/// `model`. Both are checked here for shape, but only where the recipe wrote
+/// the value out in full: a value holding a template placeholder is decided at
+/// run time against a context this pass has never seen, and a bash step's
+/// launch fields are never resolved at all. The rules themselves are
+/// [`crate::models::check_launch_value`], shared with the runner, so a literal
+/// this pass accepts is one the run accepts.
+fn validate_step_launch_fields(recipe: &Recipe) -> Result<(), ParseError> {
+    for step in &recipe.steps {
+        if let Some(declared) = step.context_mode.as_deref() {
+            if StepContextMode::parse(declared).is_none() {
+                return Err(ParseError::Invalid(format!(
+                    "Step '{}': context_mode '{}' is not recognised; the only accepted value is \
+                     '{}'",
+                    crate::models::diagnostic_identifier(&step.id),
+                    crate::models::diagnostic_identifier(declared),
+                    StepContextMode::MINIMAL
+                )));
+            }
+            if step.effective_type() != StepType::Agent {
+                return Err(ParseError::Invalid(format!(
+                    "Step '{}': context_mode is only valid on an agent step",
+                    crate::models::diagnostic_identifier(&step.id)
+                )));
+            }
+        }
+
+        // A bash step never reaches `ResolvedLaunch::resolve`, so its `model:`
+        // and `effort:` are inert. Checking them here would fail a recipe that
+        // runs perfectly well today.
+        if step.effective_type() == StepType::Bash {
+            continue;
+        }
+        for (field, raw) in [
+            (LaunchField::Model, step.model.as_deref()),
+            (LaunchField::Effort, step.effort.as_deref()),
+        ] {
+            let Some(raw) = raw else {
+                continue;
+            };
+            // Deferred, not exempt: what this renders to is checked at the
+            // step by the same predicate. `contains_template_expression` is
+            // backed by the regex `RecipeContext::render` substitutes with, so
+            // a value this skips is exactly a value rendering would change.
+            if crate::context::contains_template_expression(raw) {
+                continue;
+            }
+            // Rendering trims before it checks, so the rules must see the
+            // trimmed value here too. An empty result means absent, and the
+            // launcher's own default stands.
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            check_launch_value(field, trimmed).map_err(|reason| {
+                ParseError::Invalid(format!(
+                    "Step '{}': {reason}",
+                    crate::models::diagnostic_identifier(&step.id)
+                ))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Resolve recipe inheritance via the `extends` field, recursively.
@@ -1265,6 +1345,8 @@ steps:
             when_tags: vec!["t".into()],
             recovery_on_failure: true,
             model: Some("m".into()),
+            context_mode: Some("minimal".into()),
+            effort: Some("low".into()),
         };
         let json = serde_json::to_value(&step).unwrap();
         for key in json.as_object().unwrap().keys() {
