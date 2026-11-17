@@ -17,6 +17,120 @@ pub fn diagnostic_identifier(raw: &str) -> String {
     raw.escape_debug().collect()
 }
 
+/// Longest rendered `model:` or `effort:` accepted.
+///
+/// Both became template sinks with #219, and a template is fed from the recipe
+/// context — which carries earlier step output, agent output, parsed JSON and
+/// `--context-file` values. The model becomes an argv token, which the
+/// environment budget does not measure at all; the effort becomes an
+/// `AMPLIHACK_`-prefixed environment value, which that budget protects from
+/// eviction rather than drops. So neither is bounded anywhere else: without
+/// this cap an oversized value surfaces either as an opaque `E2BIG` from
+/// `execve` or as a budget error that stops the run. This is the one place
+/// both sinks are bounded.
+///
+/// The number is chosen to clear the longest identifier any provider
+/// publishes — a Bedrock inference-profile ARN runs to about 110 bytes — with
+/// room to spare, while staying far below both the kernel's per-string limit
+/// and the environment budget's floor. It bounds a sink; it does not express
+/// an opinion about what a model may be called.
+const MAX_LAUNCH_VALUE_BYTES: usize = 256;
+
+/// A character a display escape would hide: a control character such as NUL or
+/// ESC, or a format character such as the bidi override `U+202E`.
+///
+/// `char::escape_debug` escapes exactly this class, and it is the escape the
+/// crate's own diagnostics use. A rendered `model` or `effort`, though, also
+/// reaches the child process, the audit JSONL and the JSON step records
+/// unescaped, so for these two values the shape is rejected rather than
+/// escaped on the way out. The three characters `escape_debug` escapes for
+/// quoting reasons are not of this class and are excluded.
+fn hides_in_display(c: char) -> bool {
+    c.escape_debug().next() == Some('\\') && !matches!(c, '\\' | '\'' | '"')
+}
+
+/// Which of the two launch fields' rules [`check_launch_value`] applies.
+///
+/// The two fields do not carry the same rules — `model` becomes an argv token
+/// and so must not look like an option, while `effort` becomes an environment
+/// value — and the selector is an enum rather than a field name so that a
+/// rename or a typo cannot silently drop `model`'s extra rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LaunchField {
+    Model,
+    Effort,
+}
+
+impl LaunchField {
+    /// The field's spelling in a recipe, as it appears in a message.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Effort => "effort",
+        }
+    }
+}
+
+/// Check an already-trimmed launch value against the shape rules for `field`.
+///
+/// The one place the rules live, so the parse-time pass over a literal and the
+/// run-time pass over a rendered value cannot disagree about a value they both
+/// check. It holds no model vocabulary: amplihack-rs resolves tier words such
+/// as `fast` in its own launcher, and every provider spells its identifiers
+/// differently, so what is rejected here is a shape that could not reach the
+/// launcher intact, never a character some provider happens not to use.
+///
+/// The returned reason begins with the quoted field name, so a caller can
+/// prefix it — the runner says `rendered 'model' …`, the parser prefixes the
+/// step id. It never contains the value, which can carry a secret or a
+/// terminal escape sequence into stderr, a step record and a CI log. This
+/// function performs no I/O and no logging.
+pub(crate) fn check_launch_value(field: LaunchField, value: &str) -> Result<(), String> {
+    let name = field.name();
+
+    // First, so the cost of checking a hostile value is bounded by the cap
+    // rather than by the length of the input.
+    if value.len() > MAX_LAUNCH_VALUE_BYTES {
+        return Err(format!(
+            "'{name}' is {} bytes; the maximum is {MAX_LAUNCH_VALUE_BYTES}",
+            value.len()
+        ));
+    }
+
+    // The highest-severity rule of the set: `--add-dir` or
+    // `--dangerously-skip-permissions` would be read as an option and alter
+    // the child's privileges rather than its model.
+    if field == LaunchField::Model && value.starts_with('-') {
+        return Err(format!(
+            "'{name}' starts with '-', which the launcher would read as an option rather than a \
+             model name"
+        ));
+    }
+
+    // Covers NUL, which cannot be placed in an environment at all; ESC, which
+    // could otherwise carry a terminal escape sequence; and the format
+    // characters, of which a bidi override such as `U+202E` reverses the
+    // display of the audit JSONL and the JSON step records — the two surfaces
+    // that write these values unescaped.
+    if value.chars().any(hides_in_display) {
+        return Err(format!("'{name}' contains a control or format character"));
+    }
+
+    // Not an argv-splitting hazard: the runner passes the model as a single
+    // argv entry and performs no shell quoting, so a space survives inside it
+    // exactly as `$` or `;` would. The rule is conservatism about anything
+    // downstream that re-parses the value, together with the observation that
+    // no published identifier contains a space, so a value that has acquired
+    // one is more likely a mis-rendered template than a model name.
+    if field == LaunchField::Model && value.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "'{name}' contains whitespace, so it would not reach the launcher as a single word"
+        ));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StepType {
@@ -105,10 +219,12 @@ pub struct Step {
     /// Rendered against the recipe context before launch, so a recipe can
     /// choose a tier from a context variable or an earlier step's output. The
     /// runner holds no model vocabulary: the rendered value travels to the
-    /// launcher byte for byte, as a `--model` argument. It is never rewritten
-    /// — the only thing the runner does besides render and trim it is refuse
-    /// a shape that could not reach the launcher as one harmless argv token,
-    /// which fails the step rather than altering the value.
+    /// launcher byte for byte, as a single `--model` argument, with no shell
+    /// quoting anywhere on the way. It is never rewritten — the only thing
+    /// the runner does besides render and trim it is apply
+    /// [`check_launch_value`], which fails the step rather than altering the
+    /// value. A value written out in full is checked by the parser instead,
+    /// against the same rules.
     pub model: Option<String>,
     /// How much context the step is started with. The only accepted value is
     /// `minimal`, and only on an agent step; a step asks for the normal start

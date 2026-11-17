@@ -31,7 +31,7 @@ const CONTEXT: &str = "AMPLIHACK_STEP_CONTEXT";
 const EFFORT: &str = "AMPLIHACK_STEP_EFFORT";
 const STEP_ID: &str = "AMPLIHACK_STEP_ID";
 
-/// Mirrors the runner's private `MAX_LAUNCH_VALUE_BYTES`.
+/// Mirrors `crate::models`'s private `MAX_LAUNCH_VALUE_BYTES`.
 ///
 /// Kept as a literal rather than imported so that moving the cap without
 /// revisiting these tests fails the boundary test instead of passing silently.
@@ -211,9 +211,36 @@ fn step_error(out: &Output, step_id: &str) -> String {
     format!("{recorded}\n{}", String::from_utf8_lossy(&out.stderr))
 }
 
+/// The `--output-format json` record of `step_id`.
+fn step_record(out: &Output, step_id: &str) -> serde_json::Value {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout[stdout.find('{').expect("JSON result")..])
+            .unwrap_or_else(|e| panic!("no JSON result: {e}\n{stdout}"));
+    json["step_results"]
+        .as_array()
+        .expect("step_results array")
+        .iter()
+        .find(|r| r["step_id"] == step_id)
+        .unwrap_or_else(|| panic!("no record for step {step_id}: {json}"))
+        .clone()
+}
+
 /// A single agent step, with whatever extra fields the test needs.
 fn one_agent_step(extra: &str) -> String {
     format!("name: contract\nsteps:\n  - id: solo\n    type: agent\n    prompt: hello\n{extra}")
+}
+
+/// A single agent step whose `effort:` is `chosen`, rendered from the context.
+///
+/// The shape rules apply to both surfaces, so a value written out in full is
+/// reported by the parser before any step runs. A test of the run-time rule
+/// has to reach the step, which means the value must arrive through a
+/// template the parser cannot resolve.
+fn templated_effort(value: &str) -> String {
+    format!(
+        "name: contract\ncontext:\n  chosen: \"{value}\"\nsteps:\n  - id: solo\n    type: agent\n    prompt: hello\n    effort: \"{{{{chosen}}}}\"\n"
+    )
 }
 
 // ── the context variable ───────────────────────────────────────────────────
@@ -642,6 +669,32 @@ fn a_recipe_step_resolves_its_model_even_when_recovery_never_fires() {
     );
 }
 
+#[test]
+fn a_recipe_step_accepts_the_launchers_own_default_model() {
+    // The other half of the same path. A `type: recipe` step resolves its
+    // model even where no agent is ever launched, so a shape rule that
+    // rejected `claude-opus-5[1m]` failed a sub-recipe step that would
+    // otherwise have run to completion — on a value that is amplihack's own
+    // default. Nothing is launched here, so the claim is on the step record
+    // rather than on an argument vector.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("recipes")).unwrap();
+    std::fs::write(
+        dir.path().join("recipes").join("child.yaml"),
+        "name: child\nsteps:\n  - id: works\n    type: bash\n    command: \"true\"\n",
+    )
+    .unwrap();
+    let yaml = "name: contract\nsteps:\n  - id: delegate\n    type: recipe\n    recipe: child\n    model: \"claude-opus-5[1m]\"\n";
+    let out = run_recipe(dir.path(), yaml, &["--recipe-dir", "recipes"], &[]);
+    assert_ran(&out);
+    assert_eq!(
+        step_record(&out, "delegate")["model"].as_str(),
+        Some("claude-opus-5[1m]"),
+        "the recipe step records the model it resolved, unchanged: {}",
+        combined(&out)
+    );
+}
+
 // ── the step id ────────────────────────────────────────────────────────────
 
 #[test]
@@ -771,14 +824,14 @@ fn an_oversized_effort_fails_the_step_before_the_spawn() {
     // The value is inserted after the inherited-value length filter, and the
     // `AMPLIHACK_` prefix protects it from budget eviction, so an unbounded
     // value would stop the spawn with an opaque budget error instead.
+    //
+    // Routed through the context, so this is the run-time rule being tested
+    // and not the parser's pass over literals. The literal case is in
+    // `tests/step_context_surface_tests.rs`, where it is reported before any
+    // step runs.
     let dir = tempfile::tempdir().unwrap();
     let long = "e".repeat(MAX_LAUNCH_VALUE_BYTES + 1);
-    let out = run_recipe(
-        dir.path(),
-        &one_agent_step(&format!("    effort: \"{long}\"\n")),
-        &[],
-        &[],
-    );
+    let out = run_recipe(dir.path(), &templated_effort(&long), &[], &[]);
     assert!(!out.status.success(), "an oversized effort must fail loud");
     let text = step_error(&out, "solo");
     assert!(text.contains("solo"), "the message names the step: {text}");
@@ -862,12 +915,7 @@ fn an_effort_carrying_a_control_or_format_character_fails_the_step() {
         ("bidi isolate", "lo\\u2066high"),
     ] {
         let dir = tempfile::tempdir().unwrap();
-        let out = run_recipe(
-            dir.path(),
-            &one_agent_step(&format!("    effort: \"{value}\"\n")),
-            &[],
-            &[],
-        );
+        let out = run_recipe(dir.path(), &templated_effort(value), &[], &[]);
         assert!(!out.status.success(), "{case}: {}", combined(&out));
         let text = step_error(&out, "solo");
         assert!(
@@ -999,6 +1047,13 @@ fn every_published_model_identifier_reaches_the_launcher_unchanged() {
     // spelling some provider already ships. Every value below but the last is
     // an identifier form a provider publishes today; the last is constructed,
     // and stands for the separator a provider has not used yet.
+    //
+    // The two bracketed forms are the case that proves the point. Claude Code
+    // accepts a context-window suffix, and `claude-opus-5[1m]` is amplihack's
+    // own default model, so a character list that rejected `[` and `]` made
+    // the runner unable to launch the launcher's default. The value reaches
+    // the launcher as one argv entry and never passes through a shell, which
+    // is what the argv assertion below records.
     for (case, model) in [
         ("tier word", "fast"),
         ("anthropic api", "claude-opus-4-5-20251101"),
@@ -1013,6 +1068,8 @@ fn every_published_model_identifier_reaches_the_launcher_unchanged() {
         ),
         ("namespaced tag", "anthropic/claude:latest"),
         ("local quantisation tag", "llama3.1:8b-instruct-q4_K_M"),
+        ("context-window suffix", "opus[1m]"),
+        ("amplihack default model", "claude-opus-5[1m]"),
         ("constructed: plus separator", "vendor-model+variant"),
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -1041,13 +1098,16 @@ fn each_model_shape_rule_fails_the_step_on_its_own() {
     // One value per rule, each tripping exactly one of them, so a failure
     // names the rule that broke rather than the composite. Every message must
     // name the field, and none may echo the value.
+    //
+    // Three rules, three values. Shell metacharacters are not among them: they
+    // are inert in an argument vector, and the list that rejected them also
+    // rejected `claude-opus-5[1m]`. Whitespace stays because a value that has
+    // acquired a space is more likely a mis-rendered template than a model
+    // name, and because no published identifier contains one. The leading
+    // hyphen keeps its own case above, in
+    // `a_model_that_renders_to_a_flag_fails_the_step`.
     for (case, tier) in [
         ("space", "haiku --allow-all-tools"),
-        ("command separator", "haiku;id"),
-        ("command substitution", "haiku$(id)"),
-        ("pipe", "haiku|id"),
-        ("backtick", "haiku`id`"),
-        ("glob", "haiku*"),
         ("escape character", "hai\\u001bku"),
         ("bidi override", "hai\\u202Eku"),
     ] {
@@ -1081,12 +1141,10 @@ fn each_model_shape_rule_fails_the_step_on_its_own() {
 fn an_oversized_model_fails_the_step() {
     let dir = tempfile::tempdir().unwrap();
     let long = "m".repeat(MAX_LAUNCH_VALUE_BYTES + 1);
-    let out = run_recipe(
-        dir.path(),
-        &one_agent_step(&format!("    model: {long}\n")),
-        &[],
-        &[],
+    let yaml = format!(
+        "name: contract\ncontext:\n  tier: \"{long}\"\nsteps:\n  - id: solo\n    type: agent\n    prompt: hello\n    model: \"{{{{tier}}}}\"\n"
     );
+    let out = run_recipe(dir.path(), &yaml, &[], &[]);
     assert!(!out.status.success(), "{}", combined(&out));
     let text = step_error(&out, "solo");
     assert!(

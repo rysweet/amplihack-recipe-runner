@@ -19,8 +19,8 @@ use crate::agent_resolver::{AgentResolveError, AgentResolver};
 use crate::context::RecipeContext;
 use crate::discovery;
 use crate::models::{
-    Recipe, RecipeResult, Step, StepContextMode, StepExecutionError, StepResult, StepStatus,
-    StepType, diagnostic_identifier,
+    LaunchField, Recipe, RecipeResult, Step, StepContextMode, StepExecutionError, StepResult,
+    StepStatus, StepType, check_launch_value, diagnostic_identifier,
 };
 use crate::parser::{RecipeParser, resolve_extends};
 use log::{error, info, warn};
@@ -42,47 +42,6 @@ const MAX_PARALLEL_STEPS: usize = 50;
 
 /// Maximum size of step output stored in memory (10 MB).
 pub const MAX_STEP_OUTPUT_BYTES: usize = 10_000_000;
-
-/// Longest rendered `model:` or `effort:` accepted.
-///
-/// Both became template sinks with #219, and a template is fed from the recipe
-/// context — which carries earlier step output, agent output, parsed JSON and
-/// `--context-file` values. The model becomes an argv token, which `bounded_env`
-/// does not measure at all; the effort becomes an `AMPLIHACK_`-prefixed
-/// environment value, which that budget protects from eviction rather than
-/// drops. So neither is bounded anywhere else: without this cap an oversized
-/// value surfaces either as an opaque `E2BIG` from `execve` or as a budget
-/// error that stops the run. This is the one place both sinks are bounded.
-///
-/// The number is chosen to clear the longest identifier any provider
-/// publishes — a Bedrock inference-profile ARN runs to about 110 bytes — with
-/// room to spare, while staying far below both the kernel's per-string limit
-/// and the environment budget's floor. It bounds a sink; it does not express
-/// an opinion about what a model may be called.
-const MAX_LAUNCH_VALUE_BYTES: usize = 256;
-
-/// Characters rejected in a rendered `model` because they would stop it being
-/// a single word if anything downstream of the spawn reached a shell.
-///
-/// The runner itself passes the value as one argv token and never through a
-/// shell, so this guards a parser it neither controls nor inspects. It is a
-/// list of dangerous shapes rather than a model vocabulary: every character a
-/// published identifier uses passes, including Vertex AI's `@` version
-/// separator and the `:` and `/` of a Bedrock inference-profile ARN.
-const MODEL_SHELL_METACHARACTERS: &str = "\\\"'`$;&|<>()[]{}*?!#~";
-
-/// A character a display escape would hide: a control character such as NUL or
-/// ESC, or a format character such as the bidi override `U+202E`.
-///
-/// `char::escape_debug` escapes exactly this class, and it is the escape the
-/// crate's own diagnostics use. A rendered `model` or `effort`, though, also
-/// reaches the child process, the audit JSONL and the JSON step records
-/// unescaped, so for these two values the shape is refused rather than escaped
-/// on the way out. The three characters `escape_debug` escapes for quoting
-/// reasons are not of this class and are excluded.
-fn hides_in_display(c: char) -> bool {
-    c.escape_debug().next() == Some('\\') && !matches!(c, '\\' | '\'' | '"')
-}
 
 /// A step's launch parameters, rendered once and checked once.
 ///
@@ -111,8 +70,11 @@ impl ResolvedLaunch {
     /// Resolve a step's model, effort and context mode against `ctx`.
     ///
     /// Fails the step when a rendered value could not reach an argument vector
-    /// or an environment safely. The message names the field; the step id is
-    /// already in `StepExecutionError`'s `Display`. It never echoes the
+    /// or an environment safely. The rules themselves live in
+    /// [`crate::models::check_launch_value`], shared with the parser's pass
+    /// over literal values so that the two surfaces cannot apply different
+    /// rules to a value they both check. The message names the field; the step
+    /// id is already in `StepExecutionError`'s `Display`. It never echoes the
     /// rejected value, which can carry a secret or a terminal escape sequence
     /// into stderr, the recorded step error and a CI log.
     fn resolve(step: &Step, ctx: &RecipeContext) -> Result<Self, StepExecutionError> {
@@ -121,68 +83,21 @@ impl ResolvedLaunch {
             message,
         };
 
-        // Shared by both sinks: render, trim, and bound the length. Neither
-        // sink is bounded anywhere else, so this is the one place it happens.
-        let bounded = |field: &str, raw: Option<&str>| {
-            let value = render_launch_value(raw, ctx);
-            match value.as_deref() {
-                Some(v) if v.len() > MAX_LAUNCH_VALUE_BYTES => Err(reject(format!(
-                    "rendered '{field}' is {} bytes; the maximum is {MAX_LAUNCH_VALUE_BYTES}",
-                    v.len()
-                ))),
-                _ => Ok(value),
-            }
-        };
+        // Render, trim, then check. `check_launch_value` reports against the
+        // quoted field name, so prefixing `rendered` names the value the rules
+        // actually saw rather than the one the recipe wrote.
+        let checked =
+            |field: LaunchField, raw: Option<&str>| -> Result<Option<String>, StepExecutionError> {
+                let value = render_launch_value(raw, ctx);
+                if let Some(v) = value.as_deref() {
+                    check_launch_value(field, v)
+                        .map_err(|reason| reject(format!("rendered {reason}")))?;
+                }
+                Ok(value)
+            };
 
-        let model = bounded("model", step.model.as_deref())?;
-        if let Some(model) = model.as_deref() {
-            if model.starts_with('-') {
-                return Err(reject(
-                    "rendered 'model' starts with '-', which the launcher would read as an \
-                     option rather than a model name"
-                        .to_string(),
-                ));
-            }
-            // Opaque in meaning, constrained in shape. The runner holds no
-            // model vocabulary — amplihack-rs resolves tier words like `fast`
-            // in its own launcher, and every provider spells its identifiers
-            // differently — so what is rejected here is a shape that could
-            // stop being one harmless word, never a character some provider
-            // happens not to use.
-            if model.chars().any(hides_in_display) {
-                return Err(reject(
-                    "rendered 'model' contains a control or format character".to_string(),
-                ));
-            }
-            if let Some(bad) = model
-                .chars()
-                .find(|c| c.is_whitespace() || MODEL_SHELL_METACHARACTERS.contains(*c))
-            {
-                return Err(reject(format!(
-                    "rendered 'model' contains {}, so it would not reach the launcher as a \
-                     single word",
-                    if bad.is_whitespace() {
-                        "whitespace"
-                    } else {
-                        "a shell metacharacter"
-                    }
-                )));
-            }
-        }
-
-        let effort = bounded("effort", step.effort.as_deref())?;
-        if let Some(effort) = effort.as_deref() {
-            // Covers NUL, which cannot be placed in an environment at all; ESC,
-            // which could otherwise carry a terminal escape sequence; and the
-            // format characters, of which a bidi override such as `U+202E`
-            // reverses the display of the audit JSONL and the JSON step
-            // records — the two surfaces that write this value unescaped.
-            if effort.chars().any(hides_in_display) {
-                return Err(reject(
-                    "rendered 'effort' contains a control or format character".to_string(),
-                ));
-            }
-        }
+        let model = checked(LaunchField::Model, step.model.as_deref())?;
+        let effort = checked(LaunchField::Effort, step.effort.as_deref())?;
 
         Ok(Self {
             model,
