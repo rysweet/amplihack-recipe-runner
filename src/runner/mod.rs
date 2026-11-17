@@ -78,11 +78,6 @@ impl ResolvedLaunch {
     /// rejected value, which can carry a secret or a terminal escape sequence
     /// into stderr, the recorded step error and a CI log.
     fn resolve(step: &Step, ctx: &RecipeContext) -> Result<Self, StepExecutionError> {
-        let reject = |message: String| StepExecutionError {
-            step_id: step.id.clone(),
-            message,
-        };
-
         // Render, trim, then check. `check_launch_value` reports against the
         // quoted field name, so prefixing `rendered` names the value the rules
         // actually saw rather than the one the recipe wrote.
@@ -90,8 +85,10 @@ impl ResolvedLaunch {
             |field: LaunchField, raw: Option<&str>| -> Result<Option<String>, StepExecutionError> {
                 let value = render_launch_value(raw, ctx);
                 if let Some(v) = value.as_deref() {
-                    check_launch_value(field, v)
-                        .map_err(|reason| reject(format!("rendered {reason}")))?;
+                    check_launch_value(field, v).map_err(|reason| StepExecutionError {
+                        step_id: step.id.clone(),
+                        message: format!("rendered {reason}"),
+                    })?;
                 }
                 Ok(value)
             };
