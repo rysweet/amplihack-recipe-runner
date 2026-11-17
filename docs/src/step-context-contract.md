@@ -293,10 +293,10 @@ something outside the recipe would arrive. A literal in a sub-recipe is not
 reached either, for the reason above. A recipe that validates can still fail a
 step on its launch values.
 
-A step that would never have executed can now fail a recipe. A step skipped by
-its `when:` condition previously carried an unusable literal `model:` to the end
-of a successful run, because nothing ever resolved it; the recipe is now
-rejected before any of its steps run. Such a value could not have launched
+A step that would never have executed can now fail a recipe. A step filtered out
+by its `when_tags` previously carried an unusable literal `model:` to the end of
+a successful run, because nothing ever resolved it; the recipe is now rejected
+before any of its steps run. Such a value could not have launched
 anything had the step been reached, but the run that used to pass does not pass
 any more.
 
