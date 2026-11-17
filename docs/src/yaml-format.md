@@ -337,15 +337,29 @@ misspelled variable name falls back to the default rather than failing. Watch
 the render warning in the log if a model override appears not to take effect.
 
 The runner does not check that the model exists, and holds no list of model
-names. It checks only that the string is safe to place on a command line: no
-leading `-`, no whitespace or shell metacharacter, no control or format
-character, at most 256 bytes. Every identifier a provider publishes passes,
-including Vertex AI's `claude-sonnet-4-5@20250929`, a Bedrock
-`us.anthropic.claude-sonnet-4-5-v1:0` or inference-profile ARN, and a tier word.
-A value failing the check fails the step rather than quietly falling back, and
-the message names the step and the field without echoing the value. Because
-`model` becomes an argv token, and argv is readable by other local processes, do
-not render a secret into it.
+names. It checks four things about the trimmed string: no leading `-`, no
+whitespace, no control or format character, at most 256 bytes. The leading
+hyphen would be read as an option by the launcher's own argument parser. The
+whitespace rule is a conservative one rather than a necessity: the value is
+passed as a single element of an argument vector and never through a shell, so a
+space survives inside it just as `$`, `;` and `[` do, but no published model
+identifier contains one, and anything downstream that re-parses the value would
+split it where the argument vector does not. Shell metacharacters are inert here
+and are **not** rejected. Every identifier in use passes unchanged, including
+Vertex AI's `claude-sonnet-4-5@20250929`, a Bedrock
+`us.anthropic.claude-sonnet-4-5-v1:0` or inference-profile ARN, a tier word, and
+a context-window suffix such as `opus[1m]` or `claude-opus-5[1m]`.
+
+Where the recipe writes the model out in full, that check runs on the trimmed
+value as the recipe is read, so
+[`--validate-only`](cli-reference.md#--validate-only) reports a value that could
+never have launched anything and the run does not start. Where the value holds a
+`{{…}}` [placeholder](cli-reference.md#template-references), its final form is
+not known until the step has its context, and the check runs there instead.
+Either way a failing value fails loudly rather than quietly falling back to the
+launcher's default, and the message names the step and the field without echoing
+the value. Because `model` becomes an argv token, and argv is readable by other
+local processes, do not render a secret into it.
 
 Where amplihack's launcher accepts tier words such as `fast`, `standard` and
 `strong`, they travel in this same `model` field. The runner passes them through
@@ -432,11 +446,20 @@ absent when it renders to nothing. It reaches the agent as
 `AMPLIHACK_STEP_EFFORT`.
 
 The runner holds no vocabulary for the field, because accepted values differ per
-harness. It checks only that the value is at most 256 bytes and free of control
-and format characters — NUL and ESC, and the bidi overrides that would reverse
-the display of a record written from it — then passes it through. A value failing that check fails the
-step, as an unusable `model` does, rather than being dropped. A value the
-launcher does not recognise is the launcher's concern, not a recipe error.
+harness. It checks only that the trimmed value is at most 256 bytes and free of
+control and format characters — NUL and ESC, and the bidi overrides that would
+reverse the display of a record written from it — then passes it through. As
+with `model`, a value written out in full is checked as the recipe is read and a
+value holding a `{{…}}` [placeholder](cli-reference.md#template-references) when
+the step resolves. A value failing that check fails, as an unusable `model`
+does, rather than being dropped. A value the launcher does not recognise is the
+launcher's concern, not a recipe error.
+
+Where a step's `model:` names a tier, that tier already implies an effort, and
+amplihack's launcher uses `effort:` as the override for the one it implies. The
+[precedence in full](step-context-contract.md#amplihack_step_effort) is the
+launcher's, not the runner's: the runner reads no tier word out of `model:` and
+derives nothing.
 
 `effort` is accepted on any step, exactly as `model` is, and ignored where no
 agent is launched. A recipe step with `recovery_on_failure: true` does launch an
@@ -453,7 +476,9 @@ start that only an agent launch can have.
 Silently unused means *entirely* unused. On a **bash step** — the one type that
 can never launch an agent — neither field is rendered, checked or recorded, so
 a `model:` or `effort:` that would fail an agent step cannot fail a bash step
-and does not appear in its [record](step-context-contract.md#step-records). On
+and does not appear in its [record](step-context-contract.md#step-records). The
+parse-time check keeps that exemption, so a bash step carrying such a value
+validates as it always has. On
 a recipe step the fields are resolved, because its recovery launch needs them,
 and the length and character checks above apply.
 

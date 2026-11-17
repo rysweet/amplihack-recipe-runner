@@ -2,7 +2,7 @@
 title: Step context contract
 description: The environment variables the runner sets on an agent child so a launcher can start a step lightweight.
 doc_type: reference
-last_updated: 2026-11-16
+last_updated: 2026-11-17
 ---
 
 # Step context contract
@@ -99,14 +99,27 @@ and amplihack owns the mapping, so the runner renders the step's `effort` field,
 trims it, treats an empty result as absent, and passes the rest through
 unchanged.
 
-**Precedence.** amplihack-rs
-[#2722](https://github.com/rysweet/amplihack-rs/pull/2722) derives a reasoning
-effort from a tier word in the step's `model:` field. Where both a tier-derived
-effort and `AMPLIHACK_STEP_EFFORT` are available, the environment variable is an
-explicit per-step request and should win; absent the variable, the tier's effort
-stands. The runner sets the variable only when the step declares a non-empty
-rendered `effort`, so the two sources never both carry a value by accident. The
-precedence itself is implemented in amplihack's launcher, not here.
+**Precedence.** A tier word in the step's `model:` field is the normal way a
+recipe chooses a step's reasoning effort. amplihack-rs
+[#2722](https://github.com/rysweet/amplihack-rs/pull/2722) derives an effort
+from the tier, so a step declaring `model: fast` already carries one and need
+say nothing further. `effort:` is the override, for a step wanting an effort
+other than the one its tier implies, or whose model names no tier at all.
+
+amplihack's launcher applies the three sources in this order, and the first that
+holds a value decides the step:
+
+1. `AMPLIHACK_STEP_EFFORT`, where it is set and non-empty.
+2. The effort implied by a tier word in the model string, where the model names
+   a tier.
+3. The harness's own default.
+
+The runner sets the variable only when the step declares an `effort` that
+renders to something non-empty, so the first source is skipped exactly when the
+recipe asked for no override and the tier's own effort stands. The order is
+implemented in amplihack's launcher, not here. The runner's share is to pass
+both fields through unchanged and to derive nothing: it never reads a tier word
+out of `model:`, and it never synthesises an effort.
 
 ### `AMPLIHACK_STEP_ID`
 
@@ -187,9 +200,9 @@ same moment, and they do not all fail the same thing.
 
 | Field | Checked | When it fails |
 |-------|---------|---------------|
-| `context_mode` | Must be exactly `minimal`, and only on an agent step. | At parse, beside the existing non-empty-id and duplicate-id checks: the recipe is rejected and no step runs. |
-| `model` | Rendered, trimmed, empty treated as absent. No leading `-`, no whitespace or shell metacharacter, no control or format character, at most 256 bytes. | At resolution, when the step is about to launch: the step fails, naming the step and the field. Earlier steps have already run. |
-| `effort` | Rendered, trimmed, empty treated as absent. No control or format characters, at most 256 bytes. | At resolution, as for `model`. |
+| `context_mode` | Must be exactly `minimal`, and only on an agent step. | At parse, beside the existing non-empty-id and duplicate-id checks: the recipe is rejected and none of its steps run. |
+| `model` | Rendered, trimmed, empty treated as absent. No leading `-`, no whitespace, no control or format character, at most 256 bytes. | At parse where the recipe writes the value out in full, after trimming: the recipe is rejected and none of its steps run. At resolution, when the step is about to launch, where the value holds a template placeholder: the step fails and earlier steps have already run. |
+| `effort` | Rendered, trimmed, empty treated as absent. No control or format characters, at most 256 bytes. | As for `model`. |
 
 Nothing beyond shape is checked. The runner does not know whether a model
 exists, whether the harness supports it, whether a tier word is current, or
@@ -198,16 +211,94 @@ amplihack, which already crosses every model string it can emit through one
 validator. A second vocabulary here would contradict having one way to choose a
 step's model.
 
-`model` and `effort` are templates, so their final values exist only once a step
-has its context; a check any earlier would be checking the template rather than
-the value. `context_mode` is a literal with a closed set of values, so it is
-checked where the parser already checks every other property of a step. A step
-whose `model` or `effort` fails its check does **not** fall back to the
-launcher's default — a template defect is loud rather than silent.
+`model` and `effort` are templates, so a value holding a placeholder has no
+final form until the step has its context; a check any earlier would be checking
+the template rather than the value. A value holding no placeholder is already
+its own final form, and is checked where the parser checks every other property
+of a step, as `context_mode` is. Wherever the check runs, a step whose `model`
+or `effort` fails it does **not** fall back to the launcher's default — a
+defect in either field is loud rather than silent.
 
 The error message for a rejected `model` or `effort` names the step and the
 field and does **not** echo the rejected value, which may carry a secret or a
-terminal escape sequence into stderr, the audit log and a CI log.
+terminal escape sequence into stderr, the audit log and a CI log. That holds on
+both surfaces. The two messages differ only in their frame: the run-time one
+describes the value as `rendered`, and the parse-time one prefixes the step id,
+because at parse there is no `StepExecutionError` to carry it.
+
+### A literal `model` or `effort` is checked when the recipe is read
+
+Where `model:` or `effort:` holds no template placeholder, the value the step
+would launch with is already known as the recipe is read, so the shape rules
+above run there as well. What counts as a placeholder is the
+[template grammar](cli-reference.md#template-references) the rest of the runner
+uses — double braces around ASCII letters, digits, underscores, dots or hyphens,
+with no spaces inside the braces. A value that merely looks templated does not
+qualify: `model: "{{ review_model }}"` has spaces inside its braces, so it is
+not a placeholder, nothing will ever substitute it, and it is now rejected at
+parse for the whitespace it contains.
+
+The parser checks the literal **after trimming it**, which is what the runner
+checks at resolution. `model: " haiku"` is `haiku` on both surfaces: it passes
+at parse and launches at run time, rather than being rejected at parse for
+leading whitespace the runner would have removed anyway. Rejected values look
+like this:
+
+```text
+Error: Failed to parse recipe: Invalid recipe: Step 'classify': 'model' starts with '-', which the launcher would read as an option rather than a model name
+```
+
+```text
+Error: Failed to parse recipe: Invalid recipe: Step 'classify': 'effort' is 257 bytes; the maximum is 256
+```
+
+Both exit `2`, from a normal run and from
+[`--validate-only`](cli-reference.md#--validate-only) alike, and none of that
+recipe's steps run. The gain is that a value which could never have launched anything is reported
+before any step of **that recipe** runs, rather than halfway through it with
+every earlier step already done and its side effects already taken. The scope is
+the recipe being read, not the whole run: parsing does not walk the sub-recipe
+graph, so a bad literal in a child is found when the child is loaded, with the
+parent's earlier steps already complete. That is the same boundary
+[literal validation and failure timing](cli-reference.md#literal-validation-and-failure-timing)
+describes for sub-recipe names.
+
+Three kinds of value are exempt from the parse-time pass, and they are exempt
+for different reasons:
+
+- **A value holding a placeholder is deferred, not exempted.** `model:
+  "{{review_model}}"` has no final form until the step has its context, and the
+  parser does not have that context. It is checked at resolution, as it always
+  has been, so it is checked exactly once either way.
+- **Anything on a bash step is never checked at all.** A bash step launches no
+  agent and resolves no launch, so its `model:` and `effort:` are inert at run
+  time and the resolution-time check never sees them. The parse-time pass skips
+  them for the same reason, which is what keeps a recipe carrying an unusable
+  value on a bash step from being rejected tomorrow.
+- **A value that trims to empty is never checked at all.** Empty means absent on
+  both surfaces, so there is no launch value to have a shape, and the launcher's
+  own default stands.
+
+Both surfaces run the same rules from the same code, so they cannot apply
+different rules to a value they both check. They do not check the same set of
+values: the parse pass adds the two exemptions above, which the runner does not
+need, because the runner never reaches those values in the first place.
+
+This narrows what `--validate-only` can promise rather than widening it. It
+certifies the launch values written out in full **by the recipe it was given**.
+A templated `model:` or `effort:` is still decided at run time against context
+the validator never sees — context fed by earlier step output, agent output,
+parsed JSON, `--context-file` and `--set` — and that is where a value shaped by
+something outside the recipe would arrive. A literal in a sub-recipe is not
+reached either, for the reason above. A recipe that validates can still fail a
+step on its launch values.
+
+A step that would never have executed can now fail a recipe. A step skipped by
+its `when:` condition previously carried an unusable literal `model:` to the end
+of a successful run, because nothing ever resolved it; the recipe is now
+rejected before any of its steps run. Such a value could not have launched
+anything had the step been reached, but the run that used to pass does not pass
+any more.
 
 ### A rejected `context_mode` names the step
 
@@ -233,18 +324,38 @@ so can never hold a value a template dragged in from somewhere else.
 The shape rules on `model` exist only because the value becomes its own argv
 token after `--model`. A value rendering to `--add-dir` or `--allow-all-tools`
 would be read as a flag by the downstream launcher's argument parser, which this
-runner neither controls nor inspects — hence the leading-hyphen rule. For the
-same reason the value must stay one word: the runner passes it as a single argv
-token and never through a shell, but it cannot inspect what the launcher does
-with it, so whitespace and the shell metacharacters are refused as well.
+runner neither controls nor inspects — hence the leading-hyphen rule.
+
+The whitespace rule rests on something weaker, and the distinction matters. The
+runner spawns the launcher with an argument vector and performs **no
+shell quoting**, so nothing stands between the recipe's value and the child's
+`argv[n]`: each argument becomes one `argv` element, and a space inside the
+value survives there intact, exactly as `$`, `;`, `|` or a backtick does.
+Whitespace is therefore not an argv-splitting hazard, and the rule is not
+claiming it is. It is conservatism about what happens further downstream: a
+launcher that interpolates the value into a shell string, writes it to a config
+file, or logs it into a whitespace-separated field will split it where the
+argument vector does not, and no published model identifier — tier word, Vertex
+AI name, Bedrock ARN, context-window suffix — contains a space. A value that has
+acquired one is far more likely a template that rendered two values together, or
+a stray newline, than a model anyone meant to launch.
+
+Whitespace is the whole of that second rule: the metacharacters are not rejected
+alongside it. An earlier draft refused a list of them all the same, and the list
+rejected identifiers that are in use. `[` and `]` are how Claude Code spells a
+context-window suffix, so `opus[1m]` was refused, and so was `claude-opus-5[1m]`,
+which is amplihack's own default model. The list is gone. Quoting belongs to
+whichever downstream component reaches a shell; no part of this crate reaches
+one on its behalf, so none of it can quote on that component's behalf either.
 
 What the rules deliberately do **not** do is enumerate the characters a model
 name may use. The runner holds no model vocabulary, so an allowlist here would
 be the runner legislating a spelling it does not know: an earlier draft of this
 rule accepted `A-Z a-z 0-9 . _ : / + -` and so rejected
 `claude-sonnet-4-5@20250929`, the documented Vertex AI form. The rules name
-dangerous shapes instead, and every identifier a provider publishes — Vertex's
-`@` separator, a Bedrock inference-profile ARN, a tier word — passes unchanged.
+dangerous shapes instead, and every identifier in use — Vertex's `@` separator,
+a Bedrock inference-profile ARN, a tier word, the `[1m]` context-window suffix
+— passes unchanged.
 A character outside the rules is refused loudly, naming the step and the field,
 rather than being rewritten or dropped.
 
@@ -428,8 +539,15 @@ from the contract, and `--model strong` on argv. Its record contains
 
 `fast` and `strong` are tier words resolved by amplihack's launcher, not by the
 runner. The runner renders the field, trims it, and passes the result through
-byte for byte, so a literal model identifier such as `haiku` behaves the same
-way.
+byte for byte, so a literal model identifier behaves the same way — `haiku`,
+Vertex AI's `claude-sonnet-4-5@20250929`, or a context-window suffix such as
+`claude-opus-5[1m]`, which reaches the launcher as one argv token with its
+brackets intact.
+
+The two steps also show the effort precedence. `classify` sets
+`AMPLIHACK_STEP_EFFORT=low`, which the launcher prefers over whatever effort the
+`fast` tier would have implied. `review` declares no `effort`, so no variable is
+set and the effort implied by `strong` stands.
 
 ## Related
 

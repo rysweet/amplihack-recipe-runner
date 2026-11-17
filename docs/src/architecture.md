@@ -154,7 +154,19 @@ invocations fail before execution or update effects. See the
    `Step::effective_type()`.
 3. Structural validation: name must be non-empty, at least one step required,
    step IDs must be unique.
-4. Unknown step fields are reported, never rejected. Once the size, anchor and
+4. Launch-field validation (`validate_step_launch_fields`): `context_mode` must
+   be `minimal` and must sit on an agent step, and a `model:` or `effort:`
+   carrying no template placeholder is trimmed and put through the same shape
+   rules the runner applies at resolution. The rules themselves live in one
+   place, `models::check_launch_value`, which both this pass and
+   `ResolvedLaunch::resolve` call, so the two surfaces cannot apply different
+   rules to a value they both check. Which values each surface checks does
+   differ: this pass skips bash steps and values holding a placeholder, neither
+   of which the runner reaches here — a bash step resolves no launch at all,
+   and a placeholder is checked once its context exists. The pass covers the
+   recipe being parsed, not the sub-recipe graph. See
+   [What the runner validates](step-context-contract.md#what-the-runner-validates).
+5. Unknown step fields are reported, never rejected. Once the size, anchor and
    structural checks pass, `parse()` re-reads the YAML as a `serde_yaml::Value`
    and checks each step's keys against `KNOWN_STEP_FIELDS`. It emits one
    warning per unknown key (`recipe '<name>': step '<id>' has unknown field
@@ -743,6 +755,14 @@ attacks.
   duplicate step IDs.
 - **Unknown field warnings**: Unknown top-level and step-level fields trigger
   warnings and are otherwise ignored. No correction is suggested.
+- **Launch-field shape**: A `model:` or `effort:` written without a template
+  placeholder is trimmed and rejected here when it could never reach an argument
+  vector or an environment — leading `-`, whitespace, control or format
+  characters, over 256 bytes. The message names the step and the field and never
+  echoes the value, which may carry a secret or an escape sequence into a CI
+  log. The whitespace rule is conservatism about downstream re-parsing rather
+  than an argv constraint; shell metacharacters are inert in an argument vector
+  and are not rejected.
 
 ### Subprocess Isolation (cli_subprocess.rs)
 
