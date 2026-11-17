@@ -201,7 +201,7 @@ same moment, and they do not all fail the same thing.
 | Field | Checked | When it fails |
 |-------|---------|---------------|
 | `context_mode` | Must be exactly `minimal`, and only on an agent step. | At parse, beside the existing non-empty-id and duplicate-id checks: the recipe is rejected and none of its steps run. |
-| `model` | Rendered, trimmed, empty treated as absent. No leading `-`, no whitespace, no control or format character, at most 256 bytes. | At parse where the recipe writes the value out in full, after trimming: the recipe is rejected and none of its steps run. At resolution, when the step is about to launch, where the value holds a template placeholder: the step fails and earlier steps have already run. |
+| `model` | Rendered, trimmed, empty treated as absent. No leading `-`, no whitespace, no control or format character, at most 256 bytes. | At parse, where the recipe writes the value out in full, after trimming: the recipe is rejected and none of its steps run. The same check runs again at resolution, when the step is about to launch; for a value holding a template placeholder that is the only check it gets, and a failure there fails the step with earlier steps already run. |
 | `effort` | Rendered, trimmed, empty treated as absent. No control or format characters, at most 256 bytes. | As for `model`. |
 
 Nothing beyond shape is checked. The runner does not know whether a model
