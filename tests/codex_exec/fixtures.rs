@@ -1,11 +1,6 @@
 use recipe_runner_rs::runner::MAX_STEP_OUTPUT_BYTES;
 use serde_json::Value;
-use std::{
-    fs,
-    os::unix::fs::PermissionsExt,
-    process::Command,
-    time::{Duration, Instant},
-};
+use std::{fs, os::unix::fs::PermissionsExt, process::Command};
 
 pub(super) const LAUNCHER: &str = r#"#!/usr/bin/python3
 import sys, os, json, pathlib, time, stat, subprocess, threading
@@ -139,20 +134,7 @@ pub(super) fn run(
     if let Some(model) = model {
         command.env("TEST_MODEL", model);
     }
-    let mut child = command.spawn().unwrap();
-    let start = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success());
-            break;
-        }
-        if start.elapsed() > Duration::from_secs(8) {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("adapter exceeded watchdog");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    assert!(command.status().unwrap().success());
     let result =
         serde_json::from_slice(&fs::read(root.path().join("result.json")).unwrap()).unwrap();
     let record = fs::read(root.path().join("record.json"))

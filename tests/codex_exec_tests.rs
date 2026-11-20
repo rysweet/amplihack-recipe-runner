@@ -46,16 +46,12 @@ fn adapter_worker() {
             Some("autonomous"),
             &root,
             std::env::var("TEST_MODEL").ok().as_deref(),
-            if std::env::var("TEST_SCENARIO").as_deref() == Ok("flood") {
-                None
-            } else {
-                Some(
-                    if std::env::var("TEST_SCENARIO").as_deref() == Ok("zero_timeout") {
-                        0
-                    } else {
-                        1
-                    },
-                )
+            // Ordinary output and transport contracts synchronise on process
+            // completion. Only deadline scenarios request a deadline.
+            match std::env::var("TEST_SCENARIO").as_deref() {
+                Ok("zero_timeout") => Some(0),
+                Ok("blocked" | "tree_timeout") => Some(1),
+                _ => None,
             },
         );
     assert_eq!(
