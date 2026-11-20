@@ -1,18 +1,65 @@
-use super::fixtures::LAUNCHER;
+use super::fixtures::{fixture_environment, install_launcher};
+#[cfg(target_os = "linux")]
+use super::process_observation::{CancellationObservation, SpawnedWorker};
+use super::{fixtures::private_tempdir, process_observation::ChildGuard};
 use serde_json::Value;
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
     process::Command,
     time::{Duration, Instant},
 };
 
+fn runner_command(root: &std::path::Path, launcher: &std::path::Path, scenario: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_recipe-runner-rs"));
+    fixture_environment(&mut command, root)
+        .env("TEST_SCENARIO", scenario)
+        .env("AMPLIHACK_LAUNCHER_BINARY", launcher)
+        .env("RECIPE_RUNNER_NO_UPDATE_CHECK", "1");
+    command
+}
+
+/// Exercise the same command constructor on both platforms without sending a
+/// signal. The Linux signal scenarios below retain their original coverage.
+pub(super) fn assert_runner_environment_is_private() {
+    let root = private_tempdir();
+    let launcher = install_launcher(root.path());
+    let recipe = root.path().join("environment.yaml");
+    fs::write(&recipe, "name: environment\nsteps:\n  - id: agent\n    type: agent\n    prompt: synthetic environment probe\n").unwrap();
+    let mut runner = ChildGuard::new(
+        runner_command(root.path(), &launcher, "success")
+            .arg(recipe)
+            .args(["--agent-binary", "codex", "--working-dir"])
+            .arg(root.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let status = loop {
+        if let Some(status) = runner.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            runner.kill().unwrap();
+            runner.wait().unwrap();
+            panic!("environment probe exceeded watchdog");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        status.success(),
+        "synthetic runner environment probe failed"
+    );
+    let record: Value =
+        serde_json::from_slice(&fs::read(root.path().join("record.json")).unwrap()).unwrap();
+    assert_eq!(record["ambient_present"], serde_json::json!([]));
+}
+
 #[cfg(target_os = "linux")]
 fn assert_runner_cancellation(signal: i32, variant: &str) {
-    let root = tempfile::tempdir().unwrap();
-    let launcher = root.path().join("launcher");
-    fs::write(&launcher, LAUNCHER).unwrap();
-    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+    let root = private_tempdir();
+    let launcher = install_launcher(root.path());
     let recipe = root.path().join("recipe.yaml");
     let agent = "  - id: agent\n    type: agent\n    prompt: safe fixture\n";
     let marker = "  - id: after\n    type: bash\n    command: touch continued\n";
@@ -46,26 +93,25 @@ fn assert_runner_cancellation(signal: i32, variant: &str) {
         _ => agent.to_string(),
     };
     fs::write(&recipe, format!("name: cancellation\nsteps:\n{steps}")).unwrap();
-    let mut runner = Command::new(env!("CARGO_BIN_EXE_recipe-runner-rs"))
-        .arg(&recipe)
-        .args(["--agent-binary", "codex", "--working-dir"])
-        .arg(root.path())
-        .env("CODEX_TEST_ROOT", root.path())
-        .env(
-            "TEST_SCENARIO",
+    let mut runner = ChildGuard::new(
+        runner_command(
+            root.path(),
+            &launcher,
             if variant == "json" {
                 "cancel_json"
             } else {
                 "cancel"
             },
         )
-        .env("AMPLIHACK_LAUNCHER_BINARY", launcher)
-        .env("AMPLIHACK_SESSION_DEPTH", "0")
-        .env("RECIPE_RUNNER_NO_UPDATE_CHECK", "1")
+        .arg(&recipe)
+        .args(["--agent-binary", "codex", "--working-dir"])
+        .arg(root.path())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .unwrap();
+        .unwrap(),
+    );
+    let worker = SpawnedWorker::capture(runner.id()).expect("spawned cancellation runner identity");
     let start = Instant::now();
     while !root.path().join("launcher.pid").exists() {
         if start.elapsed() > Duration::from_secs(5) {
@@ -78,25 +124,26 @@ fn assert_runner_cancellation(signal: i32, variant: &str) {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let launcher: i32 = fs::read_to_string(root.path().join("launcher.pid"))
-        .unwrap()
-        .parse()
-        .unwrap();
+    let processes =
+        CancellationObservation::capture(root.path(), &worker, start + Duration::from_secs(5))
+            .expect("known live cancellation processes must be observed");
+    let launcher = processes.launcher_pid();
     assert_eq!(unsafe { libc::getpgid(launcher) }, launcher);
     assert_ne!(unsafe { libc::getpgid(runner.id() as i32) }, launcher);
     assert_eq!(unsafe { libc::kill(runner.id() as i32, signal) }, 0);
     let deadline = Instant::now() + Duration::from_secs(6);
     while runner.try_wait().unwrap().is_none() {
         if Instant::now() > deadline {
-            unsafe {
-                libc::kill(-launcher, libc::SIGKILL);
-            }
+            processes
+                .cleanup()
+                .expect("verified cancellation fallback cleanup failed");
             runner.kill().unwrap();
             runner.wait().unwrap();
             panic!("cancellation exceeded cleanup bounds");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+    processes.assert_stopped();
     let output = runner.wait_with_output().unwrap();
     assert!(
         !output.status.success(),
@@ -117,28 +164,6 @@ fn assert_runner_cancellation(signal: i32, variant: &str) {
         "{variant}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    for file in ["launcher.pid", "descendant.pid"] {
-        let pid = fs::read_to_string(root.path().join(file)).unwrap();
-        let live = fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
-            .map(|stat| {
-                !matches!(
-                    stat.rsplit_once(')')
-                        .unwrap()
-                        .1
-                        .split_whitespace()
-                        .next()
-                        .unwrap(),
-                    "Z" | "X"
-                )
-            })
-            .unwrap_or(false);
-        if live {
-            unsafe {
-                libc::kill(-launcher, libc::SIGKILL);
-            }
-        }
-        assert!(!live, "{file} alive at runner return");
-    }
     let record: Value =
         serde_json::from_slice(&fs::read(root.path().join("record.json")).unwrap()).unwrap();
     assert!(
